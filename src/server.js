@@ -2297,12 +2297,13 @@ app.get("/admin/sends", {
 app.get("/admin/queue/jobs", {
   schema: {
     summary: "List queued send jobs",
-    description: "Returns pending send jobs in actual processing order (active first, then next-to-run), with a text preview and priority. `delayedHighCount` covers the complete queue even when the visible list is limited. **Master token only.**",
+    description: "Returns pending send jobs in actual processing order (active first, then next-to-run), with a text preview and priority. Pass `all=true` to return the complete queue; otherwise `limit` controls the visible list. **Master token only.**",
     tags: ["Admin"],
     querystring: {
       type: "object",
       properties: {
-        limit: { type: "integer", minimum: 1, maximum: 500, default: 100 }
+        limit: { type: "integer", minimum: 1, maximum: 500, default: 100 },
+        all: { type: "boolean", default: false }
       }
     },
     response: {
@@ -2356,7 +2357,7 @@ app.get("/admin/queue/jobs", {
     }
   }
 }, async (request) => {
-  const limit = parseLimit(request.query.limit, 100, 500);
+  const limit = request.query.all ? null : parseLimit(request.query.limit, 100, 500);
   const [jobs, delayedHighCount, counts] = await Promise.all([
     sendQueue.listJobs({ limit }),
     sendQueue.countDeferredHighJobs(),

@@ -244,12 +244,13 @@ class SendQueue {
   // Returns a light shape — no full message body, just a preview.
   async listJobs({ states = ["active", "waiting", "paused", "delayed"], limit = 100 } = {}) {
     const jobs = [];
-    let remaining = Math.max(0, limit);
+    const unlimited = limit == null;
+    let remaining = unlimited ? Infinity : Math.max(0, limit);
     for (const state of states) {
       if (remaining === 0) break;
-      const stateJobs = await this.queue.getJobs([state], 0, remaining - 1, true);
+      const stateJobs = await this.queue.getJobs([state], 0, unlimited ? -1 : remaining - 1, true);
       jobs.push(...stateJobs);
-      remaining -= stateJobs.length;
+      if (!unlimited) remaining -= stateJobs.length;
     }
     const out = [];
     for (const job of jobs) {

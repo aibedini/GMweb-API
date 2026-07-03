@@ -229,6 +229,33 @@ test("queue dashboard lists jobs in worker processing order", async () => {
   assert.deepEqual(calls.map((call) => call.state), ["active", "waiting"]);
 });
 
+test("queue dashboard can list the complete pending queue", async () => {
+  const q = Object.create(SendQueue.prototype);
+  const makeJob = (id, state) => ({
+    id,
+    data: { to: id, text: id, priority: "normal" },
+    opts: { attempts: 3 },
+    getState: async () => state
+  });
+  const byState = {
+    active: [makeJob("active", "active")],
+    waiting: [makeJob("waiting-1", "waiting"), makeJob("waiting-2", "waiting")],
+    paused: [makeJob("paused", "paused")],
+    delayed: [makeJob("delayed", "delayed")]
+  };
+  const calls = [];
+  q.queue = {
+    getJobs: async ([state], start, end, asc) => {
+      calls.push({ state, start, end, asc });
+      return end === -1 ? byState[state].slice(start) : byState[state].slice(start, end + 1);
+    }
+  };
+
+  const jobs = await q.listJobs({ limit: null });
+  assert.deepEqual(jobs.map((job) => job.id), ["active", "waiting-1", "waiting-2", "paused", "delayed"]);
+  assert.equal(calls.every((call) => call.end === -1 && call.asc === true), true);
+});
+
 test("deferred HIGH count scans the complete pending queue", async () => {
   const q = Object.create(SendQueue.prototype);
   const makeJob = ({ priority, state, deferCount = 0, lifo = false }) => ({

@@ -39,7 +39,7 @@ export function QueuePage() {
     try {
       const [c, j] = await Promise.all([
         api<{ counts: QueueCounts; paused: boolean; quietHours: QueueQuietHours }>("/admin/queue", { headers: { "Content-Type": "text/plain" } }),
-        api<{ jobs: QueueJob[]; delayedHighCount: number }>("/admin/queue/jobs?limit=100", { headers: { "Content-Type": "text/plain" } }),
+        api<{ jobs: QueueJob[]; delayedHighCount: number }>("/admin/queue/jobs?all=true", { headers: { "Content-Type": "text/plain" } }),
       ]);
       setCounts(c.counts);
       setPaused(c.paused);
