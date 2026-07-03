@@ -98,7 +98,7 @@ export function QueuePage() {
       await api<{ ok: boolean; count: number }>("/admin/queue/jobs/bulk", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: selectedJobIds, action })
+        body: { ids: selectedJobIds, action }
       });
       setSelectedJobIds([]);
       await load();
