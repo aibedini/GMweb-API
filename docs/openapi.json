@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.3.21",
+    "version": "0.3.22",
     "contact": {
       "name": "GMweb API"
     }
@@ -1599,6 +1599,152 @@
                         },
                         "suppressed": {
                           "type": "integer"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/settings/send-pacing": {
+      "get": {
+        "summary": "Get live send pacing settings",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Returns the durable global pacing settings used by the queue worker. **Master token only.**",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "string"
+                    },
+                    "settings": {
+                      "type": "object",
+                      "properties": {
+                        "maxPerMinute": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 60
+                        },
+                        "randomDelayEnabled": {
+                          "type": "boolean"
+                        },
+                        "randomExtraSeconds": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 120
+                        },
+                        "minimumIntervalSeconds": {
+                          "type": "number"
+                        },
+                        "maximumIntervalSeconds": {
+                          "type": "number"
+                        },
+                        "updatedAt": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update live send pacing settings",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Persists and applies global queue pacing immediately, including a job currently waiting in the pacing stage. Random delay adds a uniformly random 0..N seconds between sends. **Master token only.**",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "maxPerMinute",
+                  "randomDelayEnabled",
+                  "randomExtraSeconds"
+                ],
+                "properties": {
+                  "maxPerMinute": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 60
+                  },
+                  "randomDelayEnabled": {
+                    "type": "boolean"
+                  },
+                  "randomExtraSeconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 120
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "appliedImmediately": {
+                      "type": "boolean"
+                    },
+                    "version": {
+                      "type": "string"
+                    },
+                    "settings": {
+                      "type": "object",
+                      "properties": {
+                        "maxPerMinute": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 60
+                        },
+                        "randomDelayEnabled": {
+                          "type": "boolean"
+                        },
+                        "randomExtraSeconds": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 120
+                        },
+                        "minimumIntervalSeconds": {
+                          "type": "number"
+                        },
+                        "maximumIntervalSeconds": {
+                          "type": "number"
+                        },
+                        "updatedAt": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
                         }
                       }
                     }

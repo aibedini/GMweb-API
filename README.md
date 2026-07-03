@@ -194,8 +194,9 @@ to the queue tail; a high-priority miss is retried after ten successful sends.
 If Google displays "Please wait before creating more conversations", the queue
 auto-pauses instead of retrying into the restriction. Resume it only after the
 session has rested, using `POST /admin/queue/resume`. You can also pause it with
-`POST /admin/queue/pause`. Tunables (env): `SEND_MIN_INTERVAL_MS`,
-`SEND_MAX_PER_MINUTE`, `SEND_DEDUPE_SECONDS`, `SEND_TIMEOUT_MS`,
+`POST /admin/queue/pause`. Live pacing is configurable in Dashboard → Settings;
+`SEND_MAX_PER_MINUTE` supplies its initial default. `SEND_MIN_INTERVAL_MS` separately
+paces new-conversation navigation. Other tunables: `SEND_DEDUPE_SECONDS`, `SEND_TIMEOUT_MS`,
 `SEND_FAIL_RESTART_THRESHOLD`, `CONVERSATION_HISTORY_MAX_BATCHES`,
 `POLL_INTERVAL_MS`.
 

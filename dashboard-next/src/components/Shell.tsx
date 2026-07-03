@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Activity,
   Send,
@@ -10,7 +10,9 @@ import {
   ScrollText,
   LogOut,
   MessageSquare,
+  Settings2,
 } from "lucide-react";
+import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useSession } from "@/lib/session";
 import { Button } from "@/components/ui/button";
@@ -23,6 +25,7 @@ import { ApiKeysPage } from "@/pages/ApiKeys";
 import { ControlsPage } from "@/pages/Controls";
 import { VncPage } from "@/pages/Vnc";
 import { LogsPage } from "@/pages/Logs";
+import { SettingsPage } from "@/pages/Settings";
 
 const NAV = [
   { id: "overview", label: "Overview", icon: Activity, el: <OverviewPage /> },
@@ -33,12 +36,20 @@ const NAV = [
   { id: "controls", label: "Controls", icon: SlidersHorizontal, el: <ControlsPage /> },
   { id: "vnc", label: "VNC", icon: Monitor, el: <VncPage /> },
   { id: "logs", label: "Logs", icon: ScrollText, el: <LogsPage /> },
+  { id: "settings", label: "Settings", icon: Settings2, el: <SettingsPage /> },
 ] as const;
 
 export function Shell() {
   const { logout } = useSession();
   const [active, setActive] = useState<string>("overview");
+  const [version, setVersion] = useState<string>("");
   const current = NAV.find((n) => n.id === active) ?? NAV[0];
+
+  useEffect(() => {
+    api<{ version: string }>("/health", { headers: { "Content-Type": "text/plain" } })
+      .then((health) => setVersion(health.version))
+      .catch(() => {});
+  }, []);
 
   return (
     <div className="flex min-h-screen bg-background text-foreground">
@@ -75,6 +86,10 @@ export function Shell() {
           })}
         </nav>
 
+        <div className="mb-1 flex items-center justify-between px-3 text-[11px] text-muted-foreground">
+          <span>GMweb API</span>
+          <span className="rounded-full border border-border bg-background/50 px-2 py-0.5 font-mono text-foreground/80">v{version || "…"}</span>
+        </div>
         <Button variant="ghost" className="justify-start text-muted-foreground" onClick={logout}>
           <LogOut className="size-4" /> Logout
         </Button>
@@ -82,8 +97,9 @@ export function Shell() {
 
       <main className="flex-1 overflow-x-hidden">
         {/* mobile top nav */}
-        <div className="flex gap-1 overflow-x-auto border-b border-border p-2 md:hidden">
-          {NAV.map((item) => (
+        <div className="flex items-center gap-2 border-b border-border p-2 md:hidden">
+          <div className="flex flex-1 gap-1 overflow-x-auto">
+            {NAV.map((item) => (
             <button
               key={item.id}
               onClick={() => setActive(item.id)}
@@ -94,7 +110,9 @@ export function Shell() {
             >
               {item.label}
             </button>
-          ))}
+            ))}
+          </div>
+          <span className="shrink-0 rounded-full border border-border px-2 py-1 font-mono text-[10px] text-muted-foreground">v{version || "…"}</span>
         </div>
 
         <div className="mx-auto max-w-6xl p-4 md:p-6">

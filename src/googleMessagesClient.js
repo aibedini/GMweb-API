@@ -379,10 +379,8 @@ class GoogleMessagesClient extends EventEmitter {
     }
 
     // 3. New number — Start-chat UI flow.
-    const baseWaitMs = Math.max(0, this.lastConversationOpenAt + this.conversationOpenIntervalMs - Date.now());
-    // Add a randomized human-like jitter delay of 5 to 15 seconds to deter Google's rate-limiting/bot detection
-    const jitterMs = Math.floor(Math.random() * 10000) + 5000;
-    const conversationWaitMs = baseWaitMs + jitterMs;
+    // Global inter-message randomness is controlled by the live Send settings.
+    const conversationWaitMs = Math.max(0, this.lastConversationOpenAt + this.conversationOpenIntervalMs - Date.now());
     if (conversationWaitMs > 0) {
       onStage?.("conversation_pacing");
       await page.waitForTimeout(conversationWaitMs);

@@ -14,6 +14,7 @@ const { GoogleMessagesClient } = require("./googleMessagesClient");
 const { ApiKeyStore } = require("./apiKeys");
 const { SendQueue } = require("./queue");
 const { SendStore } = require("./sendStore");
+const { SendPacingController } = require("./sendPacing");
 const { sendGate, DEFAULT_TIME_ZONE } = require("./sendSchedule");
 const pkg = require("../package.json");
 
@@ -500,10 +501,14 @@ const SEND_FAIL_RESTART_THRESHOLD = Number(process.env.SEND_FAIL_RESTART_THRESHO
 const SEND_HARD_RESTART_THRESHOLD = Number(process.env.SEND_HARD_RESTART_THRESHOLD) || 2;
 const HARD_RESTART_COOLDOWN_MS = Number(process.env.HARD_RESTART_COOLDOWN_MS) || 5 * 60 * 1000;
 const browserRecoveryFile = path.join(config.rootDir, "data", "browser-recovery.json");
-// Deliberately conservative pacing for browser-driven sends. The minimum gap
-// prevents bursts; BullMQ's limiter also caps starts across a full minute.
-const SEND_MIN_INTERVAL_MS = Math.max(1000, Number(process.env.SEND_MIN_INTERVAL_MS) || 15000);
-const SEND_MAX_PER_MINUTE = Math.max(1, Number(process.env.SEND_MAX_PER_MINUTE) || 4);
+const sendPacing = new SendPacingController({
+  filePath: path.join(config.rootDir, "data", "send-settings.json"),
+  defaults: {
+    maxPerMinute: Math.max(1, Number(process.env.SEND_MAX_PER_MINUTE) || 4),
+    randomDelayEnabled: false,
+    randomExtraSeconds: 0
+  }
+});
 const SEND_TIME_ZONE = process.env.SEND_TIMEZONE || DEFAULT_TIME_ZONE;
 const SEND_QUIET_START_HOUR = Number(process.env.SEND_QUIET_START_HOUR ?? 2);
 const SEND_QUIET_END_HOUR = Number(process.env.SEND_QUIET_END_HOUR ?? 8);
@@ -511,7 +516,6 @@ let sendFailStreak = 0;
 let recovering = false;
 let recoverEscalations = 0;
 let lastHardRestartAt = 0;
-let lastSendStartedAt = 0;
 let hardRecoveryScheduled = false;
 
 function isBrowserAutomationWedge(error) {
@@ -536,13 +540,22 @@ async function scheduleHardBrowserRecovery(reason, jobId) {
 }
 
 async function waitForSendPace(job) {
-  const waitMs = Math.max(0, lastSendStartedAt + SEND_MIN_INTERVAL_MS - Date.now());
-  if (waitMs > 0) {
-    sendStore.markStage(job.id, "pacing");
-    emitSse({ type: "send_stage", requestId: requestIdForJob(job), jobId: job.id, to: job.data?.to, stage: "pacing", waitMs, at: new Date().toISOString() });
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-  }
-  lastSendStartedAt = Date.now();
+  await sendPacing.wait({
+    onWait: ({ waitMs, randomExtraMs, settings }) => {
+      sendStore.markStage(job.id, "pacing");
+      emitSse({
+        type: "send_stage",
+        requestId: requestIdForJob(job),
+        jobId: job.id,
+        to: job.data?.to,
+        stage: "pacing",
+        waitMs,
+        randomExtraMs,
+        maxPerMinute: settings.maxPerMinute,
+        at: new Date().toISOString()
+      });
+    }
+  });
 }
 
 function isHighPriorityJob(job) {
@@ -801,9 +814,6 @@ function startSendWorker() {
         }
       },
       onError: (err) => app.log.warn({ err }, "send worker error")
-    },
-    {
-      limiter: { max: SEND_MAX_PER_MINUTE, duration: 60000 }
     }
   );
 }
@@ -2197,6 +2207,76 @@ app.get("/admin/queue", {
   };
 });
 
+const sendPacingSettingsSchema = {
+  type: "object",
+  properties: {
+    maxPerMinute: { type: "integer", minimum: 1, maximum: 60 },
+    randomDelayEnabled: { type: "boolean" },
+    randomExtraSeconds: { type: "integer", minimum: 0, maximum: 120 },
+    minimumIntervalSeconds: { type: "number" },
+    maximumIntervalSeconds: { type: "number" },
+    updatedAt: { type: ["string", "null"] }
+  }
+};
+
+app.get("/admin/settings/send-pacing", {
+  schema: {
+    summary: "Get live send pacing settings",
+    description: "Returns the durable global pacing settings used by the queue worker. **Master token only.**",
+    tags: ["Admin"],
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          version: { type: "string" },
+          settings: sendPacingSettingsSchema
+        }
+      }
+    }
+  }
+}, async () => ({ version: pkg.version, settings: sendPacing.snapshot() }));
+
+app.put("/admin/settings/send-pacing", {
+  schema: {
+    summary: "Update live send pacing settings",
+    description: "Persists and applies global queue pacing immediately, including a job currently waiting in the pacing stage. Random delay adds a uniformly random 0..N seconds between sends. **Master token only.**",
+    tags: ["Admin"],
+    body: {
+      type: "object",
+      required: ["maxPerMinute", "randomDelayEnabled", "randomExtraSeconds"],
+      properties: {
+        maxPerMinute: { type: "integer", minimum: 1, maximum: 60 },
+        randomDelayEnabled: { type: "boolean" },
+        randomExtraSeconds: { type: "integer", minimum: 0, maximum: 120 }
+      }
+    },
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          appliedImmediately: { type: "boolean" },
+          version: { type: "string" },
+          settings: sendPacingSettingsSchema
+        }
+      }
+    }
+  }
+}, async (request, reply) => {
+  const parsed = z.object({
+    maxPerMinute: z.number().int().min(1).max(60),
+    randomDelayEnabled: z.boolean(),
+    randomExtraSeconds: z.number().int().min(0).max(120)
+  }).safeParse(request.body);
+  if (!parsed.success) {
+    reply.code(400).send({ error: "invalid_body", details: parsed.error.flatten() });
+    return;
+  }
+  const settings = await sendPacing.update(parsed.data);
+  emitSse({ type: "send_pacing_settings_updated", settings, at: new Date().toISOString() });
+  return { ok: true, appliedImmediately: true, version: pkg.version, settings };
+});
+
 app.post("/admin/queue/pause", {
   schema: {
     summary: "Pause the send queue",
@@ -2784,6 +2864,7 @@ async function main() {
   }
   await loadSessions();
   await apiKeyStore.load();
+  await sendPacing.load();
   const queueWasPaused = await sendQueue.isPaused().catch(() => true);
   if (!queueWasPaused) await sendQueue.pause();
   startSendWorker();
