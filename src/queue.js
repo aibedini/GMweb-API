@@ -249,13 +249,13 @@ class SendQueue {
     for (const state of states) {
       if (remaining === 0) break;
       const stateJobs = await this.queue.getJobs([state], 0, unlimited ? -1 : remaining - 1, true);
-      jobs.push(...stateJobs);
+      jobs.push(...stateJobs.map((job) => ({ job, state })));
       if (!unlimited) remaining -= stateJobs.length;
     }
     const out = [];
-    for (const job of jobs) {
+    for (const entry of jobs) {
+      const { job, state } = entry;
       if (!job) continue;
-      const state = await job.getState().catch(() => "unknown");
       out.push({
         id: job.id,
         state,
