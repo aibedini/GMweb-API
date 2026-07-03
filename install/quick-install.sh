@@ -56,10 +56,11 @@ ART
 
 # stdin may be a pipe (curl | bash); read menu input from the terminal.
 read_tty() { local __v; if [[ -r /dev/tty ]]; then read -r "$@" <"/dev/tty"; else read -r "$@"; fi; }
-pause()    { echo; printf '%s' "${DIM}Press Enter to continue…${RST}"; read_tty _; }
+pause()    { echo; printf '%s' "${DIM}Press Enter to continue…${RST}" >/dev/tty; read_tty _; }
 ask() { # ask "Prompt" "default" -> echoes answer
+  # Write prompt to /dev/tty so it stays visible even inside \$(…) subshell captures.
   local p="$1" d="${2:-}" a
-  if [[ -n "$d" ]]; then printf '%s [%s]: ' "$p" "$d"; else printf '%s: ' "$p"; fi
+  if [[ -n "$d" ]]; then printf '%s [%s]: ' "$p" "$d" >/dev/tty; else printf '%s: ' "$p" >/dev/tty; fi
   read_tty a; echo "${a:-$d}"
 }
 confirm() { # confirm "Question?" -> returns 0 on y
