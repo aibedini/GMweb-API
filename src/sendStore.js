@@ -43,11 +43,18 @@ class SendStore {
         active_at   INTEGER,
         stage_at    INTEGER,
         finished_at INTEGER,
-        sent_at     INTEGER
+        sent_at     INTEGER,
+        result_json TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_sends_dedupe  ON sends (dedupe_key, status, sent_at);
       CREATE INDEX IF NOT EXISTS idx_sends_job     ON sends (job_id);
       CREATE INDEX IF NOT EXISTS idx_sends_status  ON sends (status);
+      CREATE TABLE IF NOT EXISTS send_job_refs (
+        job_id      TEXT PRIMARY KEY,
+        send_id     INTEGER NOT NULL,
+        attached_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_send_job_refs_send ON send_job_refs (send_id);
     `);
     // Additive migrations keep existing production ledgers readable.
     for (const sql of [
@@ -57,7 +64,8 @@ class SendStore {
       "ALTER TABLE sends ADD COLUMN queued_at INTEGER",
       "ALTER TABLE sends ADD COLUMN active_at INTEGER",
       "ALTER TABLE sends ADD COLUMN stage_at INTEGER",
-      "ALTER TABLE sends ADD COLUMN finished_at INTEGER"
+      "ALTER TABLE sends ADD COLUMN finished_at INTEGER",
+      "ALTER TABLE sends ADD COLUMN result_json TEXT"
     ]) {
       try { this.db.exec(sql); } catch { /* already present */ }
     }
@@ -77,18 +85,30 @@ class SendStore {
       `SELECT * FROM sends WHERE dedupe_key=? AND status IN ('queued','active') ORDER BY created_at DESC LIMIT 1`
     );
     this._attach = this.db.prepare(`UPDATE sends SET job_id=?, queued_at=?, updated_at=? WHERE id=?`);
+    this._attachRef = this.db.prepare(
+      `INSERT INTO send_job_refs (job_id, send_id, attached_at) VALUES (?, ?, ?)
+       ON CONFLICT(job_id) DO UPDATE SET send_id=excluded.send_id, attached_at=excluded.attached_at`
+    );
     this._setById = this.db.prepare(
       `UPDATE sends SET status=@status, error=@error, updated_at=@now,
          finished_at=CASE WHEN @status IN ('sent','failed','suppressed','cancelled') THEN @now ELSE finished_at END
        WHERE id=@id`
     );
     this._setStage = this.db.prepare(`UPDATE sends SET stage=?, stage_at=?, updated_at=? WHERE job_id=?`);
-    this._byJob = this.db.prepare(`SELECT * FROM sends WHERE job_id=? ORDER BY id DESC LIMIT 1`);
+    this._byJob = this.db.prepare(
+      `SELECT s.* FROM sends s
+       WHERE s.job_id=@job_id OR EXISTS (
+         SELECT 1 FROM send_job_refs r WHERE r.send_id=s.id AND r.job_id=@job_id
+       )
+       ORDER BY s.id DESC LIMIT 1`
+    );
+    this._byId = this.db.prepare(`SELECT * FROM sends WHERE id=? LIMIT 1`);
     this._setStatusByJob = this.db.prepare(
       `UPDATE sends SET status=@status, attempts=@attempts, error=@error, updated_at=@now,
          active_at = CASE WHEN @status='active' THEN @now ELSE active_at END,
          finished_at = CASE WHEN @status IN ('sent','failed','suppressed','cancelled') THEN @now ELSE finished_at END,
-         sent_at = CASE WHEN @status='sent' THEN @now ELSE sent_at END
+         sent_at = CASE WHEN @status='sent' THEN @now ELSE sent_at END,
+         result_json = CASE WHEN @result_json IS NOT NULL THEN @result_json ELSE result_json END
        WHERE job_id=@job_id`
     );
     this._pending = this.db.prepare(
@@ -104,6 +124,12 @@ class SendStore {
          (@dedupe_key, @to_number, @text, @key_name, @priority, @idempotency_key, @job_id,
           @status, @stage, @attempts, @error, @created_at, @updated_at, @queued_at, @active_at, @stage_at)`
     );
+    this._attachTxn = this.db.transaction((id, jobId, now) => {
+      const current = this._byId.get(id);
+      if (current?.job_id) this._attachRef.run(String(current.job_id), id, now);
+      this._attachRef.run(String(jobId), id, now);
+      this._attach.run(String(jobId), now, now, id);
+    });
 
     // Claim runs in a transaction so two concurrent identical requests can't both
     // pass the de-dupe check and double-send.
@@ -159,7 +185,7 @@ class SendStore {
 
   attachJob(id, jobId) {
     const now = Date.now();
-    this._attach.run(String(jobId), now, now, id);
+    this._attachTxn(id, jobId, now);
   }
 
   markById(id, status, error = null) {
@@ -173,13 +199,37 @@ class SendStore {
     this._setStage.run(stage, now, now, String(jobId));
   }
 
-  markStatus(jobId, status, { attempts = 0, error = null } = {}) {
+  markStatus(jobId, status, { attempts = 0, error = null, result = null } = {}) {
     if (!jobId) return;
-    this._setStatusByJob.run({ job_id: String(jobId), status, attempts, error, now: Date.now() });
+    let resultJson = null;
+    if (result !== null && result !== undefined) {
+      try { resultJson = JSON.stringify(result); } catch { resultJson = JSON.stringify({ value: String(result) }); }
+    }
+    this._setStatusByJob.run({
+      job_id: String(jobId), status, attempts, error,
+      result_json: resultJson, now: Date.now()
+    });
   }
 
   byJob(jobId) {
-    return jobId ? this._byJob.get(String(jobId)) : null;
+    return jobId ? this._byJob.get({ job_id: String(jobId) }) : null;
+  }
+
+  byId(id) {
+    return Number.isInteger(Number(id)) ? this._byId.get(Number(id)) : null;
+  }
+
+  requestId(id) {
+    return Number.isInteger(Number(id)) ? `send_${Number(id)}` : null;
+  }
+
+  // A requestId is stable for the lifetime of the SQLite ledger row even when
+  // BullMQ replaces its job during defer/retry/promotion. Raw job ids remain a
+  // backwards-compatible lookup for integrations already using them.
+  byReference(reference) {
+    const value = String(reference || "");
+    const match = /^send_(\d+)$/.exec(value);
+    return match ? this.byId(match[1]) : this.byJob(value);
   }
 
   // Rows still unfinished — used on boot to rebuild the queue if Redis lost them.

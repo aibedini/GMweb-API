@@ -327,6 +327,8 @@ test("idempotent sends receive a complete durable SQLite timeline", () => {
       to: "+989000000000", text: "test", keyName: "eve",
       priority: "high", idempotencyKey: "test-idem"
     });
+    const requestId = store.requestId(id);
+    assert.equal(requestId, `send_${id}`);
     store.attachJob(id, "42");
     store.markStatus("42", "active", { attempts: 1 });
     store.markStage("42", "typing");
@@ -338,6 +340,15 @@ test("idempotent sends receive a complete durable SQLite timeline", () => {
     assert(row.queued_at > 0);
     assert(row.active_at > 0);
     assert(row.stage_at > 0);
+    // Replacing a BullMQ job must not replace the public request identity.
+    store.attachJob(id, "43");
+    store.markStatus("43", "sent", { attempts: 2, result: { sent: true, transport: "rcs" } });
+    const completed = store.byReference(requestId);
+    assert.equal(completed.job_id, "43");
+    assert.equal(completed.status, "sent");
+    assert.deepEqual(JSON.parse(completed.result_json), { sent: true, transport: "rcs" });
+    assert.equal(store.byReference("43").id, id);
+    assert.equal(store.byReference("42").id, id);
     assert.equal(store.backfillPending({
       jobId: "legacy-1", state: "waiting", to: "+989000000001", text: "legacy",
       keyName: "eve", priority: "normal", attempts: 1, createdAt: Date.now() - 5000

@@ -1042,7 +1042,7 @@
         "tags": [
           "Messaging"
         ],
-        "description": "Queue an SMS/RCS message for delivery via Google Messages.\n\n**Asynchronous by default.** The message is added to a durable Redis-backed\nqueue and processed in the background by a single worker (one browser, one\nsend at a time). The endpoint returns a `jobId` immediately with HTTP 202.\n\n**Track delivery via:**\n- `GET /send/status/{jobId}` — poll the job state\n- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed`\n\n**Retries:** failed sends retry up to 3 times with exponential backoff.\n\n**Synchronous mode:** pass `\"wait\": true` to block until the send finishes\n(up to 90s) and receive the result directly. Use only for low-volume callers.\n\n**Priority:** pass `\"priority\": \"high\"` to jump the queue. A high-priority\nmessage is processed **next** (right after the send already in flight finishes),\nahead of every normal-priority message still waiting — then the queue/campaign\ncontinues as before. Use it for time-sensitive transactional messages (e.g. a\nrenewal confirmation) so they aren't stuck behind a bulk reminder campaign.\n\n**Quiet hours:** normal-priority messages are held from 02:00 through 07:59\n`Asia/Tehran` and released at 08:00. Delayed retries are also held even when\nHIGH; only a fresh high-priority first attempt bypasses quiet hours.\n\n**Rate limits (project keys):** configurable per-minute and per-hour (default 10/min, 100/hr).\n\n**Phone format:** include country code, e.g. `+989121234567`.\n\n**Auto de-dupe:** an identical `{to,text}` re-sent within ~120s (no Idempotency-Key needed) is suppressed and returns `status:\"duplicate_suppressed\"` with the original `jobId` — guards against accidental double-posting.",
+        "description": "Queue an SMS/RCS message for delivery via Google Messages.\n\n**Asynchronous by default.** The message is added to a durable Redis-backed\nqueue and processed in the background by a single worker (one browser, one\nsend at a time). The endpoint returns a stable `requestId` plus the current\nBullMQ `jobId` immediately with HTTP 202.\n\n**Track delivery via:**\n- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps\n  (`jobId` is also accepted for backwards compatibility)\n- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed`\n\n**Retries:** failed sends retry up to 3 times with exponential backoff.\n\n**Synchronous mode:** pass `\"wait\": true` to block until the send finishes\n(up to 90s) and receive the result directly. Use only for low-volume callers.\n\n**Priority:** pass `\"priority\": \"high\"` to jump the queue. A high-priority\nmessage is processed **next** (right after the send already in flight finishes),\nahead of every normal-priority message still waiting — then the queue/campaign\ncontinues as before. Use it for time-sensitive transactional messages (e.g. a\nrenewal confirmation) so they aren't stuck behind a bulk reminder campaign.\n\n**Quiet hours:** normal-priority messages are held from 02:00 through 07:59\n`Asia/Tehran` and released at 08:00. Delayed retries are also held even when\nHIGH; only a fresh high-priority first attempt bypasses quiet hours.\n\n**Rate limits (project keys):** configurable per-minute and per-hour (default 10/min, 100/hr).\n\n**Phone format:** include country code, e.g. `+989121234567`.\n\n**Auto de-dupe:** an identical `{to,text}` re-sent within ~120s (no Idempotency-Key needed) is suppressed and returns `status:\"duplicate_suppressed\"` with the original `jobId` — guards against accidental double-posting.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1111,6 +1111,18 @@
                     "ok": {
                       "type": "boolean"
                     },
+                    "requestId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "statusUrl": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
                     "jobId": {
                       "type": [
                         "null",
@@ -1161,13 +1173,27 @@
                     "ok": {
                       "type": "boolean"
                     },
+                    "requestId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Stable send request id. Use this value for status polling even if retries replace the queue job."
+                    },
+                    "statusUrl": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
                     "jobId": {
                       "type": "string"
                     },
                     "status": {
                       "type": "string",
                       "enum": [
-                        "queued"
+                        "queued",
+                        "deferred"
                       ]
                     },
                     "priority": {
@@ -1184,6 +1210,21 @@
                     "queuePosition": {
                       "type": "integer",
                       "description": "Approximate number of jobs ahead (incl. active). ~0 for high priority."
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "releaseAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "timeZone": {
+                      "type": "string"
+                    },
+                    "releaseAfterSuccesses": {
+                      "type": "integer"
                     }
                   }
                 }
@@ -1270,6 +1311,18 @@
                     "ok": {
                       "type": "boolean"
                     },
+                    "requestId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "statusUrl": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
                     "jobId": {
                       "type": "string"
                     },
@@ -1290,21 +1343,22 @@
         }
       }
     },
-    "/send/status/{jobId}": {
+    "/send/status/{reference}": {
       "get": {
-        "summary": "Get send job status",
+        "summary": "Get durable send request status",
         "tags": [
           "Messaging"
         ],
-        "description": "Returns the current state of a queued send job: `waiting`, `active`, `completed`, `failed`, or `delayed` (awaiting retry). Includes attempt count and result/error.",
+        "description": "Poll with the stable `requestId` returned by `POST /send` (recommended), or a BullMQ `jobId` for backwards compatibility. Returns the durable delivery status, granular browser stage, final result/error, and ISO-8601 timestamps. The request remains queryable after retries replace the queue job or Redis prunes it.",
         "parameters": [
           {
             "schema": {
               "type": "string"
             },
             "in": "path",
-            "name": "jobId",
-            "required": true
+            "name": "reference",
+            "required": true,
+            "description": "Stable requestId (`send_123`) or current jobId"
           }
         ],
         "responses": {
@@ -1315,8 +1369,27 @@
                 "schema": {
                   "type": "object",
                   "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "requestId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "jobId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
                     "id": {
-                      "type": "string"
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Backwards-compatible alias of jobId"
                     },
                     "state": {
                       "type": "string",
@@ -1325,7 +1398,35 @@
                         "active",
                         "completed",
                         "failed",
-                        "delayed"
+                        "delayed",
+                        "cancelled",
+                        "suppressed"
+                      ]
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "queued",
+                        "active",
+                        "sent",
+                        "failed",
+                        "cancelled",
+                        "suppressed"
+                      ]
+                    },
+                    "stage": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "terminal": {
+                      "type": "boolean"
+                    },
+                    "successful": {
+                      "type": [
+                        "null",
+                        "boolean"
                       ]
                     },
                     "to": {
@@ -1349,7 +1450,37 @@
                         "string"
                       ]
                     },
+                    "currentAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
                     "createdAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "queuedAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "activeAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "stageAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "updatedAt": {
                       "type": [
                         "null",
                         "string"
@@ -1366,6 +1497,32 @@
                         "null",
                         "string"
                       ]
+                    },
+                    "sentAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "timeline": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "status": {
+                            "type": "string"
+                          },
+                          "stage": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "at": {
+                            "type": "string"
+                          }
+                        }
+                      }
                     }
                   }
                 }

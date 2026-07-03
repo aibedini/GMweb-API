@@ -539,7 +539,7 @@ async function waitForSendPace(job) {
   const waitMs = Math.max(0, lastSendStartedAt + SEND_MIN_INTERVAL_MS - Date.now());
   if (waitMs > 0) {
     sendStore.markStage(job.id, "pacing");
-    emitSse({ type: "send_stage", jobId: job.id, to: job.data?.to, stage: "pacing", waitMs, at: new Date().toISOString() });
+    emitSse({ type: "send_stage", requestId: requestIdForJob(job), jobId: job.id, to: job.data?.to, stage: "pacing", waitMs, at: new Date().toISOString() });
     await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
   lastSendStartedAt = Date.now();
@@ -554,6 +554,11 @@ function isDelayedRetryJob(job) {
     Number(job?.opts?.delay || job?.delay || 0) > 0 ||
     Number(job?.data?.deferCount || 0) > 0 ||
     Boolean(job?.data?.deferReason);
+}
+
+function requestIdForJob(job) {
+  const ledgerId = job?.data?._ledgerId || sendStore.byJob(job?.id)?.id;
+  return sendStore.requestId(ledgerId);
 }
 
 async function deferQuietHoursJob(job, releaseAt) {
@@ -577,6 +582,7 @@ async function deferQuietHoursJob(job, releaseAt) {
   const event = {
     type: "send_deferred",
     reason: "quiet_hours",
+    requestId: requestIdForJob(job),
     jobId: job.id,
     deferredJobId: deferredJob.id,
     to: job.data?.to,
@@ -612,6 +618,7 @@ async function deferConversationJob(job, error) {
 
   const event = {
     type: "send_deferred",
+    requestId: requestIdForJob(job),
     jobId: job.id,
     deferredJobId: deferred.job.id,
     to: job.data?.to,
@@ -625,12 +632,15 @@ async function deferConversationJob(job, error) {
 
 async function handleSendCompleted(job, result) {
   if (result?.deferred) return;
-  sendStore.markStatus(job.id, "sent", { attempts: job.attemptsMade || 0 });
+  sendStore.markStatus(job.id, "sent", { attempts: job.attemptsMade || 0, result });
   const event = {
     type: "send_completed",
+    requestId: requestIdForJob(job),
     jobId: job.id,
+    status: "sent",
     to: job.data?.to,
     text: job.data?.text,
+    result: result || null,
     fastPath: result?.fastPath,
     at: result?.at || new Date().toISOString()
   };
@@ -670,7 +680,7 @@ function startSendWorker() {
             // Per-message progress: record the stage in the ledger and stream it.
             onStage: (s) => {
               sendStore.markStage(job.id, s);
-              emitSse({ type: "send_stage", jobId: job.id, to: job.data?.to, stage: s, at: new Date().toISOString() });
+              emitSse({ type: "send_stage", requestId: requestIdForJob(job), jobId: job.id, to: job.data?.to, stage: s, at: new Date().toISOString() });
             }
           }),
           new Promise((_, reject) => setTimeout(() => reject(new Error("send_timeout")), SEND_TIMEOUT_MS))
@@ -703,6 +713,7 @@ function startSendWorker() {
         sendStore.markStatus(job.id, "active", { attempts: job.attemptsMade || 0 });
         emitSse({
           type: "send_processing",
+          requestId: requestIdForJob(job),
           jobId: job.id,
           to: job.data?.to,
           at: new Date().toISOString()
@@ -724,7 +735,9 @@ function startSendWorker() {
         });
         const event = {
           type: "send_failed",
+          requestId: requestIdForJob(job),
           jobId: job?.id,
+          status: willRetry ? "queued" : "failed",
           to: job?.data?.to,
           error: err?.message || "send failed",
           attemptsMade,
@@ -1709,10 +1722,12 @@ app.post("/send", {
       "",
       "**Asynchronous by default.** The message is added to a durable Redis-backed",
       "queue and processed in the background by a single worker (one browser, one",
-      "send at a time). The endpoint returns a `jobId` immediately with HTTP 202.",
+      "send at a time). The endpoint returns a stable `requestId` plus the current",
+      "BullMQ `jobId` immediately with HTTP 202.",
       "",
       "**Track delivery via:**",
-      "- `GET /send/status/{jobId}` — poll the job state",
+      "- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps",
+      "  (`jobId` is also accepted for backwards compatibility)",
       "- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed`",
       "",
       "**Retries:** failed sends retry up to 3 times with exponential backoff.",
@@ -1766,11 +1781,17 @@ app.post("/send", {
         description: "Message accepted and queued",
         properties: {
           ok: { type: "boolean" },
+          requestId: { type: ["string", "null"], description: "Stable send request id. Use this value for status polling even if retries replace the queue job." },
+          statusUrl: { type: ["string", "null"] },
           jobId: { type: "string" },
-          status: { type: "string", enum: ["queued"] },
+          status: { type: "string", enum: ["queued", "deferred"] },
           priority: { type: "string", enum: ["high", "normal"] },
           deduped: { type: "boolean", description: "True if this returned an existing job for a repeated Idempotency-Key." },
-          queuePosition: { type: "integer", description: "Approximate number of jobs ahead (incl. active). ~0 for high priority." }
+          queuePosition: { type: "integer", description: "Approximate number of jobs ahead (incl. active). ~0 for high priority." },
+          reason: { type: "string" },
+          releaseAt: { type: ["string", "null"] },
+          timeZone: { type: "string" },
+          releaseAfterSuccesses: { type: "integer" }
         }
       },
       409: {
@@ -1786,6 +1807,8 @@ app.post("/send", {
         description: "Returned when wait=true and the send succeeded, for a deduped Idempotency-Key whose job already completed, or when an identical {to,text} was suppressed within the dedupe window (`duplicate_suppressed`).",
         properties: {
           ok: { type: "boolean" },
+          requestId: { type: ["string", "null"] },
+          statusUrl: { type: ["string", "null"] },
           jobId: { type: ["string", "null"] },
           status: { type: "string", enum: ["completed", "duplicate_suppressed"] },
           reason: { type: "string", enum: ["duplicate_suppressed", "duplicate_inflight"], description: "Why a send was suppressed: already sent within the window, or still in flight." },
@@ -1808,6 +1831,8 @@ app.post("/send", {
         description: "Returned only when wait=true and the send failed",
         properties: {
           ok: { type: "boolean" },
+          requestId: { type: ["string", "null"] },
+          statusUrl: { type: ["string", "null"] },
           jobId: { type: "string" },
           status: { type: "string", enum: ["failed"] },
           error: { type: "string" }
@@ -1874,9 +1899,18 @@ app.post("/send", {
       }
       if (rec && rec.jobId) {
         const st = await sendQueue.jobStatus(rec.jobId).catch(() => null);
-        const done = st?.state === "completed";
+        const ledger = sendStore.byJob(rec.jobId);
+        const done = ledger?.status === "sent" || st?.state === "completed";
         reply.code(done ? 200 : 202);
-        return { ok: true, jobId: rec.jobId, status: done ? "completed" : "queued", priority: highPriority ? "high" : "normal", deduped: true };
+        return {
+          ok: true,
+          requestId: ledger ? sendStore.requestId(ledger.id) : null,
+          statusUrl: ledger ? `/send/status/${sendStore.requestId(ledger.id)}` : null,
+          jobId: rec.jobId,
+          status: done ? "completed" : "queued",
+          priority: highPriority ? "high" : "normal",
+          deduped: true
+        };
       }
       // Original job expired/purged — re-reserve and fall through to send fresh.
       await sendQueue.reserveIdempotency(idemKey, bodyHash).catch(() => {});
@@ -1898,6 +1932,8 @@ app.post("/send", {
       reply.code(200);
       return {
         ok: true,
+        requestId: sendStore.requestId(claim.row.id),
+        statusUrl: `/send/status/${sendStore.requestId(claim.row.id)}`,
         jobId: claim.row.job_id || null,
         status: "duplicate_suppressed",
         reason: claim.action,           // duplicate_suppressed | duplicate_inflight
@@ -1912,6 +1948,7 @@ app.post("/send", {
       priority: highPriority ? "high" : "normal", idempotencyKey: idemKey
     });
   }
+  const requestId = sendStore.requestId(ledgerId);
 
   let job;
   try {
@@ -1922,6 +1959,7 @@ app.post("/send", {
         keyId: projectKey?.id || null,
         keyName: projectKey?.name || "master",
         priority: highPriority ? "high" : "normal",
+        _ledgerId: ledgerId,
         _idempotencyKey: idemKey,
         _bodyHash: bodyHash
       },
@@ -1934,7 +1972,7 @@ app.post("/send", {
   }
   if (idemKey) await sendQueue.setIdempotencyJob(idemKey, job.id, bodyHash).catch(() => {});
   if (ledgerId) sendStore.attachJob(ledgerId, job.id);
-  emitSse({ type: "send_queued", jobId: job.id, to, priority: highPriority ? "high" : "normal", at: new Date().toISOString() });
+  emitSse({ type: "send_queued", requestId, jobId: job.id, to, priority: highPriority ? "high" : "normal", at: new Date().toISOString() });
 
   if (wait) {
     try {
@@ -1943,6 +1981,8 @@ app.post("/send", {
         reply.code(202);
         return {
           ok: true,
+          requestId,
+          statusUrl: `/send/status/${requestId}`,
           jobId: result.deferredJobId,
           status: "deferred",
           priority: result.priority,
@@ -1952,9 +1992,9 @@ app.post("/send", {
           releaseAfterSuccesses: result.releaseAfterSuccesses
         };
       }
-      return { ok: true, jobId: job.id, status: "completed", result };
+      return { ok: true, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "completed", result };
     } catch (error) {
-      reply.code(502).send({ ok: false, jobId: job.id, status: "failed", error: error.message });
+      reply.code(502).send({ ok: false, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "failed", error: error.message });
       return;
     }
   }
@@ -1963,6 +2003,8 @@ app.post("/send", {
   reply.code(202);
   return {
     ok: true,
+    requestId,
+    statusUrl: `/send/status/${requestId}`,
     jobId: job.id,
     status: "queued",
     priority: highPriority ? "high" : "normal",
@@ -1970,34 +2012,136 @@ app.post("/send", {
   };
 });
 
-app.get("/send/status/:jobId", {
+app.get("/send/status/:reference", {
   schema: {
-    summary: "Get send job status",
-    description: "Returns the current state of a queued send job: `waiting`, `active`, `completed`, `failed`, or `delayed` (awaiting retry). Includes attempt count and result/error.",
+    summary: "Get durable send request status",
+    description: "Poll with the stable `requestId` returned by `POST /send` (recommended), or a BullMQ `jobId` for backwards compatibility. Returns the durable delivery status, granular browser stage, final result/error, and ISO-8601 timestamps. The request remains queryable after retries replace the queue job or Redis prunes it.",
     tags: ["Messaging"],
-    params: { type: "object", properties: { jobId: { type: "string" } } },
+    params: {
+      type: "object",
+      required: ["reference"],
+      properties: { reference: { type: "string", description: "Stable requestId (`send_123`) or current jobId" } }
+    },
     response: {
       200: {
         type: "object",
         properties: {
-          id: { type: "string" },
-          state: { type: "string", enum: ["waiting", "active", "completed", "failed", "delayed"] },
+          ok: { type: "boolean" },
+          requestId: { type: ["string", "null"] },
+          jobId: { type: ["string", "null"] },
+          id: { type: ["string", "null"], description: "Backwards-compatible alias of jobId" },
+          state: { type: "string", enum: ["waiting", "active", "completed", "failed", "delayed", "cancelled", "suppressed"] },
+          status: { type: "string", enum: ["queued", "active", "sent", "failed", "cancelled", "suppressed"] },
+          stage: { type: ["string", "null"] },
+          terminal: { type: "boolean" },
+          successful: { type: ["boolean", "null"] },
           to: { type: "string" },
           attemptsMade: { type: "integer" },
           maxAttempts: { type: "integer" },
           result: { type: ["object", "null"] },
           failedReason: { type: ["string", "null"] },
+          currentAt: { type: ["string", "null"] },
           createdAt: { type: ["string", "null"] },
+          queuedAt: { type: ["string", "null"] },
+          activeAt: { type: ["string", "null"] },
+          stageAt: { type: ["string", "null"] },
+          updatedAt: { type: ["string", "null"] },
           processedAt: { type: ["string", "null"] },
-          finishedAt: { type: ["string", "null"] }
+          finishedAt: { type: ["string", "null"] },
+          sentAt: { type: ["string", "null"] },
+          timeline: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                status: { type: "string" },
+                stage: { type: ["string", "null"] },
+                at: { type: "string" }
+              }
+            }
+          }
         }
       }
     }
   }
 }, async (request, reply) => {
-  const status = await sendQueue.jobStatus(request.params.jobId);
-  if (!status) { reply.code(404).send({ error: "not_found" }); return; }
-  return status;
+  const reference = request.params.reference;
+  const ledger = sendStore.byReference(reference);
+  // Project keys can only inspect sends created by that same project. The
+  // master token retains access to every request.
+  if (request._projectKey && (!ledger || ledger.key_name !== request._projectKey.name)) {
+    reply.code(404).send({ error: "not_found" });
+    return;
+  }
+
+  const liveJobId = ledger?.job_id || reference;
+  const live = await sendQueue.jobStatus(liveJobId).catch(() => null);
+  if (!ledger && !live) { reply.code(404).send({ error: "not_found" }); return; }
+  if (!ledger) {
+    const legacyStatus = {
+      waiting: "queued", delayed: "queued", active: "active",
+      completed: "sent", failed: "failed"
+    }[live.state] || "queued";
+    const legacyTerminal = ["completed", "failed"].includes(live.state);
+    return {
+      ok: true, requestId: null, jobId: live.id, ...live,
+      status: legacyStatus,
+      stage: null,
+      terminal: legacyTerminal,
+      successful: live.state === "completed" ? true : (legacyTerminal ? false : null),
+      currentAt: live.finishedAt || live.processedAt || live.createdAt,
+      queuedAt: live.createdAt,
+      activeAt: live.processedAt,
+      stageAt: null,
+      updatedAt: live.finishedAt || live.processedAt || live.createdAt,
+      sentAt: live.state === "completed" ? live.finishedAt : null,
+      timeline: []
+    };
+  }
+
+  const iso = (value) => value ? new Date(Number(value)).toISOString() : null;
+  let result = live?.result || null;
+  if (ledger.result_json) {
+    try { result = JSON.parse(ledger.result_json); } catch { result = { value: ledger.result_json }; }
+  }
+  const terminal = ["sent", "failed", "cancelled", "suppressed"].includes(ledger.status);
+  const fallbackState = {
+    queued: "waiting", active: "active", sent: "completed", failed: "failed",
+    cancelled: "cancelled", suppressed: "suppressed"
+  }[ledger.status] || "waiting";
+  const timeline = [
+    ledger.queued_at && { status: "queued", stage: null, at: iso(ledger.queued_at) },
+    ledger.active_at && { status: "active", stage: null, at: iso(ledger.active_at) },
+    ledger.stage_at && { status: ledger.status, stage: ledger.stage || null, at: iso(ledger.stage_at) },
+    ledger.finished_at && { status: ledger.status, stage: ledger.stage || null, at: iso(ledger.finished_at) }
+  ].filter(Boolean).sort((a, b) => a.at.localeCompare(b.at));
+
+  return {
+    ok: true,
+    requestId: sendStore.requestId(ledger.id),
+    jobId: ledger.job_id || live?.id || null,
+    id: ledger.job_id || live?.id || null,
+    state: live?.state || fallbackState,
+    status: ledger.status,
+    stage: ledger.stage || null,
+    terminal,
+    successful: ledger.status === "sent" ? true : (terminal ? false : null),
+    to: ledger.to_number,
+    attemptsMade: Math.max(Number(ledger.attempts || 0), Number(live?.attemptsMade || 0)),
+    maxAttempts: live?.maxAttempts || 3,
+    result,
+    failedReason: ledger.error || live?.failedReason || null,
+    currentAt: iso(ledger.finished_at || ledger.stage_at || ledger.updated_at),
+    createdAt: iso(ledger.created_at),
+    queuedAt: iso(ledger.queued_at),
+    activeAt: iso(ledger.active_at),
+    stageAt: iso(ledger.stage_at),
+    updatedAt: iso(ledger.updated_at),
+    processedAt: live?.processedAt || iso(ledger.active_at),
+    finishedAt: live?.finishedAt || iso(ledger.finished_at),
+    sentAt: iso(ledger.sent_at),
+    timeline
+  };
 });
 
 app.get("/admin/queue", {
