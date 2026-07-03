@@ -81,8 +81,9 @@ export function OverviewPage() {
   const queueCards: Array<{ k: string; v: number; tone: string }> = [
     { k: "Waiting", v: counts?.waiting ?? 0, tone: "text-amber-400" },
     { k: "Active", v: counts?.active ?? 0, tone: "text-primary" },
-    { k: "Completed", v: counts?.completed ?? 0, tone: "text-emerald-400" },
+    { k: "Sent", v: counts?.sent ?? 0, tone: "text-emerald-400" },
     { k: "Failed", v: counts?.failed ?? 0, tone: "text-red-400" },
+    { k: "Suppressed", v: counts?.suppressed ?? 0, tone: "text-zinc-400" },
   ];
 
   return (
@@ -140,7 +141,7 @@ export function OverviewPage() {
             ? <Badge variant="warning">paused</Badge>
             : counts && counts.waiting + counts.active === 0 && <Badge variant="success">idle</Badge>}
         </div>
-        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
           {queueCards.map((c) => (
             <SpotlightCard key={c.k} className="p-4">
               <div className="text-xs uppercase tracking-wide text-muted-foreground">{c.k}</div>

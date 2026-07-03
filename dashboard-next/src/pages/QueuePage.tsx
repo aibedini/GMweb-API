@@ -28,6 +28,7 @@ export function QueuePage() {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [actionError, setActionError] = useState("");
   const [staleSince, setStaleSince] = useState<number | null>(null);
+  const [selectedJobIds, setSelectedJobIds] = useState<string[]>([]);
 
   function messageFor(err: unknown) {
     return err instanceof ApiError ? err.message : "network error";
@@ -46,6 +47,8 @@ export function QueuePage() {
       setJobs(j.jobs);
       setDelayedHighCount(j.delayedHighCount);
       setStaleSince(null);
+      // Keep only selections that still exist in the updated list
+      setSelectedJobIds((prev) => prev.filter((id) => j.jobs.some((job) => job.id === id)));
     } catch (err) {
       // Background polling failure: don't yell at the user every 8s, but do
       // surface it if it persists — an expired session otherwise looks
@@ -67,6 +70,44 @@ export function QueuePage() {
   useSSE((e) => {
     if (e.type.startsWith("send_") || e.type.startsWith("queue_")) load().catch(() => {});
   }, true);
+
+  const toggleSelectJob = useCallback((id: string) => {
+    setSelectedJobIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    );
+  }, []);
+
+  const isAllSelected = jobs.length > 0 && jobs.every((job) => selectedJobIds.includes(job.id));
+  const isSomeSelected = selectedJobIds.length > 0 && !isAllSelected;
+
+  const toggleSelectAll = useCallback(() => {
+    if (isAllSelected) {
+      setSelectedJobIds([]);
+    } else {
+      setSelectedJobIds(jobs.map((job) => job.id));
+    }
+  }, [isAllSelected, jobs]);
+
+  async function performBulkAction(action: "cancel" | "complete") {
+    if (busyAction || selectedJobIds.length === 0) return;
+    const actionLabel = action === "cancel" ? "cancel" : "complete";
+    if (!confirm(`Are you sure you want to ${actionLabel} ${selectedJobIds.length} selected messages?`)) return;
+    setBusyAction(`bulk:${action}`);
+    setActionError("");
+    try {
+      await api<{ ok: boolean; count: number }>("/admin/queue/jobs/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: selectedJobIds, action })
+      });
+      setSelectedJobIds([]);
+      await load();
+    } catch (err) {
+      setActionError(`Bulk ${actionLabel} failed: ${messageFor(err)}`);
+    } finally {
+      setBusyAction(null);
+    }
+  }
 
   async function promote(id: string) {
     if (busyAction) return;
@@ -180,8 +221,59 @@ export function QueuePage() {
           <div className="p-6 text-center text-sm text-muted-foreground">Queue is empty.</div>
         ) : (
           <div className="max-h-[60vh] divide-y divide-border overflow-y-auto">
+            {/* Bulk actions bar */}
+            <div className="flex items-center justify-between border-b bg-muted/30 px-4 py-2 text-xs">
+              <div className="flex items-center gap-3">
+                <input
+                  type="checkbox"
+                  checked={isAllSelected}
+                  ref={(el) => {
+                    if (el) {
+                      el.indeterminate = isSomeSelected;
+                    }
+                  }}
+                  onChange={toggleSelectAll}
+                  className="size-4 cursor-pointer rounded border-zinc-700 bg-background/50 accent-primary text-primary focus:ring-primary"
+                />
+                <span className="font-medium text-muted-foreground">
+                  {selectedJobIds.length} of {jobs.length} selected
+                </span>
+              </div>
+              {selectedJobIds.length > 0 && (
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-[11px] font-medium text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/10 hover:text-emerald-300"
+                    disabled={busyAction !== null}
+                    onClick={() => performBulkAction("complete")}
+                  >
+                    Set Completed
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-[11px] font-medium text-red-400 border-red-500/20 hover:bg-red-500/10 hover:text-red-300"
+                    disabled={busyAction !== null}
+                    onClick={() => performBulkAction("cancel")}
+                  >
+                    Cancel Selected
+                  </Button>
+                </div>
+              )}
+            </div>
+
             {jobs.map((job) => (
               <div key={job.id} className="flex items-start gap-3 px-4 py-3">
+                {/* Individual checkbox */}
+                <div className="flex items-start pt-1">
+                  <input
+                    type="checkbox"
+                    checked={selectedJobIds.includes(job.id)}
+                    onChange={() => toggleSelectJob(job.id)}
+                    className="size-4 cursor-pointer rounded border-zinc-700 bg-background/50 accent-primary text-primary focus:ring-primary"
+                  />
+                </div>
                 <div className="flex w-20 shrink-0 flex-col items-start gap-1">
                   <Badge variant={job.state === "active" ? "default" : job.state === "delayed" ? "warning" : "secondary"}>
                     {job.state}

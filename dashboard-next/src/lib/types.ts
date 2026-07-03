@@ -41,6 +41,8 @@ export interface QueueCounts {
   completed: number;
   failed: number;
   delayed: number;
+  sent: number;
+  suppressed: number;
 }
 
 export interface QueueQuietHours {

@@ -2172,18 +2172,30 @@ app.get("/admin/queue", {
               active: { type: "integer" },
               completed: { type: "integer" },
               failed: { type: "integer" },
-              delayed: { type: "integer" }
+              delayed: { type: "integer" },
+              sent: { type: "integer" },
+              suppressed: { type: "integer" }
             }
           }
         }
       }
     }
   }
-}, async () => ({
-  paused: await sendQueue.isPaused(),
-  counts: await sendQueue.counts(),
-  quietHours: currentQuietHours()
-}));
+}, async () => {
+  const qc = await sendQueue.counts();
+  const dbStats = sendStore.stats();
+  return {
+    paused: await sendQueue.isPaused(),
+    counts: {
+      ...qc,
+      completed: dbStats.sent,
+      failed: dbStats.failed,
+      sent: dbStats.sent,
+      suppressed: dbStats.suppressed
+    },
+    quietHours: currentQuietHours()
+  };
+});
 
 app.post("/admin/queue/pause", {
   schema: {
@@ -2419,6 +2431,72 @@ app.delete("/admin/queue/jobs/:id", {
   if (!ok) { reply.code(404).send({ error: "not_found" }); return; }
   if (ledger) sendStore.markById(ledger.id, "cancelled", "cancelled_by_admin");
   return { ok: true };
+});
+
+app.post("/admin/queue/jobs/bulk", {
+  schema: {
+    summary: "Bulk perform actions on queued jobs",
+    description: "Performs cancel or complete actions on multiple jobs in the send queue. **Master token only.**",
+    tags: ["Admin"],
+    body: {
+      type: "object",
+      required: ["ids", "action"],
+      properties: {
+        ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "List of job/UUID IDs to perform action on"
+        },
+        action: {
+          type: "string",
+          enum: ["cancel", "complete"],
+          description: "Action to perform on selected jobs (cancel = Cancel, complete = Set Completed)"
+        }
+      }
+    },
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          count: { type: "integer" }
+        }
+      }
+    }
+  }
+}, async (request) => {
+  const { ids, action } = request.body;
+  let count = 0;
+  for (const id of ids) {
+    const ledger = sendStore.byJob(id);
+    const ok = await sendQueue.removeJob(id);
+    if (ok) {
+      count++;
+      if (ledger) {
+        if (action === "cancel") {
+          sendStore.markById(ledger.id, "cancelled", "cancelled_by_admin");
+        } else if (action === "complete") {
+          sendStore.markById(ledger.id, "sent", null);
+        }
+      }
+    } else {
+      if (ledger) {
+        count++;
+        if (action === "cancel") {
+          sendStore.markById(ledger.id, "cancelled", "cancelled_by_admin");
+        } else if (action === "complete") {
+          sendStore.markById(ledger.id, "sent", null);
+        }
+      }
+    }
+  }
+  emitSse({
+    type: "queue_bulk_action_completed",
+    action,
+    count,
+    at: new Date().toISOString()
+  });
+  return { ok: true, count };
 });
 
 // ─── API Key Management (master / dashboard only) ────────────────────────────
