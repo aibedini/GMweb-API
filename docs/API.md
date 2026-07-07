@@ -91,9 +91,22 @@ Opens a conversation and returns messages from it.
 ```json
 {
   "to": "+989195292411",
-  "text": "test"
+  "text": "test",
+  "priority": "high"
 }
 ```
+
+Returns `requestId`, `statusUrl`, and `jobId`. Store `requestId` as the stable
+shared id for polling/cancel; `jobId` is the current queue job id.
+
+### GET /send/status/:reference
+
+Poll send status using `requestId` such as `send_123` or a current `jobId`.
+
+### POST /send/cancel/:reference
+
+Cancels a queued send before it starts. Project API keys can cancel only their
+own sends. Returns `409 not_cancellable` when the send is already active/sent.
 
 ### GET /events
 

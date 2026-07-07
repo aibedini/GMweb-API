@@ -55,8 +55,9 @@ Full schemas are in [`openapi.json`](./openapi.json). The relevant subset:
 |---|---|
 | `GET /health` | Public. Returns `{ ok, service, version }`. Used for **sync detection** (see §4). |
 | `GET /ready` | `200` when Google Messages is paired and ready; `503` otherwise. Check before sending. |
-| `POST /send` | Queue a message. Returns `202 { jobId }`. Pass `"wait": true` to block for the result. |
-| `GET /send/status/:jobId` | Poll a send job: `waiting` / `active` / `completed` / `failed` / `delayed`. |
+| `POST /send` | Queue a message. Returns `202 { requestId, jobId }`. Pass `"wait": true` to block for the result. |
+| `GET /send/status/:requestId` | Poll a send request: `queued` / `active` / `sent` / `failed` / `cancelled`. `jobId` is also accepted. |
+| `POST /send/cancel/:requestId` | Cancel a queued send before it starts. Project keys can cancel only their own sends. |
 | `GET /conversations?limit=20` | List recent conversations (title, snippet, unread, stable `href`). |
 | `POST /conversations/open` | Open a conversation by `href` / `id` / `title` / `index`. |
 | `GET /messages/active?limit=50` | Read messages from the currently open conversation. |
@@ -69,11 +70,26 @@ curl -X POST https://YOUR_HOST/send \
   -H "Authorization: Bearer gmw_..." \
   -H "Content-Type: application/json" \
   -d '{ "to": "+989121234567", "text": "Hello" }'
-# -> 202 { "ok": true, "jobId": "...", "status": "queued" }
+# -> 202 { "ok": true, "requestId": "send_123", "statusUrl": "/send/status/send_123", "jobId": "...", "status": "queued" }
 ```
 Phone numbers must include the country code. Sends are async by default; either poll
-`GET /send/status/:jobId` or listen on `GET /events`. For simple callers, add
-`"wait": true` to get `200 { status: "completed" }` directly (up to 90s).
+`GET /send/status/:requestId` or listen on `GET /events`. `jobId` is still
+accepted for backwards compatibility, but consumers should store `requestId`
+because it remains stable even if the internal queue job changes. For simple
+callers, add `"wait": true` to get `200 { status: "completed" }` directly
+(up to 90s).
+
+### Cancel before send starts
+
+```bash
+curl -X POST https://YOUR_HOST/send/cancel/send_123 \
+  -H "Authorization: Bearer gmw_..."
+# -> 200 { "ok": true, "requestId": "send_123", "status": "cancelled", "terminal": true }
+```
+
+Cancel only works before the worker starts sending the message. If the send is
+already active or already terminal, GMweb returns `409 { "error": "not_cancellable" }`.
+Project API keys can cancel only send requests created by that same key.
 
 ### Read incoming SMS
 ```bash

@@ -115,8 +115,57 @@ Authorization: Bearer {API_KEY}
 - `404` if the id is unknown/purged (success kept ~1 day, failures ~7 days).
 
 **Or stream (push):** `GET {BASE}/events` (SSE) emits `send_queued`,
-`send_processing`, `send_completed`, `send_failed`, each with `jobId`. The
-`send_queued` event also includes `"priority": "high" | "normal"`.
+`send_processing`, `send_completed`, `send_failed`, `send_cancelled`, each with
+`jobId`. The `send_queued` event also includes `"priority": "high" | "normal"`.
+
+---
+
+## Cancel a send before it starts
+
+Eve should store the `requestId` returned by `POST /send`. It is the stable
+shared id between Eve and GMweb. `jobId` also works, but `requestId` is safer
+because internal queue job ids can change during retry/defer/promote flows.
+
+```bash
+curl -X POST {BASE}/send/cancel/send_123 \
+  -H "Authorization: Bearer {API_KEY}"
+```
+
+Success response:
+
+```jsonc
+// 200 OK
+{
+  "ok": true,
+  "requestId": "send_123",
+  "statusUrl": "/send/status/send_123",
+  "jobId": "413",
+  "status": "cancelled",
+  "state": "cancelled",
+  "cancelled": true,
+  "terminal": true
+}
+```
+
+If the worker has already started sending it, GMweb does not interrupt the
+browser mid-send. Eve receives:
+
+```jsonc
+// 409 Conflict
+{
+  "ok": false,
+  "error": "not_cancellable",
+  "reason": "already_active",
+  "requestId": "send_123",
+  "jobId": "413",
+  "status": "active",
+  "state": "active"
+}
+```
+
+If it was already sent/failed/suppressed, `reason` is `"already_terminal"`.
+Calling cancel again after a successful cancel is safe and returns `200` with
+`"alreadyCancelled": true`.
 
 ---
 

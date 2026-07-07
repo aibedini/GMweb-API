@@ -305,6 +305,39 @@ test("single-job promotion clears delay markers and works for normal jobs", asyn
   assert.equal(added.opts.lifo, true);
 });
 
+test("consumer cancel removes only pending jobs", async () => {
+  const q = Object.create(SendQueue.prototype);
+  const forgotten = [];
+  let removedWaiting = false;
+  const jobs = {
+    waiting: {
+      id: "waiting",
+      getState: async () => "waiting",
+      remove: async () => { removedWaiting = true; }
+    },
+    active: {
+      id: "active",
+      getState: async () => "active",
+      remove: async () => { throw new Error("active job should not be removed"); }
+    }
+  };
+  q.queue = { getJob: async (id) => jobs[id] || null };
+  q.forgetDeferredHigh = async (id) => { forgotten.push(String(id)); };
+
+  const waiting = await q.cancelPendingJob("waiting");
+  const active = await q.cancelPendingJob("active");
+  const missing = await q.cancelPendingJob("missing");
+
+  assert.equal(waiting.cancelled, true);
+  assert.equal(waiting.state, "waiting");
+  assert.equal(removedWaiting, true);
+  assert.deepEqual(forgotten, ["waiting"]);
+  assert.equal(active.cancelled, false);
+  assert.equal(active.reason, "active");
+  assert.equal(missing.cancelled, false);
+  assert.equal(missing.reason, "not_found");
+});
+
 test("previous-year timestamps stop sidebar warm-up", () => {
   const c = client();
   assert.equal(c.timestampIsBeforeCurrentYear("Jun 30"), false);

@@ -390,13 +390,24 @@ class SendQueue {
     return released;
   }
 
-  // Remove a job from the queue (cancel a pending send).
-  async removeJob(id) {
+  // Cancel a send only while it is still pending. An active job is already
+  // driving the browser and must finish/fail through the normal worker path.
+  async cancelPendingJob(id) {
     const job = await this.queue.getJob(id);
-    if (!job) return false;
+    if (!job) return { cancelled: false, reason: "not_found", state: null };
+    const state = await job.getState().catch(() => "unknown");
+    if (!["waiting", "paused", "delayed"].includes(state)) {
+      return { cancelled: false, reason: state === "active" ? "active" : "not_pending", state };
+    }
     await this.forgetDeferredHigh(id);
     await job.remove();
-    return true;
+    return { cancelled: true, id: String(id), state };
+  }
+
+  // Backwards-compatible boolean helper used by older admin paths.
+  async removeJob(id) {
+    const result = await this.cancelPendingJob(id);
+    return result.cancelled;
   }
 
   // Block until a job finishes (used by /send?wait=true). Throws on failure/timeout.

@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.3.22",
+    "version": "0.3.23",
     "contact": {
       "name": "GMweb API"
     }
@@ -1133,7 +1133,9 @@
                       "type": "string",
                       "enum": [
                         "completed",
-                        "duplicate_suppressed"
+                        "duplicate_suppressed",
+                        "cancelled",
+                        "failed"
                       ]
                     },
                     "reason": {
@@ -1523,6 +1525,167 @@
                           }
                         }
                       }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/send/cancel/{reference}": {
+      "post": {
+        "summary": "Cancel a queued send request",
+        "tags": [
+          "Messaging"
+        ],
+        "description": "Cancels a send that has not started yet. Pass the stable `requestId` returned by `POST /send` (recommended), or the current BullMQ `jobId` for backwards compatibility. Project API keys can cancel only their own send requests. If the send is already active or terminal, the endpoint returns `409 not_cancellable` and leaves the request unchanged.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "reference",
+            "required": true,
+            "description": "Stable requestId (`send_123`) or current jobId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "requestId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "statusUrl": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "jobId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "cancelled"
+                      ]
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "cancelled"
+                      ]
+                    },
+                    "cancelled": {
+                      "type": "boolean"
+                    },
+                    "alreadyCancelled": {
+                      "type": "boolean"
+                    },
+                    "cancelledFromState": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "terminal": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "not_found"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "not_cancellable"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string",
+                      "enum": [
+                        "already_active",
+                        "already_terminal",
+                        "not_pending",
+                        "not_found",
+                        "queue_remove_failed"
+                      ]
+                    },
+                    "requestId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "statusUrl": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "jobId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "status": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "state": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
                     }
                   }
                 }

@@ -1738,7 +1738,8 @@ app.post("/send", {
       "**Track delivery via:**",
       "- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps",
       "  (`jobId` is also accepted for backwards compatibility)",
-      "- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed`",
+      "- `POST /send/cancel/{requestId}` — cancel before the worker starts sending",
+      "- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed` / `send_cancelled`",
       "",
       "**Retries:** failed sends retry up to 3 times with exponential backoff.",
       "",
@@ -1820,7 +1821,7 @@ app.post("/send", {
           requestId: { type: ["string", "null"] },
           statusUrl: { type: ["string", "null"] },
           jobId: { type: ["string", "null"] },
-          status: { type: "string", enum: ["completed", "duplicate_suppressed"] },
+          status: { type: "string", enum: ["completed", "duplicate_suppressed", "cancelled", "failed"] },
           reason: { type: "string", enum: ["duplicate_suppressed", "duplicate_inflight"], description: "Why a send was suppressed: already sent within the window, or still in flight." },
           deduped: { type: "boolean" },
           priority: { type: "string", enum: ["high", "normal"] },
@@ -1910,14 +1911,18 @@ app.post("/send", {
       if (rec && rec.jobId) {
         const st = await sendQueue.jobStatus(rec.jobId).catch(() => null);
         const ledger = sendStore.byJob(rec.jobId);
-        const done = ledger?.status === "sent" || st?.state === "completed";
-        reply.code(done ? 200 : 202);
+        const duplicateStatus =
+          ledger?.status === "sent" || st?.state === "completed" ? "completed" :
+          ledger?.status === "cancelled" ? "cancelled" :
+          ledger?.status === "failed" || st?.state === "failed" ? "failed" :
+          "queued";
+        reply.code(duplicateStatus === "queued" ? 202 : 200);
         return {
           ok: true,
           requestId: ledger ? sendStore.requestId(ledger.id) : null,
           statusUrl: ledger ? `/send/status/${sendStore.requestId(ledger.id)}` : null,
           jobId: rec.jobId,
-          status: done ? "completed" : "queued",
+          status: duplicateStatus,
           priority: highPriority ? "high" : "normal",
           deduped: true
         };
@@ -2151,6 +2156,214 @@ app.get("/send/status/:reference", {
     finishedAt: live?.finishedAt || iso(ledger.finished_at),
     sentAt: iso(ledger.sent_at),
     timeline
+  };
+});
+
+app.post("/send/cancel/:reference", {
+  schema: {
+    summary: "Cancel a queued send request",
+    description: [
+      "Cancels a send that has not started yet. Pass the stable `requestId`",
+      "returned by `POST /send` (recommended), or the current BullMQ `jobId`",
+      "for backwards compatibility. Project API keys can cancel only their own",
+      "send requests. If the send is already active or terminal, the endpoint",
+      "returns `409 not_cancellable` and leaves the request unchanged."
+    ].join(" "),
+    tags: ["Messaging"],
+    params: {
+      type: "object",
+      required: ["reference"],
+      properties: {
+        reference: { type: "string", description: "Stable requestId (`send_123`) or current jobId" }
+      }
+    },
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          requestId: { type: ["string", "null"] },
+          statusUrl: { type: ["string", "null"] },
+          jobId: { type: ["string", "null"] },
+          status: { type: "string", enum: ["cancelled"] },
+          state: { type: "string", enum: ["cancelled"] },
+          cancelled: { type: "boolean" },
+          alreadyCancelled: { type: "boolean" },
+          cancelledFromState: { type: ["string", "null"] },
+          terminal: { type: "boolean" }
+        }
+      },
+      404: {
+        type: "object",
+        properties: { error: { type: "string", enum: ["not_found"] } }
+      },
+      409: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          error: { type: "string", enum: ["not_cancellable"] },
+          reason: {
+            type: "string",
+            enum: ["already_active", "already_terminal", "not_pending", "not_found", "queue_remove_failed"]
+          },
+          requestId: { type: ["string", "null"] },
+          statusUrl: { type: ["string", "null"] },
+          jobId: { type: ["string", "null"] },
+          status: { type: ["string", "null"] },
+          state: { type: ["string", "null"] }
+        }
+      }
+    }
+  }
+}, async (request, reply) => {
+  const reference = request.params.reference;
+  const ledger = sendStore.byReference(reference);
+
+  // Project keys can cancel only sends created by that same project. Return
+  // 404 instead of 403 so one project cannot probe another project's ids.
+  if (request._projectKey && (!ledger || ledger.key_name !== request._projectKey.name)) {
+    reply.code(404).send({ error: "not_found" });
+    return;
+  }
+
+  if (!ledger) {
+    const live = await sendQueue.jobStatus(reference).catch(() => null);
+    if (!live) { reply.code(404).send({ error: "not_found" }); return; }
+    const result = await sendQueue.cancelPendingJob(reference).catch((error) => ({
+      cancelled: false,
+      reason: "queue_remove_failed",
+      error: error.message,
+      state: live.state
+    }));
+    if (!result.cancelled) {
+      reply.code(409).send({
+        ok: false,
+        error: "not_cancellable",
+        reason: result.reason === "active" ? "already_active" :
+          (["completed", "failed"].includes(result.state) ? "already_terminal" : result.reason),
+        requestId: null,
+        statusUrl: null,
+        jobId: live.id,
+        status: null,
+        state: result.state || live.state
+      });
+      return;
+    }
+    emitSse({ type: "send_cancelled", requestId: null, jobId: live.id, at: new Date().toISOString() });
+    return {
+      ok: true,
+      requestId: null,
+      statusUrl: null,
+      jobId: live.id,
+      status: "cancelled",
+      state: "cancelled",
+      cancelled: true,
+      alreadyCancelled: false,
+      cancelledFromState: result.state || live.state,
+      terminal: true
+    };
+  }
+
+  const requestId = sendStore.requestId(ledger.id);
+  const statusUrl = `/send/status/${requestId}`;
+  const jobId = ledger.job_id || null;
+
+  if (ledger.status === "cancelled") {
+    return {
+      ok: true,
+      requestId,
+      statusUrl,
+      jobId,
+      status: "cancelled",
+      state: "cancelled",
+      cancelled: true,
+      alreadyCancelled: true,
+      cancelledFromState: null,
+      terminal: true
+    };
+  }
+
+  if (["sent", "failed", "suppressed"].includes(ledger.status)) {
+    reply.code(409).send({
+      ok: false,
+      error: "not_cancellable",
+      reason: "already_terminal",
+      requestId,
+      statusUrl,
+      jobId,
+      status: ledger.status,
+      state: ledger.status === "sent" ? "completed" : ledger.status
+    });
+    return;
+  }
+
+  const live = jobId ? await sendQueue.jobStatus(jobId).catch(() => null) : null;
+  if (live?.state === "active" || ledger.status === "active") {
+    reply.code(409).send({
+      ok: false,
+      error: "not_cancellable",
+      reason: "already_active",
+      requestId,
+      statusUrl,
+      jobId,
+      status: ledger.status,
+      state: live?.state || "active"
+    });
+    return;
+  }
+
+  if (jobId && live) {
+    const result = await sendQueue.cancelPendingJob(jobId).catch((error) => ({
+      cancelled: false,
+      reason: "queue_remove_failed",
+      error: error.message,
+      state: live.state
+    }));
+    if (!result.cancelled) {
+      reply.code(409).send({
+        ok: false,
+        error: "not_cancellable",
+        reason: result.reason === "active" ? "already_active" :
+          (["completed", "failed"].includes(result.state) ? "already_terminal" : result.reason),
+        requestId,
+        statusUrl,
+        jobId,
+        status: ledger.status,
+        state: result.state || live.state
+      });
+      return;
+    }
+    sendStore.markById(ledger.id, "cancelled", "cancelled_by_consumer");
+    emitSse({ type: "send_cancelled", requestId, jobId, to: ledger.to_number, at: new Date().toISOString() });
+    return {
+      ok: true,
+      requestId,
+      statusUrl,
+      jobId,
+      status: "cancelled",
+      state: "cancelled",
+      cancelled: true,
+      alreadyCancelled: false,
+      cancelledFromState: result.state || live.state,
+      terminal: true
+    };
+  }
+
+  // If Redis lost the pending job, cancel the durable ledger row so boot-time
+  // reconciliation will not re-enqueue it later.
+  sendStore.markById(ledger.id, "cancelled", "cancelled_by_consumer_missing_queue_job");
+  emitSse({ type: "send_cancelled", requestId, jobId, to: ledger.to_number, reason: "queue_job_missing", at: new Date().toISOString() });
+  return {
+    ok: true,
+    requestId,
+    statusUrl,
+    jobId,
+    status: "cancelled",
+    state: "cancelled",
+    cancelled: true,
+    alreadyCancelled: false,
+    cancelledFromState: null,
+    terminal: true
   };
 });
 
@@ -2765,6 +2978,7 @@ app.get("/events", {
       "- `send_processing` — the worker started sending a queued message",
       "- `send_completed` — a queued message was sent successfully (includes `jobId`)",
       "- `send_failed` — a send attempt failed (`willRetry` indicates if it will be retried)",
+      "- `send_cancelled` — a queued send was cancelled before it started",
       "",
       "**Usage (JavaScript):**",
       "```js",
