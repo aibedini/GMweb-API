@@ -676,30 +676,42 @@ class GoogleMessagesClient extends EventEmitter {
       "[contenteditable='true']",
       "textarea"
     ]);
+    const normalizedText = text.replace(/\s+/g, " ").trim();
+    const outgoingCountBefore = await page.evaluate(() => {
+      return [...document.querySelectorAll("mws-text-message-part")]
+        .filter((node) => {
+          const aria = node.getAttribute("aria-label") || "";
+          const rect = node.getBoundingClientRect();
+          return aria.startsWith("You said:") || rect.left > window.innerWidth * 0.55;
+        }).length;
+    }).catch(() => null);
+
     await messageInput.fill(text).catch(async () => {
       await messageInput.click();
       await page.keyboard.type(text);
     });
     await messageInput.press("Enter");
 
-    // Soft verify: assume the send went (GM clears the composer on success), and
-    // only report failure if we have POSITIVE evidence it's stuck — i.e. the
-    // composer STILL holds our exact text a moment later. This avoids false
-    // negatives (which would make every send "fail") while still catching the
-    // real wedge where Enter silently does nothing.
-    await page.waitForTimeout(900);
+    // A cleared composer is not delivery evidence: Google Messages can clear it
+    // while navigation/re-rendering loses the send. Only succeed after a NEW
+    // outgoing bubble containing this exact text appears in the conversation.
+    if (outgoingCountBefore === null) return false;
     try {
-      const stillHasText = await page.evaluate((sent) => {
-        const el = document.querySelector(
-          "[aria-label*='Text message' i], textarea[aria-label*='message' i], [contenteditable='true'][aria-label*='message' i], textarea, [contenteditable='true']"
-        );
-        if (!el) return false;
-        const val = ((el.value !== undefined ? el.value : el.textContent) || "").replace(/\s+/g, " ").trim();
-        return val === sent;
-      }, text.replace(/\s+/g, " ").trim());
-      return !stillHasText;
+      await page.waitForFunction(({ before, wanted }) => {
+        const outgoing = [...document.querySelectorAll("mws-text-message-part")]
+          .filter((node) => {
+            const aria = node.getAttribute("aria-label") || "";
+            const rect = node.getBoundingClientRect();
+            return aria.startsWith("You said:") || rect.left > window.innerWidth * 0.55;
+          });
+        if (outgoing.length <= before) return false;
+        const last = outgoing[outgoing.length - 1];
+        const actual = (last?.innerText || last?.textContent || "").replace(/\s+/g, " ").trim();
+        return actual === wanted;
+      }, { before: outgoingCountBefore, wanted: normalizedText }, { timeout: 10000 });
+      return true;
     } catch {
-      return true; // can't tell → assume sent (don't manufacture failures)
+      return false;
     }
   }
 

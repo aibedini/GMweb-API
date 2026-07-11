@@ -71,6 +71,34 @@ test("a selected recipient without a composer is retried from Start chat", async
   assert(stages.includes("recipient_filled"));
 });
 
+test("typeAndSend requires a new matching outgoing bubble", async () => {
+  const c = client();
+  const input = { fill: async () => {}, press: async () => {} };
+  const page = {
+    evaluate: async () => 4,
+    waitForFunction: async (_fn, arg) => {
+      assert.deepEqual(arg, { before: 4, wanted: "hello world" });
+    },
+    keyboard: { type: async () => {} }
+  };
+  c.ensurePage = async () => page;
+  c.locatorFirst = async () => input;
+  assert.equal(await c.typeAndSend("hello   world"), true);
+});
+
+test("typeAndSend never assumes sent when bubble verification fails", async () => {
+  const c = client();
+  const input = { fill: async () => {}, press: async () => {} };
+  const page = {
+    evaluate: async () => 2,
+    waitForFunction: async () => { throw new Error("timeout"); },
+    keyboard: { type: async () => {} }
+  };
+  c.ensurePage = async () => page;
+  c.locatorFirst = async () => input;
+  assert.equal(await c.typeAndSend("not sent"), false);
+});
+
 test("normal misses go to the queue tail and high misses wait ten successes", async () => {
   const q = Object.create(SendQueue.prototype);
   const enqueued = [];

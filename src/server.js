@@ -2553,6 +2553,7 @@ app.get("/admin/sends", {
               properties: {
                 id: { type: "integer" },
                 to: { type: "string" },
+                text: { type: "string" },
                 textPreview: { type: "string" },
                 keyName: { type: ["string", "null"] },
                 jobId: { type: ["string", "null"] },
@@ -2561,6 +2562,8 @@ app.get("/admin/sends", {
                 attempts: { type: "integer" },
                 error: { type: ["string", "null"] },
                 createdAt: { type: ["string", "null"] },
+                updatedAt: { type: ["string", "null"] },
+                finishedAt: { type: ["string", "null"] },
                 sentAt: { type: ["string", "null"] }
               }
             }
@@ -2574,6 +2577,7 @@ app.get("/admin/sends", {
   const sends = sendStore.recent(limit).map((r) => ({
     id: r.id,
     to: r.to_number,
+    text: String(r.text || ""),
     textPreview: String(r.text || "").replace(/\s+/g, " ").slice(0, 80),
     keyName: r.key_name,
     jobId: r.job_id,
@@ -2582,6 +2586,8 @@ app.get("/admin/sends", {
     attempts: r.attempts,
     error: r.error,
     createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+    updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+    finishedAt: r.finished_at ? new Date(r.finished_at).toISOString() : null,
     sentAt: r.sent_at ? new Date(r.sent_at).toISOString() : null
   }));
   return { stats: sendStore.stats(), sends };
