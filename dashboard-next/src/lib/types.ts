@@ -85,6 +85,38 @@ export interface QueueJob {
   };
 }
 
+export interface SendHistoryStats {
+  queued?: number;
+  active?: number;
+  sent?: number;
+  failed?: number;
+  suppressed?: number;
+  cancelled?: number;
+  [status: string]: number | undefined;
+}
+
+export interface SendHistoryItem {
+  id: string | number;
+  to: string | null;
+  text: string;
+  textPreview?: string;
+  keyName: string | null;
+  jobId: string | null;
+  status: string;
+  stage: string | null;
+  attempts: number;
+  error: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  finishedAt: string | null;
+  sentAt: string | null;
+}
+
+export interface SendHistoryResponse {
+  stats: SendHistoryStats;
+  sends: SendHistoryItem[];
+}
+
 export interface Conversation {
   id: string;
   href: string;

@@ -11,6 +11,7 @@ import {
   LogOut,
   MessageSquare,
   Settings2,
+  History,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -26,11 +27,13 @@ import { ControlsPage } from "@/pages/Controls";
 import { VncPage } from "@/pages/Vnc";
 import { LogsPage } from "@/pages/Logs";
 import { SettingsPage } from "@/pages/Settings";
+import { HistoryPage } from "@/pages/HistoryPage";
 
 const NAV = [
   { id: "overview", label: "Overview", icon: Activity, el: <OverviewPage /> },
   { id: "send", label: "Send", icon: Send, el: <SendPage /> },
   { id: "queue", label: "Queue", icon: ListOrdered, el: <QueuePage /> },
+  { id: "history", label: "History", icon: History, el: <HistoryPage /> },
   { id: "conversations", label: "Conversations", icon: MessagesSquare, el: <ConversationsPage /> },
   { id: "apikeys", label: "API Keys", icon: KeyRound, el: <ApiKeysPage /> },
   { id: "controls", label: "Controls", icon: SlidersHorizontal, el: <ControlsPage /> },
