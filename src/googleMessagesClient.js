@@ -334,9 +334,9 @@ class GoogleMessagesClient extends EventEmitter {
     return page.screenshot({ fullPage: true, type: "png" });
   }
 
-  async sendMessage({ to, text, onStage }) {
+  async sendMessage({ to, text, onStage, shouldCancel }) {
     return this.withBrowserLock(
-      () => this.sendMessageUnlocked({ to, text, onStage }),
+      () => this.sendMessageUnlocked({ to, text, onStage, shouldCancel }),
       { timeoutMs: this.sendOperationTimeoutMs }
     );
   }
@@ -408,9 +408,15 @@ class GoogleMessagesClient extends EventEmitter {
     return false;
   }
 
-  async sendMessageUnlocked({ to, text, onStage }) {
+  async sendMessageUnlocked({ to, text, onStage, shouldCancel }) {
     if (!to || !text) throw new Error("Both 'to' and 'text' are required.");
     const stage = (s) => { try { onStage?.(s); } catch { /* ignore */ } };
+    const throwIfCancelled = () => {
+      if (!shouldCancel?.()) return;
+      const error = new Error(`Send to ${to} was cancelled before submission.`);
+      error.code = "SEND_CANCELLED";
+      throw error;
+    };
 
     const page = await this.ensurePage();
     await page.bringToFront().catch(() => {});
@@ -421,6 +427,7 @@ class GoogleMessagesClient extends EventEmitter {
     // Messages here causes a long resync and loses the warm sidebar index.
     let sent = false;
     for (let attempt = 1; attempt <= 3 && !sent; attempt++) {
+      throwIfCancelled();
       stage(attempt === 1 ? "opening" : `ui_retry_${attempt}`);
       let opened = false;
       try {
@@ -444,11 +451,15 @@ class GoogleMessagesClient extends EventEmitter {
       }
 
       if (opened) {
-        // Dup-guard (retries only): a previous attempt may already have delivered
-        // this text — if so, don't send it again.
-        if (attempt > 1 && await this.lastOutgoingMatches(text)) { stage("already_sent"); sent = true; break; }
+        // A previous/replacement operation may already have submitted this text.
+        // If it is visible, do not press Enter again.
+        throwIfCancelled();
+        if (await this.lastOutgoingMatches(text)) { stage("already_sent"); sent = true; break; }
         stage("typing");
-        sent = await this.typeAndSend(text).catch(() => false);
+        sent = await this.typeAndSend(text, { shouldCancel }).catch((error) => {
+          if (error?.code === "SEND_CANCELLED") throw error;
+          return false;
+        });
         if (sent) { 
           stage("sent"); 
           // If we are in Google Rate Limited Mode, count consecutive successes
@@ -463,6 +474,9 @@ class GoogleMessagesClient extends EventEmitter {
           break; 
         }
         stage("send_unverified");
+        const error = new Error(`Send to ${to} was submitted once but the outgoing bubble could not be verified.`);
+        error.code = "SEND_UNVERIFIED";
+        throw error;
       }
 
       // A selected-recipient chip with no composer is a known Google UI miss.
@@ -660,12 +674,9 @@ class GoogleMessagesClient extends EventEmitter {
     }, null, { timeout }).catch(() => {});
   }
 
-  // Type the text into the REAL message composer (not the Start-chat recipient
-  // box) and press Enter. Returns true only once we VERIFY the send actually
-  // happened — GM clears the composer on a successful send, so an empty composer
-  // (or our text appearing as the last outgoing bubble) confirms it. A silent
-  // wedge (Enter does nothing) is reported as false so the caller can retry.
-  async typeAndSend(text) {
+  // Type into the real composer and press Enter exactly once. Success requires
+  // a newly rendered matching bubble. A silent wedge is terminal/unverified.
+  async typeAndSend(text, { shouldCancel } = {}) {
     const page = await this.ensurePage();
     const messageInput = await this.locatorFirst([
       "[aria-label*='Text message' i]",
@@ -677,60 +688,52 @@ class GoogleMessagesClient extends EventEmitter {
       "textarea"
     ]);
     const normalizedText = text.replace(/\s+/g, " ").trim();
-    const outgoingCountBefore = await page.evaluate(() => {
-      return [...document.querySelectorAll("mws-text-message-part")]
-        .filter((node) => {
-          const aria = node.getAttribute("aria-label") || "";
-          const rect = node.getBoundingClientRect();
-          return aria.startsWith("You said:") || rect.left > window.innerWidth * 0.55;
-        }).length;
+    const messageCountBefore = await page.evaluate(() => {
+      return document.querySelectorAll("mws-text-message-part").length;
     }).catch(() => null);
 
     await messageInput.fill(text).catch(async () => {
       await messageInput.click();
       await page.keyboard.type(text);
     });
+    if (shouldCancel?.()) {
+      const error = new Error("Send cancelled before Enter was pressed.");
+      error.code = "SEND_CANCELLED";
+      throw error;
+    }
     await messageInput.press("Enter");
 
     // A cleared composer is not delivery evidence: Google Messages can clear it
     // while navigation/re-rendering loses the send. Only succeed after a NEW
     // outgoing bubble containing this exact text appears in the conversation.
-    if (outgoingCountBefore === null) return false;
+    if (messageCountBefore === null) return false;
     try {
       await page.waitForFunction(({ before, wanted }) => {
-        const outgoing = [...document.querySelectorAll("mws-text-message-part")]
-          .filter((node) => {
-            const aria = node.getAttribute("aria-label") || "";
-            const rect = node.getBoundingClientRect();
-            return aria.startsWith("You said:") || rect.left > window.innerWidth * 0.55;
-          });
-        if (outgoing.length <= before) return false;
-        const last = outgoing[outgoing.length - 1];
-        const actual = (last?.innerText || last?.textContent || "").replace(/\s+/g, " ").trim();
-        return actual === wanted;
-      }, { before: outgoingCountBefore, wanted: normalizedText }, { timeout: 10000 });
+        const messages = [...document.querySelectorAll("mws-text-message-part")];
+        if (messages.length <= before) return false;
+        return messages.slice(before).some((node) => {
+          const actual = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+          return actual === wanted || actual.includes(wanted);
+        });
+      }, { before: messageCountBefore, wanted: normalizedText }, { timeout: 10000 });
       return true;
     } catch {
       return false;
     }
   }
 
-  // True if the most recent OUTGOING bubble in the open thread equals `text` —
-  // used as a de-dupe guard before retyping on a reload-retry.
+  // Conservative duplicate guard across SMS/RCS layouts. Bubble geometry is
+  // deliberately ignored because it changes between Google Messages layouts.
   async lastOutgoingMatches(text) {
     const page = await this.ensurePage();
     const want = text.replace(/\s+/g, " ").trim();
     try {
       return await page.evaluate((wanted) => {
-        const out = [...document.querySelectorAll("mws-text-message-part")]
-          .filter((n) => {
-            const aria = n.getAttribute("aria-label") || "";
-            const rect = n.getBoundingClientRect();
-            return aria.startsWith("You said:") || rect.left > 720;
-          });
-        const last = out[out.length - 1];
-        const t = last ? (last.innerText || last.textContent || "").replace(/\s+/g, " ").trim() : "";
-        return t === wanted;
+        const recent = [...document.querySelectorAll("mws-text-message-part")].slice(-12);
+        return recent.some((node) => {
+          const actual = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+          return actual === wanted || actual.includes(wanted);
+        });
       }, want);
     } catch {
       return false;

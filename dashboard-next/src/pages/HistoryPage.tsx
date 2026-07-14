@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
-const FILTERS = ["all", "queued", "active", "sent", "failed", "suppressed", "cancelled"];
+const FILTERS = ["all", "queued", "active", "sent", "unverified", "failed", "suppressed", "cancelled"];
 
 function dateTime(value: string | null) {
   if (!value) return "—";
@@ -19,6 +19,7 @@ function dateTime(value: string | null) {
 function statusStyle(status: string) {
   if (status === "sent") return "border-emerald-500/30 bg-emerald-500/10 text-emerald-300";
   if (status === "failed") return "border-red-500/30 bg-red-500/10 text-red-300";
+  if (status === "unverified") return "border-orange-500/30 bg-orange-500/10 text-orange-300";
   if (status === "active") return "border-violet-500/30 bg-violet-500/10 text-violet-300";
   if (status === "queued") return "border-amber-500/30 bg-amber-500/10 text-amber-300";
   return "border-zinc-500/30 bg-zinc-500/10 text-zinc-300";
@@ -88,9 +89,9 @@ export function HistoryPage() {
     return sends.filter((s) => (status === "all" || s.status === status) && (!q || [s.to, s.text, s.textPreview, s.keyName, s.jobId, s.id, s.error, s.stage].some((v) => String(v ?? "").toLocaleLowerCase().includes(q))));
   }, [sends, query, status]);
   const count = (name: string) => stats[name] ?? sends.filter((s) => s.status === name).length;
-  const summary = [["Queued", count("queued")], ["Active", count("active")], ["Sent", count("sent")], ["Failed", count("failed")], ["Suppressed / cancelled", count("suppressed") + count("cancelled")]] as const;
+  const summary = [["Queued", count("queued")], ["Active", count("active")], ["Sent", count("sent")], ["Unverified", count("unverified")], ["Failed", count("failed")], ["Suppressed / cancelled", count("suppressed") + count("cancelled")]] as const;
   return <div className="space-y-4">
-    <div className="grid grid-cols-2 gap-2 md:grid-cols-5">{summary.map(([label, value]) => <Card key={label} className="bg-card/60"><CardContent className="p-3"><div className="text-[11px] uppercase tracking-wider text-muted-foreground">{label}</div><div className="mt-1 text-2xl font-semibold tabular-nums">{value}</div>{label === "Suppressed / cancelled" && <div className="mt-1 text-[10px] text-muted-foreground">{count("suppressed")} suppressed · {count("cancelled")} cancelled</div>}</CardContent></Card>)}</div>
+    <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">{summary.map(([label, value]) => <Card key={label} className="bg-card/60"><CardContent className="p-3"><div className="text-[11px] uppercase tracking-wider text-muted-foreground">{label}</div><div className="mt-1 text-2xl font-semibold tabular-nums">{value}</div>{label === "Suppressed / cancelled" && <div className="mt-1 text-[10px] text-muted-foreground">{count("suppressed")} suppressed · {count("cancelled")} cancelled</div>}</CardContent></Card>)}</div>
     <Card>
       <CardHeader className="gap-3">
         <div className="flex flex-wrap items-center justify-between gap-3"><div><CardTitle className="flex items-center gap-2"><History className="size-5 text-primary" />Durable send ledger</CardTitle><p className="mt-1 text-xs text-muted-foreground">“Sent” means an outgoing bubble was confirmed in Google Messages; it does not mean carrier delivery.</p></div><Button variant="secondary" size="sm" onClick={load} disabled={loading}><RefreshCw className={cn("size-4", loading && "animate-spin")} />Refresh</Button></div>

@@ -89,6 +89,7 @@ export interface SendHistoryStats {
   queued?: number;
   active?: number;
   sent?: number;
+  unverified?: number;
   failed?: number;
   suppressed?: number;
   cancelled?: number;

@@ -99,6 +99,73 @@ test("typeAndSend never assumes sent when bubble verification fails", async () =
   assert.equal(await c.typeAndSend("not sent"), false);
 });
 
+test("an unverified submit presses Enter only once and never UI-retries", async () => {
+  const c = client();
+  let submits = 0;
+  const stages = [];
+  c.ensurePage = async () => ({
+    bringToFront: async () => {},
+    waitForTimeout: async () => {},
+    url: () => "https://messages.google.com/web/conversations/example"
+  });
+  c.ensurePaired = async () => {};
+  c.openForSend = async () => true;
+  c.lastOutgoingMatches = async () => false;
+  c.typeAndSend = async () => { submits += 1; return false; };
+
+  await assert.rejects(
+    c.sendMessageUnlocked({
+      to: "+989121234567", text: "one submission", onStage: (stage) => stages.push(stage)
+    }),
+    (error) => error.code === "SEND_UNVERIFIED"
+  );
+  assert.equal(submits, 1);
+  assert.equal(stages.filter((stage) => stage === "typing").length, 1);
+  assert(stages.includes("send_unverified"));
+  assert.equal(stages.some((stage) => stage.startsWith("ui_retry_")), false);
+});
+
+test("a recent matching bubble prevents another Enter", async () => {
+  const c = client();
+  let submits = 0;
+  const stages = [];
+  c.ensurePage = async () => ({
+    bringToFront: async () => {},
+    url: () => "https://messages.google.com/web/conversations/example"
+  });
+  c.ensurePaired = async () => {};
+  c.openForSend = async () => true;
+  c.lastOutgoingMatches = async () => true;
+  c.typeAndSend = async () => { submits += 1; return true; };
+
+  const result = await c.sendMessageUnlocked({
+    to: "+989121234567", text: "already visible", onStage: (stage) => stages.push(stage)
+  });
+  assert.equal(result.type, "sent");
+  assert.equal(submits, 0);
+  assert(stages.includes("already_sent"));
+});
+
+test("active cancellation stops before Enter", async () => {
+  const c = client();
+  let enterPresses = 0;
+  const input = {
+    fill: async () => {},
+    press: async () => { enterPresses += 1; }
+  };
+  c.ensurePage = async () => ({
+    evaluate: async () => 2,
+    keyboard: { type: async () => {} }
+  });
+  c.locatorFirst = async () => input;
+
+  await assert.rejects(
+    c.typeAndSend("cancel me", { shouldCancel: () => true }),
+    (error) => error.code === "SEND_CANCELLED"
+  );
+  assert.equal(enterPresses, 0);
+});
+
 test("normal misses go to the queue tail and high misses wait ten successes", async () => {
   const q = Object.create(SendQueue.prototype);
   const enqueued = [];
@@ -445,6 +512,34 @@ test("idempotent sends receive a complete durable SQLite timeline", () => {
     assert.equal(legacy.stage, "legacy_queued");
     assert.equal(legacy.status, "queued");
     assert.equal(store.backfillPending({ jobId: "legacy-1" }), false);
+  } finally {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("unverified is terminal and suppresses an identical resend", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-unverified-store-"));
+  const store = new SendStore(path.join(dir, "sends.db"));
+  try {
+    const first = store.claim({
+      to: "+989000000002", text: "single submit", keyName: "eve",
+      priority: "high", windowMs: 24 * 60 * 60 * 1000
+    });
+    assert.equal(first.action, "new");
+    store.attachJob(first.id, "unverified-job");
+    store.markStatus("unverified-job", "unverified", { error: "bubble_not_verified" });
+    const row = store.byJob("unverified-job");
+    assert.equal(row.status, "unverified");
+    assert(row.finished_at > 0);
+
+    const duplicate = store.claim({
+      to: "+989000000002", text: "single submit", keyName: "eve",
+      priority: "high", windowMs: 24 * 60 * 60 * 1000
+    });
+    assert.equal(duplicate.action, "duplicate_suppressed");
+    assert.equal(duplicate.row.id, first.id);
+    assert.equal(store.stats().unverified, 1);
   } finally {
     store.close();
     fs.rmSync(dir, { recursive: true, force: true });

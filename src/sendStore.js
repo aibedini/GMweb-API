@@ -33,7 +33,7 @@ class SendStore {
         priority    TEXT NOT NULL DEFAULT 'normal',
         idempotency_key TEXT,
         job_id      TEXT,
-        status      TEXT NOT NULL,           -- queued | active | sent | failed | suppressed
+        status      TEXT NOT NULL,           -- queued | active | sent | unverified | failed | suppressed
         stage       TEXT,                    -- granular progress: opening | locating | start_chat | composer_ready | typing | sent | stuck_reload ...
         attempts    INTEGER NOT NULL DEFAULT 0,
         error       TEXT,
@@ -79,7 +79,10 @@ class SendStore {
           'queued', @now, @now, @now)`
     );
     this._lastSent = this.db.prepare(
-      `SELECT * FROM sends WHERE dedupe_key=? AND status='sent' AND sent_at > ? ORDER BY sent_at DESC LIMIT 1`
+      `SELECT * FROM sends
+       WHERE dedupe_key=? AND status IN ('sent','unverified')
+         AND COALESCE(sent_at, finished_at) > ?
+       ORDER BY COALESCE(sent_at, finished_at) DESC LIMIT 1`
     );
     this._inflight = this.db.prepare(
       `SELECT * FROM sends WHERE dedupe_key=? AND status IN ('queued','active') ORDER BY created_at DESC LIMIT 1`
@@ -91,7 +94,7 @@ class SendStore {
     );
     this._setById = this.db.prepare(
       `UPDATE sends SET status=@status, error=@error, updated_at=@now,
-         finished_at=CASE WHEN @status IN ('sent','failed','suppressed','cancelled') THEN @now ELSE finished_at END
+         finished_at=CASE WHEN @status IN ('sent','unverified','failed','suppressed','cancelled') THEN @now ELSE finished_at END
        WHERE id=@id`
     );
     this._setStage = this.db.prepare(`UPDATE sends SET stage=?, stage_at=?, updated_at=? WHERE job_id=?`);
@@ -106,7 +109,7 @@ class SendStore {
     this._setStatusByJob = this.db.prepare(
       `UPDATE sends SET status=@status, attempts=@attempts, error=@error, updated_at=@now,
          active_at = CASE WHEN @status='active' THEN @now ELSE active_at END,
-         finished_at = CASE WHEN @status IN ('sent','failed','suppressed','cancelled') THEN @now ELSE finished_at END,
+         finished_at = CASE WHEN @status IN ('sent','unverified','failed','suppressed','cancelled') THEN @now ELSE finished_at END,
          sent_at = CASE WHEN @status='sent' THEN @now ELSE sent_at END,
          result_json = CASE WHEN @result_json IS NOT NULL THEN @result_json ELSE result_json END
        WHERE job_id=@job_id`
@@ -238,7 +241,7 @@ class SendStore {
   }
 
   stats() {
-    const out = { queued: 0, active: 0, sent: 0, failed: 0, suppressed: 0 };
+    const out = { queued: 0, active: 0, sent: 0, unverified: 0, failed: 0, suppressed: 0, cancelled: 0 };
     for (const r of this._statsRows.all()) out[r.status] = r.n;
     return out;
   }

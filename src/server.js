@@ -491,6 +491,12 @@ const SEND_TIMEOUT_MS = Math.max(240000, Number(config.sendTimeoutMs) || 240000)
 // hours (or still in flight) is suppressed — even with no Idempotency-Key, and
 // even across restarts (backed by the SQLite ledger). Default 24h.
 const SEND_DEDUPE_MS = (Number(process.env.SEND_DEDUPE_HOURS) || 24) * 3600 * 1000;
+// Conversation-opening misses may be deferred once. A submitted-but-unverified
+// message is NEVER deferred or retried because Enter may already have sent it.
+const configuredConversationDefers = Number(process.env.SEND_MAX_CONVERSATION_DEFERS ?? 1);
+const MAX_CONVERSATION_DEFERS = Number.isFinite(configuredConversationDefers)
+  ? Math.max(0, Math.floor(configuredConversationDefers))
+  : 1;
 const SEND_FAIL_RESTART_THRESHOLD = Number(process.env.SEND_FAIL_RESTART_THRESHOLD) || 3;
 // client.recover() only drops Playwright's reference and reconnects — it
 // fixes a wedged *page*, but does nothing if the Chrome *process* itself is
@@ -517,6 +523,7 @@ let recovering = false;
 let recoverEscalations = 0;
 let lastHardRestartAt = 0;
 let hardRecoveryScheduled = false;
+const activeSendCancellationRequests = new Set();
 
 function isBrowserAutomationWedge(error) {
   const text = String(error?.message || error || "");
@@ -644,7 +651,72 @@ async function deferConversationJob(job, error) {
 }
 
 async function handleSendCompleted(job, result) {
+  activeSendCancellationRequests.delete(String(job.id));
   if (result?.deferred) return;
+  // The consumer may have cancelled while Playwright was between two awaits.
+  // Never let a late worker completion overwrite that terminal decision.
+  if (sendStore.byJob(job.id)?.status === "cancelled") return;
+  if (result?.cancelled) {
+    sendStore.markStatus(job.id, "cancelled", {
+      attempts: job.attemptsMade || 0,
+      error: result.error || "cancelled_by_consumer",
+      result
+    });
+    const event = {
+      type: "send_cancelled",
+      requestId: requestIdForJob(job),
+      jobId: job.id,
+      status: "cancelled",
+      to: job.data?.to,
+      error: result.error || "cancelled_by_consumer",
+      at: new Date().toISOString()
+    };
+    emitSse(event);
+    postWebhook(event);
+    return;
+  }
+  if (result?.unverified) {
+    sendStore.markStatus(job.id, "unverified", {
+      attempts: job.attemptsMade || 0,
+      error: result.error || "outgoing_bubble_not_verified_after_single_submit",
+      result
+    });
+    const event = {
+      type: "send_unverified",
+      requestId: requestIdForJob(job),
+      jobId: job.id,
+      status: "unverified",
+      terminal: true,
+      successful: false,
+      to: job.data?.to,
+      error: result.error || "outgoing_bubble_not_verified_after_single_submit",
+      at: new Date().toISOString()
+    };
+    emitSse(event);
+    postWebhook(event);
+    return;
+  }
+  if (result?.terminalFailure) {
+    sendStore.markStatus(job.id, "failed", {
+      attempts: job.attemptsMade || 0,
+      error: result.error || "conversation_open_failed",
+      result
+    });
+    const event = {
+      type: "send_failed",
+      requestId: requestIdForJob(job),
+      jobId: job.id,
+      status: "failed",
+      terminal: true,
+      successful: false,
+      to: job.data?.to,
+      error: result.error || "conversation_open_failed",
+      at: new Date().toISOString()
+    };
+    emitSse(event);
+    postWebhook(event);
+    return;
+  }
   sendStore.markStatus(job.id, "sent", { attempts: job.attemptsMade || 0, result });
   const event = {
     type: "send_completed",
@@ -690,6 +762,7 @@ function startSendWorker() {
           client.sendMessage({
             to: job.data.to,
             text: job.data.text,
+            shouldCancel: () => activeSendCancellationRequests.has(String(job.id)),
             // Per-message progress: record the stage in the ledger and stream it.
             onStage: (s) => {
               sendStore.markStage(job.id, s);
@@ -702,6 +775,12 @@ function startSendWorker() {
         recoverEscalations = 0; // and proves the browser is genuinely healthy again
         return result;
       } catch (error) {
+        if (error?.code === "SEND_CANCELLED") {
+          return { cancelled: true, error: error.message };
+        }
+        if (error?.code === "SEND_UNVERIFIED") {
+          return { unverified: true, submittedOnce: true, error: error.message };
+        }
         if (isBrowserAutomationWedge(error)) {
           sendStore.markStage(job.id, "browser_unresponsive");
           await scheduleHardBrowserRecovery(error.message, job.id);
@@ -716,6 +795,12 @@ function startSendWorker() {
           });
         }
         if (error?.code === "CONVERSATION_OPEN_DEFER") {
+          if (Number(job.data?.deferCount || 0) >= MAX_CONVERSATION_DEFERS) {
+            return {
+              terminalFailure: true,
+              error: `${error.message} Maximum conversation defers reached (${MAX_CONVERSATION_DEFERS}).`
+            };
+          }
           return deferConversationJob(job, error);
         }
         throw error;
@@ -737,6 +822,7 @@ function startSendWorker() {
           .catch((error) => app.log.warn({ error }, "send completion bookkeeping failed"));
       },
       onFailed: (job, err) => {
+        activeSendCancellationRequests.delete(String(job?.id || ""));
         const attemptsMade = job?.attemptsMade || 0;
         const maxAttempts = job?.opts?.attempts || 1;
         const willRetry = attemptsMade < maxAttempts;
@@ -1041,7 +1127,7 @@ const STAGE_LABELS = {
   selecting_recipient: "Selecting recipient",
   open_by_url: "Opening cached conversation URL",
   typing: "Typing and sending message",
-  send_unverified: "Send was not confirmed; retrying UI",
+  send_unverified: "Submitted once; outgoing bubble was not confirmed",
   retrying_without_reload: "Retrying without reloading Messages",
   browser_unresponsive: "Chrome automation is unresponsive; recovery scheduled",
   google_rate_limited: "Google asked the gateway to wait",
@@ -1821,7 +1907,7 @@ app.post("/send", {
           requestId: { type: ["string", "null"] },
           statusUrl: { type: ["string", "null"] },
           jobId: { type: ["string", "null"] },
-          status: { type: "string", enum: ["completed", "duplicate_suppressed", "cancelled", "failed"] },
+          status: { type: "string", enum: ["completed", "duplicate_suppressed", "unverified", "cancelled", "failed"] },
           reason: { type: "string", enum: ["duplicate_suppressed", "duplicate_inflight"], description: "Why a send was suppressed: already sent within the window, or still in flight." },
           deduped: { type: "boolean" },
           priority: { type: "string", enum: ["high", "normal"] },
@@ -1912,9 +1998,10 @@ app.post("/send", {
         const st = await sendQueue.jobStatus(rec.jobId).catch(() => null);
         const ledger = sendStore.byJob(rec.jobId);
         const duplicateStatus =
-          ledger?.status === "sent" || st?.state === "completed" ? "completed" :
+          ledger?.status === "unverified" ? "unverified" :
           ledger?.status === "cancelled" ? "cancelled" :
           ledger?.status === "failed" || st?.state === "failed" ? "failed" :
+          ledger?.status === "sent" || (!ledger && st?.state === "completed") ? "completed" :
           "queued";
         reply.code(duplicateStatus === "queued" ? 202 : 200);
         return {
@@ -2007,6 +2094,25 @@ app.post("/send", {
           releaseAfterSuccesses: result.releaseAfterSuccesses
         };
       }
+      if (result?.unverified) {
+        return {
+          ok: false, requestId, statusUrl: `/send/status/${requestId}`,
+          jobId: job.id, status: "unverified", result
+        };
+      }
+      if (result?.cancelled) {
+        return {
+          ok: false, requestId, statusUrl: `/send/status/${requestId}`,
+          jobId: job.id, status: "cancelled", result
+        };
+      }
+      if (result?.terminalFailure) {
+        reply.code(502);
+        return {
+          ok: false, requestId, statusUrl: `/send/status/${requestId}`,
+          jobId: job.id, status: "failed", error: result.error
+        };
+      }
       return { ok: true, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "completed", result };
     } catch (error) {
       reply.code(502).send({ ok: false, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "failed", error: error.message });
@@ -2045,8 +2151,8 @@ app.get("/send/status/:reference", {
           requestId: { type: ["string", "null"] },
           jobId: { type: ["string", "null"] },
           id: { type: ["string", "null"], description: "Backwards-compatible alias of jobId" },
-          state: { type: "string", enum: ["waiting", "active", "completed", "failed", "delayed", "cancelled", "suppressed"] },
-          status: { type: "string", enum: ["queued", "active", "sent", "failed", "cancelled", "suppressed"] },
+          state: { type: "string", enum: ["waiting", "active", "completed", "failed", "delayed", "unverified", "cancelled", "suppressed"] },
+          status: { type: "string", enum: ["queued", "active", "sent", "unverified", "failed", "cancelled", "suppressed"] },
           stage: { type: ["string", "null"] },
           terminal: { type: "boolean" },
           successful: { type: ["boolean", "null"] },
@@ -2119,10 +2225,10 @@ app.get("/send/status/:reference", {
   if (ledger.result_json) {
     try { result = JSON.parse(ledger.result_json); } catch { result = { value: ledger.result_json }; }
   }
-  const terminal = ["sent", "failed", "cancelled", "suppressed"].includes(ledger.status);
+  const terminal = ["sent", "unverified", "failed", "cancelled", "suppressed"].includes(ledger.status);
   const fallbackState = {
     queued: "waiting", active: "active", sent: "completed", failed: "failed",
-    cancelled: "cancelled", suppressed: "suppressed"
+    unverified: "unverified", cancelled: "cancelled", suppressed: "suppressed"
   }[ledger.status] || "waiting";
   const timeline = [
     ledger.queued_at && { status: "queued", stage: null, at: iso(ledger.queued_at) },
@@ -2166,8 +2272,8 @@ app.post("/send/cancel/:reference", {
       "Cancels a send that has not started yet. Pass the stable `requestId`",
       "returned by `POST /send` (recommended), or the current BullMQ `jobId`",
       "for backwards compatibility. Project API keys can cancel only their own",
-      "send requests. If the send is already active or terminal, the endpoint",
-      "returns `409 not_cancellable` and leaves the request unchanged."
+      "send requests. Pending jobs are removed immediately. For an active job,",
+      "the browser operation is signalled to stop before any further Enter press."
     ].join(" "),
     tags: ["Messaging"],
     params: {
@@ -2283,7 +2389,7 @@ app.post("/send/cancel/:reference", {
     };
   }
 
-  if (["sent", "failed", "suppressed"].includes(ledger.status)) {
+  if (["sent", "unverified", "failed", "suppressed"].includes(ledger.status)) {
     reply.code(409).send({
       ok: false,
       error: "not_cancellable",
@@ -2299,17 +2405,27 @@ app.post("/send/cancel/:reference", {
 
   const live = jobId ? await sendQueue.jobStatus(jobId).catch(() => null) : null;
   if (live?.state === "active" || ledger.status === "active") {
-    reply.code(409).send({
-      ok: false,
-      error: "not_cancellable",
-      reason: "already_active",
+    if (jobId) activeSendCancellationRequests.add(String(jobId));
+    sendStore.markById(ledger.id, "cancelled", "cancelled_by_consumer_active");
+    emitSse({
+      type: "send_cancel_requested",
+      requestId,
+      jobId,
+      to: ledger.to_number,
+      at: new Date().toISOString()
+    });
+    return {
+      ok: true,
       requestId,
       statusUrl,
       jobId,
-      status: ledger.status,
-      state: live?.state || "active"
-    });
-    return;
+      status: "cancelled",
+      state: "cancelled",
+      cancelled: true,
+      alreadyCancelled: false,
+      cancelledFromState: "active",
+      terminal: true
+    };
   }
 
   if (jobId && live) {
@@ -2397,7 +2513,9 @@ app.get("/admin/queue", {
               failed: { type: "integer" },
               delayed: { type: "integer" },
               sent: { type: "integer" },
-              suppressed: { type: "integer" }
+              unverified: { type: "integer" },
+              suppressed: { type: "integer" },
+              cancelled: { type: "integer" }
             }
           }
         }
@@ -2414,7 +2532,9 @@ app.get("/admin/queue", {
       completed: dbStats.sent,
       failed: dbStats.failed,
       sent: dbStats.sent,
-      suppressed: dbStats.suppressed
+      unverified: dbStats.unverified,
+      suppressed: dbStats.suppressed,
+      cancelled: dbStats.cancelled
     },
     quietHours: currentQuietHours()
   };
@@ -2543,7 +2663,8 @@ app.get("/admin/sends", {
             type: "object",
             properties: {
               queued: { type: "integer" }, active: { type: "integer" }, sent: { type: "integer" },
-              failed: { type: "integer" }, suppressed: { type: "integer" }
+              unverified: { type: "integer" }, failed: { type: "integer" },
+              suppressed: { type: "integer" }, cancelled: { type: "integer" }
             }
           },
           sends: {

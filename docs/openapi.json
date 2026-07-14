@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.3.24",
+    "version": "0.3.26",
     "contact": {
       "name": "GMweb API"
     }
@@ -1134,6 +1134,7 @@
                       "enum": [
                         "completed",
                         "duplicate_suppressed",
+                        "unverified",
                         "cancelled",
                         "failed"
                       ]
@@ -1401,6 +1402,7 @@
                         "completed",
                         "failed",
                         "delayed",
+                        "unverified",
                         "cancelled",
                         "suppressed"
                       ]
@@ -1411,6 +1413,7 @@
                         "queued",
                         "active",
                         "sent",
+                        "unverified",
                         "failed",
                         "cancelled",
                         "suppressed"
@@ -1540,7 +1543,7 @@
         "tags": [
           "Messaging"
         ],
-        "description": "Cancels a send that has not started yet. Pass the stable `requestId` returned by `POST /send` (recommended), or the current BullMQ `jobId` for backwards compatibility. Project API keys can cancel only their own send requests. If the send is already active or terminal, the endpoint returns `409 not_cancellable` and leaves the request unchanged.",
+        "description": "Cancels a send that has not started yet. Pass the stable `requestId` returned by `POST /send` (recommended), or the current BullMQ `jobId` for backwards compatibility. Project API keys can cancel only their own send requests. Pending jobs are removed immediately. For an active job, the browser operation is signalled to stop before any further Enter press.",
         "parameters": [
           {
             "schema": {
@@ -1760,7 +1763,13 @@
                         "sent": {
                           "type": "integer"
                         },
+                        "unverified": {
+                          "type": "integer"
+                        },
                         "suppressed": {
+                          "type": "integer"
+                        },
+                        "cancelled": {
                           "type": "integer"
                         }
                       }
@@ -2017,10 +2026,16 @@
                         "sent": {
                           "type": "integer"
                         },
+                        "unverified": {
+                          "type": "integer"
+                        },
                         "failed": {
                           "type": "integer"
                         },
                         "suppressed": {
+                          "type": "integer"
+                        },
+                        "cancelled": {
                           "type": "integer"
                         }
                       }
