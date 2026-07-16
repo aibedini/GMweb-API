@@ -1,20 +1,22 @@
 # Simple Setup
 
-This is the short path for a fresh Ubuntu 22 VPS.
+Fresh install or repair/reinstall on Ubuntu 22:
 
 ## 1. Install
 
 ```bash
-git clone https://github.com/yoyoraya/GMweb-API.git
-cd GMweb-API
-sudo bash install/ubuntu22.sh
+curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | sudo bash
 ```
+
+Running the same command again repairs the installation, updates `/opt/gmweb-api`,
+rebuilds the React app, rotates the API token and dashboard password, and
+restarts the services.
 
 The installer prepares:
 
 - Chrome on a virtual display
 - GMweb API service
-- local-only API on port `3030`
+- API and both web interfaces on public port `3030`
 - local-only noVNC helper for pairing
 - a strong API token in `/opt/gmweb-api/.env`
 
@@ -58,27 +60,16 @@ gmweb token
 
 You can also type `gmweb` to open the full server menu.
 
-## 4. Use API From Your Computer
-
-Open an SSH tunnel:
+## 4. Open From Your Computer
 
 ```bash
-ssh -L 3030:127.0.0.1:3030 root@SERVER_IP
-```
-
-Then call:
-
-```bash
-curl -H "Authorization: Bearer TOKEN" http://127.0.0.1:3030/ready
+curl -H "Authorization: Bearer TOKEN" http://SERVER_IP:3030/ready
 ```
 
 ## 5. Use The Dashboard
 
-With the same tunnel open, visit:
-
-```text
-http://127.0.0.1:3030/dashboard
-```
+Open `http://SERVER_IP:3030/app` for the React console or
+`http://SERVER_IP:3030/dashboard` for the classic dashboard.
 
 Enter the API token. The dashboard includes status, send, conversations,
 restart controls, VNC on/off, and an embedded noVNC console.
@@ -97,8 +88,8 @@ After that, open:
 https://dashboard.example.com/dashboard
 ```
 
-Do not expose `3030` directly. The public setup keeps the API local and exposes
-only HTTPS through Nginx.
+For production HTTPS, use the optional public-dashboard command above. Ensure
+TCP port `3030` is allowed by the VPS provider firewall when using direct access.
 
 ## Speed Notes
 

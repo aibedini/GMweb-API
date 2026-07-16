@@ -37,37 +37,24 @@ to events** without touching the browser.
 
 ## 🚀 One‑command install (Ubuntu 22.04)
 
-The fastest path. A single **menu‑driven** script installs every dependency
-(Chrome, Redis, VNC, Node), wires up **systemd services + a self‑healing watchdog
-+ log rotation**, generates credentials, and **walks you through pairing** — then
-lets you secure, monitor, update, or fully remove everything.
+The fastest path installs Chrome, Redis, VNC, Node, the API services, both web
+interfaces, and generates the required credentials.
 
 ```bash
-# from a cloned repo:
-sudo bash install/quick-install.sh
-
-# …or straight from GitHub (clones into /opt/gmweb-api):
-curl -fsSL https://raw.githubusercontent.com/yoyoraya/GMweb-API/main/install/quick-install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | sudo bash
 ```
 
-It installs a **`gmweb-install`** command to reopen the menu anytime:
+Run the same command again to repair/reinstall. It updates the app, rebuilds the
+React console, rotates the exposed API token and dashboard password, and
+restarts all core services.
 
-```text
-1) Quick install / repair     5) 🔒 Security (firewall · rotate token · audit)
-2) 🔗 Pairing wizard          6) 🌐 Public dashboard (HTTPS)
-3) ⚙️  Services (start/stop/VNC) 7) ⬆️  Update from git
-4) 📊 Logs & monitoring        8) 🧨 Uninstall (full purge + self‑delete)
-```
-
-What the guided install sets up for you:
+What the installer sets up for you:
 
 | Component | Purpose |
 |---|---|
 | `gmweb-chrome` | Google Chrome on a virtual display (Xvfb), exposed over CDP `:9222` |
-| `gmweb-api` | the REST API on `127.0.0.1:3030` (requires Redis) |
+| `gmweb-api` | REST API plus React `/app` and classic `/dashboard` on public port `3030` |
 | `gmweb-vnc` / `gmweb-novnc` | on‑demand VNC console for scanning the pairing QR |
-| `gmweb-monitor.timer` | 🩺 watchdog every 2 min — heals a wedged session automatically |
-| `/var/log/gmweb/` | install + watchdog logs, rotated weekly |
 
 ---
 
@@ -161,8 +148,14 @@ Integrating another project? See **[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
 | `…/app` | **React console** — overview, send, queue (promote/cancel), Google‑Messages‑style conversations, API keys, controls, VNC, logs |
 | `…/dashboard` | **classic** built‑in dashboard (zero‑build) |
 
-Both use the same 2‑step login (dashboard **password → API token**). On a VPS,
-reach them via an SSH tunnel, or expose over HTTPS:
+Both use the same 2-step login (dashboard **password → API token**). After install:
+
+```text
+http://SERVER_IP:3030/app
+http://SERVER_IP:3030/dashboard
+```
+
+Allow TCP `3030` in the VPS provider firewall. For HTTPS with a domain:
 
 ```bash
 gmweb public-dashboard install dashboard.example.com admin@example.com
@@ -211,8 +204,6 @@ gmweb vnc-on     gmweb vnc-off        gmweb token
 gmweb smoke      gmweb uninstall
 ```
 
-`gmweb-install` reopens the full installer menu (services, security, logs, update, uninstall).
-
 ---
 
 ## 🧨 Uninstall
@@ -244,7 +235,7 @@ More docs: [VPS](docs/VPS.md) · [No‑GUI VPS](docs/VPS_NO_GUI.md) · [Operatio
 ## 🛡️ Production notes
 
 - ✅ `NODE_ENV=production` and a strong `API_TOKEN`.
-- ✅ Keep the API bound to `127.0.0.1`; put HTTPS + a firewall in front.
+- ✅ Direct setup binds to `0.0.0.0:3030`; protect the port with the generated credentials and a firewall. Prefer HTTPS for internet-facing production use.
 - ✅ `ENABLE_DEBUG_ROUTES=false`.
 - ✅ Keep `data/browser-profile` private and backed up (it holds the Google session).
 - ✅ Give consumers a **project key**, not the master token.

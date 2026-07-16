@@ -3,9 +3,7 @@
 For a fresh Ubuntu 22 server, prefer the automated installer and manager menu:
 
 ```bash
-git clone https://github.com/yoyoraya/GMweb-API.git
-cd GMweb-API
-sudo bash install/ubuntu22.sh
+curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | sudo bash
 gmweb
 ```
 
@@ -28,13 +26,13 @@ Install Chrome if it is not already installed.
 ```env
 NODE_ENV=production
 PORT=3030
-HOST=127.0.0.1
+HOST=0.0.0.0
 API_TOKEN=use-a-long-random-token
 HEADLESS=true
 USER_DATA_DIR=./data/browser-profile
 ```
 
-Use `HOST=127.0.0.1` behind Nginx. Use `HOST=0.0.0.0` only if firewall rules are tight.
+The quick installer uses `HOST=0.0.0.0`, so `/app`, `/dashboard`, and the token-protected API are reachable at `http://SERVER_IP:3030`.
 
 ## 3. Pair Google Messages
 

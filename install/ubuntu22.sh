@@ -6,10 +6,11 @@ APP_SLUG="gmweb-api"
 APP_USER="${APP_USER:-gmweb}"
 APP_DIR="${APP_DIR:-/opt/gmweb-api}"
 APP_PORT="${APP_PORT:-3030}"
+PUBLIC_HOST="${PUBLIC_HOST:-0.0.0.0}"
 DISPLAY_ID="${DISPLAY_ID:-:99}"
 CDP_PORT="${CDP_PORT:-9222}"
 SERVER_TIMEZONE="${SERVER_TIMEZONE:-Asia/Tehran}"
-REPO_URL="${REPO_URL:-}"
+REPO_URL="${REPO_URL:-https://github.com/aibedini/GMweb-API.git}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -31,7 +32,8 @@ fi
 
 echo "==> Installing system packages"
 apt-get update
-apt-get install -y ca-certificates curl wget gnupg git rsync sudo tar xvfb x11vnc fluxbox novnc websockify
+apt-get install -y ca-certificates curl wget gnupg git rsync sudo tar xvfb x11vnc fluxbox novnc websockify redis-server jq
+systemctl enable --now redis-server
 
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'Number(process.versions.node.split(`.`)[0])')" -lt 20 ]]; then
   echo "==> Installing Node.js 22"
@@ -58,14 +60,7 @@ fi
 echo "==> Preparing app directory: $APP_DIR"
 mkdir -p "$APP_DIR"
 
-if [[ -n "$REPO_URL" ]]; then
-  if [[ -d "$APP_DIR/.git" ]]; then
-    git -C "$APP_DIR" pull --ff-only
-  else
-    rm -rf "$APP_DIR"
-    git clone "$REPO_URL" "$APP_DIR"
-  fi
-elif [[ -f "$SOURCE_DIR/package.json" ]]; then
+if [[ -f "$SOURCE_DIR/package.json" ]]; then
   if [[ "$SOURCE_DIR" != "$APP_DIR" ]]; then
     echo "No REPO_URL provided. Syncing project from $SOURCE_DIR to $APP_DIR."
     rsync -a --delete \
@@ -77,6 +72,18 @@ elif [[ -f "$SOURCE_DIR/package.json" ]]; then
   else
     echo "No REPO_URL provided. Using project files already in $APP_DIR."
   fi
+elif [[ -d "$APP_DIR/.git" ]]; then
+  git -C "$APP_DIR" pull --ff-only
+elif [[ -n "$REPO_URL" ]]; then
+  TEMP_CHECKOUT="$(mktemp -d)"
+  trap 'rm -rf "$TEMP_CHECKOUT"' EXIT
+  git clone --depth 1 "$REPO_URL" "$TEMP_CHECKOUT"
+  rsync -a --delete \
+    --exclude ".git/" \
+    --exclude ".env" \
+    --exclude "data/" \
+    --exclude "node_modules/" \
+    "$TEMP_CHECKOUT/" "$APP_DIR/"
 else
   echo "No REPO_URL provided and no package.json found next to this installer."
   echo "Run from a cloned GMweb API repo or pass REPO_URL=https://github.com/.../GMweb-API.git"
@@ -94,6 +101,9 @@ fi
 echo "==> Installing npm dependencies"
 as_app_user "cd '$APP_DIR' && npm ci --omit=dev"
 
+echo "==> Building React console (/app)"
+as_app_user "cd '$APP_DIR/dashboard-next' && npm ci && npm run build"
+
 TOKEN="$(as_app_user "cd '$APP_DIR' && node scripts/new-token.js")"
 DASHBOARD_USERNAME="${DASHBOARD_USERNAME:-gmwebadmin}"
 DASHBOARD_PASSWORD="${DASHBOARD_PASSWORD:-$(node -e "console.log(require('node:crypto').randomBytes(33).toString('base64url'))")}"
@@ -103,7 +113,7 @@ if [[ ! -f "$APP_DIR/.env" ]]; then
   cat > "$APP_DIR/.env" <<ENV
 NODE_ENV=production
 PORT=$APP_PORT
-HOST=127.0.0.1
+HOST=$PUBLIC_HOST
 API_TOKEN=$TOKEN
 HEADLESS=false
 USER_DATA_DIR=./data/browser-profile
@@ -136,7 +146,28 @@ ENV
   chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
   chmod 600 "$APP_DIR/.env"
 else
-  echo ".env already exists; not overwriting it."
+  echo "==> Repairing existing .env"
+  if grep -q '^HOST=' "$APP_DIR/.env"; then
+    sed -i "s/^HOST=.*/HOST=$PUBLIC_HOST/" "$APP_DIR/.env"
+  else
+    printf '\nHOST=%s\n' "$PUBLIC_HOST" >> "$APP_DIR/.env"
+  fi
+  if grep -q '^API_TOKEN=' "$APP_DIR/.env"; then
+    sed -i "s|^API_TOKEN=.*|API_TOKEN=$TOKEN|" "$APP_DIR/.env"
+  else
+    printf 'API_TOKEN=%s\n' "$TOKEN" >> "$APP_DIR/.env"
+  fi
+  DASHBOARD_USERNAME="$(grep -m1 '^DASHBOARD_USERNAME=' "$APP_DIR/.env" | cut -d= -f2-)"
+  DASHBOARD_USERNAME="${DASHBOARD_USERNAME:-gmwebadmin}"
+  DASHBOARD_PASSWORD="$(node -e "console.log(require('node:crypto').randomBytes(33).toString('base64url'))")"
+  DASHBOARD_PASSWORD_HASH="$(as_app_user "cd '$APP_DIR' && node scripts/hash-password.js '$DASHBOARD_PASSWORD'")"
+  if grep -q '^DASHBOARD_PASSWORD_HASH=' "$APP_DIR/.env"; then
+    sed -i "s|^DASHBOARD_PASSWORD_HASH=.*|DASHBOARD_PASSWORD_HASH=$DASHBOARD_PASSWORD_HASH|" "$APP_DIR/.env"
+  else
+    printf 'DASHBOARD_PASSWORD_HASH=%s\n' "$DASHBOARD_PASSWORD_HASH" >> "$APP_DIR/.env"
+  fi
+  chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
+  chmod 600 "$APP_DIR/.env"
 fi
 
 chmod +x "$APP_DIR/scripts/vps-chrome.sh" "$APP_DIR/scripts/pairing-vnc.sh"
@@ -269,7 +300,7 @@ WantedBy=multi-user.target
 SERVICE
 
 systemctl daemon-reload
-systemctl enable gmweb-chrome.service gmweb-api.service
+systemctl enable --now gmweb-chrome.service gmweb-api.service
 systemctl disable gmweb-vnc.service gmweb-novnc.service 2>/dev/null || true
 
 echo
@@ -280,15 +311,17 @@ echo "Dashboard username: $DASHBOARD_USERNAME"
 echo "Dashboard password: $DASHBOARD_PASSWORD"
 echo
 echo "Manager menu: gmweb"
-echo "Dashboard: http://127.0.0.1:$APP_PORT/dashboard"
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+echo "React app: http://${SERVER_IP:-SERVER_IP}:$APP_PORT/app"
+echo "Classic dashboard: http://${SERVER_IP:-SERVER_IP}:$APP_PORT/dashboard"
+echo "API base URL: http://${SERVER_IP:-SERVER_IP}:$APP_PORT"
 echo
 echo "Next:"
-echo "1) gmweb start"
-echo "2) gmweb vnc-on"
-echo "3) From your laptop: ssh -L 6080:127.0.0.1:6080 root@SERVER_IP"
-echo "4) Open http://127.0.0.1:6080/vnc.html and pair Google Messages"
-echo "5) gmweb vnc-off"
-echo "6) gmweb smoke"
+echo "1) gmweb vnc-on"
+echo "2) From your laptop: ssh -L 6080:127.0.0.1:6080 root@SERVER_IP"
+echo "3) Open http://127.0.0.1:6080/vnc.html and pair Google Messages"
+echo "4) gmweb vnc-off"
+echo "5) gmweb smoke"
 echo
 echo "Optional public dashboard:"
 echo "gmweb public-dashboard install dashboard.example.com admin@example.com"

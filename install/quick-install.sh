@@ -20,7 +20,7 @@ DISPLAY_ID="${DISPLAY_ID:-:99}"
 VNC_PORT="${VNC_PORT:-5900}"
 NOVNC_PORT="${NOVNC_PORT:-6080}"
 SERVER_TIMEZONE="${SERVER_TIMEZONE:-Asia/Tehran}"
-REPO_URL="${REPO_URL:-https://github.com/yoyoraya/GMweb-API.git}"
+REPO_URL="${REPO_URL:-https://github.com/aibedini/GMweb-API.git}"
 LOG_DIR="/var/log/gmweb"
 STATE_DIR="/var/lib/gmweb"
 INSTALL_LOG="$LOG_DIR/install.log"
@@ -158,7 +158,11 @@ sync_app() {
   elif [[ -d "$APP_DIR/.git" ]]; then
     info "Updating existing git checkout"; git -C "$APP_DIR" pull --ff-only >>"$INSTALL_LOG" 2>&1 || warn "git pull failed"
   else
-    info "Cloning $REPO_URL"; rm -rf "$APP_DIR"; git clone "$REPO_URL" "$APP_DIR" >>"$INSTALL_LOG" 2>&1
+    local tmp; tmp="$(mktemp -d)"
+    info "Refreshing from $REPO_URL while preserving credentials and browser data"
+    git clone --depth 1 "$REPO_URL" "$tmp" >>"$INSTALL_LOG" 2>&1
+    rsync -a --delete --exclude ".git/" --exclude ".env" --exclude "data/" --exclude "node_modules/" "$tmp/" "$APP_DIR/"
+    rm -rf "$tmp"
   fi
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
   [[ -f "$APP_DIR/package.json" ]] || { err "No app found in $APP_DIR"; return 1; }
@@ -169,7 +173,7 @@ sync_app() {
 
   # The React console (/app) ships pre-built in public/dashboard-next. If a source
   # checkout is missing the build, build it here so /app works out of the box.
-  if [[ -f "$APP_DIR/dashboard-next/package.json" && ! -f "$APP_DIR/public/dashboard-next/index.html" ]]; then
+  if [[ -f "$APP_DIR/dashboard-next/package.json" ]]; then
     step "Building the React console (/app)"
     runuser -u "$APP_USER" -- bash -lc "cd '$APP_DIR/dashboard-next' && npm ci && npm run build" >>"$INSTALL_LOG" 2>&1 \
       && ok "Console built" || warn "Console build skipped/failed — /dashboard still works. See $INSTALL_LOG"
@@ -179,7 +183,11 @@ sync_app() {
 }
 
 write_env() {
-  if [[ -f "$APP_DIR/.env" ]]; then ok ".env exists — keeping it"; return; fi
+  if [[ -f "$APP_DIR/.env" ]]; then
+    if grep -q '^HOST=' "$APP_DIR/.env"; then sed -i 's/^HOST=.*/HOST=0.0.0.0/' "$APP_DIR/.env"; else printf '\nHOST=0.0.0.0\n' >>"$APP_DIR/.env"; fi
+    ok ".env exists — credentials kept; public port binding repaired"
+    return
+  fi
   step "Generating .env (token + dashboard credentials)"
   local token user pass hash
   token="$(runuser -u "$APP_USER" -- bash -lc "cd '$APP_DIR' && node scripts/new-token.js")"
@@ -189,7 +197,7 @@ write_env() {
   cat >"$APP_DIR/.env" <<ENV
 NODE_ENV=production
 PORT=$APP_PORT
-HOST=127.0.0.1
+HOST=0.0.0.0
 API_TOKEN=$token
 HEADLESS=false
 USER_DATA_DIR=./data/browser-profile
@@ -380,8 +388,8 @@ show_credentials() {
   ip="$(curl -fsS -m 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
   echo "${BOLD}${GRN}GMweb is installed.${RST}"
   echo
-  echo "  ${BOLD}Console (new):${RST} http://127.0.0.1:$APP_PORT/app        ${DIM}React UI${RST}"
-  echo "  ${BOLD}Dashboard:${RST}     http://127.0.0.1:$APP_PORT/dashboard  ${DIM}classic${RST}"
+  echo "  ${BOLD}Console (new):${RST} http://${ip:-SERVER_IP}:$APP_PORT/app        ${DIM}React UI${RST}"
+  echo "  ${BOLD}Dashboard:${RST}     http://${ip:-SERVER_IP}:$APP_PORT/dashboard  ${DIM}classic${RST}"
   echo "  ${BOLD}Username:${RST}      $user"
   echo "  ${BOLD}Password:${RST}      $pass"
   echo "  ${BOLD}API token:${RST}  $token"
@@ -558,18 +566,19 @@ security_audit() {
   local env="$APP_DIR/.env"
   [[ "$(stat -c '%a' "$env" 2>/dev/null)" == "600" ]] && ok ".env is 600" || warn ".env not 600 → run option 5"
   grep -q '^API_TOKEN=change-me' "$env" 2>/dev/null && err "API_TOKEN is the default! rotate it." || ok "API token is not default"
-  grep -q '^HOST=127.0.0.1' "$env" 2>/dev/null && ok "API bound to localhost (not public)" || warn "HOST is not 127.0.0.1 — port may be exposed"
+  grep -q '^HOST=0.0.0.0' "$env" 2>/dev/null && ok "API available on the server IP" || warn "API is not bound to all interfaces"
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then ok "ufw firewall active"; else warn "ufw firewall not active → option 2"; fi
-  ss -ltn 2>/dev/null | grep -q "0.0.0.0:$APP_PORT" && err "Port $APP_PORT listening on 0.0.0.0 (public!)" || ok "Port $APP_PORT not public"
+  ss -ltn 2>/dev/null | grep -q "0.0.0.0:$APP_PORT" && ok "Port $APP_PORT is listening publicly" || warn "Port $APP_PORT is not publicly reachable"
   command -v fail2ban-client >/dev/null 2>&1 && ok "fail2ban present" || warn "fail2ban not installed (optional, blocks SSH brute force)"
   hr
 }
 firewall_lockdown() {
   command -v ufw >/dev/null 2>&1 || { logged apt-get install -y ufw; }
   ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1
+  ufw allow "$APP_PORT/tcp" >/dev/null 2>&1
   confirm "Also allow 80/443 (for public dashboard)?" && { ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null; }
   yes | ufw enable >/dev/null 2>&1 || true
-  ok "Firewall enabled (SSH allowed; GMweb ports stay localhost-only)"
+  ok "Firewall enabled (SSH and GMweb port $APP_PORT allowed)"
   ufw status verbose | sed 's/^/  /'
 }
 rotate_token() {
