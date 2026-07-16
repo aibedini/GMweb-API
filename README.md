@@ -38,7 +38,9 @@ to events** without touching the browser.
 ## 🚀 One‑command install (Ubuntu 22.04)
 
 The fastest path installs Chrome, Redis, VNC, Node, the API services, both web
-interfaces, and generates the required credentials.
+interfaces, and generates the required credentials. It also creates an automatic
+`gmweb.<SERVER_IP>.nip.io` address, configures Nginx and obtains a Let's Encrypt
+certificate, so the React console is available at `https://.../app`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | sudo bash
@@ -48,12 +50,23 @@ Run the same command again to repair/reinstall. It updates the app, rebuilds the
 React console, rotates the exposed API token and dashboard password, and
 restarts all core services.
 
+Open TCP ports **80** and **443** in the VPS/provider firewall before running it.
+To use your own domain or skip public HTTPS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | \
+  sudo env PUBLIC_DOMAIN=gmweb.example.com LETSENCRYPT_EMAIL=admin@example.com bash
+
+curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | \
+  sudo env PUBLIC_DASHBOARD=0 bash
+```
+
 What the installer sets up for you:
 
 | Component | Purpose |
 |---|---|
 | `gmweb-chrome` | Google Chrome on a virtual display (Xvfb), exposed over CDP `:9222` |
-| `gmweb-api` | REST API plus React `/app` and classic `/dashboard` on public port `3030` |
+| `gmweb-api` | REST API plus React `/app` and classic `/dashboard`, securely proxied by Nginx |
 | `gmweb-vnc` / `gmweb-novnc` | on‑demand VNC console for scanning the pairing QR |
 
 ---

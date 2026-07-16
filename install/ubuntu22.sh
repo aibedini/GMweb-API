@@ -7,6 +7,9 @@ APP_USER="${APP_USER:-gmweb}"
 APP_DIR="${APP_DIR:-/opt/gmweb-api}"
 APP_PORT="${APP_PORT:-3030}"
 PUBLIC_HOST="${PUBLIC_HOST:-0.0.0.0}"
+PUBLIC_DASHBOARD="${PUBLIC_DASHBOARD:-auto}"
+PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
+LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 DISPLAY_ID="${DISPLAY_ID:-:99}"
 CDP_PORT="${CDP_PORT:-9222}"
 SERVER_TIMEZONE="${SERVER_TIMEZONE:-Asia/Tehran}"
@@ -303,6 +306,28 @@ systemctl daemon-reload
 systemctl enable --now gmweb-chrome.service gmweb-api.service
 systemctl disable gmweb-vnc.service gmweb-novnc.service 2>/dev/null || true
 
+PUBLIC_URL=""
+if [[ "$PUBLIC_DASHBOARD" != "0" && "$PUBLIC_DASHBOARD" != "false" && "$PUBLIC_DASHBOARD" != "no" ]]; then
+  echo "==> Configuring public HTTPS access"
+  if [[ -z "$PUBLIC_DOMAIN" ]]; then
+    PUBLIC_IP="$(curl -4fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    if [[ "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      PUBLIC_DOMAIN="gmweb.${PUBLIC_IP}.nip.io"
+    fi
+  fi
+
+  if [[ -n "$PUBLIC_DOMAIN" ]]; then
+    if bash "$APP_DIR/scripts/public-dashboard.sh" install "$PUBLIC_DOMAIN" "$LETSENCRYPT_EMAIL"; then
+      PUBLIC_URL="https://$PUBLIC_DOMAIN"
+    else
+      echo "Warning: HTTPS setup could not complete. Ensure ports 80 and 443 are open in the VPS/provider firewall, then run:"
+      echo "  gmweb public-dashboard install $PUBLIC_DOMAIN ${LETSENCRYPT_EMAIL:-admin@example.com}"
+    fi
+  else
+    echo "Warning: public IPv4 could not be detected; HTTPS setup skipped. Set PUBLIC_DOMAIN and run the installer again."
+  fi
+fi
+
 echo
 echo "==> Installed $APP_NAME"
 echo "App directory: $APP_DIR"
@@ -312,9 +337,15 @@ echo "Dashboard password: $DASHBOARD_PASSWORD"
 echo
 echo "Manager menu: gmweb"
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-echo "React app: http://${SERVER_IP:-SERVER_IP}:$APP_PORT/app"
-echo "Classic dashboard: http://${SERVER_IP:-SERVER_IP}:$APP_PORT/dashboard"
-echo "API base URL: http://${SERVER_IP:-SERVER_IP}:$APP_PORT"
+if [[ -n "$PUBLIC_URL" ]]; then
+  echo "React app: $PUBLIC_URL/app"
+  echo "Classic dashboard: $PUBLIC_URL/dashboard"
+  echo "API base URL: $PUBLIC_URL"
+else
+  echo "React app: http://${SERVER_IP:-SERVER_IP}:$APP_PORT/app"
+  echo "Classic dashboard: http://${SERVER_IP:-SERVER_IP}:$APP_PORT/dashboard"
+  echo "API base URL: http://${SERVER_IP:-SERVER_IP}:$APP_PORT"
+fi
 echo
 echo "Next:"
 echo "1) gmweb vnc-on"
