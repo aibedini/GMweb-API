@@ -185,6 +185,8 @@ sync_app() {
 write_env() {
   if [[ -f "$APP_DIR/.env" ]]; then
     if grep -q '^HOST=' "$APP_DIR/.env"; then sed -i 's/^HOST=.*/HOST=0.0.0.0/' "$APP_DIR/.env"; else printf '\nHOST=0.0.0.0\n' >>"$APP_DIR/.env"; fi
+    grep -m1 '^API_TOKEN=' "$APP_DIR/.env" | cut -d= -f2- >"$STATE_DIR/api-token.txt"
+    chmod 600 "$STATE_DIR/api-token.txt"
     ok ".env exists — credentials kept; public port binding repaired"
     return
   fi
@@ -236,6 +238,7 @@ SEND_QUIET_END_HOUR=8
 CONVERSATION_HISTORY_MAX_BATCHES=80
 ENV
   chown "$APP_USER:$APP_USER" "$APP_DIR/.env"; chmod 600 "$APP_DIR/.env"
+  printf '%s' "$token" >"$STATE_DIR/api-token.txt"; chmod 600 "$STATE_DIR/api-token.txt"
   printf '%s' "$pass" >"$STATE_DIR/dashboard-password.txt"; chmod 600 "$STATE_DIR/dashboard-password.txt"
   ok "Wrote $APP_DIR/.env (mode 600)"
 }
@@ -582,11 +585,8 @@ firewall_lockdown() {
   ufw status verbose | sed 's/^/  /'
 }
 rotate_token() {
-  local new; new="$(runuser -u "$APP_USER" -- bash -lc "cd '$APP_DIR' && node scripts/new-token.js")"
-  sed -i "s|^API_TOKEN=.*|API_TOKEN=$new|" "$APP_DIR/.env"
-  systemctl restart gmweb-api
-  ok "New API token: ${BOLD}$new${RST}"
-  warn "Update every client (Eve, dashboard) with the new token."
+  APP_DIR="$APP_DIR" APP_USER="$APP_USER" STATE_DIR="$STATE_DIR" \
+    bash "$APP_DIR/scripts/gmweb-menu.sh" token-reset
 }
 change_dashboard_password() {
   APP_DIR="$APP_DIR" APP_USER="$APP_USER" STATE_DIR="$STATE_DIR" \

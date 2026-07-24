@@ -142,6 +142,17 @@ Put it in `.env`:
 API_TOKEN=<new-token>
 ```
 
+For an atomic rotation from the server manager, use:
+
+```bash
+sudo gmweb token-reset
+```
+
+The command generates a strong token, restarts the API, verifies that the new
+token can access an admin endpoint, and restores the previous token if
+activation fails. The same action is available as option 15 in the `gmweb`
+interactive menu.
+
 Restart the process.
 
 ## Backup Browser Profile

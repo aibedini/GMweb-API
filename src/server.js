@@ -1374,7 +1374,10 @@ if (config.dashboardEnabled) {
     const schema = z.object({ token: z.string().min(1) });
     const parsed = schema.safeParse(request.body || {});
     if (!parsed.success || (config.apiToken && parsed.data.token !== config.apiToken)) {
-      reply.code(401).send({ error: "unauthorized" });
+      reply.code(401).send({
+        error: "invalid_api_token",
+        message: "This API token is not active. Run `gmweb token` on the server to print the active token."
+      });
       return;
     }
     const session = createDashboardSession(request);

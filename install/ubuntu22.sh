@@ -194,6 +194,8 @@ else
 fi
 
 mkdir -p "$STATE_DIR"
+printf '%s' "$TOKEN" > "$STATE_DIR/api-token.txt"
+chmod 600 "$STATE_DIR/api-token.txt"
 printf '%s' "$DASHBOARD_PASSWORD" > "$STATE_DIR/dashboard-password.txt"
 chmod 600 "$STATE_DIR/dashboard-password.txt"
 

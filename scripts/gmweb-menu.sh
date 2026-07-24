@@ -10,6 +10,7 @@ VNC_SERVICE="${VNC_SERVICE:-gmweb-vnc.service}"
 NOVNC_SERVICE="${NOVNC_SERVICE:-gmweb-novnc.service}"
 API_URL="${API_URL:-http://127.0.0.1:3030}"
 STATE_DIR="${STATE_DIR:-/var/lib/gmweb}"
+API_TOKEN_FILE="${API_TOKEN_FILE:-$STATE_DIR/api-token.txt}"
 DASHBOARD_PASSWORD_FILE="${DASHBOARD_PASSWORD_FILE:-$STATE_DIR/dashboard-password.txt}"
 DASHBOARD_CREDENTIALS_FILE="${DASHBOARD_CREDENTIALS_FILE:-/root/gmweb-api-dashboard-login.txt}"
 
@@ -102,6 +103,77 @@ random_dashboard_password() {
   else
     node -e "console.log(require('node:crypto').randomBytes(33).toString('base64url'))"
   fi
+}
+
+random_api_token() {
+  if [[ -f "$APP_DIR/scripts/new-token.js" ]]; then
+    run_as_app "cd '$APP_DIR' && node scripts/new-token.js"
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'
+  else
+    echo "Cannot generate an API token: Node.js and OpenSSL are unavailable." >&2
+    return 1
+  fi
+}
+
+api_accepts_token() {
+  local api_token="$1"
+  local status
+  status="$(curl -sS -o /dev/null -w '%{http_code}' \
+    --connect-timeout 2 --max-time 5 \
+    -H "Authorization: Bearer $api_token" \
+    "$API_URL/admin/overview" 2>/dev/null || true)"
+  [[ "$status" == "200" ]]
+}
+
+wait_for_api_token() {
+  local api_token="$1"
+  local attempt
+  for attempt in {1..20}; do
+    if api_accepts_token "$api_token"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+save_api_token_file() {
+  local api_token="$1"
+  mkdir -p "$STATE_DIR"
+  printf '%s' "$api_token" > "$API_TOKEN_FILE"
+  chmod 600 "$API_TOKEN_FILE"
+}
+
+rotate_api_token() {
+  need_root "$@"
+  local old_token new_token
+  old_token="$(token || true)"
+  [[ -n "$old_token" ]] || {
+    echo "${C_RED}No API_TOKEN found in $APP_DIR/.env${C_RESET}"
+    return 1
+  }
+
+  new_token="$(random_api_token)"
+  [[ -n "$new_token" ]] || {
+    echo "${C_RED}Token generation failed.${C_RESET}"
+    return 1
+  }
+
+  set_env_value API_TOKEN "$new_token"
+  if ! systemctl restart "$API_SERVICE" || ! wait_for_api_token "$new_token"; then
+    echo "${C_RED}The new token did not become active; restoring the previous token.${C_RESET}" >&2
+    set_env_value API_TOKEN "$old_token"
+    systemctl restart "$API_SERVICE" || true
+    wait_for_api_token "$old_token" || true
+    return 1
+  fi
+
+  save_api_token_file "$new_token"
+  echo "${C_GREEN}API token rotated and verified.${C_RESET}"
+  echo "API token: $new_token"
+  echo
+  echo "${C_YELLOW}Existing dashboard sessions and API clients must use this new token.${C_RESET}"
 }
 
 hash_dashboard_password() {
@@ -388,6 +460,7 @@ render_menu() {
   echo " 12) Uninstall GMweb API"
   echo " 13) Public dashboard setup"
   echo " 14) Reset dashboard username / password"
+  echo " 15) Generate and activate a new API token"
   echo "  0) Exit"
   echo
 }
@@ -422,6 +495,15 @@ menu_loop() {
         pause
         ;;
       14) dashboard_credentials; pause ;;
+      15)
+        read -r -p "Rotate the API token? Existing clients will stop working [y/N]: " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+          rotate_api_token
+        else
+          echo "Cancelled."
+        fi
+        pause
+        ;;
       0) exit 0 ;;
       *) echo "${C_RED}Invalid option.${C_RESET}"; pause ;;
     esac
@@ -443,6 +525,7 @@ case "$cmd" in
   vnc-on) vnc_on "$@" ;;
   vnc-off) vnc_off "$@" ;;
   token) show_token "$@" ;;
+  token-reset|rotate-token) rotate_api_token "$@" ;;
   logs) logs "$@" ;;
   update) update_app "$@" ;;
   uninstall) uninstall_app "$@" ;;
@@ -464,6 +547,7 @@ Commands:
   vnc-on           Start temporary noVNC pairing access
   vnc-off          Stop noVNC pairing access
   token            Print API token
+  token-reset      Generate, activate, and verify a new API token
   logs [target]    Follow logs: api, chrome, vnc, novnc
   update           Git pull, npm ci, restart API
   uninstall        Remove GMweb API from the server

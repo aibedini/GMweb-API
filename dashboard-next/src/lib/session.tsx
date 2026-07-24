@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { api, setCsrfToken, setUnauthorizedHandler } from "./api";
+import { api, ApiError, setCsrfToken, setUnauthorizedHandler } from "./api";
 import type { SessionInfo } from "./types";
 
 interface SessionState {
@@ -55,10 +55,21 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }
 
   async function tokenLogin(token: string) {
-    const r = await api<{ ok: boolean; csrfToken: string }>("/dashboard/login", {
-      method: "POST",
-      body: { token },
-    });
+    let r: { ok: boolean; csrfToken: string };
+    try {
+      r = await api<{ ok: boolean; csrfToken: string }>("/dashboard/login", {
+        method: "POST",
+        body: { token },
+      });
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        throw new Error("This API token is not active. On the server run: gmweb token");
+      }
+      if (error instanceof ApiError && error.status === 429) {
+        throw new Error("Too many attempts. Wait one minute and try again.");
+      }
+      throw error;
+    }
     if (r.csrfToken) setCsrfToken(r.csrfToken);
     setAuthenticated(true);
   }

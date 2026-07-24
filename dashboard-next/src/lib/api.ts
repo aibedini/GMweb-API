@@ -63,7 +63,8 @@ export async function api<T = unknown>(path: string, options: Options = {}): Pro
     // active cookie). Both need a resync against the server's truth rather
     // than being swallowed by the calling page.
     const needsResync = res.status === 401 || (res.status === 403 && d.error === "csrf_failed");
-    if (needsResync && path !== "/dashboard/session") onUnauthorized?.();
+    const isLoginAttempt = path === "/dashboard/login" || path === "/dashboard/password-login";
+    if (needsResync && path !== "/dashboard/session" && !isLoginAttempt) onUnauthorized?.();
     throw new ApiError(d.message || d.error || `HTTP ${res.status}`, res.status);
   }
   return data as T;
