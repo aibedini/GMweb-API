@@ -110,7 +110,7 @@ as_app_user "cd '$APP_DIR/dashboard-next' && npm ci && npm run build"
 TOKEN="$(as_app_user "cd '$APP_DIR' && node scripts/new-token.js")"
 DASHBOARD_USERNAME="${DASHBOARD_USERNAME:-gmwebadmin}"
 DASHBOARD_PASSWORD="${DASHBOARD_PASSWORD:-$(node -e "console.log(require('node:crypto').randomBytes(33).toString('base64url'))")}"
-DASHBOARD_PASSWORD_HASH="$(as_app_user "cd '$APP_DIR' && node scripts/hash-password.js '$DASHBOARD_PASSWORD'")"
+DASHBOARD_PASSWORD_HASH="$(printf '%s' "$DASHBOARD_PASSWORD" | runuser -u "$APP_USER" -- node "$APP_DIR/scripts/hash-password.js" --stdin)"
 if [[ ! -f "$APP_DIR/.env" ]]; then
   echo "==> Creating .env"
   cat > "$APP_DIR/.env" <<ENV
@@ -163,7 +163,7 @@ else
   DASHBOARD_USERNAME="$(grep -m1 '^DASHBOARD_USERNAME=' "$APP_DIR/.env" | cut -d= -f2-)"
   DASHBOARD_USERNAME="${DASHBOARD_USERNAME:-gmwebadmin}"
   DASHBOARD_PASSWORD="$(node -e "console.log(require('node:crypto').randomBytes(33).toString('base64url'))")"
-  DASHBOARD_PASSWORD_HASH="$(as_app_user "cd '$APP_DIR' && node scripts/hash-password.js '$DASHBOARD_PASSWORD'")"
+  DASHBOARD_PASSWORD_HASH="$(printf '%s' "$DASHBOARD_PASSWORD" | runuser -u "$APP_USER" -- node "$APP_DIR/scripts/hash-password.js" --stdin)"
   if grep -q '^DASHBOARD_PASSWORD_HASH=' "$APP_DIR/.env"; then
     sed -i "s|^DASHBOARD_PASSWORD_HASH=.*|DASHBOARD_PASSWORD_HASH=$DASHBOARD_PASSWORD_HASH|" "$APP_DIR/.env"
   else
@@ -317,7 +317,9 @@ if [[ "$PUBLIC_DASHBOARD" != "0" && "$PUBLIC_DASHBOARD" != "false" && "$PUBLIC_D
   fi
 
   if [[ -n "$PUBLIC_DOMAIN" ]]; then
-    if bash "$APP_DIR/scripts/public-dashboard.sh" install "$PUBLIC_DOMAIN" "$LETSENCRYPT_EMAIL"; then
+    if GMWEB_DASHBOARD_USER="$DASHBOARD_USERNAME" \
+       GMWEB_DASHBOARD_PASS="$DASHBOARD_PASSWORD" \
+       bash "$APP_DIR/scripts/public-dashboard.sh" install "$PUBLIC_DOMAIN" "$LETSENCRYPT_EMAIL"; then
       PUBLIC_URL="https://$PUBLIC_DOMAIN"
     else
       echo "Warning: HTTPS setup could not complete. Ensure ports 80 and 443 are open in the VPS/provider firewall, then run:"

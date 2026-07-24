@@ -9,6 +9,9 @@ CHROME_SERVICE="${CHROME_SERVICE:-gmweb-chrome.service}"
 VNC_SERVICE="${VNC_SERVICE:-gmweb-vnc.service}"
 NOVNC_SERVICE="${NOVNC_SERVICE:-gmweb-novnc.service}"
 API_URL="${API_URL:-http://127.0.0.1:3030}"
+STATE_DIR="${STATE_DIR:-/var/lib/gmweb}"
+DASHBOARD_PASSWORD_FILE="${DASHBOARD_PASSWORD_FILE:-$STATE_DIR/dashboard-password.txt}"
+DASHBOARD_CREDENTIALS_FILE="${DASHBOARD_CREDENTIALS_FILE:-/root/gmweb-api-dashboard-login.txt}"
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -50,6 +53,157 @@ token() {
   if [[ -f "$APP_DIR/.env" ]]; then
     grep '^API_TOKEN=' "$APP_DIR/.env" | tail -n 1 | sed 's/^API_TOKEN=//'
   fi
+}
+
+env_value() {
+  local key="$1"
+  if [[ -f "$APP_DIR/.env" ]]; then
+    grep -m1 "^${key}=" "$APP_DIR/.env" | cut -d= -f2-
+  fi
+}
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  local env_file="$APP_DIR/.env"
+  local tmp found=0 line
+
+  [[ -f "$env_file" ]] || {
+    echo "Missing environment file: $env_file"
+    return 1
+  }
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || {
+    echo "$key cannot contain a newline."
+    return 1
+  }
+
+  tmp="$(mktemp "$APP_DIR/.env.gmweb.XXXXXX")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$key="* ]]; then
+      if [[ "$found" -eq 0 ]]; then
+        printf '%s=%s\n' "$key" "$value" >> "$tmp"
+        found=1
+      fi
+    else
+      printf '%s\n' "$line" >> "$tmp"
+    fi
+  done < "$env_file"
+  if [[ "$found" -eq 0 ]]; then
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  fi
+  chown "$APP_USER:$APP_USER" "$tmp" 2>/dev/null || true
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$env_file"
+}
+
+random_dashboard_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 33 | tr '+/' '-_' | tr -d '=\n'
+  else
+    node -e "console.log(require('node:crypto').randomBytes(33).toString('base64url'))"
+  fi
+}
+
+hash_dashboard_password() {
+  local password="$1"
+  if id "$APP_USER" >/dev/null 2>&1; then
+    printf '%s' "$password" | runuser -u "$APP_USER" -- node "$APP_DIR/scripts/hash-password.js" --stdin
+  else
+    printf '%s' "$password" | node "$APP_DIR/scripts/hash-password.js" --stdin
+  fi
+}
+
+save_dashboard_credentials() {
+  local username="$1"
+  local password="$2"
+  local hash
+
+  [[ -n "$username" ]] || { echo "Dashboard username cannot be empty."; return 1; }
+  [[ ${#username} -le 128 ]] || { echo "Dashboard username must be at most 128 characters."; return 1; }
+  [[ "$username" != *$'\n'* && "$username" != *$'\r'* ]] || {
+    echo "Dashboard username cannot contain a newline."
+    return 1
+  }
+  [[ -n "$password" ]] || { echo "Dashboard password cannot be empty."; return 1; }
+  [[ ${#password} -le 512 ]] || { echo "Dashboard password must be at most 512 characters."; return 1; }
+
+  hash="$(hash_dashboard_password "$password")"
+  set_env_value DASHBOARD_USERNAME "$username"
+  set_env_value DASHBOARD_PASSWORD_HASH "$hash"
+
+  mkdir -p "$STATE_DIR"
+  printf '%s' "$password" > "$DASHBOARD_PASSWORD_FILE"
+  chmod 600 "$DASHBOARD_PASSWORD_FILE"
+  if [[ -f "$DASHBOARD_CREDENTIALS_FILE" ]]; then
+    local dashboard_url
+    dashboard_url="$(grep -m1 '^URL=' "$DASHBOARD_CREDENTIALS_FILE" | cut -d= -f2- || true)"
+    {
+      [[ -z "$dashboard_url" ]] || printf 'URL=%s\n' "$dashboard_url"
+      printf 'USERNAME=%s\n' "$username"
+      printf 'PASSWORD=%s\n' "$password"
+    } > "$DASHBOARD_CREDENTIALS_FILE"
+    chmod 600 "$DASHBOARD_CREDENTIALS_FILE"
+  fi
+  systemctl restart "$API_SERVICE"
+
+  echo "${C_GREEN}Dashboard credentials updated.${C_RESET}"
+  echo "Username: $username"
+  echo "Password: $password"
+  echo
+  echo "${C_YELLOW}Existing dashboard sessions may need to sign in again.${C_RESET}"
+}
+
+dashboard_credentials() {
+  need_root "$@"
+  local current_user mode username password first second
+  current_user="$(env_value DASHBOARD_USERNAME || true)"
+  current_user="${current_user:-gmwebadmin}"
+
+  if [[ ! -t 0 ]]; then
+    echo "Interactive terminal required. Run: gmweb credentials"
+    return 2
+  fi
+
+  echo "${C_BOLD}${C_BLUE}Dashboard credentials${C_RESET}"
+  echo
+  echo "Current username: $current_user"
+  echo
+  echo "  1) Keep username; generate a new password"
+  echo "  2) Set username; generate a new password"
+  echo "  3) Keep username; choose a new password"
+  echo "  4) Set username and choose a new password"
+  echo "  0) Cancel"
+  echo
+  read -r -p "Select: " mode
+
+  case "$mode" in
+    1)
+      username="$current_user"
+      password="$(random_dashboard_password)"
+      ;;
+    2)
+      read -r -p "New username: " username
+      password="$(random_dashboard_password)"
+      ;;
+    3)
+      username="$current_user"
+      read -r -s -p "New password: " first; echo
+      read -r -s -p "Confirm password: " second; echo
+      [[ "$first" == "$second" ]] || { echo "${C_RED}Passwords do not match.${C_RESET}"; return 1; }
+      password="$first"
+      ;;
+    4)
+      read -r -p "New username: " username
+      read -r -s -p "New password: " first; echo
+      read -r -s -p "Confirm password: " second; echo
+      [[ "$first" == "$second" ]] || { echo "${C_RED}Passwords do not match.${C_RESET}"; return 1; }
+      password="$first"
+      ;;
+    0) return 0 ;;
+    *) echo "${C_RED}Invalid option.${C_RESET}"; return 2 ;;
+  esac
+
+  save_dashboard_credentials "$username" "$password"
 }
 
 run_as_app() {
@@ -233,6 +387,7 @@ render_menu() {
   echo " 11) Update from git"
   echo " 12) Uninstall GMweb API"
   echo " 13) Public dashboard setup"
+  echo " 14) Reset dashboard username / password"
   echo "  0) Exit"
   echo
 }
@@ -266,6 +421,7 @@ menu_loop() {
         public_dashboard install "$domain" "$email"
         pause
         ;;
+      14) dashboard_credentials; pause ;;
       0) exit 0 ;;
       *) echo "${C_RED}Invalid option.${C_RESET}"; pause ;;
     esac
@@ -291,6 +447,7 @@ case "$cmd" in
   update) update_app "$@" ;;
   uninstall) uninstall_app "$@" ;;
   public-dashboard) public_dashboard "$@" ;;
+  credentials|dashboard-credentials) dashboard_credentials "$@" ;;
   -h|--help|help)
     cat <<HELP
 Usage: gmweb [command]
@@ -311,6 +468,7 @@ Commands:
   update           Git pull, npm ci, restart API
   uninstall        Remove GMweb API from the server
   public-dashboard Manage public HTTPS dashboard exposure
+  credentials      Reset dashboard username/password interactively
 HELP
     ;;
   *)

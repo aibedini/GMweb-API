@@ -548,7 +548,7 @@ security_menu() {
     echo "  1) Run security audit"
     echo "  2) Firewall: allow only SSH (ufw)"
     echo "  3) Rotate API master token"
-    echo "  4) Change dashboard password"
+    echo "  4) Reset dashboard username / password"
     echo "  5) Lock down .env permissions"
     echo "  0) Back"
     case "$(ask 'Choose' '')" in
@@ -589,13 +589,8 @@ rotate_token() {
   warn "Update every client (Eve, dashboard) with the new token."
 }
 change_dashboard_password() {
-  local pass hash; pass="$(ask 'New dashboard password (blank = random)' '')"
-  [[ -z "$pass" ]] && pass="$(node -e "console.log(require('node:crypto').randomBytes(33).toString('base64url'))")"
-  hash="$(runuser -u "$APP_USER" -- bash -lc "cd '$APP_DIR' && node scripts/hash-password.js '$pass'")"
-  sed -i "s|^DASHBOARD_PASSWORD_HASH=.*|DASHBOARD_PASSWORD_HASH=$hash|" "$APP_DIR/.env"
-  printf '%s' "$pass" >"$STATE_DIR/dashboard-password.txt"; chmod 600 "$STATE_DIR/dashboard-password.txt"
-  systemctl restart gmweb-api
-  ok "Dashboard password set to: ${BOLD}$pass${RST}"
+  APP_DIR="$APP_DIR" APP_USER="$APP_USER" STATE_DIR="$STATE_DIR" \
+    bash "$APP_DIR/scripts/gmweb-menu.sh" credentials
 }
 
 # ── 6. Public dashboard ───────────────────────────────────────────────────────
