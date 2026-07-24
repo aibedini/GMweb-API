@@ -6,6 +6,7 @@ APP_SLUG="gmweb-api"
 APP_USER="${APP_USER:-gmweb}"
 APP_DIR="${APP_DIR:-/opt/gmweb-api}"
 APP_PORT="${APP_PORT:-3030}"
+STATE_DIR="${STATE_DIR:-/var/lib/gmweb}"
 PUBLIC_HOST="${PUBLIC_HOST:-0.0.0.0}"
 PUBLIC_DASHBOARD="${PUBLIC_DASHBOARD:-auto}"
 PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
@@ -27,6 +28,31 @@ timedatectl set-timezone "$SERVER_TIMEZONE"
 
 as_app_user() {
   runuser -u "$APP_USER" -- bash -lc "$*"
+}
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  local env_file="$APP_DIR/.env"
+  local tmp found=0 line
+
+  tmp="$(mktemp "$APP_DIR/.env.install.XXXXXX")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$key="* ]]; then
+      if [[ "$found" -eq 0 ]]; then
+        printf '%s=%s\n' "$key" "$value" >> "$tmp"
+        found=1
+      fi
+    else
+      printf '%s\n' "$line" >> "$tmp"
+    fi
+  done < "$env_file"
+  if [[ "$found" -eq 0 ]]; then
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  fi
+  chown "$APP_USER:$APP_USER" "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$env_file"
 }
 
 if [[ "$(lsb_release -rs 2>/dev/null || true)" != "22.04" ]]; then
@@ -150,28 +176,26 @@ ENV
   chmod 600 "$APP_DIR/.env"
 else
   echo "==> Repairing existing .env"
-  if grep -q '^HOST=' "$APP_DIR/.env"; then
-    sed -i "s/^HOST=.*/HOST=$PUBLIC_HOST/" "$APP_DIR/.env"
-  else
-    printf '\nHOST=%s\n' "$PUBLIC_HOST" >> "$APP_DIR/.env"
-  fi
-  if grep -q '^API_TOKEN=' "$APP_DIR/.env"; then
-    sed -i "s|^API_TOKEN=.*|API_TOKEN=$TOKEN|" "$APP_DIR/.env"
-  else
-    printf 'API_TOKEN=%s\n' "$TOKEN" >> "$APP_DIR/.env"
-  fi
+  set_env_value HOST "$PUBLIC_HOST"
+  set_env_value API_TOKEN "$TOKEN"
   DASHBOARD_USERNAME="$(grep -m1 '^DASHBOARD_USERNAME=' "$APP_DIR/.env" | cut -d= -f2-)"
   DASHBOARD_USERNAME="${DASHBOARD_USERNAME:-gmwebadmin}"
   DASHBOARD_PASSWORD="$(node -e "console.log(require('node:crypto').randomBytes(33).toString('base64url'))")"
   DASHBOARD_PASSWORD_HASH="$(printf '%s' "$DASHBOARD_PASSWORD" | runuser -u "$APP_USER" -- node "$APP_DIR/scripts/hash-password.js" --stdin)"
-  if grep -q '^DASHBOARD_PASSWORD_HASH=' "$APP_DIR/.env"; then
-    sed -i "s|^DASHBOARD_PASSWORD_HASH=.*|DASHBOARD_PASSWORD_HASH=$DASHBOARD_PASSWORD_HASH|" "$APP_DIR/.env"
-  else
-    printf 'DASHBOARD_PASSWORD_HASH=%s\n' "$DASHBOARD_PASSWORD_HASH" >> "$APP_DIR/.env"
-  fi
+  set_env_value DASHBOARD_PASSWORD_HASH "$DASHBOARD_PASSWORD_HASH"
+  # A previous HTTPS attempt may have left secure-only settings behind. Start
+  # from direct-HTTP-safe values; public-dashboard.sh enables them after TLS
+  # has been configured successfully.
+  set_env_value DASHBOARD_COOKIE_SECURE "false"
+  set_env_value DASHBOARD_BIND_USER_AGENT "false"
+  set_env_value CORS_ORIGIN ""
   chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
   chmod 600 "$APP_DIR/.env"
 fi
+
+mkdir -p "$STATE_DIR"
+printf '%s' "$DASHBOARD_PASSWORD" > "$STATE_DIR/dashboard-password.txt"
+chmod 600 "$STATE_DIR/dashboard-password.txt"
 
 chmod +x "$APP_DIR/scripts/vps-chrome.sh" "$APP_DIR/scripts/pairing-vnc.sh"
 chmod +x "$APP_DIR/scripts/gmweb-menu.sh" "$APP_DIR/scripts/uninstall.sh" "$APP_DIR/scripts/public-dashboard.sh"
@@ -303,7 +327,9 @@ WantedBy=multi-user.target
 SERVICE
 
 systemctl daemon-reload
-systemctl enable --now gmweb-chrome.service gmweb-api.service
+systemctl enable gmweb-chrome.service gmweb-api.service
+systemctl restart gmweb-chrome.service
+systemctl restart gmweb-api.service
 systemctl disable gmweb-vnc.service gmweb-novnc.service 2>/dev/null || true
 
 PUBLIC_URL=""
