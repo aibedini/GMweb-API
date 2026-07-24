@@ -45,7 +45,8 @@ gmweb
 ```
 
 The menu includes status, readiness, smoke test, restart, Chrome restart,
-temporary VNC/noVNC access, logs, update, token display, and uninstall.
+temporary VNC/noVNC access, logs, update, token display, dashboard credential
+reset, and uninstall.
 
 Non-interactive commands:
 
@@ -58,7 +59,12 @@ gmweb vnc-off
 gmweb logs api
 gmweb token
 gmweb smoke
+gmweb credentials
 ```
+
+`gmweb credentials` can keep or change the dashboard username and can either
+generate a strong password or accept a password entered twice without echoing
+it to the terminal.
 
 ## Uninstall
 

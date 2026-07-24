@@ -10,6 +10,8 @@ NGINX_SITE="/etc/nginx/sites-available/$SITE_NAME.conf"
 NGINX_LINK="/etc/nginx/sites-enabled/$SITE_NAME.conf"
 NGINX_MAP="/etc/nginx/conf.d/$SITE_NAME-websocket-map.conf"
 DASHBOARD_CREDENTIALS="/root/${SITE_NAME}-dashboard-login.txt"
+STATE_DIR="${STATE_DIR:-/var/lib/gmweb}"
+DASHBOARD_PASSWORD_FILE="${DASHBOARD_PASSWORD_FILE:-$STATE_DIR/dashboard-password.txt}"
 
 usage() {
   cat <<HELP
@@ -81,13 +83,16 @@ install_public_dashboard() {
   local dashboard_user="${GMWEB_DASHBOARD_USER:-gmwebadmin}"
   local dashboard_pass="${GMWEB_DASHBOARD_PASS:-$(random_password)}"
   local dashboard_hash
-  dashboard_hash="$(node "$APP_DIR/scripts/hash-password.js" "$dashboard_pass")"
+  dashboard_hash="$(printf '%s' "$dashboard_pass" | node "$APP_DIR/scripts/hash-password.js" --stdin)"
   cat > "$DASHBOARD_CREDENTIALS" <<CREDS
 URL=https://$domain/dashboard
 USERNAME=$dashboard_user
 PASSWORD=$dashboard_pass
 CREDS
   chmod 600 "$DASHBOARD_CREDENTIALS"
+  mkdir -p "$STATE_DIR"
+  printf '%s' "$dashboard_pass" > "$DASHBOARD_PASSWORD_FILE"
+  chmod 600 "$DASHBOARD_PASSWORD_FILE"
 
   echo "==> Writing Nginx reverse proxy"
   cat > "$NGINX_MAP" <<'NGINX'

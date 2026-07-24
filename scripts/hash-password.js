@@ -1,8 +1,11 @@
 const crypto = require("node:crypto");
 
-const password = process.argv[2];
+let password = process.argv[2];
+if (process.argv[2] === "--stdin") {
+  password = require("node:fs").readFileSync(0, "utf8");
+}
 if (!password) {
-  console.error("Usage: node scripts/hash-password.js <password>");
+  console.error("Usage: node scripts/hash-password.js <password|--stdin>");
   process.exit(2);
 }
 

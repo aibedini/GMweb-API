@@ -214,7 +214,7 @@ paces new-conversation navigation. Other tunables: `SEND_DEDUPE_SECONDS`, `SEND_
 gmweb            # interactive menu
 gmweb status     gmweb restart        gmweb restart-chrome
 gmweb vnc-on     gmweb vnc-off        gmweb token
-gmweb smoke      gmweb uninstall
+gmweb smoke      gmweb credentials    gmweb uninstall
 ```
 
 ---
