@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.3.26",
+    "version": "0.3.27",
     "contact": {
       "name": "GMweb API"
     }
@@ -1437,6 +1437,30 @@
                     "to": {
                       "type": "string"
                     },
+                    "requestedTo": {
+                      "type": "string",
+                      "description": "Phone number requested by the API caller."
+                    },
+                    "sentTo": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Recipient number verified in Google Messages before Enter was pressed."
+                    },
+                    "recipientEvidence": {
+                      "type": [
+                        "null",
+                        "object"
+                      ],
+                      "description": "How the active conversation was matched to sentTo."
+                    },
+                    "conversationUrl": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
                     "attemptsMade": {
                       "type": "integer"
                     },
@@ -2050,6 +2074,27 @@
                           },
                           "to": {
                             "type": "string"
+                          },
+                          "requestedTo": {
+                            "type": "string"
+                          },
+                          "sentTo": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "recipientEvidence": {
+                            "type": [
+                              "null",
+                              "object"
+                            ]
+                          },
+                          "conversationUrl": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
                           },
                           "text": {
                             "type": "string"

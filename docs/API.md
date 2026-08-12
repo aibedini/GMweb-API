@@ -102,6 +102,9 @@ shared id for polling/cancel; `jobId` is the current queue job id.
 ### GET /send/status/:reference
 
 Poll send status using `requestId` such as `send_123` or a current `jobId`.
+For completed sends, compare `requestedTo` with `sentTo`. The response also
+contains `recipientEvidence` and `conversationUrl` so recipient selection can be
+audited. GMweb refuses to press Enter if the active recipient cannot be verified.
 
 ### POST /send/cancel/:reference
 

@@ -133,6 +133,8 @@ curl -X POST http://127.0.0.1:3030/send \
 - 🔁 Pass an `Idempotency-Key` header to make your own retries safe.
 
 Track delivery via `GET /send/status/:jobId` or the live `GET /events` stream.
+Completed status/history records include both the requested number and the
+recipient number verified in Google Messages before submission.
 
 ---
 

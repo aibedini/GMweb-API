@@ -9,3 +9,4 @@
 *.css text eol=lf
 .env.example text eol=lf
 scripts/hooks/* text eol=lf
+.codebase-memory/graph.db.zst binary merge=ours

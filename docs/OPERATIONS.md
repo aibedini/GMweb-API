@@ -60,7 +60,33 @@ gmweb logs api
 gmweb token
 gmweb smoke
 gmweb credentials
+gmweb update
 ```
+
+### Safe server update
+
+The installed manager already has **option 11: Update from git**, equivalent to
+`sudo gmweb update`. It runs `git pull --ff-only`, installs the locked production
+dependencies with `npm ci --omit=dev`, and restarts only `gmweb-api.service`;
+Chrome, its paired profile, Redis, and the durable SQLite send ledger stay in
+place.
+
+For the safest production rollout:
+
+1. In Dashboard → Queue, pause the queue. The active send is allowed to finish.
+2. Wait until the active count is zero; queued messages remain durable.
+3. Back up `/opt/gmweb-api/.env` and the `data/` directory.
+4. Run `sudo gmweb`, choose option 11, or run `sudo gmweb update` directly.
+5. Run `sudo gmweb status` and `sudo gmweb smoke`, then inspect
+   `sudo journalctl -u gmweb-api -n 100 --no-pager` if readiness is not green.
+6. Resume the queue from the dashboard.
+
+This flow has a short API restart window (normally a few seconds), but does not
+lose queued messages or the Google pairing. True zero-HTTP-downtime is not
+currently provided: the deployment has one API/worker process controlling one
+browser, so running two releases concurrently would risk duplicate browser
+workers. Blue/green deployment requires separating the HTTP API from the single
+send worker before adding a second API instance.
 
 `gmweb credentials` can keep or change the dashboard username and can either
 generate a strong password or accept a password entered twice without echoing

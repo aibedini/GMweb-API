@@ -39,11 +39,15 @@ regenerates the spec whenever `src/server.js` is staged and blocks the commit if
 `docs/openapi.json` is stale. Enable it once per clone with
 `git config core.hooksPath scripts/hooks`. Bypass deliberately with `git commit --no-verify`.
 
-## ALWAYS: keep the knowledge graph fresh
-A graphify knowledge graph lives in `graphify-out/`. After making non-trivial
-changes to the codebase, refresh it (re-run `/graphify` on the project) so future
-sessions can query the graph instead of re-reading the whole repo. Treat questions
-about the codebase as graphify queries first when `graphify-out/` exists.
+## ALWAYS: use Codebase Memory MCP first
+The repository uses the current `codebase-memory-mcp` knowledge graph. At the
+start of every session, call `list_projects` or `index_status`. Use
+`search_graph`, `trace_path`, and `get_code_snippet` before broad grep/glob/file
+reads, then call `check_index_coverage` for every evidence path. Fall back to
+direct reads only for literals, configs, scripts, docs, generated files, and
+reported coverage gaps. Run `detect_changes` after implementation and refresh
+the persisted index after substantial changes. See [AGENTS.md](AGENTS.md) for
+the complete workflow; it applies to every model working in this repository.
 
 ## Run notes
 - Needs **Redis** (BullMQ) and **Chromium**. After a fresh `npm install`, run `npx playwright install chromium` before starting the server.
