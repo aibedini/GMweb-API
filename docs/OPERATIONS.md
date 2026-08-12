@@ -71,6 +71,14 @@ dependencies with `npm ci --omit=dev`, and restarts only `gmweb-api.service`;
 Chrome, its paired profile, Redis, and the durable SQLite send ledger stay in
 place.
 
+Older archive-based installations have no `.git` directory. Option 11 detects
+that automatically and performs a one-time safe conversion: it clones `main`
+into a staging directory, validates dependencies and syntax, pauses and drains
+the queue, stops API/Chrome, backs up `.env`, `data/`, and `/var/lib/gmweb`,
+atomically swaps the app directory, and waits for readiness. If readiness fails,
+the previous directory is restored automatically. Successful conversion prints
+both backup paths; future option-11 updates use normal `git pull --ff-only`.
+
 For the safest production rollout:
 
 1. In Dashboard → Queue, pause the queue. The active send is allowed to finish.

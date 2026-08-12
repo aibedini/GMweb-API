@@ -13,6 +13,8 @@ STATE_DIR="${STATE_DIR:-/var/lib/gmweb}"
 API_TOKEN_FILE="${API_TOKEN_FILE:-$STATE_DIR/api-token.txt}"
 DASHBOARD_PASSWORD_FILE="${DASHBOARD_PASSWORD_FILE:-$STATE_DIR/dashboard-password.txt}"
 DASHBOARD_CREDENTIALS_FILE="${DASHBOARD_CREDENTIALS_FILE:-/root/gmweb-api-dashboard-login.txt}"
+REPO_URL="${REPO_URL:-https://github.com/aibedini/GMweb-API.git}"
+UPDATE_DRAIN_TIMEOUT_SECONDS="${UPDATE_DRAIN_TIMEOUT_SECONDS:-300}"
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -406,18 +408,194 @@ logs() {
   journalctl -u "$service" -n 120 -f
 }
 
+queue_snapshot() {
+  local api_token
+  api_token="$(token || true)"
+  [[ -n "$api_token" ]] || return 1
+  curl -fsS --max-time 10 -H "Authorization: Bearer $api_token" "$API_URL/admin/queue"
+}
+
+queue_snapshot_value() {
+  local expression="$1"
+  node -e '
+    let raw = "";
+    process.stdin.on("data", (chunk) => { raw += chunk; });
+    process.stdin.on("end", () => {
+      try {
+        const data = JSON.parse(raw);
+        if (process.argv[1] === "paused") process.stdout.write(data.paused ? "true" : "false");
+        else process.stdout.write(String(Number(data.counts?.active || 0)));
+      } catch { process.exit(1); }
+    });
+  ' "$expression"
+}
+
+queue_control() {
+  local action="$1" api_token
+  api_token="$(token || true)"
+  [[ -n "$api_token" ]] || return 1
+  curl -fsS --max-time 15 -X POST \
+    -H "Authorization: Bearer $api_token" \
+    -H "Content-Type: application/json" \
+    -d '{}' "$API_URL/admin/queue/$action" >/dev/null
+}
+
+pause_and_drain_queue() {
+  local snapshot active waited=0
+  snapshot="$(queue_snapshot)" || {
+    echo "${C_RED}Cannot inspect the queue; refusing a migration without send-safety checks.${C_RESET}"
+    return 1
+  }
+  UPDATE_QUEUE_WAS_PAUSED="$(printf '%s' "$snapshot" | queue_snapshot_value paused)"
+  queue_control pause
+  echo "Queue paused; waiting for the active send to finish..."
+
+  while (( waited < UPDATE_DRAIN_TIMEOUT_SECONDS )); do
+    snapshot="$(queue_snapshot)" || return 1
+    active="$(printf '%s' "$snapshot" | queue_snapshot_value active)"
+    if (( active == 0 )); then
+      echo "${C_GREEN}Queue drained safely.${C_RESET}"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  echo "${C_RED}Active send did not finish within ${UPDATE_DRAIN_TIMEOUT_SECONDS}s; migration cancelled.${C_RESET}"
+  [[ "$UPDATE_QUEUE_WAS_PAUSED" == "true" ]] || queue_control resume || true
+  return 1
+}
+
+wait_for_api_ready() {
+  local api_token waited=0 response
+  api_token="$(token || true)"
+  [[ -n "$api_token" ]] || return 1
+  while (( waited < 90 )); do
+    response="$(curl -fsS --max-time 8 -H "Authorization: Bearer $api_token" "$API_URL/ready" 2>/dev/null || true)"
+    if printf '%s' "$response" | node -e '
+      let raw=""; process.stdin.on("data", c => raw += c);
+      process.stdin.on("end", () => { try { process.exit(JSON.parse(raw).ready === true ? 0 : 1); } catch { process.exit(1); } });
+    '; then
+      return 0
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
+adopt_git_checkout() {
+  local stamp app_parent stage previous backup failed data_kb free_kb required_kb
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  app_parent="$(dirname "$APP_DIR")"
+  stage="$app_parent/.gmweb-update-stage-$stamp"
+  previous="$APP_DIR.previous-$stamp"
+  backup="/var/backups/gmweb/$stamp"
+  failed="$APP_DIR.failed-$stamp"
+  UPDATE_QUEUE_WAS_PAUSED="true"
+
+  echo "Archive installation detected; converting it to a managed Git checkout."
+  echo "Repository: $REPO_URL"
+  [[ -f "$APP_DIR/.env" && -d "$APP_DIR/data" ]] || {
+    echo "${C_RED}Missing $APP_DIR/.env or $APP_DIR/data; refusing migration.${C_RESET}"
+    return 1
+  }
+  if ! git ls-remote --exit-code "$REPO_URL" refs/heads/main >/dev/null; then
+    echo "${C_RED}Cannot reach the main branch at $REPO_URL; existing installation was not changed.${C_RESET}"
+    return 1
+  fi
+  if ! git clone --branch main --single-branch "$REPO_URL" "$stage"; then
+    case "$stage" in "$app_parent"/.gmweb-update-stage-*) rm -rf -- "$stage" ;; esac
+    return 1
+  fi
+  chown -R "$APP_USER:$APP_USER" "$stage"
+  if ! run_as_app "cd '$stage' && npm ci --omit=dev" || ! run_as_app "cd '$stage' && npm run check"; then
+    echo "${C_RED}The new release failed validation; existing installation was not changed.${C_RESET}"
+    case "$stage" in "$app_parent"/.gmweb-update-stage-*) rm -rf -- "$stage" ;; esac
+    return 1
+  fi
+
+  data_kb="$(du -sk "$APP_DIR/data" | awk '{print $1}')"
+  free_kb="$(df -Pk "$app_parent" | awk 'NR==2 {print $4}')"
+  required_kb=$((data_kb * 2 + 524288))
+  if (( free_kb < required_kb )); then
+    echo "${C_RED}Not enough disk for two safety copies of data/. Need about $((required_kb / 1024)) MB free.${C_RESET}"
+    case "$stage" in "$app_parent"/.gmweb-update-stage-*) rm -rf -- "$stage" ;; esac
+    return 1
+  fi
+
+  if ! pause_and_drain_queue; then
+    case "$stage" in "$app_parent"/.gmweb-update-stage-*) rm -rf -- "$stage" ;; esac
+    return 1
+  fi
+
+  if (
+    set -e
+    systemctl stop "$API_SERVICE"
+    systemctl stop "$CHROME_SERVICE"
+
+    install -d -m 700 "$backup"
+    cp -a "$APP_DIR/.env" "$backup/.env"
+    cp -a "$APP_DIR/data" "$backup/data"
+    [[ ! -d "$STATE_DIR" ]] || cp -a "$STATE_DIR" "$backup/state-dir"
+    test -s "$backup/.env"
+    test -d "$backup/data"
+
+    cp -a "$APP_DIR/.env" "$stage/.env"
+    cp -a "$APP_DIR/data" "$stage/data"
+    chown -R "$APP_USER:$APP_USER" "$stage"
+    chmod 600 "$stage/.env"
+
+    mv "$APP_DIR" "$previous"
+    mv "$stage" "$APP_DIR"
+    install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb
+
+    systemctl start "$CHROME_SERVICE"
+    sleep 2
+    systemctl start "$API_SERVICE"
+    wait_for_api_ready
+  ); then
+    if [[ "$UPDATE_QUEUE_WAS_PAUSED" != "true" ]] && ! queue_control resume; then
+      echo "${C_YELLOW}Update succeeded, but the queue could not be resumed automatically. Resume it from Dashboard -> Queue.${C_RESET}"
+    fi
+    echo "${C_GREEN}Converted to Git checkout and updated successfully.${C_RESET}"
+    echo "Data backup:      $backup"
+    echo "Previous install: $previous"
+    echo "Future updates:   sudo gmweb update"
+    return 0
+  else
+    echo "${C_RED}Migration failed; rolling back automatically.${C_RESET}"
+    systemctl stop "$API_SERVICE" "$CHROME_SERVICE" 2>/dev/null || true
+    if [[ -d "$previous" ]]; then
+      [[ ! -e "$APP_DIR" ]] || mv "$APP_DIR" "$failed"
+      mv "$previous" "$APP_DIR"
+      [[ ! -x "$APP_DIR/scripts/gmweb-menu.sh" ]] || install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb
+    fi
+    systemctl start "$CHROME_SERVICE"
+    sleep 2
+    systemctl start "$API_SERVICE"
+    [[ "$UPDATE_QUEUE_WAS_PAUSED" == "true" ]] || { sleep 2; queue_control resume || true; }
+    echo "Rollback complete. Existing data remains at $APP_DIR."
+    [[ ! -d "$failed" ]] || echo "Failed release kept at $failed"
+    return 1
+  fi
+}
+
 update_app() {
   need_root "$@"
   if [[ ! -d "$APP_DIR/.git" ]]; then
-    echo "No git checkout found in $APP_DIR."
-    echo "Update by rerunning the installer or deploying a fresh release archive."
-    return 1
+    adopt_git_checkout
+    return
   fi
 
   git -C "$APP_DIR" pull --ff-only
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
   run_as_app "cd '$APP_DIR' && npm ci --omit=dev"
   systemctl restart "$API_SERVICE"
+  wait_for_api_ready || {
+    echo "${C_RED}API restarted but did not become ready. Check: journalctl -u $API_SERVICE -n 100${C_RESET}"
+    return 1
+  }
   echo "${C_GREEN}Updated and restarted API.${C_RESET}"
 }
 
@@ -456,7 +634,7 @@ render_menu() {
   echo "  8) Turn VNC/noVNC off"
   echo "  9) Show API token"
   echo " 10) Logs"
-  echo " 11) Update from git"
+  echo " 11) Safe update / connect old install to Git"
   echo " 12) Uninstall GMweb API"
   echo " 13) Public dashboard setup"
   echo " 14) Reset dashboard username / password"
@@ -549,7 +727,7 @@ Commands:
   token            Print API token
   token-reset      Generate, activate, and verify a new API token
   logs [target]    Follow logs: api, chrome, vnc, novnc
-  update           Git pull, npm ci, restart API
+  update           Safe update; converts archive installs to Git once
   uninstall        Remove GMweb API from the server
   public-dashboard Manage public HTTPS dashboard exposure
   credentials      Reset dashboard username/password interactively
