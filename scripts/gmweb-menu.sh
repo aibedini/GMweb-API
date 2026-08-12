@@ -588,7 +588,7 @@ update_app() {
     return
   fi
 
-  git -C "$APP_DIR" pull --ff-only
+  run_as_app "git -C '$APP_DIR' pull --ff-only"
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
   run_as_app "cd '$APP_DIR' && npm ci --omit=dev"
   systemctl restart "$API_SERVICE"
