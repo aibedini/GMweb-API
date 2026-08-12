@@ -2160,6 +2160,10 @@ app.get("/send/status/:reference", {
           terminal: { type: "boolean" },
           successful: { type: ["boolean", "null"] },
           to: { type: "string" },
+          requestedTo: { type: "string", description: "Phone number requested by the API caller." },
+          sentTo: { type: ["string", "null"], description: "Recipient number verified in Google Messages before Enter was pressed." },
+          recipientEvidence: { type: ["object", "null"], description: "How the active conversation was matched to sentTo." },
+          conversationUrl: { type: ["string", "null"] },
           attemptsMade: { type: "integer" },
           maxAttempts: { type: "integer" },
           result: { type: ["object", "null"] },
@@ -2251,6 +2255,10 @@ app.get("/send/status/:reference", {
     terminal,
     successful: ledger.status === "sent" ? true : (terminal ? false : null),
     to: ledger.to_number,
+    requestedTo: result?.requestedTo || ledger.to_number,
+    sentTo: result?.sentTo || null,
+    recipientEvidence: result?.recipientEvidence || null,
+    conversationUrl: result?.conversationUrl || null,
     attemptsMade: Math.max(Number(ledger.attempts || 0), Number(live?.attemptsMade || 0)),
     maxAttempts: live?.maxAttempts || 3,
     result,
@@ -2677,6 +2685,10 @@ app.get("/admin/sends", {
               properties: {
                 id: { type: "integer" },
                 to: { type: "string" },
+                requestedTo: { type: "string" },
+                sentTo: { type: ["string", "null"] },
+                recipientEvidence: { type: ["object", "null"] },
+                conversationUrl: { type: ["string", "null"] },
                 text: { type: "string" },
                 textPreview: { type: "string" },
                 keyName: { type: ["string", "null"] },
@@ -2698,9 +2710,16 @@ app.get("/admin/sends", {
   }
 }, async (request) => {
   const limit = parseLimit(request.query.limit, 100, 1000);
-  const sends = sendStore.recent(limit).map((r) => ({
+  const sends = sendStore.recent(limit).map((r) => {
+    let result = null;
+    try { result = r.result_json ? JSON.parse(r.result_json) : null; } catch { /* malformed legacy row */ }
+    return {
     id: r.id,
     to: r.to_number,
+    requestedTo: result?.requestedTo || r.to_number,
+    sentTo: result?.sentTo || null,
+    recipientEvidence: result?.recipientEvidence || null,
+    conversationUrl: result?.conversationUrl || null,
     text: String(r.text || ""),
     textPreview: String(r.text || "").replace(/\s+/g, " ").slice(0, 80),
     keyName: r.key_name,
@@ -2713,7 +2732,7 @@ app.get("/admin/sends", {
     updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
     finishedAt: r.finished_at ? new Date(r.finished_at).toISOString() : null,
     sentAt: r.sent_at ? new Date(r.sent_at).toISOString() : null
-  }));
+  }; });
   return { stats: sendStore.stats(), sends };
 });
 

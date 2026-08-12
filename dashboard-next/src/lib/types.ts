@@ -99,6 +99,10 @@ export interface SendHistoryStats {
 export interface SendHistoryItem {
   id: string | number;
   to: string | null;
+  requestedTo?: string | null;
+  sentTo?: string | null;
+  recipientEvidence?: Record<string, unknown> | null;
+  conversationUrl?: string | null;
   text: string;
   textPreview?: string;
   keyName: string | null;

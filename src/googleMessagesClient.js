@@ -350,7 +350,10 @@ class GoogleMessagesClient extends EventEmitter {
     const cached = this.getCachedRecipientConversation(to);
     if (cached?.href) {
       const convId = cached.href.split("/").pop();
-      if (convId && page.url().includes(convId) && await this.composerReady(1200)) return true;
+      if (convId && page.url().includes(convId) && await this.composerReady(1200)) {
+        this.activeSendRecipientEvidence = { ...cached.recipientEvidence, conversationUrl: page.url() };
+        return true;
+      }
     }
 
     // 2. Existing conversation — find it in the sidebar and click it (SPA, no reload).
@@ -364,8 +367,12 @@ class GoogleMessagesClient extends EventEmitter {
       if (match && match.href) {
         const clicked = await this.clickConversationInSidebar(page, match.href);
         if (clicked && await this.composerReady(6000)) {
-          this.cacheRecipientConversation(to, match.href);
-          return true;
+          const evidence = this.recipientEvidenceFromText(to, match.title, "sidebar_scroll", match.href);
+          if (evidence) {
+            this.activeSendRecipientEvidence = { ...evidence, conversationUrl: page.url() };
+            this.cacheRecipientConversation(to, match.href, match.title || "", this.activeSendRecipientEvidence);
+            return true;
+          }
         }
       }
 
@@ -410,6 +417,10 @@ class GoogleMessagesClient extends EventEmitter {
 
   async sendMessageUnlocked({ to, text, onStage, shouldCancel }) {
     if (!to || !text) throw new Error("Both 'to' and 'text' are required.");
+    // Evidence is scoped to this locked send operation. Never reuse recipient
+    // evidence from the previous job: doing so could turn a navigation miss
+    // into a send to the conversation that happened to remain open.
+    this.activeSendRecipientEvidence = null;
     const stage = (s) => { try { onStage?.(s); } catch { /* ignore */ } };
     const throwIfCancelled = () => {
       if (!shouldCancel?.()) return;
@@ -451,6 +462,14 @@ class GoogleMessagesClient extends EventEmitter {
       }
 
       if (opened) {
+        const recipientEvidence = this.activeSendRecipientEvidence;
+        if (!recipientEvidence || recipientEvidence.cacheKey !== this.recipientCacheKey(to)) {
+          stage("recipient_unverified");
+          const error = new Error(`Refusing to send to ${to}: the active conversation recipient was not verified.`);
+          error.code = "RECIPIENT_UNVERIFIED";
+          error.statusCode = 409;
+          throw error;
+        }
         // A previous/replacement operation may already have submitted this text.
         // If it is visible, do not press Enter again.
         throwIfCancelled();
@@ -493,11 +512,16 @@ class GoogleMessagesClient extends EventEmitter {
       throw error;
     }
 
-    this.cacheRecipientConversation(to, page.url());
+    const recipientEvidence = this.activeSendRecipientEvidence;
+    this.cacheRecipientConversation(to, page.url(), "", recipientEvidence);
 
     const event = {
       type: "sent",
       to,
+      requestedTo: String(to),
+      sentTo: recipientEvidence.sentTo,
+      recipientEvidence,
+      conversationUrl: page.url(),
       text,
       at: new Date().toISOString()
     };
@@ -543,7 +567,7 @@ class GoogleMessagesClient extends EventEmitter {
     // Persistent recipient cache is the cheapest path; the warm in-memory
     // sidebar index covers every conversation loaded for the current year.
     const cached = this.getCachedRecipientConversation(to);
-    let match = cached?.href ? { href: cached.href, title: cached.title || "", text: cached.title || "" } : null;
+    let match = cached?.href ? { href: cached.href, title: cached.title || "", text: cached.title || "", evidence: cached.recipientEvidence } : null;
     if (!match) {
       match = [...this.sidebarConversationIndex.values()]
         .find((conversation) => this.conversationMatchesRecipient(conversation, to));
@@ -556,17 +580,21 @@ class GoogleMessagesClient extends EventEmitter {
       match = visible.find((conversation) => this.conversationMatchesRecipient(conversation, to));
     }
     if (!match?.href) return false;
+    const evidence = match.evidence || this.recipientEvidenceFromText(to, match.title, "sidebar", match.href);
+    if (!evidence) return false;
 
     // Already viewing it?
     const convId = match.href.split("/").pop();
     if (convId && page.url().includes(convId) && await this.composerReady(800)) {
-      this.cacheRecipientConversation(to, match.href);
+      this.activeSendRecipientEvidence = { ...evidence, conversationUrl: page.url() };
+      this.cacheRecipientConversation(to, match.href, match.title || "", this.activeSendRecipientEvidence);
       return true;
     }
 
     const clicked = await this.clickConversationInSidebar(page, match.href);
     if (clicked && await this.composerReady(6000)) {
-      this.cacheRecipientConversation(to, match.href);
+      this.activeSendRecipientEvidence = { ...evidence, conversationUrl: page.url() };
+      this.cacheRecipientConversation(to, match.href, match.title || "", this.activeSendRecipientEvidence);
       return true;
     }
 
@@ -577,7 +605,8 @@ class GoogleMessagesClient extends EventEmitter {
     try {
       await page.goto(new URL(match.href, MESSAGES_URL).toString(), { waitUntil: "domcontentloaded" });
       if (await this.composerReady(10000)) {
-        this.cacheRecipientConversation(to, match.href);
+        this.activeSendRecipientEvidence = { ...evidence, conversationUrl: page.url() };
+        this.cacheRecipientConversation(to, match.href, match.title || "", this.activeSendRecipientEvidence);
         return true;
       }
     } catch { /* fall through to Start chat */ }
@@ -630,13 +659,18 @@ class GoogleMessagesClient extends EventEmitter {
       // last-resort fallback for layouts where no row is clickable.
       onStage?.("selecting_recipient");
       const selection = await this.clickRecipientOption(to);
-      if (selection === "opened") return true;
+      if (selection.status === "opened") {
+        this.activeSendRecipientEvidence = selection.evidence;
+        return true;
+      }
       // The screenshot case: Google accepted the recipient and rendered a chip,
       // but never transitioned to the composer. Do not keep clicking the chip;
       // let the next attempt reset Start chat and enter the number again.
-      if (selection === "selected") return false;
-      await recipientInput.press("Enter").catch(() => {});
-      return await this.composerReady(5000);
+      if (selection.status === "selected") return false;
+      // Do not press Enter against an unverified generic suggestion. Google may
+      // focus the first contact instead of the literal number, which is exactly
+      // how a message can land in the wrong existing conversation.
+      return false;
     } catch {
       onStage?.("recipient_input_failed");
       return false;
@@ -647,17 +681,23 @@ class GoogleMessagesClient extends EventEmitter {
   // Uses the cached href, otherwise scans the conversation list once.
   async openConversationByUrl(to) {
     const page = await this.ensurePage();
-    let href = this.getCachedRecipientConversation(to)?.href || null;
+    const cached = this.getCachedRecipientConversation(to);
+    let href = cached?.href || null;
+    let evidence = cached?.recipientEvidence || null;
     if (!href) {
       const conversations = await this.listConversationsUnlocked(80);
       const match = conversations.find((c) => this.conversationMatchesRecipient(c, to));
       href = match?.href || null;
+      evidence = match ? this.recipientEvidenceFromText(to, match.title, "sidebar", href) : null;
     }
-    if (!href) return false;
+    if (!href || !evidence) return false;
     try {
       await page.goto(new URL(href, MESSAGES_URL).toString(), { waitUntil: "domcontentloaded" });
       const ready = await this.composerReady(10000);
-      if (ready) this.cacheRecipientConversation(to, href);
+      if (ready) {
+        this.activeSendRecipientEvidence = { ...evidence, conversationUrl: page.url() };
+        this.cacheRecipientConversation(to, href, "", this.activeSendRecipientEvidence);
+      }
       return ready;
     } catch {
       this.deleteCachedRecipientConversation(to);
@@ -1201,8 +1241,11 @@ class GoogleMessagesClient extends EventEmitter {
   }
 
   conversationMatchesRecipient(conversation, to) {
-    const haystack = this.normalizePhone(conversation.text || `${conversation.title} ${conversation.snippet}`);
-    return this.phoneVariants(to).some((variant) => variant.length >= 7 && haystack.includes(variant));
+    // Never match against `text` or `snippet`: they include the previous SMS
+    // body, which commonly contains another customer's renewal identifier or
+    // phone number. Matching that preview can open the wrong conversation.
+    const titleDigits = this.normalizePhone(conversation.title);
+    return this.phoneVariants(to).some((variant) => variant.length >= 7 && titleDigits === variant);
   }
 
   normalizePhone(value) {
@@ -1222,6 +1265,25 @@ class GoogleMessagesClient extends EventEmitter {
     return this.phoneVariants(to).sort((a, b) => b.length - a.length)[0] || String(to);
   }
 
+  recipientEvidenceFromText(to, text, source, hrefOrUrl = "") {
+    const normalized = this.normalizePhone(text);
+    const matchedVariant = this.phoneVariants(to)
+      .filter((variant) => variant.length >= 7)
+      .find((variant) => normalized.includes(variant));
+    if (!matchedVariant) return null;
+    let conversationUrl = "";
+    try { conversationUrl = new URL(hrefOrUrl || "/", MESSAGES_URL).toString(); } catch { /* leave blank */ }
+    return {
+      cacheKey: this.recipientCacheKey(to),
+      requestedTo: String(to),
+      sentTo: String(to),
+      source,
+      matchedVariant,
+      matchedText: String(text || "").replace(/\s+/g, " ").trim().slice(0, 240),
+      conversationUrl
+    };
+  }
+
   readConversationCache() {
     try {
       if (!fs.existsSync(this.config.conversationCacheFile)) return { recipients: {} };
@@ -1237,16 +1299,24 @@ class GoogleMessagesClient extends EventEmitter {
   }
 
   getCachedRecipientConversation(to) {
-    return this.conversationCache.recipients?.[this.recipientCacheKey(to)] || null;
+    const cacheKey = this.recipientCacheKey(to);
+    const cached = this.conversationCache.recipients?.[cacheKey] || null;
+    // Old cache entries did not carry recipient proof. Ignore them so an old,
+    // possibly incorrect number -> conversation mapping can never authorize a send.
+    return cached?.verifiedTo === cacheKey && cached?.recipientEvidence?.cacheKey === cacheKey ? cached : null;
   }
 
-  cacheRecipientConversation(to, hrefOrUrl, title = "") {
+  cacheRecipientConversation(to, hrefOrUrl, title = "", recipientEvidence = null) {
     const parsedUrl = new URL(hrefOrUrl, MESSAGES_URL);
     if (!parsedUrl.pathname.includes("/web/conversations/")) return;
+    const cacheKey = this.recipientCacheKey(to);
+    if (!recipientEvidence || recipientEvidence.cacheKey !== cacheKey) return;
     this.conversationCache.recipients ||= {};
-    this.conversationCache.recipients[this.recipientCacheKey(to)] = {
+    this.conversationCache.recipients[cacheKey] = {
       href: parsedUrl.pathname,
       title,
+      verifiedTo: cacheKey,
+      recipientEvidence: { ...recipientEvidence, conversationUrl: parsedUrl.toString() },
       updatedAt: new Date().toISOString()
     };
     this.writeConversationCache();
@@ -1279,11 +1349,8 @@ class GoogleMessagesClient extends EventEmitter {
       `mws-contact-selection-list :has-text("${local}")`,
       `mws-contact-selection-list-item :has-text("${to}")`,
       `mws-contact-selection-list-item :has-text("${local}")`,
-      `[role='option'] :has-text("Send to")`,
-      `[role='listitem'] :has-text("Send to")`,
-      `[role='option']`,
-      `[role='listitem']`,
-      `mws-contact-selection-list-item`
+      `mws-contact-selection-list-item:has-text("${to}")`,
+      `mws-contact-selection-list-item:has-text("${local}")`
     ];
 
     let option;
@@ -1292,12 +1359,21 @@ class GoogleMessagesClient extends EventEmitter {
       // loop could spend 40+ seconds clicking the same selected chip through
       // different selectors.
       option = await this.locatorFirst(selectors);
+      const optionText = await option.evaluate((node) => {
+        const text = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+        const aria = node.getAttribute?.("aria-label") || "";
+        return `${text} ${aria}`.trim();
+      });
+      const evidence = this.recipientEvidenceFromText(to, optionText, "recipient_option", page.url());
+      if (!evidence) return { status: "missing", evidence: null };
       await option.click({ timeout: 1500 });
+      if (await this.composerReady(4500)) {
+        return { status: "opened", evidence: { ...evidence, conversationUrl: page.url() } };
+      }
+      return { status: "selected", evidence };
     } catch {
-      return "missing";
+      return { status: "missing", evidence: null };
     }
-    if (await this.composerReady(4500)) return "opened";
-    return "selected";
   }
 
   async extractMessagesFromPage(page, limit) {

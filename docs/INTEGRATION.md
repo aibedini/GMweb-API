@@ -73,7 +73,12 @@ curl -X POST https://YOUR_HOST/send \
 # -> 202 { "ok": true, "requestId": "send_123", "statusUrl": "/send/status/send_123", "jobId": "...", "status": "queued" }
 ```
 Phone numbers must include the country code. Sends are async by default; either poll
-`GET /send/status/:requestId` or listen on `GET /events`. `jobId` is still
+`GET /send/status/:requestId` or listen on `GET /events`. A successful status
+includes `requestedTo`, `sentTo`, `recipientEvidence`, and `conversationUrl`.
+Treat `sentTo` as the recipient that GMweb verified in the Google Messages UI
+before pressing Enter; `requestedTo` is the original API input. New sends fail
+closed with `recipient_unverified` rather than sending when this proof cannot be
+established. `jobId` is still
 accepted for backwards compatibility, but consumers should store `requestId`
 because it remains stable even if the internal queue job changes. For simple
 callers, add `"wait": true` to get `200 { status: "completed" }` directly

@@ -1,0 +1,10 @@
+# Generated and legacy graph outputs add noise but no source-level knowledge.
+graphify-out/
+public/dashboard-next/
+docs/openapi.json
+
+# Runtime/private/dependency directories (also ignored by git).
+data/
+node_modules/
+dashboard-next/node_modules/
+dashboard-next/dist/

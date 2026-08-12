@@ -40,7 +40,10 @@ function SendRecord({ send }: { send: SendHistoryItem }) {
     <div className="grid gap-4 lg:grid-cols-[170px_minmax(0,1fr)_220px]">
       <div className="space-y-2">
         <Badge variant="outline" className={cn("uppercase", statusStyle(send.status))}>{send.status}</Badge>
-        <div className="flex items-center gap-1 font-mono text-sm font-semibold"><span dir="ltr">{send.to || "—"}</span>{send.to && <CopyButton value={send.to} label="number" />}</div>
+        <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Requested recipient</div>
+        <div className="flex items-center gap-1 font-mono text-sm font-semibold"><span dir="ltr">{send.requestedTo || send.to || "—"}</span>{(send.requestedTo || send.to) && <CopyButton value={String(send.requestedTo || send.to)} label="requested number" />}</div>
+        <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Confirmed sent to</div>
+        <div className={cn("flex items-center gap-1 font-mono text-sm font-semibold", send.status === "sent" && !send.sentTo && "text-orange-300")}><span dir="ltr">{send.sentTo || (send.status === "sent" ? "Legacy / unverified" : "—")}</span>{send.sentTo && <CopyButton value={send.sentTo} label="confirmed number" />}</div>
         <div className="text-xs text-muted-foreground">Project <span className="font-medium text-foreground">{send.keyName || "—"}</span></div>
         <div className="text-xs text-muted-foreground">Stage <span className="text-foreground">{send.stage || "—"}</span> · attempt {send.attempts ?? 0}</div>
       </div>
@@ -86,7 +89,7 @@ export function HistoryPage() {
   useSSE((e) => { if (e.type.startsWith("send_") || e.type.startsWith("queue_")) load(); }, true);
   const filtered = useMemo(() => {
     const q = query.trim().toLocaleLowerCase();
-    return sends.filter((s) => (status === "all" || s.status === status) && (!q || [s.to, s.text, s.textPreview, s.keyName, s.jobId, s.id, s.error, s.stage].some((v) => String(v ?? "").toLocaleLowerCase().includes(q))));
+    return sends.filter((s) => (status === "all" || s.status === status) && (!q || [s.to, s.requestedTo, s.sentTo, s.text, s.textPreview, s.keyName, s.jobId, s.id, s.error, s.stage].some((v) => String(v ?? "").toLocaleLowerCase().includes(q))));
   }, [sends, query, status]);
   const count = (name: string) => stats[name] ?? sends.filter((s) => s.status === name).length;
   const summary = [["Queued", count("queued")], ["Active", count("active")], ["Sent", count("sent")], ["Unverified", count("unverified")], ["Failed", count("failed")], ["Suppressed / cancelled", count("suppressed") + count("cancelled")]] as const;

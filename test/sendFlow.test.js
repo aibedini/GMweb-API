@@ -58,7 +58,7 @@ test("a selected recipient without a composer is retried from Start chat", async
   });
   c.clickFirst = async () => { startChatClicks += 1; };
   c.locatorFirst = async () => input;
-  c.clickRecipientOption = async () => "selected";
+  c.clickRecipientOption = async () => ({ status: "selected", evidence: { cacheKey: "989121234567" } });
 
   const opened = await c.startChatFlow(
     "+989121234567",
@@ -86,6 +86,49 @@ test("typeAndSend requires a new matching outgoing bubble", async () => {
   assert.equal(await c.typeAndSend("hello   world"), true);
 });
 
+test("recipient option selection rejects a different phone number", async () => {
+  const c = client();
+  let clicked = false;
+  const option = {
+    evaluate: async () => "Send to +989351112233",
+    click: async () => { clicked = true; }
+  };
+  c.ensurePage = async () => ({ url: () => "https://messages.google.com/web/conversations/new" });
+  c.locatorFirst = async () => option;
+
+  const selection = await c.clickRecipientOption("+989127096919");
+  assert.equal(selection.status, "missing");
+  assert.equal(selection.evidence, null);
+  assert.equal(clicked, false);
+});
+
+test("conversation lookup never matches a phone number from the message preview", () => {
+  const c = client();
+  const conversation = {
+    title: "+989127096919",
+    snippet: "Renew v20909129177288?",
+    text: "+989127096919 Renew v20909129177288?"
+  };
+  assert.equal(c.conversationMatchesRecipient(conversation, "+989127096919"), true);
+  assert.equal(c.conversationMatchesRecipient(conversation, "+989129177288"), false);
+});
+
+test("send fails closed when the opened conversation has no recipient evidence", async () => {
+  const c = client();
+  c.ensurePage = async () => ({
+    bringToFront: async () => {},
+    waitForTimeout: async () => {},
+    url: () => "https://messages.google.com/web/conversations/wrong"
+  });
+  c.ensurePaired = async () => {};
+  c.openForSend = async () => true;
+
+  await assert.rejects(
+    c.sendMessageUnlocked({ to: "+989127096919", text: "must not send" }),
+    (error) => error.code === "RECIPIENT_UNVERIFIED"
+  );
+});
+
 test("typeAndSend never assumes sent when bubble verification fails", async () => {
   const c = client();
   const input = { fill: async () => {}, press: async () => {} };
@@ -110,6 +153,15 @@ test("an unverified submit presses Enter only once and never UI-retries", async 
   });
   c.ensurePaired = async () => {};
   c.openForSend = async () => true;
+  c.activeSendRecipientEvidence = null;
+  c.openForSend = async (to) => {
+    c.activeSendRecipientEvidence = {
+      cacheKey: c.recipientCacheKey(to), requestedTo: to, sentTo: to,
+      source: "test", matchedVariant: c.recipientCacheKey(to), matchedText: to,
+      conversationUrl: "https://messages.google.com/web/conversations/example"
+    };
+    return true;
+  };
   c.lastOutgoingMatches = async () => false;
   c.typeAndSend = async () => { submits += 1; return false; };
 
@@ -134,7 +186,14 @@ test("a recent matching bubble prevents another Enter", async () => {
     url: () => "https://messages.google.com/web/conversations/example"
   });
   c.ensurePaired = async () => {};
-  c.openForSend = async () => true;
+  c.openForSend = async (to) => {
+    c.activeSendRecipientEvidence = {
+      cacheKey: c.recipientCacheKey(to), requestedTo: to, sentTo: to,
+      source: "test", matchedVariant: c.recipientCacheKey(to), matchedText: to,
+      conversationUrl: "https://messages.google.com/web/conversations/example"
+    };
+    return true;
+  };
   c.lastOutgoingMatches = async () => true;
   c.typeAndSend = async () => { submits += 1; return true; };
 
@@ -142,6 +201,8 @@ test("a recent matching bubble prevents another Enter", async () => {
     to: "+989121234567", text: "already visible", onStage: (stage) => stages.push(stage)
   });
   assert.equal(result.type, "sent");
+  assert.equal(result.requestedTo, "+989121234567");
+  assert.equal(result.sentTo, "+989121234567");
   assert.equal(submits, 0);
   assert(stages.includes("already_sent"));
 });
@@ -665,7 +726,7 @@ test("google messages rate limit fallback scrolling mode triggers, scrolls, defe
     listCalls += 1;
     if (listCalls === 1) return [];
     return [
-      { id: "1", href: "/web/conversations/abc", title: "Target contact", text: "+989128904528", timestamp: "Jun 1" }
+      { id: "1", href: "/web/conversations/abc", title: "+989128904528", text: "+989128904528", timestamp: "Jun 1" }
     ];
   };
 
