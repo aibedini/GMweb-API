@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "fb5dfddeba556c8e3e3b9cc035e35b8195447dfb",
-    "indexed_at": "2026-08-12T16:44:36Z",
+    "commit": "928007063767efdbbc4068838fcbdb0a0561f4c4",
+    "indexed_at": "2026-08-12T16:46:41Z",
     "project": "C-Users-Mahna-GoogleMEssage",
     "nodes": 1173,
     "edges": 3231,
     "original_size": 4784128,
-    "compressed_size": 860061,
+    "compressed_size": 860900,
     "compression_level": 9
 }

@@ -509,7 +509,9 @@ adopt_git_checkout() {
     return 1
   fi
   chown -R "$APP_USER:$APP_USER" "$stage"
-  if ! run_as_app "cd '$stage' && npm ci --omit=dev" || ! run_as_app "cd '$stage' && npm run check"; then
+  if ! run_as_app "cd '$stage' && npm ci --omit=dev" ||
+     ! run_as_app "cd '$stage' && npm run check" ||
+     ! bash -n "$stage/scripts/gmweb-menu.sh"; then
     echo "${C_RED}The new release failed validation; existing installation was not changed.${C_RESET}"
     case "$stage" in "$app_parent"/.gmweb-update-stage-*) rm -rf -- "$stage" ;; esac
     return 1
@@ -591,6 +593,8 @@ update_app() {
   run_as_app "git -C '$APP_DIR' pull --ff-only"
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
   run_as_app "cd '$APP_DIR' && npm ci --omit=dev"
+  bash -n "$APP_DIR/scripts/gmweb-menu.sh"
+  install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb
   systemctl restart "$API_SERVICE"
   wait_for_api_ready || {
     echo "${C_RED}API restarted but did not become ready. Check: journalctl -u $API_SERVICE -n 100${C_RESET}"
