@@ -20,6 +20,24 @@ automation commands. Two consecutive failed probes restart `gmweb-chrome` and
 `gmweb-api`. A send-level browser/lock timeout triggers the same recovery
 immediately, with a persistent five-minute cooldown.
 
+Send-time recovery is stage-aware. A `checking_paired` failure occurs before
+the composer is touched, so GMweb safely reloads the conversations page,
+reconnects Playwright, checks pairing again, and lets BullMQ retry the queued
+message. If the session is still unready, or a `browser_unresponsive` timeout
+shows that CDP itself is wedged, GMweb restarts `gmweb-chrome` and `gmweb-api`.
+The persistent five-minute cooldown prevents restart loops; a genuinely
+unpaired phone still requires an operator to scan the QR code.
+
+Recovery evidence is available in three places:
+
+- `journalctl -u gmweb-api` for service logs;
+- `/opt/gmweb-api/data/browser-recovery.jsonl` for durable structured events;
+- `/var/log/gmweb/monitor.log` for the independent timer watchdog.
+
+When `WEBHOOK_URL` points to Eve or another monitoring server, the same
+`browser_recovering` and `browser_hard_restart` events are also posted there.
+Without `WEBHOOK_URL`, recovery logs remain only on the GMweb server.
+
 The dashboard Overview card reports `automation_healthy` or `Hung`. The Queue
 page reports queued/started timestamps, waiting and active durations, current
 browser stage, time in that stage, attempts, SQLite tracking status, and a

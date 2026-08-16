@@ -147,7 +147,7 @@ recipient number verified in Google Messages before submission.
 | `POST /send` · `GET /send/status/:id` | queue a message · poll a job |
 | `GET /conversations?limit=` | list recent conversations |
 | `GET /messages/active` · `POST /conversations/messages` | read the open / a specific thread |
-| `GET /events` | SSE stream (`send_queued/processing/completed/failed`, `conversation_changed`) |
+| `GET /events` | SSE stream (send lifecycle, conversation changes, browser recovery) |
 | `GET /admin/queue` · `GET /admin/queue/jobs` · `POST .../promote` · `DELETE .../:id` | queue stats, list, bump, cancel |
 | `GET/POST/PATCH/DELETE /admin/api-keys…` | manage project keys |
 

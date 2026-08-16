@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.3.27",
+    "version": "0.3.28",
     "contact": {
       "name": "GMweb API"
     }
@@ -2793,7 +2793,7 @@
         "tags": [
           "Messaging"
         ],
-        "description": "Subscribe to real-time events using SSE (Server-Sent Events).\n\n**Event types:**\n- `conversation_changed` — a conversation's last message or unread state changed\n- `send_queued` — a message was accepted into the send queue\n- `send_processing` — the worker started sending a queued message\n- `send_completed` — a queued message was sent successfully (includes `jobId`)\n- `send_failed` — a send attempt failed (`willRetry` indicates if it will be retried)\n- `send_cancelled` — a queued send was cancelled before it started\n\n**Usage (JavaScript):**\n```js\nconst es = new EventSource('/events', { headers: { Authorization: 'Bearer gmw_...' } });\nes.onmessage = (e) => console.log(JSON.parse(e.data));\n```\n\nConnection stays open until closed by the client. Reconnect with exponential backoff.",
+        "description": "Subscribe to real-time events using SSE (Server-Sent Events).\n\n**Event types:**\n- `conversation_changed` — a conversation's last message or unread state changed\n- `send_queued` — a message was accepted into the send queue\n- `send_processing` — the worker started sending a queued message\n- `send_completed` — a queued message was sent successfully (includes `jobId`)\n- `send_failed` — a send attempt failed (`willRetry` indicates if it will be retried)\n- `send_cancelled` — a queued send was cancelled before it started\n- `browser_recovering` — a safe pre-submit reload/reconnect started or finished\n- `browser_hard_restart` — Chrome and API restart was scheduled after recovery failed\n\n**Usage (JavaScript):**\n```js\nconst es = new EventSource('/events', { headers: { Authorization: 'Bearer gmw_...' } });\nes.onmessage = (e) => console.log(JSON.parse(e.data));\n```\n\nConnection stays open until closed by the client. Reconnect with exponential backoff.",
         "responses": {
           "200": {
             "description": "SSE stream",

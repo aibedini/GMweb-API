@@ -1152,6 +1152,9 @@ class GoogleMessagesClient extends EventEmitter {
     }
     if (!status.paired) {
       const error = new Error(`Google Messages is not ready: ${status.hint}`);
+      // This happens before the composer is touched, so the queue worker can
+      // safely reload/reconnect Chrome and retry without risking a duplicate.
+      error.code = "GOOGLE_MESSAGES_NOT_READY";
       error.statusCode = 409;
       error.details = status;
       throw error;
@@ -1703,7 +1706,7 @@ class GoogleMessagesClient extends EventEmitter {
 
   // Drop the current (possibly wedged) page and reconnect to the external
   // Chrome with a fresh Messages page. Does NOT kill the Chrome process.
-  async recover() {
+  async recover({ reload = false } = {}) {
     return this.withBrowserLock(async () => {
       this.stopPolling();
       // Session is wedged — force-close any rotation tab immediately (skip grace).
@@ -1714,7 +1717,11 @@ class GoogleMessagesClient extends EventEmitter {
       this.context = null;
       this.page = null;
       await this.startUnlocked();
-      return { recovered: true, at: new Date().toISOString() };
+      if (reload) {
+        await this.page.goto(`${MESSAGES_URL}/conversations`, { waitUntil: "domcontentloaded" });
+        await this.page.waitForLoadState("domcontentloaded").catch(() => {});
+      }
+      return { recovered: true, reloaded: reload, at: new Date().toISOString() };
     }, { timeoutMs: 60000 });
   }
 }

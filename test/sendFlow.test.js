@@ -16,6 +16,44 @@ function client() {
   });
 }
 
+test("unpaired readiness failures are marked safe for pre-submit recovery", async () => {
+  const c = client();
+  c.pairedWaitMs = 0;
+  c.closeRotationTabs = async () => {};
+  c.page = { waitForTimeout: async () => {} };
+  c.statusUnlocked = async () => ({
+    paired: false,
+    qrVisible: false,
+    signInVisible: true,
+    hint: "sign in to the controlled Chrome profile, then pair your phone",
+    url: "https://messages.google.com/web/"
+  });
+
+  await assert.rejects(
+    c.ensurePaired(),
+    (error) => error.code === "GOOGLE_MESSAGES_NOT_READY" && error.details.signInVisible === true
+  );
+});
+
+test("browser recovery can force a conversations reload before retry", async () => {
+  const c = client();
+  const navigations = [];
+  c.withBrowserLock = async (action) => action();
+  c.stopPolling = () => {};
+  c.closeRotationTabs = async () => {};
+  c.startUnlocked = async () => {
+    c.page = {
+      goto: async (url, options) => navigations.push({ url, options }),
+      waitForLoadState: async () => {}
+    };
+  };
+
+  const result = await c.recover({ reload: true });
+  assert.equal(result.reloaded, true);
+  assert.equal(navigations.length, 1);
+  assert.match(navigations[0].url, /messages\.google\.com\/web\/conversations/);
+});
+
 test("send retries stay inside the SPA and defer after three UI misses", async () => {
   const c = client();
   assert(c.sendOperationTimeoutMs >= 220000);

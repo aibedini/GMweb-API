@@ -62,7 +62,13 @@ Full schemas are in [`openapi.json`](./openapi.json). The relevant subset:
 | `POST /conversations/open` | Open a conversation by `href` / `id` / `title` / `index`. |
 | `GET /messages/active?limit=50` | Read messages from the currently open conversation. |
 | `POST /conversations/messages` | Open a conversation **and** return its messages in one call. |
-| `GET /events` | SSE stream: `send_queued` / `send_processing` / `send_completed` / `send_failed` / `conversation_changed`. |
+| `GET /events` | SSE stream: send lifecycle, `conversation_changed`, `browser_recovering`, and `browser_hard_restart`. |
+
+If `WEBHOOK_URL` is configured, browser recovery events are delivered to that
+receiver as well as the live SSE stream. `browser_recovering` includes the
+recovery `action` and `outcome`; `browser_hard_restart` means the Chrome and API
+service restart has been scheduled. Consumers should log these events but must
+not resubmit the SMS: the original BullMQ job remains responsible for retrying.
 
 ### Send a message
 ```bash

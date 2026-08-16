@@ -507,6 +507,7 @@ const SEND_FAIL_RESTART_THRESHOLD = Number(process.env.SEND_FAIL_RESTART_THRESHO
 const SEND_HARD_RESTART_THRESHOLD = Number(process.env.SEND_HARD_RESTART_THRESHOLD) || 2;
 const HARD_RESTART_COOLDOWN_MS = Number(process.env.HARD_RESTART_COOLDOWN_MS) || 5 * 60 * 1000;
 const browserRecoveryFile = path.join(config.rootDir, "data", "browser-recovery.json");
+const browserRecoveryLogFile = path.join(config.rootDir, "data", "browser-recovery.jsonl");
 const sendPacing = new SendPacingController({
   filePath: path.join(config.rootDir, "data", "send-settings.json"),
   defaults: {
@@ -530,20 +531,116 @@ function isBrowserAutomationWedge(error) {
   return /send_timeout|browser_lock_.*timeout|connectOverCDP.*Timeout|Target page.*closed/i.test(text);
 }
 
+function isPairingReadinessFailure(error) {
+  return error?.code === "GOOGLE_MESSAGES_NOT_READY";
+}
+
+async function publishBrowserRecovery(event) {
+  const payload = {
+    ...event,
+    at: event.at || new Date().toISOString()
+  };
+  await fs.mkdir(path.dirname(browserRecoveryLogFile), { recursive: true }).catch(() => {});
+  await fs.appendFile(browserRecoveryLogFile, `${JSON.stringify(payload)}\n`, "utf8").catch((error) => {
+    app.log.warn({ error }, "could not persist browser recovery event");
+  });
+  emitSse(payload);
+  // WEBHOOK_URL may point at Eve or another monitoring server. Recovery must
+  // never wait for that remote receiver before the local retry can proceed.
+  postWebhook(payload);
+  return payload;
+}
+
 async function scheduleHardBrowserRecovery(reason, jobId) {
   if (hardRecoveryScheduled || process.platform === "win32") return false;
   let previous = {};
   try { previous = JSON.parse(await fs.readFile(browserRecoveryFile, "utf8")); } catch { /* first recovery */ }
-  if (Date.now() - Number(previous.at || 0) < HARD_RESTART_COOLDOWN_MS) return false;
+  if (Date.now() - Number(previous.at || 0) < HARD_RESTART_COOLDOWN_MS) {
+    await publishBrowserRecovery({
+      type: "browser_recovering",
+      action: "hard_restart",
+      outcome: "cooldown",
+      reason: String(reason || "browser_unresponsive"),
+      jobId: String(jobId || ""),
+      retryAfterMs: HARD_RESTART_COOLDOWN_MS - (Date.now() - Number(previous.at || 0))
+    });
+    return false;
+  }
 
   hardRecoveryScheduled = true;
   const record = { at: Date.now(), reason: String(reason || "browser_unresponsive"), jobId: String(jobId || "") };
   await fs.writeFile(browserRecoveryFile, JSON.stringify(record, null, 2), "utf8").catch(() => {});
   app.log.error({ reason: record.reason, jobId: record.jobId }, "browser automation wedged; scheduling hard recovery");
-  emitSse({ type: "browser_hard_restart", reason: record.reason, jobId: record.jobId, at: new Date().toISOString() });
+  await publishBrowserRecovery({
+    type: "browser_hard_restart",
+    action: "restart_chrome_and_api",
+    outcome: "scheduled",
+    reason: record.reason,
+    jobId: record.jobId
+  });
   scheduleSystemctl(["restart", "gmweb-chrome.service"]);
   setTimeout(() => scheduleSystemctl(["restart", "gmweb-api.service"]), 2500);
   return true;
+}
+
+async function recoverUnreadyBrowser(error, job) {
+  if (recovering) return false;
+  recovering = true;
+  sendStore.markStage(job.id, "browser_recovering");
+  const details = error?.details || {};
+  await publishBrowserRecovery({
+    type: "browser_recovering",
+    action: "reload_and_reconnect",
+    outcome: "started",
+    reason: error?.code || "GOOGLE_MESSAGES_NOT_READY",
+    jobId: String(job.id || ""),
+    hint: details.hint || "",
+    url: details.url || "",
+    qrVisible: Boolean(details.qrVisible),
+    signInVisible: Boolean(details.signInVisible)
+  });
+
+  try {
+    await client.recover({ reload: true });
+    const status = await client.status();
+    if (status.paired) {
+      app.log.info({ jobId: job.id }, "Google Messages recovered after reload/reconnect");
+      await publishBrowserRecovery({
+        type: "browser_recovering",
+        action: "reload_and_reconnect",
+        outcome: "recovered",
+        reason: error?.code || "GOOGLE_MESSAGES_NOT_READY",
+        jobId: String(job.id || "")
+      });
+      return true;
+    }
+
+    app.log.warn({ jobId: job.id, status }, "Google Messages still unready after reload/reconnect");
+    await publishBrowserRecovery({
+      type: "browser_recovering",
+      action: "reload_and_reconnect",
+      outcome: "still_unready",
+      reason: error?.code || "GOOGLE_MESSAGES_NOT_READY",
+      jobId: String(job.id || ""),
+      hint: status.hint || "",
+      qrVisible: Boolean(status.qrVisible),
+      signInVisible: Boolean(status.signInVisible)
+    });
+    return scheduleHardBrowserRecovery(error.message, job.id);
+  } catch (recoveryError) {
+    app.log.warn({ error: recoveryError, jobId: job.id }, "reload/reconnect recovery failed");
+    await publishBrowserRecovery({
+      type: "browser_recovering",
+      action: "reload_and_reconnect",
+      outcome: "failed",
+      reason: error?.code || "GOOGLE_MESSAGES_NOT_READY",
+      jobId: String(job.id || ""),
+      error: recoveryError?.message || String(recoveryError)
+    });
+    return scheduleHardBrowserRecovery(recoveryError?.message || error.message, job.id);
+  } finally {
+    recovering = false;
+  }
 }
 
 async function waitForSendPace(job) {
@@ -784,6 +881,8 @@ function startSendWorker() {
         if (isBrowserAutomationWedge(error)) {
           sendStore.markStage(job.id, "browser_unresponsive");
           await scheduleHardBrowserRecovery(error.message, job.id);
+        } else if (isPairingReadinessFailure(error)) {
+          await recoverUnreadyBrowser(error, job);
         }
         if (error?.code === "GOOGLE_CONVERSATION_RATE_LIMIT") {
           await sendQueue.pause();
@@ -1129,6 +1228,7 @@ const STAGE_LABELS = {
   typing: "Typing and sending message",
   send_unverified: "Submitted once; outgoing bubble was not confirmed",
   retrying_without_reload: "Retrying without reloading Messages",
+  browser_recovering: "Reloading and reconnecting Google Messages",
   browser_unresponsive: "Chrome automation is unresponsive; recovery scheduled",
   google_rate_limited: "Google asked the gateway to wait",
   sent: "Send confirmed",
@@ -1170,6 +1270,8 @@ function enrichQueueJob(job) {
   } else if (job.state === "active") {
     if (stage === "browser_unresponsive" || activeForMs >= SEND_TIMEOUT_MS) {
       diagnosis = { code: "browser_unresponsive", severity: "error", message: "Chrome/Google Messages automation is hung; automatic recovery is scheduled" };
+    } else if (stage === "browser_recovering") {
+      diagnosis = { code: "browser_recovering", severity: "warning", message: "Google Messages was not ready; automatic reload/reconnect is running" };
     } else if (!stage && activeForMs > 15000) {
       diagnosis = { code: "waiting_browser_lock", severity: "warning", message: "Waiting for the browser automation lock; a previous browser action may be stuck" };
     } else {
@@ -3128,6 +3230,8 @@ app.get("/events", {
       "- `send_completed` — a queued message was sent successfully (includes `jobId`)",
       "- `send_failed` — a send attempt failed (`willRetry` indicates if it will be retried)",
       "- `send_cancelled` — a queued send was cancelled before it started",
+      "- `browser_recovering` — a safe pre-submit reload/reconnect started or finished",
+      "- `browser_hard_restart` — Chrome and API restart was scheduled after recovery failed",
       "",
       "**Usage (JavaScript):**",
       "```js",

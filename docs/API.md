@@ -113,4 +113,5 @@ own sends. Returns `409 not_cancellable` when the send is already active/sent.
 
 ### GET /events
 
-Server-sent events stream for sent-message and conversation-change events.
+Server-sent events stream for send lifecycle, conversation changes, and browser
+recovery (`browser_recovering` / `browser_hard_restart`) events.
