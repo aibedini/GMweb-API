@@ -1,10 +1,11 @@
 # Graph Report - GoogleMEssage  (2026-08-17)
 
 ## Corpus Check
-- cluster-only mode — file stats not available
+- 82 files · ~83,867 words
+- Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 1457 nodes · 4213 edges · 85 communities (67 shown, 18 thin omitted)
+- 1457 nodes · 4213 edges · 90 communities (72 shown, 18 thin omitted)
 - Extraction: 88% EXTRACTED · 12% INFERRED · 0% AMBIGUOUS · INFERRED: 525 edges (avg confidence: 0.51)
 - Token cost: 0 input · 0 output
 
@@ -36,20 +37,20 @@
 - startSendWorker
 - index-C7h9QJI0.js
 - r
-- gp
+- d
 - app.js
 - quick-install.sh
-- zl
+- a
 - i
-- oxlint
+- constructor
 - types.ts
 - start
 - la
-- Go
+- is
 - compilerOptions
 - SendStore
-- zd
-- np
+- get
+- e
 - dependencies
 - SendPacingController
 - react
@@ -58,7 +59,10 @@
 - priorityForJob
 - devDependencies
 - kd
+- mount
+- then
 - Answers to §6 checklist
+- Go
 - Conversations.tsx
 - قرارداد GMweb برای پروژه Eve: اولویت ارسال، feeder اطلاعیه و وضعیت تحویل
 - dashboard-next/package.json
@@ -68,7 +72,8 @@
 - HistoryPage.tsx
 - Overview.tsx
 - package.json
-- Dn
+- On
+- Lu
 - browser-probe.js
 - doctor.js
 - openLoginChrome.js
@@ -90,6 +95,7 @@
 - @radix-ui/react-slot
 - @types/node
 - @types/react-dom
+- @vitejs/plugin-react
 - copilot-instructions.md
 - pre-commit
 - new-token.js
@@ -109,14 +115,14 @@
 ## Surprising Connections (you probably didn't know these)
 - `Dashboard embedded VNC console` --semantically_similar_to--> `VNC/noVNC pairing flow`  [INFERRED] [semantically similar]
   public/dashboard/index.html → docs/SIMPLE_SETUP.md
-- `GMweb Dashboard UI` --references--> `GET /conversations endpoint`  [INFERRED]
-  public/dashboard/index.html → docs/API.md
 - `GMweb API HTTP bridge` --conceptually_related_to--> `GMweb`  [INFERRED]
   README.md → CLAUDE.md
+- `GMweb Dashboard UI` --references--> `GET /conversations endpoint`  [INFERRED]
+  public/dashboard/index.html → docs/API.md
 - `POST /send endpoint` --shares_data_with--> `BullMQ send queue (queue.js)`  [INFERRED]
   docs/API.md → CLAUDE.md
-- `GMweb Dashboard UI` --references--> `POST /send endpoint`  [INFERRED]
-  public/dashboard/index.html → docs/API.md
+- `GMweb API endpoints reference` --references--> `Auth model (master token vs project key)`  [INFERRED]
+  docs/API.md → CLAUDE.md
 
 ## Import Cycles
 - None detected.
@@ -126,7 +132,7 @@
 - **Headless VPS pairing stack** — docs_vps_no_gui_xvfb, docs_simple_setup_vnc_pairing, docs_vps_no_gui_connect_mode, docs_operations_browser_profile [INFERRED 0.85]
 - **Message send pipeline** — docs_api_send, claude_queue_js, claude_redis, claude_google_messages_client [INFERRED 0.85]
 
-## Communities (85 total, 18 thin omitted)
+## Communities (90 total, 18 thin omitted)
 
 ### Community 1 - "GMweb API HTTP bridge"
 Cohesion: 0.07
@@ -134,11 +140,11 @@ Nodes (46): Project API keys (apiKeys.js), Auth model (master token vs project k
 
 ### Community 2 - "pc"
 Cohesion: 0.06
-Nodes (92): Ac(), ao(), at(), ba(), bc(), bu(), ca(), cd() (+84 more)
+Nodes (86): Ac(), ao(), at(), ba(), bc(), bu(), cd(), cf() (+78 more)
 
 ### Community 3 - "server.js"
 Cohesion: 0.04
-Nodes (53): activeSendCancellationRequests, ADMIN_ONLY_PREFIXES, ANNOUNCEMENT_PENDING_LIMIT, { ApiKeyStore }, authFailBuckets, backfillPendingLedger(), browserRecoveryFile, browserRecoveryLogFile (+45 more)
+Nodes (55): activeSendCancellationRequests, ADMIN_ONLY_PREFIXES, ANNOUNCEMENT_PENDING_LIMIT, { ApiKeyStore }, authFailBuckets, backfillPendingLedger(), browserRecoveryFile, browserRecoveryLogFile (+47 more)
 
 ### Community 4 - "scripts"
 Cohesion: 0.15
@@ -161,12 +167,12 @@ Cohesion: 0.36
 Nodes (9): install_public_dashboard(), need_root(), remove_public_dashboard(), set_env_value(), public-dashboard.sh script, show_credentials(), status_public_dashboard(), usage() (+1 more)
 
 ### Community 10 - "requireToken"
-Cohesion: 0.23
-Nodes (12): applySecurityHeaders(), bearerToken(), csrfAllowed(), dashboardSession(), hasDashboardAccess(), isAdminOnlyPath(), isAuthBlocked(), isDashboardAsset() (+4 more)
+Cohesion: 0.24
+Nodes (11): applySecurityHeaders(), bearerToken(), csrfAllowed(), hasDashboardAccess(), isAdminOnlyPath(), isAuthBlocked(), isDashboardAsset(), recordAuthFailure() (+3 more)
 
 ### Community 11 - "createDashboardSession"
-Cohesion: 0.27
-Nodes (10): cleanupDashboardSessions(), clearDashboardSession(), createDashboardPasswordSession(), createDashboardSession(), dashboardPasswordSession(), parseCookies(), passwordAuthEnabled(), randomToken() (+2 more)
+Cohesion: 0.25
+Nodes (11): cleanupDashboardSessions(), clearDashboardSession(), createDashboardPasswordSession(), createDashboardSession(), dashboardPasswordSession(), dashboardSession(), parseCookies(), passwordAuthEnabled() (+3 more)
 
 ### Community 12 - "uninstall.sh"
 Cohesion: 0.46
@@ -181,8 +187,8 @@ Cohesion: 0.33
 Nodes (5): fs, main(), path, rootDir, app
 
 ### Community 15 - "sendFlow.test.js"
-Cohesion: 0.10
-Nodes (20): { chromium }, { EventEmitter }, fs, normalizeComparableMessage(), path, sendGate(), sendSchedule(), zonedClock() (+12 more)
+Cohesion: 0.11
+Nodes (18): { chromium }, { EventEmitter }, fs, normalizeComparableMessage(), path, sendGate(), sendSchedule(), zonedClock() (+10 more)
 
 ### Community 16 - "ubuntu22.sh"
 Cohesion: 0.83
@@ -194,15 +200,15 @@ Nodes (15): deferConversationJob(), deferQuietHoursJob(), emitSse(), handleSendC
 
 ### Community 20 - "index-C7h9QJI0.js"
 Cohesion: 0.04
-Nodes (80): addVariantChild(), animation(), Bi(), bindToMotionValue(), bn(), t(), Bo(), Ce() (+72 more)
+Nodes (51): addVariantChild(), ai(), animation(), Bi(), bn(), t(), Ce(), componentDidUpdate() (+43 more)
 
 ### Community 21 - "r"
 Cohesion: 0.10
-Nodes (74): add(), ae(), Al(), b(), C(), cl(), Cu(), D() (+66 more)
+Nodes (48): add(), ae(), ap(), b(), bindToMotionValue(), Bo(), C(), D() (+40 more)
 
-### Community 22 - "gp"
-Cohesion: 0.14
-Nodes (34): cm(), E(), Er(), fm(), gp(), ae(), ce(), k() (+26 more)
+### Community 22 - "d"
+Cohesion: 0.12
+Nodes (44): Bd(), cm(), E(), Er(), gp(), ae(), ce(), k() (+36 more)
 
 ### Community 23 - "app.js"
 Cohesion: 0.12
@@ -212,29 +218,33 @@ Nodes (41): api(), bind(), buildApiKeyRow(), buildMessageDivs(), cancelJob(), cl
 Cohesion: 0.18
 Nodes (40): ask(), banner(), change_dashboard_password(), configure_timezone(), confirm(), do_full_install(), do_uninstall(), err() (+32 more)
 
-### Community 25 - "zl"
-Cohesion: 0.70
-Nodes (5): Bl(), Rl(), ul(), vl(), zl()
+### Community 25 - "a"
+Cohesion: 0.15
+Nodes (37): Al(), cl(), cr(), Cu(), Dl(), ea(), ep(), fd() (+29 more)
 
 ### Community 26 - "i"
-Cohesion: 0.10
-Nodes (32): Aa(), br(), bt(), cr(), ct(), ed(), Fr(), getVelocity() (+24 more)
+Cohesion: 0.11
+Nodes (32): Aa(), br(), bt(), ct(), dp(), fp(), Ft(), s() (+24 more)
+
+### Community 27 - "constructor"
+Cohesion: 0.08
+Nodes (31): attachTimeline(), constructor(), dirty(), Dr(), end(), finish(), handleScroll(), initAnimation() (+23 more)
 
 ### Community 28 - "types.ts"
 Cohesion: 0.09
 Nodes (25): api(), ApiError, csrfToken, Options, setCsrfToken(), setUnauthorizedHandler(), Ctx, SessionProvider() (+17 more)
 
 ### Community 29 - "start"
-Cohesion: 0.07
-Nodes (56): addListeners(), attachTimeline(), Au(), cancel(), cc(), clearAnimation(), commitStyles(), destroy() (+48 more)
+Cohesion: 0.16
+Nodes (30): addListeners(), Au(), cancel(), cc(), clearAnimation(), commitStyles(), Du(), ei() (+22 more)
 
 ### Community 30 - "la"
-Cohesion: 0.12
-Nodes (35): attach(), Bd(), Da(), fi(), Ke(), la(), a(), b() (+27 more)
+Cohesion: 0.13
+Nodes (26): attach(), Da(), fi(), getVelocity(), Ia(), ja(), Ka(), la() (+18 more)
 
-### Community 31 - "Go"
-Cohesion: 0.06
-Nodes (51): addValue(), ai(), as(), bs(), build(), complete(), cs(), Fa() (+43 more)
+### Community 31 - "is"
+Cohesion: 0.13
+Nodes (26): Bl(), bs(), build(), cs(), gd(), Ho(), hs(), Il() (+18 more)
 
 ### Community 32 - "compilerOptions"
 Cohesion: 0.08
@@ -244,13 +254,13 @@ Nodes (23): compilerOptions, allowImportingTsExtensions, erasableSyntaxOnly, jsx
 Cohesion: 0.11
 Nodes (6): crypto, Database, dedupeKey(), fs, path, SendStore
 
-### Community 34 - "zd"
-Cohesion: 0.11
-Nodes (33): af(), Bf(), Ef(), Fl(), he(), Id(), If(), Il() (+25 more)
+### Community 34 - "get"
+Cohesion: 0.23
+Nodes (23): af(), Bf(), get(), If(), jf(), kf(), Mf(), ml() (+15 more)
 
-### Community 35 - "np"
-Cohesion: 0.25
-Nodes (8): dp(), Mp(), np(), t(), pp(), rn(), wf(), yt()
+### Community 35 - "e"
+Cohesion: 0.12
+Nodes (22): complete(), duration(), getGeneratorVelocity(), hr(), iterationDuration(), measureEndState(), measureInitialState(), measureInstanceViewportBox() (+14 more)
 
 ### Community 36 - "dependencies"
 Cohesion: 0.10
@@ -278,15 +288,27 @@ Nodes (9): connection, { normalizeSendPriority, priorityForJob }, { Queue, Worke
 
 ### Community 42 - "devDependencies"
 Cohesion: 0.12
-Nodes (17): autoprefixer, devDependencies, autoprefixer, postcss, tailwindcss, tailwindcss-animate, @types/react, typescript (+9 more)
+Nodes (17): autoprefixer, devDependencies, autoprefixer, oxlint, postcss, tailwindcss, tailwindcss-animate, @types/react (+9 more)
 
 ### Community 43 - "kd"
-Cohesion: 0.14
-Nodes (25): Ad(), ap(), ar(), gf(), gn(), ip(), ir(), jd() (+17 more)
+Cohesion: 0.21
+Nodes (17): Ad(), ar(), gf(), ir(), jd(), jr(), kd(), Nd() (+9 more)
+
+### Community 44 - "mount"
+Cohesion: 0.19
+Nodes (15): createPanHandlers(), dd(), handleChildMotionValue(), hd(), jump(), mount(), onBlur(), onFocus() (+7 more)
+
+### Community 45 - "then"
+Cohesion: 0.17
+Nodes (15): ds(), fm(), fs(), ga(), getDefaultTransition(), ha(), isAnimating(), ls() (+7 more)
 
 ### Community 46 - "Answers to §6 checklist"
 Cohesion: 0.14
 Nodes (13): 0) Most important architectural fact (read first), 1. Delivery reports (DLR), 2. `/send` id — exact current response, 3. Webhook, 4. Polling — exact current response, 5. Error codes, 6. Rate limits, 7. Idempotency (+5 more)
+
+### Community 47 - "Go"
+Cohesion: 0.23
+Nodes (14): addValue(), as(), ca(), Fa(), getStaticValue(), getValue(), Go(), hasValue() (+6 more)
 
 ### Community 48 - "Conversations.tsx"
 Cohesion: 0.26
@@ -320,9 +342,13 @@ Nodes (5): dateTime(), FILTERS, HistoryPage(), SendRecord(), statusStyle()
 Cohesion: 0.33
 Nodes (5): description, main, name, private, version
 
-### Community 57 - "Dn"
-Cohesion: 0.67
-Nodes (4): An(), Dn(), kn(), Nn()
+### Community 57 - "On"
+Cohesion: 0.40
+Nodes (6): An(), Dn(), getSize(), kn(), Nn(), On()
+
+### Community 58 - "Lu"
+Cohesion: 0.33
+Nodes (6): clear(), clearListeners(), destroy(), Iu(), Lu(), unmount()
 
 ### Community 59 - "browser-probe.js"
 Cohesion: 0.40
@@ -373,7 +399,7 @@ Cohesion: 0.67
 Nodes (3): config, main(), request()
 
 ## Knowledge Gaps
-- **266 isolated node(s):** `Options`, `ApiKey`, `Conversation`, `Message`, `Overview` (+261 more)
+- **266 isolated node(s):** `$schema`, `typescript`, `oxc`, `react/rules-of-hooks`, `warn` (+261 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **18 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
@@ -382,10 +408,10 @@ _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `GoogleMessagesClient` connect `GoogleMessagesClient` to `server.js`, `sendFlow.test.js`?**
   _High betweenness centrality (0.026) - this node is a cross-community bridge._
-- **Why does `SendQueue` connect `SendQueue` to `priorityForJob`, `server.js`, `sendFlow.test.js`?**
-  _High betweenness centrality (0.012) - this node is a cross-community bridge._
+- **Why does `react` connect `react` to `App.tsx`, `button.tsx`, `Controls.tsx`, `Logs.tsx`, `Shell.tsx`, `useSSE.ts`, `Conversations.tsx`, `plugins`, `QueuePage`, `ApiKeysPage`, `HistoryPage.tsx`, `Overview.tsx`, `types.ts`, `card.tsx`, `Settings.tsx`?**
+  _High betweenness centrality (0.010) - this node is a cross-community bridge._
 - **Why does `dependencies` connect `dependencies` to `package.json`?**
-  _High betweenness centrality (0.006) - this node is a cross-community bridge._
+  _High betweenness centrality (0.009) - this node is a cross-community bridge._
 - **Are the 31 inferred relationships involving `i()` (e.g. with `Ac()` and `ap()`) actually correct?**
   _`i()` has 31 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 59 inferred relationships involving `r()` (e.g. with `ae()` and `Al()`) actually correct?**
