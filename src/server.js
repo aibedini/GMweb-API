@@ -25,6 +25,7 @@ const app = Fastify({
 });
 
 const client = new GoogleMessagesClient(config);
+client.setPacingController(sendPacing);
 const sseClients = new Set();
 const apiKeyStore = new ApiKeyStore(
   path.join(config.rootDir, "data", "api-keys.json"),
@@ -2871,6 +2872,7 @@ app.put("/admin/settings/send-pacing", {
     return;
   }
   const settings = await sendPacing.update(parsed.data);
+  client.refreshConversationInterval();
   emitSse({ type: "send_pacing_settings_updated", settings, at: new Date().toISOString() });
   return { ok: true, appliedImmediately: true, version: pkg.version, settings };
 });
@@ -3557,6 +3559,7 @@ async function main() {
   await loadSessions();
   await apiKeyStore.load();
   await sendPacing.load();
+  client.refreshConversationInterval();
   const queueWasPaused = await sendQueue.isPaused().catch(() => true);
   if (!queueWasPaused) await sendQueue.pause();
   startSendWorker();

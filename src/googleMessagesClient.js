@@ -52,8 +52,12 @@ class GoogleMessagesClient extends EventEmitter {
     this.rotationSeen = new WeakMap(); // page -> first-seen timestamp
     // Applies to every Start-chat attempt, including retries within one job.
     // Worker pacing alone cannot protect against those internal retries.
+    // Default from config; overridden by live pacing settings via setPacingSettings().
     this.conversationOpenIntervalMs = Math.max(1000, Number(config.sendMinIntervalMs) || 15000);
     this.lastConversationOpenAt = 0;
+    // Live pacing controller (optional) — when set, conversation interval tracks
+    // the dashboard's "Maximum messages per minute" setting instead of static config.
+    this.pacingController = null;
     // A warm index of the sidebar lets sends open existing threads with one
     // SPA click instead of repeatedly invoking Google's new-conversation flow.
     this.sidebarConversationIndex = this.readSidebarIndexCache();
@@ -84,6 +88,22 @@ class GoogleMessagesClient extends EventEmitter {
     // Rate limit fallback states for adaptive scrolling of sidebar
     this.googleRateLimitedMode = false;
     this.consecutiveSuccessfulConversationSends = 0;
+  }
+
+  // Bind the live pacing controller so conversation-open interval tracks the
+  // dashboard's "Maximum messages per minute" instead of the static config.
+  setPacingController(controller) {
+    this.pacingController = controller;
+    this.refreshConversationInterval();
+  }
+
+  refreshConversationInterval() {
+    if (this.pacingController) {
+      const snapshot = this.pacingController.snapshot();
+      // Use the minimum interval from pacing (e.g. 30s for 2/min) as the base
+      // conversation-open cooldown. This is stricter than the static 15s default.
+      this.conversationOpenIntervalMs = snapshot.minimumIntervalSeconds * 1000;
+    }
   }
 
   async start() {
