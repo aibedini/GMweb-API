@@ -25,7 +25,6 @@ const app = Fastify({
 });
 
 const client = new GoogleMessagesClient(config);
-client.setPacingController(sendPacing);
 const sseClients = new Set();
 const apiKeyStore = new ApiKeyStore(
   path.join(config.rootDir, "data", "api-keys.json"),
@@ -519,6 +518,7 @@ const sendPacing = new SendPacingController({
     randomExtraSeconds: 0
   }
 });
+client.setPacingController(sendPacing);
 const SEND_TIME_ZONE = process.env.SEND_TIMEZONE || DEFAULT_TIME_ZONE;
 const SEND_QUIET_START_HOUR = Number(process.env.SEND_QUIET_START_HOUR ?? 2);
 const SEND_QUIET_END_HOUR = Number(process.env.SEND_QUIET_END_HOUR ?? 8);
