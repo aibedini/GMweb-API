@@ -5,6 +5,14 @@ const { chromium } = require("playwright");
 
 const MESSAGES_URL = "https://messages.google.com/web";
 
+function normalizeComparableMessage(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 class GoogleMessagesClient extends EventEmitter {
   constructor(config) {
     super();
@@ -66,6 +74,13 @@ class GoogleMessagesClient extends EventEmitter {
     this.conversationHistoryMaxBatches = Math.max(1, Number(config.conversationHistoryMaxBatches) || 80);
     this.conversationIndexMaxBatches = Math.max(1, Number(config.conversationIndexMaxBatches) || 6);
     this.conversationIndexBudgetMs = Math.max(10000, Number(config.conversationIndexBudgetMs) || 45000);
+    // Enter is pressed at most once. If Google's SPA does not render the
+    // outgoing bubble immediately, these checks only re-read the DOM; they
+    // never type or submit the message again.
+    this.sendVerificationInitialTimeoutMs = Math.max(1000, Number(config.sendVerificationInitialTimeoutMs) || 15000);
+    this.sendVerificationRetryDelaysMs = Array.isArray(config.sendVerificationRetryDelaysMs)
+      ? config.sendVerificationRetryDelaysMs.map(Number).filter((value) => Number.isFinite(value) && value >= 0)
+      : [3000, 10000, 20000];
     // Rate limit fallback states for adaptive scrolling of sidebar
     this.googleRateLimitedMode = false;
     this.consecutiveSuccessfulConversationSends = 0;
@@ -346,7 +361,7 @@ class GoogleMessagesClient extends EventEmitter {
   async openForSend(to, onStage, { restartNewConversation = false } = {}) {
     const page = await this.ensurePage();
 
-    // 1. Already viewing this recipient's conversation? Skip straight to send.
+    // 1. Already viewing this recipient's verified conversation? Skip to send.
     const cached = this.getCachedRecipientConversation(to);
     if (cached?.href) {
       const convId = cached.href.split("/").pop();
@@ -354,6 +369,15 @@ class GoogleMessagesClient extends EventEmitter {
         this.activeSendRecipientEvidence = { ...cached.recipientEvidence, conversationUrl: page.url() };
         return true;
       }
+    }
+
+    // Old cache rows know only number -> href. The href is a candidate, not
+    // authorization to send. Upgrade it only after the active header/details
+    // exposes the exact requested phone number.
+    const legacyCandidate = restartNewConversation ? null : this.getLegacyRecipientCandidate(to);
+    if (legacyCandidate) {
+      onStage?.("legacy_candidate_found");
+      if (await this.revalidateLegacyConversation(to, legacyCandidate, onStage)) return true;
     }
 
     // 2. Existing conversation — find it in the sidebar and click it (SPA, no reload).
@@ -437,6 +461,7 @@ class GoogleMessagesClient extends EventEmitter {
     // The whole send is retryable, but retries stay inside the SPA. Reloading
     // Messages here causes a long resync and loses the warm sidebar index.
     let sent = false;
+    let submissionEvidence = null;
     for (let attempt = 1; attempt <= 3 && !sent; attempt++) {
       throwIfCancelled();
       stage(attempt === 1 ? "opening" : `ui_retry_${attempt}`);
@@ -475,12 +500,22 @@ class GoogleMessagesClient extends EventEmitter {
         throwIfCancelled();
         if (await this.lastOutgoingMatches(text)) { stage("already_sent"); sent = true; break; }
         stage("typing");
-        sent = await this.typeAndSend(text, { shouldCancel }).catch((error) => {
-          if (error?.code === "SEND_CANCELLED") throw error;
-          return false;
-        });
-        if (sent) { 
-          stage("sent"); 
+        const submission = await this.typeAndSend(text, { shouldCancel });
+        if (!submission.verified) {
+          stage("verification_pending");
+          const reconciliation = await this.verifySubmittedMessage(text, {
+            onAttempt: (verificationAttempt) => stage(`verification_retry_${verificationAttempt}`)
+          });
+          submission.verificationAttempts += reconciliation.attempts;
+          submission.verified = reconciliation.verified;
+          if (reconciliation.verified) {
+            submission.verificationStatus = "confirmed_after_recheck";
+            submission.verificationMethod = reconciliation.method;
+          }
+        }
+        if (submission.verified) {
+          sent = true;
+          stage(submission.verificationStatus === "confirmed_after_recheck" ? "sent_after_recheck" : "sent");
           // If we are in Google Rate Limited Mode, count consecutive successes
           if (this.googleRateLimitedMode) {
             this.consecutiveSuccessfulConversationSends += 1;
@@ -490,11 +525,23 @@ class GoogleMessagesClient extends EventEmitter {
               stage("exiting_google_rate_limit_fallback_mode");
             }
           }
-          break; 
+          submissionEvidence = submission;
+          break;
         }
-        stage("send_unverified");
+        stage("unverified_manual_review");
         const error = new Error(`Send to ${to} was submitted once but the outgoing bubble could not be verified.`);
         error.code = "SEND_UNVERIFIED";
+        error.details = {
+          submittedOnce: true,
+          submittedAt: submission.submittedAt,
+          verificationStatus: "manual_review_required",
+          verificationAttempts: submission.verificationAttempts,
+          verificationMethod: submission.verificationMethod,
+          requestedTo: String(to),
+          sentTo: recipientEvidence.sentTo,
+          recipientEvidence,
+          conversationUrl: page.url()
+        };
         throw error;
       }
 
@@ -522,6 +569,7 @@ class GoogleMessagesClient extends EventEmitter {
       sentTo: recipientEvidence.sentTo,
       recipientEvidence,
       conversationUrl: page.url(),
+      submission: submissionEvidence,
       text,
       at: new Date().toISOString()
     };
@@ -611,6 +659,98 @@ class GoogleMessagesClient extends EventEmitter {
       }
     } catch { /* fall through to Start chat */ }
     return false;
+  }
+
+  async revalidateLegacyConversation(to, candidate, onStage) {
+    const page = await this.ensurePage();
+    try {
+      onStage?.("candidate_opened_for_verification");
+      await page.goto(new URL(candidate.href, MESSAGES_URL).toString(), { waitUntil: "domcontentloaded" });
+      if (!await this.composerReady(10000)) {
+        onStage?.("candidate_rejected");
+        return false;
+      }
+
+      let evidence = await this.extractRecipientEvidenceFromActiveConversation(to, "conversation_header_revalidated");
+      if (!evidence) {
+        const details = await this.locatorFirst([
+          "[aria-label*='Conversation details' i]",
+          "[aria-label*='Contact info' i]",
+          "[aria-label*='Details' i]",
+          "button:has-text('Details')"
+        ]).catch(() => null);
+        if (details) {
+          await details.click({ timeout: 1500 }).catch(() => {});
+          await page.waitForTimeout(750);
+          evidence = await this.extractRecipientEvidenceFromActiveConversation(to, "conversation_details_revalidated");
+          await page.keyboard.press("Escape").catch(() => {});
+        }
+      }
+
+      if (!evidence) {
+        onStage?.("candidate_rejected");
+        return false;
+      }
+      this.activeSendRecipientEvidence = { ...evidence, conversationUrl: page.url() };
+      this.cacheRecipientConversation(to, candidate.href, candidate.title || "", this.activeSendRecipientEvidence);
+      onStage?.("recipient_revalidated");
+      return true;
+    } catch {
+      onStage?.("candidate_rejected");
+      return false;
+    }
+  }
+
+  async extractRecipientEvidenceFromActiveConversation(to, source) {
+    const page = await this.ensurePage();
+    const variants = this.phoneVariants(to).filter((variant) => variant.length >= 7);
+    try {
+      const match = await page.evaluate((wantedVariants) => {
+        const digits = (value) => String(value || "").replace(/\D/g, "");
+        const scopes = [...document.querySelectorAll(
+          "mws-conversation-header, header, [role='dialog'], mws-conversation-details, aside"
+        )].filter((node) => {
+          if (node.closest("nav.conversation-list, mws-conversation-list-item")) return false;
+          const rect = node.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && rect.left > 250;
+        });
+        for (const scope of scopes) {
+          const nodes = [scope, ...scope.querySelectorAll("[aria-label], a[href^='tel:'], [data-phone-number], [data-number]")];
+          for (const node of nodes) {
+            if (node.closest("mws-text-message-part, mws-message-wrapper, [data-message-id]")) continue;
+            const text = [
+              node.innerText || node.textContent || "",
+              node.getAttribute?.("aria-label") || "",
+              node.getAttribute?.("href") || "",
+              node.getAttribute?.("data-phone-number") || "",
+              node.getAttribute?.("data-number") || ""
+            ].join(" ");
+            // Compare complete phone-like tokens, not arbitrary digit substrings.
+            // This avoids accepting a header that merely contains the requested
+            // number inside a longer, different identifier.
+            const phoneTokens = String(text).match(/(?:\+?\d[\d\s().-]{5,}\d)/g) || [];
+            const normalizedTokens = phoneTokens.map(digits).filter(Boolean);
+            const matchedVariant = wantedVariants.find((variant) => normalizedTokens.includes(variant));
+            if (matchedVariant) {
+              return { matchedVariant, matchedText: String(text).replace(/\s+/g, " ").trim().slice(0, 240) };
+            }
+          }
+        }
+        return null;
+      }, variants);
+      if (!match) return null;
+      return {
+        cacheKey: this.recipientCacheKey(to),
+        requestedTo: String(to),
+        sentTo: String(to),
+        source,
+        matchedVariant: match.matchedVariant,
+        matchedText: match.matchedText,
+        conversationUrl: page.url()
+      };
+    } catch {
+      return null;
+    }
   }
 
   // Open a conversation purely through the "Start chat" UI — no page reload.
@@ -714,8 +854,9 @@ class GoogleMessagesClient extends EventEmitter {
     }, null, { timeout }).catch(() => {});
   }
 
-  // Type into the real composer and press Enter exactly once. Success requires
-  // a newly rendered matching bubble. A silent wedge is terminal/unverified.
+  // Type into the real composer and press Enter exactly once. Verification does
+  // not depend on the DOM node count increasing: Google may recycle a virtualized
+  // message node or insert invisible bidi marks into Persian text.
   async typeAndSend(text, { shouldCancel } = {}) {
     const page = await this.ensurePage();
     const messageInput = await this.locatorFirst([
@@ -727,11 +868,6 @@ class GoogleMessagesClient extends EventEmitter {
       "[contenteditable='true']",
       "textarea"
     ]);
-    const normalizedText = text.replace(/\s+/g, " ").trim();
-    const messageCountBefore = await page.evaluate(() => {
-      return document.querySelectorAll("mws-text-message-part").length;
-    }).catch(() => null);
-
     await messageInput.fill(text).catch(async () => {
       await messageInput.click();
       await page.keyboard.type(text);
@@ -741,43 +877,104 @@ class GoogleMessagesClient extends EventEmitter {
       error.code = "SEND_CANCELLED";
       throw error;
     }
+    const submittedAt = new Date().toISOString();
     await messageInput.press("Enter");
 
-    // A cleared composer is not delivery evidence: Google Messages can clear it
-    // while navigation/re-rendering loses the send. Only succeed after a NEW
-    // outgoing bubble containing this exact text appears in the conversation.
-    if (messageCountBefore === null) return false;
-    try {
-      await page.waitForFunction(({ before, wanted }) => {
-        const messages = [...document.querySelectorAll("mws-text-message-part")];
-        if (messages.length <= before) return false;
-        return messages.slice(before).some((node) => {
-          const actual = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
-          return actual === wanted || actual.includes(wanted);
-        });
-      }, { before: messageCountBefore, wanted: normalizedText }, { timeout: 10000 });
-      return true;
-    } catch {
-      return false;
-    }
+    const deadline = Date.now() + this.sendVerificationInitialTimeoutMs;
+    let attempts = 0;
+    do {
+      attempts += 1;
+      if (await this.outgoingMessageMatches(text)) {
+        return {
+          submittedOnce: true,
+          submittedAt,
+          verified: true,
+          verificationStatus: "confirmed_initial",
+          verificationMethod: "outgoing_bubble_dom",
+          verificationAttempts: attempts
+        };
+      }
+      if (Date.now() < deadline) await page.waitForTimeout(500);
+    } while (Date.now() < deadline);
+
+    return {
+      submittedOnce: true,
+      submittedAt,
+      verified: false,
+      verificationStatus: "pending_recheck",
+      verificationMethod: "outgoing_bubble_dom",
+      verificationAttempts: attempts
+    };
   }
 
-  // Conservative duplicate guard across SMS/RCS layouts. Bubble geometry is
-  // deliberately ignored because it changes between Google Messages layouts.
-  async lastOutgoingMatches(text) {
+  async verifySubmittedMessage(text, { onAttempt } = {}) {
     const page = await this.ensurePage();
-    const want = text.replace(/\s+/g, " ").trim();
+    let attempts = 0;
+    for (const delayMs of this.sendVerificationRetryDelaysMs) {
+      attempts += 1;
+      onAttempt?.(attempts);
+      if (delayMs > 0) await page.waitForTimeout(delayMs);
+      if (await this.outgoingMessageMatches(text)) {
+        return { verified: true, attempts, method: "outgoing_bubble_dom_recheck" };
+      }
+    }
+    return { verified: false, attempts, method: "outgoing_bubble_dom_recheck" };
+  }
+
+  async outgoingMessageMatches(text) {
+    const page = await this.ensurePage();
+    const want = normalizeComparableMessage(text);
     try {
       return await page.evaluate((wanted) => {
-        const recent = [...document.querySelectorAll("mws-text-message-part")].slice(-12);
-        return recent.some((node) => {
-          const actual = (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim();
+        const normalize = (value) => String(value || "")
+          .normalize("NFKC")
+          .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        const roots = [document];
+        for (let index = 0; index < roots.length; index += 1) {
+          for (const node of roots[index].querySelectorAll("*")) {
+            if (node.shadowRoot) roots.push(node.shadowRoot);
+          }
+        }
+        const selectors = [
+          "mws-text-message-part",
+          "mws-message-wrapper",
+          "[data-message-id]",
+          "[data-e2e-message-direction]",
+          "[data-message-direction]",
+          "[aria-label^='You said:' i]",
+          "[aria-label^='You sent' i]"
+        ];
+        const candidates = [...new Set(roots.flatMap((root) => selectors.flatMap((selector) => [...root.querySelectorAll(selector)])))];
+        return candidates.slice(-40).some((node) => {
+          const aria = node.getAttribute?.("aria-label") || "";
+          const direction = [
+            aria,
+            node.getAttribute?.("data-e2e-message-direction") || "",
+            node.getAttribute?.("data-message-direction") || "",
+            node.getAttribute?.("data-direction") || "",
+            node.className || ""
+          ].join(" ");
+          const explicitlyOutgoing = /\b(you said|you sent|outgoing|outbound|sent)\b/i.test(direction);
+          const explicitlyIncoming = /\b(incoming|inbound|received)\b/i.test(direction);
+          const rect = node.getBoundingClientRect?.();
+          const geometricallyOutgoing = rect && rect.width > 0 && rect.width < window.innerWidth * 0.65
+            && (rect.left + rect.width / 2) > window.innerWidth * 0.56;
+          if (explicitlyIncoming || (!explicitlyOutgoing && !geometricallyOutgoing)) return false;
+          const actual = normalize(`${node.innerText || node.textContent || ""} ${aria}`);
           return actual === wanted || actual.includes(wanted);
         });
       }, want);
     } catch {
       return false;
     }
+  }
+
+  // Conservative duplicate guard. It shares the same outgoing-only detector
+  // used after Enter, so a visible previous copy prevents another submission.
+  async lastOutgoingMatches(text) {
+    return this.outgoingMessageMatches(text);
   }
 
   // Wait for the app shell (sidebar / composer) to be present after a load —
@@ -1309,6 +1506,19 @@ class GoogleMessagesClient extends EventEmitter {
     return cached?.verifiedTo === cacheKey && cached?.recipientEvidence?.cacheKey === cacheKey ? cached : null;
   }
 
+  getLegacyRecipientCandidate(to) {
+    const cacheKey = this.recipientCacheKey(to);
+    const cached = this.conversationCache.recipients?.[cacheKey] || null;
+    if (!cached?.href || this.getCachedRecipientConversation(to)) return null;
+    try {
+      const parsed = new URL(cached.href, MESSAGES_URL);
+      if (!parsed.pathname.includes("/web/conversations/")) return null;
+      return { href: parsed.pathname, title: cached.title || "" };
+    } catch {
+      return null;
+    }
+  }
+
   cacheRecipientConversation(to, hrefOrUrl, title = "", recipientEvidence = null) {
     const parsedUrl = new URL(hrefOrUrl, MESSAGES_URL);
     if (!parsedUrl.pathname.includes("/web/conversations/")) return;
@@ -1727,5 +1937,6 @@ class GoogleMessagesClient extends EventEmitter {
 }
 
 module.exports = {
-  GoogleMessagesClient
+  GoogleMessagesClient,
+  normalizeComparableMessage
 };

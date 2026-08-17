@@ -39,13 +39,19 @@ function SendRecord({ send }: { send: SendHistoryItem }) {
   return <article className="mx-2 my-2 rounded-lg border border-border bg-background/30 px-3 py-3 shadow-sm lg:mx-0 lg:my-0 lg:rounded-none lg:border-x-0 lg:border-t-0 lg:bg-transparent lg:px-4 lg:py-4 lg:shadow-none lg:last:border-b-0">
     <div className="grid gap-4 lg:grid-cols-[170px_minmax(0,1fr)_220px]">
       <div className="space-y-2">
-        <Badge variant="outline" className={cn("uppercase", statusStyle(send.status))}>{send.status}</Badge>
+        <div className="flex flex-wrap gap-1.5">
+          <Badge variant="outline" className={cn("uppercase", statusStyle(send.status))}>{send.status}</Badge>
+          {send.priority && <Badge variant={send.priority === "critical" ? "warning" : "secondary"}>{send.priority.toUpperCase()} · P{send.priorityLevel ?? "?"}</Badge>}
+        </div>
         <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Requested recipient</div>
         <div className="flex items-center gap-1 font-mono text-sm font-semibold"><span dir="ltr">{send.requestedTo || send.to || "—"}</span>{(send.requestedTo || send.to) && <CopyButton value={String(send.requestedTo || send.to)} label="requested number" />}</div>
-        <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Confirmed sent to</div>
+        <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Verified recipient</div>
         <div className={cn("flex items-center gap-1 font-mono text-sm font-semibold", send.status === "sent" && !send.sentTo && "text-orange-300")}><span dir="ltr">{send.sentTo || (send.status === "sent" ? "Legacy / unverified" : "—")}</span>{send.sentTo && <CopyButton value={send.sentTo} label="confirmed number" />}</div>
         <div className="text-xs text-muted-foreground">Project <span className="font-medium text-foreground">{send.keyName || "—"}</span></div>
         <div className="text-xs text-muted-foreground">Stage <span className="text-foreground">{send.stage || "—"}</span> · attempt {send.attempts ?? 0}</div>
+        {send.submittedOnce && <div className="rounded-md border border-orange-500/20 bg-orange-500/5 px-2 py-1.5 text-[11px] text-orange-200">
+          Enter pressed once · {send.verificationStatus || "verification pending"} · {send.verificationAttempts ?? 0} check(s)
+        </div>}
       </div>
       <div className="min-w-0">
         <div className="mb-1.5 flex items-center justify-between text-[11px] font-medium uppercase tracking-wider text-muted-foreground"><span>Message evidence</span><CopyButton value={text} label="message" /></div>

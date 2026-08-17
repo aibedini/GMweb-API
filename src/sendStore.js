@@ -98,6 +98,10 @@ class SendStore {
        WHERE id=@id`
     );
     this._setStage = this.db.prepare(`UPDATE sends SET stage=?, stage_at=?, updated_at=? WHERE job_id=?`);
+    this._setPriorityByJob = this.db.prepare(
+      `UPDATE sends SET priority=@priority, updated_at=@now
+       WHERE job_id=@job_id OR id IN (SELECT send_id FROM send_job_refs WHERE job_id=@job_id)`
+    );
     this._byJob = this.db.prepare(
       `SELECT s.* FROM sends s
        WHERE s.job_id=@job_id OR EXISTS (
@@ -200,6 +204,15 @@ class SendStore {
     if (!jobId) return;
     const now = Date.now();
     this._setStage.run(stage, now, now, String(jobId));
+  }
+
+  updatePriorityByJob(jobId, priority) {
+    if (!jobId) return 0;
+    return this._setPriorityByJob.run({
+      job_id: String(jobId),
+      priority: String(priority),
+      now: Date.now()
+    }).changes;
   }
 
   markStatus(jobId, status, { attempts = 0, error = null, result = null } = {}) {

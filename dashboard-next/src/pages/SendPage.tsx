@@ -12,7 +12,7 @@ import { cn } from "@/lib/utils";
 export function SendPage() {
   const [to, setTo] = useState("");
   const [text, setText] = useState("");
-  const [high, setHigh] = useState(false);
+  const [critical, setCritical] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
@@ -23,9 +23,9 @@ export function SendPage() {
     try {
       const r = await api<{ jobId: string; status: string; priority?: string }>("/send", {
         method: "POST",
-        body: { to: to.trim(), text, ...(high ? { priority: "high" } : {}) },
+        body: { to: to.trim(), text, priority: critical ? "critical" : "expiring" },
       });
-      setResult({ ok: true, msg: `Queued · job ${r.jobId} · ${r.priority ?? "normal"}` });
+      setResult({ ok: true, msg: `Queued · job ${r.jobId} · ${r.priority ?? "expiring"}` });
       setText("");
     } catch (err) {
       setResult({ ok: false, msg: err instanceof Error ? err.message : "Send failed" });
@@ -52,17 +52,17 @@ export function SendPage() {
           </div>
           <button
             type="button"
-            onClick={() => setHigh((v) => !v)}
+            onClick={() => setCritical((v) => !v)}
             className={cn(
               "flex w-full items-center justify-between rounded-lg border px-3 py-2 text-sm transition-colors",
-              high ? "border-amber-500/40 bg-amber-500/10 text-amber-300" : "border-border text-muted-foreground hover:bg-accent"
+              critical ? "border-amber-500/40 bg-amber-500/10 text-amber-300" : "border-border text-muted-foreground hover:bg-accent"
             )}
           >
             <span className="flex items-center gap-2">
-              <Zap className="size-4" /> High priority (jump the queue)
+              <Zap className="size-4" /> Critical (purchase / renewal)
             </span>
-            <span className={cn("h-5 w-9 rounded-full p-0.5 transition-colors", high ? "bg-amber-500" : "bg-secondary")}>
-              <span className={cn("block size-4 rounded-full bg-white transition-transform", high && "translate-x-4")} />
+            <span className={cn("h-5 w-9 rounded-full p-0.5 transition-colors", critical ? "bg-amber-500" : "bg-secondary")}>
+              <span className={cn("block size-4 rounded-full bg-white transition-transform", critical && "translate-x-4")} />
             </span>
           </button>
 

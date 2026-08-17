@@ -19,6 +19,14 @@ function listFromEnv(value) {
   return String(value).split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+function intListFromEnv(value, fallback) {
+  if (!value) return fallback;
+  const parsed = String(value).split(",")
+    .map((item) => Number.parseInt(item.trim(), 10))
+    .filter((item) => Number.isFinite(item) && item >= 0);
+  return parsed.length ? parsed : fallback;
+}
+
 const rootDir = path.resolve(__dirname, "..");
 
 function findChromeExecutable() {
@@ -51,6 +59,8 @@ module.exports = {
   pollIntervalMs: intFromEnv(process.env.POLL_INTERVAL_MS, 5000),
   sendMinIntervalMs: intFromEnv(process.env.SEND_MIN_INTERVAL_MS, 15000),
   sendTimeoutMs: intFromEnv(process.env.SEND_TIMEOUT_MS, 240000),
+  sendVerificationInitialTimeoutMs: intFromEnv(process.env.SEND_VERIFICATION_INITIAL_TIMEOUT_MS, 15000),
+  sendVerificationRetryDelaysMs: intListFromEnv(process.env.SEND_VERIFICATION_RETRY_DELAYS_MS, [3000, 10000, 20000]),
   conversationHistoryMaxBatches: intFromEnv(process.env.CONVERSATION_HISTORY_MAX_BATCHES, 80),
   conversationCacheFile: path.resolve(rootDir, process.env.CONVERSATION_CACHE_FILE || "./data/conversation-cache.json"),
   conversationIndexFile: path.resolve(rootDir, process.env.CONVERSATION_INDEX_FILE || "./data/conversation-index.json"),

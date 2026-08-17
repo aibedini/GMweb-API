@@ -16,6 +16,7 @@ const { SendQueue } = require("./queue");
 const { SendStore } = require("./sendStore");
 const { SendPacingController } = require("./sendPacing");
 const { sendGate, DEFAULT_TIME_ZONE } = require("./sendSchedule");
+const { PRIORITY_LEVELS, PRIORITY_NAMES, normalizeSendPriority, priorityForJob } = require("./sendPriority");
 const pkg = require("../package.json");
 
 const app = Fastify({
@@ -491,6 +492,7 @@ const SEND_TIMEOUT_MS = Math.max(240000, Number(config.sendTimeoutMs) || 240000)
 // hours (or still in flight) is suppressed — even with no Idempotency-Key, and
 // even across restarts (backed by the SQLite ledger). Default 24h.
 const SEND_DEDUPE_MS = (Number(process.env.SEND_DEDUPE_HOURS) || 24) * 3600 * 1000;
+const ANNOUNCEMENT_PENDING_LIMIT = Math.max(1, Number(process.env.ANNOUNCEMENT_PENDING_LIMIT) || 200);
 // Conversation-opening misses may be deferred once. A submitted-but-unverified
 // message is NEVER deferred or retried because Enter may already have sent it.
 const configuredConversationDefers = Number(process.env.SEND_MAX_CONVERSATION_DEFERS ?? 1);
@@ -663,7 +665,7 @@ async function waitForSendPace(job) {
 }
 
 function isHighPriorityJob(job) {
-  return job?.data?.priority === "high" || Boolean(job?.opts?.lifo);
+  return priorityForJob(job).bypassQuietHours;
 }
 
 function isDelayedRetryJob(job) {
@@ -679,18 +681,19 @@ function requestIdForJob(job) {
 }
 
 async function deferQuietHoursJob(job, releaseAt) {
-  const high = isHighPriorityJob(job);
+  const priority = priorityForJob(job);
   const ledger = sendStore.byJob(job.id);
   const data = {
     ...job.data,
-    priority: high ? "high" : "normal",
+    priority: priority.name,
+    priorityLevel: priority.level,
     _ledgerId: ledger?.id || job.data?._ledgerId || null
   };
   const releaseIso = releaseAt.toISOString();
   sendStore.markStatus(job.id, "queued", { attempts: job.attemptsMade || 0 });
   sendStore.markStage(job.id, "quiet_hours");
 
-  const deferredJob = await sendQueue.deferUntil(data, releaseAt, "quiet_hours", { highPriority: high });
+  const deferredJob = await sendQueue.deferUntil(data, releaseAt, "quiet_hours", { priority: priority.name });
   if (data._ledgerId) sendStore.attachJob(data._ledgerId, deferredJob.id);
   if (data._idempotencyKey && data._bodyHash) {
     await sendQueue.setIdempotencyJob(data._idempotencyKey, deferredJob.id, data._bodyHash).catch(() => {});
@@ -703,7 +706,8 @@ async function deferQuietHoursJob(job, releaseAt) {
     jobId: job.id,
     deferredJobId: deferredJob.id,
     to: job.data?.to,
-    priority: high ? "high" : "normal",
+    priority: priority.name,
+    priorityLevel: priority.level,
     timeZone: SEND_TIME_ZONE,
     releaseAt: releaseIso,
     at: new Date().toISOString()
@@ -713,11 +717,12 @@ async function deferQuietHoursJob(job, releaseAt) {
 }
 
 async function deferConversationJob(job, error) {
-  const high = isHighPriorityJob(job);
+  const priority = priorityForJob(job);
   const ledger = sendStore.byJob(job.id);
   const data = {
     ...job.data,
-    priority: high ? "high" : "normal",
+    priority: priority.name,
+    priorityLevel: priority.level,
     _ledgerId: ledger?.id || job.data?._ledgerId || null
   };
   sendStore.markStatus(job.id, "queued", {
@@ -725,9 +730,7 @@ async function deferConversationJob(job, error) {
     error: error.message
   });
 
-  const deferred = high
-    ? await sendQueue.deferHigh(data, 10)
-    : await sendQueue.deferNormal(data, 10);
+  const deferred = await sendQueue.deferBySuccesses(data, 10);
   if (data._ledgerId) sendStore.attachJob(data._ledgerId, deferred.job.id);
   if (data._idempotencyKey && data._bodyHash) {
     await sendQueue.setIdempotencyJob(data._idempotencyKey, deferred.job.id, data._bodyHash).catch(() => {});
@@ -739,7 +742,8 @@ async function deferConversationJob(job, error) {
     jobId: job.id,
     deferredJobId: deferred.job.id,
     to: job.data?.to,
-    priority: high ? "high" : "normal",
+    priority: priority.name,
+    priorityLevel: priority.level,
     releaseAfterSuccesses: 10,
     at: new Date().toISOString()
   };
@@ -750,6 +754,7 @@ async function deferConversationJob(job, error) {
 async function handleSendCompleted(job, result) {
   activeSendCancellationRequests.delete(String(job.id));
   if (result?.deferred) return;
+  const priority = priorityForJob(job);
   // The consumer may have cancelled while Playwright was between two awaits.
   // Never let a late worker completion overwrite that terminal decision.
   if (sendStore.byJob(job.id)?.status === "cancelled") return;
@@ -765,6 +770,8 @@ async function handleSendCompleted(job, result) {
       jobId: job.id,
       status: "cancelled",
       to: job.data?.to,
+      priority: priority.name,
+      priorityLevel: priority.level,
       error: result.error || "cancelled_by_consumer",
       at: new Date().toISOString()
     };
@@ -786,7 +793,15 @@ async function handleSendCompleted(job, result) {
       terminal: true,
       successful: false,
       to: job.data?.to,
+      priority: priority.name,
+      priorityLevel: priority.level,
       error: result.error || "outgoing_bubble_not_verified_after_single_submit",
+      submittedOnce: true,
+      submittedAt: result.submittedAt || null,
+      verificationStatus: result.verificationStatus || "manual_review_required",
+      verificationAttempts: Number(result.verificationAttempts || 0),
+      conversationUrl: result.conversationUrl || null,
+      recipientEvidence: result.recipientEvidence || null,
       at: new Date().toISOString()
     };
     emitSse(event);
@@ -807,6 +822,8 @@ async function handleSendCompleted(job, result) {
       terminal: true,
       successful: false,
       to: job.data?.to,
+      priority: priority.name,
+      priorityLevel: priority.level,
       error: result.error || "conversation_open_failed",
       at: new Date().toISOString()
     };
@@ -815,14 +832,21 @@ async function handleSendCompleted(job, result) {
     return;
   }
   sendStore.markStatus(job.id, "sent", { attempts: job.attemptsMade || 0, result });
+  const submission = result?.submission || {};
   const event = {
     type: "send_completed",
     requestId: requestIdForJob(job),
     jobId: job.id,
     status: "sent",
     to: job.data?.to,
+    priority: priority.name,
+    priorityLevel: priority.level,
     text: job.data?.text,
     result: result || null,
+    submittedOnce: Boolean(submission.submittedOnce),
+    submittedAt: submission.submittedAt || null,
+    verificationStatus: submission.verificationStatus || null,
+    verificationAttempts: Number(submission.verificationAttempts || 0),
     fastPath: result?.fastPath,
     at: result?.at || new Date().toISOString()
   };
@@ -831,10 +855,13 @@ async function handleSendCompleted(job, result) {
 
   const release = await sendQueue.recordSuccessAndReleaseHigh();
   if (release.released) {
+    const releasedPriority = priorityForJob(release.released);
     emitSse({
       type: "send_deferred_released",
       jobId: release.released.id,
       to: release.released.data?.to,
+      priority: releasedPriority.name,
+      priorityLevel: releasedPriority.level,
       successSequence: release.sequence,
       at: new Date().toISOString()
     });
@@ -844,6 +871,7 @@ async function handleSendCompleted(job, result) {
 function startSendWorker() {
   sendQueue.startWorker(
     async (job) => {
+      const priority = priorityForJob(job);
       // Runs in-process; shares the single Playwright browser via withBrowserLock.
       const schedule = sendGate(new Date(), {
         highPriority: isHighPriorityJob(job),
@@ -863,7 +891,7 @@ function startSendWorker() {
             // Per-message progress: record the stage in the ledger and stream it.
             onStage: (s) => {
               sendStore.markStage(job.id, s);
-              emitSse({ type: "send_stage", requestId: requestIdForJob(job), jobId: job.id, to: job.data?.to, stage: s, at: new Date().toISOString() });
+              emitSse({ type: "send_stage", requestId: requestIdForJob(job), jobId: job.id, to: job.data?.to, priority: priority.name, priorityLevel: priority.level, stage: s, at: new Date().toISOString() });
             }
           }),
           new Promise((_, reject) => setTimeout(() => reject(new Error("send_timeout")), SEND_TIMEOUT_MS))
@@ -876,7 +904,12 @@ function startSendWorker() {
           return { cancelled: true, error: error.message };
         }
         if (error?.code === "SEND_UNVERIFIED") {
-          return { unverified: true, submittedOnce: true, error: error.message };
+          return {
+            unverified: true,
+            submittedOnce: true,
+            error: error.message,
+            ...(error.details || {})
+          };
         }
         if (isBrowserAutomationWedge(error)) {
           sendStore.markStage(job.id, "browser_unresponsive");
@@ -907,12 +940,15 @@ function startSendWorker() {
     },
     {
       onActive: (job) => {
+        const priority = priorityForJob(job);
         sendStore.markStatus(job.id, "active", { attempts: job.attemptsMade || 0 });
         emitSse({
           type: "send_processing",
           requestId: requestIdForJob(job),
           jobId: job.id,
           to: job.data?.to,
+          priority: priority.name,
+          priorityLevel: priority.level,
           at: new Date().toISOString()
         });
       },
@@ -925,6 +961,7 @@ function startSendWorker() {
         const attemptsMade = job?.attemptsMade || 0;
         const maxAttempts = job?.opts?.attempts || 1;
         const willRetry = attemptsMade < maxAttempts;
+        const priority = priorityForJob(job);
         // While BullMQ still has retries left the job goes back to waiting, so
         // keep the ledger row 'queued'; only mark 'failed' once it's terminal.
         sendStore.markStatus(job?.id, willRetry ? "queued" : "failed", {
@@ -937,6 +974,8 @@ function startSendWorker() {
           jobId: job?.id,
           status: willRetry ? "queued" : "failed",
           to: job?.data?.to,
+          priority: priority.name,
+          priorityLevel: priority.level,
           error: err?.message || "send failed",
           attemptsMade,
           willRetry,
@@ -954,10 +993,13 @@ function startSendWorker() {
           sendQueue.recordSuccessAndReleaseHigh()
             .then((release) => {
               if (release.released) {
+                const releasedPriority = priorityForJob(release.released);
                 emitSse({
                   type: "send_deferred_released",
                   jobId: release.released.id,
                   to: release.released.data?.to,
+                  priority: releasedPriority.name,
+                  priorityLevel: releasedPriority.level,
                   successSequence: release.sequence,
                   at: new Date().toISOString()
                 });
@@ -1216,6 +1258,10 @@ const STAGE_LABELS = {
   legacy_active: "Active job imported from the existing Redis backlog",
   checking_paired: "Checking Google Messages session",
   opening: "Opening recipient conversation",
+  legacy_candidate_found: "Found an old cached conversation candidate",
+  candidate_opened_for_verification: "Opened cached candidate to verify its phone number",
+  recipient_revalidated: "Cached conversation recipient revalidated",
+  candidate_rejected: "Cached candidate did not prove the requested phone number",
   locating: "Searching existing conversations",
   conversation_pacing: "Waiting before opening a new conversation",
   start_chat: "Opening Start chat",
@@ -1227,6 +1273,12 @@ const STAGE_LABELS = {
   open_by_url: "Opening cached conversation URL",
   typing: "Typing and sending message",
   send_unverified: "Submitted once; outgoing bubble was not confirmed",
+  verification_pending: "Submitted once; checking for the outgoing bubble without resending",
+  verification_retry_1: "Verification recheck 1; no resend",
+  verification_retry_2: "Verification recheck 2; no resend",
+  verification_retry_3: "Verification recheck 3; no resend",
+  sent_after_recheck: "Send confirmed by a later verification check",
+  unverified_manual_review: "Submitted once; automatic checks exhausted; manual review required",
   retrying_without_reload: "Retrying without reloading Messages",
   browser_recovering: "Reloading and reconnecting Google Messages",
   browser_unresponsive: "Chrome automation is unresponsive; recovery scheduled",
@@ -1248,7 +1300,7 @@ function enrichQueueJob(job) {
   const stageForMs = stageMs ? Math.max(0, now - stageMs) : 0;
   const quietHours = currentQuietHours(new Date(now));
   const quietHoursHeld = quietHours.active &&
-    (job.priority !== "high" || job.state === "delayed") &&
+    (job.priority !== "critical" || job.state === "delayed") &&
     ["waiting", "paused", "delayed"].includes(job.state);
   const visibleStage = quietHoursHeld ? "quiet_hours" : stage;
 
@@ -1256,13 +1308,13 @@ function enrichQueueJob(job) {
   if (quietHoursHeld) {
     diagnosis = {
       code: "quiet_hours", severity: "info",
-      message: job.priority === "high"
-        ? `Delayed HIGH retry held by quiet hours until 08:00 ${SEND_TIME_ZONE}`
-        : `Held by quiet hours until 08:00 ${SEND_TIME_ZONE}; only fresh HIGH messages can send now`
+      message: job.priority === "critical"
+        ? `Delayed CRITICAL retry held by quiet hours until 08:00 ${SEND_TIME_ZONE}`
+        : `Held by quiet hours until 08:00 ${SEND_TIME_ZONE}; only fresh CRITICAL messages can send now`
     };
   } else if (job.state === "delayed") {
     diagnosis = job.deferReason === "quiet_hours"
-      ? { code: "quiet_hours", severity: "info", message: "Normal SMS paused until 08:00 Asia/Tehran; HIGH priority can send now" }
+      ? { code: "quiet_hours", severity: "info", message: "Non-critical SMS paused until 08:00 Asia/Tehran; fresh CRITICAL messages can send now" }
       : {
           code: "retry_backoff", severity: "warning",
           message: job.failedReason ? `Retry scheduled after: ${job.failedReason}` : "Waiting for retry delay"
@@ -1937,15 +1989,15 @@ app.post("/send", {
       "**Synchronous mode:** pass `\"wait\": true` to block until the send finishes",
       "(up to 90s) and receive the result directly. Use only for low-volume callers.",
       "",
-      "**Priority:** pass `\"priority\": \"high\"` to jump the queue. A high-priority",
-      "message is processed **next** (right after the send already in flight finishes),",
-      "ahead of every normal-priority message still waiting — then the queue/campaign",
-      "continues as before. Use it for time-sensitive transactional messages (e.g. a",
-      "renewal confirmation) so they aren't stuck behind a bulk reminder campaign.",
+      "**Priority lanes:** use `critical` (purchase/renewal), `expired` (already expired),",
+      "`expiring` (near expiry; default), or `announcement` (bulk/lowest). Lower numeric",
+      "levels run first and every lane remains FIFO. Legacy `high` maps to `critical`;",
+      "legacy `normal` maps to `expiring`.",
       "",
-      "**Quiet hours:** normal-priority messages are held from 02:00 through 07:59",
+      "**Quiet hours:** non-critical messages are held from 02:00 through 07:59",
       "`Asia/Tehran` and released at 08:00. Delayed retries are also held even when",
-      "HIGH; only a fresh high-priority first attempt bypasses quiet hours.",
+      "CRITICAL; only a fresh critical first attempt bypasses quiet hours.",
+      "Announcements are capped at the configured pending capacity (default 200).",
       "",
       "**Rate limits (project keys):** configurable per-minute and per-hour (default 10/min, 100/hr).",
       "",
@@ -1962,11 +2014,14 @@ app.post("/send", {
         text: { type: "string", minLength: 1, maxLength: 4000, description: "Message content. Plain text only." },
         wait: { type: "boolean", default: false, description: "If true, block until the send completes (max 90s) and return the result." },
         priority: {
-          type: ["string", "integer"],
-          description: "Send priority. A fresh `\"high\"` first attempt jumps the queue and bypasses the 02:00–08:00 Asia/Tehran hold. Once delayed/retrying, every job is held until 08:00 even if HIGH. Omit or use `\"normal\"` for FIFO. A numeric 1-10 is also accepted (1-3 = high)."
+          oneOf: [
+            { type: "string", enum: ["critical", "expired", "expiring", "announcement", "high", "normal"] },
+            { type: "integer", minimum: 1, maximum: 10 }
+          ],
+          description: "Priority lane: `critical`=1, `expired`=3, `expiring`=6 (default), `announcement`=10. FIFO within a lane. Legacy `high` and `normal`, plus numeric 1-10, remain accepted. Only a fresh critical attempt bypasses quiet hours."
         }
       },
-      examples: [{ to: "+989121234567", text: "Hello from GMweb API!", priority: "high" }]
+      examples: [{ to: "+989121234567", text: "تمدید شد", priority: "critical" }]
     },
     headers: {
       type: "object",
@@ -1987,9 +2042,10 @@ app.post("/send", {
           statusUrl: { type: ["string", "null"] },
           jobId: { type: "string" },
           status: { type: "string", enum: ["queued", "deferred"] },
-          priority: { type: "string", enum: ["high", "normal"] },
+          priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
+          priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           deduped: { type: "boolean", description: "True if this returned an existing job for a repeated Idempotency-Key." },
-          queuePosition: { type: "integer", description: "Approximate number of jobs ahead (incl. active). ~0 for high priority." },
+          queuePosition: { type: "integer", description: "Approximate active and same-or-higher-priority jobs ahead." },
           reason: { type: "string" },
           releaseAt: { type: ["string", "null"] },
           timeZone: { type: "string" },
@@ -2015,17 +2071,24 @@ app.post("/send", {
           status: { type: "string", enum: ["completed", "duplicate_suppressed", "unverified", "cancelled", "failed"] },
           reason: { type: "string", enum: ["duplicate_suppressed", "duplicate_inflight"], description: "Why a send was suppressed: already sent within the window, or still in flight." },
           deduped: { type: "boolean" },
-          priority: { type: "string", enum: ["high", "normal"] },
+          priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
+          priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           result: { type: "object" }
         }
       },
       429: {
         type: "object",
         properties: {
-          error: { type: "string", enum: ["send_rate_limited"] },
+          error: { type: "string", enum: ["send_rate_limited", "announcement_queue_full"] },
           reason: { type: "string", enum: ["per_minute_limit", "per_hour_limit"] },
           limits: { type: "object", properties: { minute: { type: "integer" }, hour: { type: "integer" } } },
-          used: { type: "object", properties: { minute: { type: "integer" }, hour: { type: "integer" } } }
+          used: { type: "object", properties: { minute: { type: "integer" }, hour: { type: "integer" } } },
+          priority: { type: "string" },
+          priorityLevel: { type: "integer" },
+          limit: { type: "integer" },
+          pending: { type: "integer" },
+          available: { type: "integer" },
+          retryAfterSeconds: { type: "integer" }
         }
       },
       502: {
@@ -2037,6 +2100,8 @@ app.post("/send", {
           statusUrl: { type: ["string", "null"] },
           jobId: { type: "string" },
           status: { type: "string", enum: ["failed"] },
+          priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
+          priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           error: { type: "string" }
         }
       }
@@ -2063,7 +2128,10 @@ app.post("/send", {
     to: z.string().min(3).max(32),
     text: z.string().min(1).max(4000),
     wait: z.boolean().optional(),
-    priority: z.union([z.enum(["high", "normal"]), z.number().int().min(1).max(10)]).optional()
+    priority: z.union([
+      z.enum([...PRIORITY_NAMES, "high", "normal"]),
+      z.number().int().min(1).max(10)
+    ]).optional()
   });
   const parsed = schema.safeParse(request.body);
   if (!parsed.success) {
@@ -2071,15 +2139,8 @@ app.post("/send", {
     return;
   }
   const { to, text, wait, priority } = parsed.data;
-
-  // High priority -> lifo: BullMQ adds the job to the tail of the wait list,
-  // which the worker pops next (it consumes from the tail). So a high-priority
-  // message runs right after the in-flight send, ahead of all waiting normal
-  // messages, then the campaign continues. A numeric priority <=3 is also "high".
-  const highPriority = priority === "high" || (typeof priority === "number" && priority <= 3);
-  const enqueueOpts = highPriority
-    ? { lifo: true }
-    : (typeof priority === "number" ? { priority } : {});
+  const sendPriority = normalizeSendPriority(priority);
+  const enqueueOpts = { priority: sendPriority.level };
 
   // Idempotency: if the caller sends an `Idempotency-Key` header, dedupe retries
   // so a network blip doesn't send the SMS twice. Same key -> original jobId.
@@ -2109,18 +2170,41 @@ app.post("/send", {
           ledger?.status === "sent" || (!ledger && st?.state === "completed") ? "completed" :
           "queued";
         reply.code(duplicateStatus === "queued" ? 202 : 200);
+        const originalPriority = normalizeSendPriority(ledger?.priority || sendPriority.name);
         return {
           ok: true,
           requestId: ledger ? sendStore.requestId(ledger.id) : null,
           statusUrl: ledger ? `/send/status/${sendStore.requestId(ledger.id)}` : null,
           jobId: rec.jobId,
           status: duplicateStatus,
-          priority: highPriority ? "high" : "normal",
+          priority: originalPriority.name,
+          priorityLevel: originalPriority.level,
           deduped: true
         };
       }
       // Original job expired/purged — re-reserve and fall through to send fresh.
       await sendQueue.reserveIdempotency(idemKey, bodyHash).catch(() => {});
+    }
+  }
+
+  // Capacity is checked after Idempotency-Key lookup so a retry of an already
+  // accepted announcement still returns the original request instead of 429.
+  if (sendPriority.name === "announcement") {
+    const pending = await sendQueue.countPendingByPriority("announcement");
+    if (pending >= ANNOUNCEMENT_PENDING_LIMIT) {
+      if (idemKey) await sendQueue.releaseIdempotency(idemKey).catch(() => {});
+      reply.header("retry-after", "60");
+      reply.code(429).send({
+        error: "announcement_queue_full",
+        message: "Announcement capacity is full; keep the remaining campaign rows in Eve and retry later.",
+        priority: "announcement",
+        priorityLevel: PRIORITY_LEVELS.announcement,
+        limit: ANNOUNCEMENT_PENDING_LIMIT,
+        pending,
+        available: 0,
+        retryAfterSeconds: 60
+      });
+      return;
     }
   }
 
@@ -2132,7 +2216,7 @@ app.post("/send", {
   if (!idemKey) {
     const claim = sendStore.claim({
       to, text, keyName: projectKey?.name || "master",
-      priority: highPriority ? "high" : "normal", windowMs: SEND_DEDUPE_MS
+      priority: sendPriority.name, windowMs: SEND_DEDUPE_MS
     });
     if (claim.action !== "new") {
       app.log.warn({ to, reason: claim.action }, "duplicate send suppressed by ledger");
@@ -2145,14 +2229,15 @@ app.post("/send", {
         status: "duplicate_suppressed",
         reason: claim.action,           // duplicate_suppressed | duplicate_inflight
         deduped: true,
-        priority: highPriority ? "high" : "normal"
+        priority: normalizeSendPriority(claim.row.priority).name,
+        priorityLevel: normalizeSendPriority(claim.row.priority).level
       };
     }
     ledgerId = claim.id;
   } else {
     ledgerId = sendStore.create({
       to, text, keyName: projectKey?.name || "master",
-      priority: highPriority ? "high" : "normal", idempotencyKey: idemKey
+      priority: sendPriority.name, idempotencyKey: idemKey
     });
   }
   const requestId = sendStore.requestId(ledgerId);
@@ -2165,7 +2250,8 @@ app.post("/send", {
         text,
         keyId: projectKey?.id || null,
         keyName: projectKey?.name || "master",
-        priority: highPriority ? "high" : "normal",
+        priority: sendPriority.name,
+        priorityLevel: sendPriority.level,
         _ledgerId: ledgerId,
         _idempotencyKey: idemKey,
         _bodyHash: bodyHash
@@ -2179,7 +2265,11 @@ app.post("/send", {
   }
   if (idemKey) await sendQueue.setIdempotencyJob(idemKey, job.id, bodyHash).catch(() => {});
   if (ledgerId) sendStore.attachJob(ledgerId, job.id);
-  emitSse({ type: "send_queued", requestId, jobId: job.id, to, priority: highPriority ? "high" : "normal", at: new Date().toISOString() });
+  emitSse({
+    type: "send_queued", requestId, jobId: job.id, to,
+    priority: sendPriority.name, priorityLevel: sendPriority.level,
+    at: new Date().toISOString()
+  });
 
   if (wait) {
     try {
@@ -2193,6 +2283,7 @@ app.post("/send", {
           jobId: result.deferredJobId,
           status: "deferred",
           priority: result.priority,
+          priorityLevel: normalizeSendPriority(result.priority).level,
           reason: result.reason,
           releaseAt: result.releaseAt,
           timeZone: result.timeZone,
@@ -2202,30 +2293,30 @@ app.post("/send", {
       if (result?.unverified) {
         return {
           ok: false, requestId, statusUrl: `/send/status/${requestId}`,
-          jobId: job.id, status: "unverified", result
+          jobId: job.id, status: "unverified", priority: sendPriority.name, priorityLevel: sendPriority.level, result
         };
       }
       if (result?.cancelled) {
         return {
           ok: false, requestId, statusUrl: `/send/status/${requestId}`,
-          jobId: job.id, status: "cancelled", result
+          jobId: job.id, status: "cancelled", priority: sendPriority.name, priorityLevel: sendPriority.level, result
         };
       }
       if (result?.terminalFailure) {
         reply.code(502);
         return {
           ok: false, requestId, statusUrl: `/send/status/${requestId}`,
-          jobId: job.id, status: "failed", error: result.error
+          jobId: job.id, status: "failed", priority: sendPriority.name, priorityLevel: sendPriority.level, error: result.error
         };
       }
-      return { ok: true, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "completed", result };
+      return { ok: true, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "completed", priority: sendPriority.name, priorityLevel: sendPriority.level, result };
     } catch (error) {
-      reply.code(502).send({ ok: false, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "failed", error: error.message });
+      reply.code(502).send({ ok: false, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "failed", priority: sendPriority.name, priorityLevel: sendPriority.level, error: error.message });
       return;
     }
   }
 
-  const counts = await sendQueue.counts().catch(() => ({}));
+  const queuePosition = await sendQueue.queuePositionForPriority(sendPriority.name, job.id).catch(() => 0);
   reply.code(202);
   return {
     ok: true,
@@ -2233,8 +2324,9 @@ app.post("/send", {
     statusUrl: `/send/status/${requestId}`,
     jobId: job.id,
     status: "queued",
-    priority: highPriority ? "high" : "normal",
-    queuePosition: highPriority ? (counts.active || 0) : (counts.waiting || 0) + (counts.active || 0)
+    priority: sendPriority.name,
+    priorityLevel: sendPriority.level,
+    queuePosition
   };
 });
 
@@ -2258,6 +2350,8 @@ app.get("/send/status/:reference", {
           id: { type: ["string", "null"], description: "Backwards-compatible alias of jobId" },
           state: { type: "string", enum: ["waiting", "active", "completed", "failed", "delayed", "unverified", "cancelled", "suppressed"] },
           status: { type: "string", enum: ["queued", "active", "sent", "unverified", "failed", "cancelled", "suppressed"] },
+          priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
+          priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           stage: { type: ["string", "null"] },
           terminal: { type: "boolean" },
           successful: { type: ["boolean", "null"] },
@@ -2266,6 +2360,10 @@ app.get("/send/status/:reference", {
           sentTo: { type: ["string", "null"], description: "Recipient number verified in Google Messages before Enter was pressed." },
           recipientEvidence: { type: ["object", "null"], description: "How the active conversation was matched to sentTo." },
           conversationUrl: { type: ["string", "null"] },
+          submittedOnce: { type: "boolean", description: "True only after Enter was pressed once." },
+          submittedAt: { type: ["string", "null"] },
+          verificationStatus: { type: ["string", "null"], description: "confirmed_initial, confirmed_after_recheck, or manual_review_required." },
+          verificationAttempts: { type: "integer", description: "DOM confirmation checks; these never resend the message." },
           attemptsMade: { type: "integer" },
           maxAttempts: { type: "integer" },
           result: { type: ["object", "null"] },
@@ -2334,6 +2432,8 @@ app.get("/send/status/:reference", {
   if (ledger.result_json) {
     try { result = JSON.parse(ledger.result_json); } catch { result = { value: ledger.result_json }; }
   }
+  const submission = result?.submission || result || {};
+  const ledgerPriority = normalizeSendPriority(ledger.priority);
   const terminal = ["sent", "unverified", "failed", "cancelled", "suppressed"].includes(ledger.status);
   const fallbackState = {
     queued: "waiting", active: "active", sent: "completed", failed: "failed",
@@ -2353,6 +2453,8 @@ app.get("/send/status/:reference", {
     id: ledger.job_id || live?.id || null,
     state: live?.state || fallbackState,
     status: ledger.status,
+    priority: ledgerPriority.name,
+    priorityLevel: ledgerPriority.level,
     stage: ledger.stage || null,
     terminal,
     successful: ledger.status === "sent" ? true : (terminal ? false : null),
@@ -2361,6 +2463,10 @@ app.get("/send/status/:reference", {
     sentTo: result?.sentTo || null,
     recipientEvidence: result?.recipientEvidence || null,
     conversationUrl: result?.conversationUrl || null,
+    submittedOnce: Boolean(submission.submittedOnce),
+    submittedAt: submission.submittedAt || null,
+    verificationStatus: submission.verificationStatus || null,
+    verificationAttempts: Number(submission.verificationAttempts || 0),
     attemptsMade: Math.max(Number(ledger.attempts || 0), Number(live?.attemptsMade || 0)),
     maxAttempts: live?.maxAttempts || 3,
     result,
@@ -2375,6 +2481,52 @@ app.get("/send/status/:reference", {
     finishedAt: live?.finishedAt || iso(ledger.finished_at),
     sentAt: iso(ledger.sent_at),
     timeline
+  };
+});
+
+app.get("/send/capacity", {
+  schema: {
+    summary: "Get send-lane capacity",
+    description: "Returns pending counts for all priority lanes and the remaining announcement slots. Eve should use `announcement.available` to bound each feeder batch. Authenticated API keys may call this endpoint.",
+    tags: ["Messaging"],
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          priorities: {
+            type: "object",
+            properties: {
+              critical: { type: "integer" },
+              expired: { type: "integer" },
+              expiring: { type: "integer" },
+              announcement: { type: "integer" }
+            }
+          },
+          announcement: {
+            type: "object",
+            properties: {
+              limit: { type: "integer" },
+              pending: { type: "integer" },
+              available: { type: "integer" },
+              recommendedBatchSize: { type: "integer" }
+            }
+          }
+        }
+      }
+    }
+  }
+}, async () => {
+  const priorities = await sendQueue.pendingCountsByPriority();
+  const pending = priorities.announcement || 0;
+  const available = Math.max(0, ANNOUNCEMENT_PENDING_LIMIT - pending);
+  return {
+    priorities,
+    announcement: {
+      limit: ANNOUNCEMENT_PENDING_LIMIT,
+      pending,
+      available,
+      recommendedBatchSize: Math.min(available, 50)
+    }
   };
 });
 
@@ -2791,10 +2943,16 @@ app.get("/admin/sends", {
                 sentTo: { type: ["string", "null"] },
                 recipientEvidence: { type: ["object", "null"] },
                 conversationUrl: { type: ["string", "null"] },
+                submittedOnce: { type: "boolean" },
+                submittedAt: { type: ["string", "null"] },
+                verificationStatus: { type: ["string", "null"] },
+                verificationAttempts: { type: "integer" },
                 text: { type: "string" },
                 textPreview: { type: "string" },
                 keyName: { type: ["string", "null"] },
                 jobId: { type: ["string", "null"] },
+                priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
+                priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
                 status: { type: "string" },
                 stage: { type: ["string", "null"], description: "Granular progress within an active send (opening, locating, start_chat, stuck_reloading, composer_ready, typing, sent...)" },
                 attempts: { type: "integer" },
@@ -2815,6 +2973,8 @@ app.get("/admin/sends", {
   const sends = sendStore.recent(limit).map((r) => {
     let result = null;
     try { result = r.result_json ? JSON.parse(r.result_json) : null; } catch { /* malformed legacy row */ }
+    const submission = result?.submission || result || {};
+    const priority = normalizeSendPriority(r.priority);
     return {
     id: r.id,
     to: r.to_number,
@@ -2822,10 +2982,16 @@ app.get("/admin/sends", {
     sentTo: result?.sentTo || null,
     recipientEvidence: result?.recipientEvidence || null,
     conversationUrl: result?.conversationUrl || null,
+    submittedOnce: Boolean(submission.submittedOnce),
+    submittedAt: submission.submittedAt || null,
+    verificationStatus: submission.verificationStatus || null,
+    verificationAttempts: Number(submission.verificationAttempts || 0),
     text: String(r.text || ""),
     textPreview: String(r.text || "").replace(/\s+/g, " ").slice(0, 80),
     keyName: r.key_name,
     jobId: r.job_id,
+    priority: priority.name,
+    priorityLevel: priority.level,
     status: r.status,
     stage: r.stage || null,
     attempts: r.attempts,
@@ -2864,7 +3030,8 @@ app.get("/admin/queue/jobs", {
                 to: { type: ["string", "null"] },
                 textPreview: { type: "string" },
                 keyName: { type: ["string", "null"] },
-                priority: { type: "string", enum: ["high", "normal"] },
+                priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
+                priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
                 attemptsMade: { type: "integer" },
                 maxAttempts: { type: "integer" },
                 failedReason: { type: ["string", "null"] },
@@ -2914,8 +3081,8 @@ app.get("/admin/queue/jobs", {
 
 app.post("/admin/queue/release-delayed-high", {
   schema: {
-    summary: "Release all deferred high-priority jobs",
-    description: "Moves every HIGH send that was previously delayed to the front of the queue for immediate processing. Preserves oldest-first order within the released batch. **Master token only.**",
+    summary: "Release all deferred critical-priority jobs",
+    description: "Moves every CRITICAL send that was previously delayed to the front of the queue for immediate processing. Preserves oldest-first order within the released batch. The route name is retained for backwards compatibility. **Master token only.**",
     tags: ["Admin"],
     response: {
       200: {
@@ -2947,7 +3114,7 @@ app.post("/admin/queue/release-delayed-high", {
 app.post("/admin/queue/jobs/:id/promote", {
   schema: {
     summary: "Send a queued job first",
-    description: "Moves any waiting/delayed send job—normal or HIGH—to the very front for immediate processing, ahead of all other waiting messages. Clears its current delay. **Master token only.**",
+    description: "Moves any waiting/delayed send job to CRITICAL and to the very front for immediate processing, ahead of other waiting messages. Clears its current delay. **Master token only.**",
     tags: ["Admin"],
     params: { type: "object", properties: { id: { type: "string" } } }
   }
@@ -2981,7 +3148,7 @@ app.delete("/admin/queue/jobs/:id", {
 app.post("/admin/queue/jobs/bulk", {
   schema: {
     summary: "Bulk perform actions on queued jobs",
-    description: "Performs cancel or complete actions on multiple jobs in the send queue. **Master token only.**",
+    description: "Cancels, manually completes, or changes the priority lane of multiple pending jobs. Active/terminal jobs are skipped and reported. Announcement changes respect the configured pending cap. **Master token only.**",
     tags: ["Admin"],
     body: {
       type: "object",
@@ -2989,59 +3156,111 @@ app.post("/admin/queue/jobs/bulk", {
       properties: {
         ids: {
           type: "array",
+          minItems: 1,
+          maxItems: 2000,
+          uniqueItems: true,
           items: { type: "string" },
           description: "List of job/UUID IDs to perform action on"
         },
         action: {
           type: "string",
-          enum: ["cancel", "complete"],
-          description: "Action to perform on selected jobs (cancel = Cancel, complete = Set Completed)"
+          enum: ["cancel", "complete", "priority"],
+          description: "Action to perform on selected jobs."
+        },
+        priority: {
+          type: "string",
+          enum: ["critical", "expired", "expiring", "announcement"],
+          description: "Required when action=priority."
         }
       }
     },
     response: {
+      400: {
+        type: "object",
+        properties: {
+          error: { type: "string", enum: ["priority_required"] },
+          message: { type: "string" }
+        }
+      },
       200: {
         type: "object",
         properties: {
           ok: { type: "boolean" },
-          count: { type: "integer" }
+          count: { type: "integer", description: "Backwards-compatible alias of processed." },
+          processed: { type: "integer" },
+          skipped: { type: "integer" },
+          priority: { type: ["string", "null"] },
+          results: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                changed: { type: "boolean" },
+                reason: { type: ["string", "null"] },
+                state: { type: ["string", "null"] },
+                priority: { type: ["string", "null"] },
+                priorityLevel: { type: ["integer", "null"] }
+              }
+            }
+          }
         }
       }
     }
   }
-}, async (request) => {
-  const { ids, action } = request.body;
-  let count = 0;
+}, async (request, reply) => {
+  const { action } = request.body;
+  const ids = [...new Set(request.body.ids.map(String))];
+  if (action === "priority" && !request.body.priority) {
+    reply.code(400).send({ error: "priority_required", message: "priority is required when action=priority" });
+    return;
+  }
+  const targetPriority = action === "priority" ? normalizeSendPriority(request.body.priority) : null;
+  let announcementAvailable = targetPriority?.name === "announcement"
+    ? Math.max(0, ANNOUNCEMENT_PENDING_LIMIT - await sendQueue.countPendingByPriority("announcement"))
+    : Infinity;
+  let processed = 0;
+  const results = [];
+
   for (const id of ids) {
     const ledger = sendStore.byJob(id);
-    const ok = await sendQueue.removeJob(id);
-    if (ok) {
-      count++;
-      if (ledger) {
-        if (action === "cancel") {
-          sendStore.markById(ledger.id, "cancelled", "cancelled_by_admin");
-        } else if (action === "complete") {
-          sendStore.markById(ledger.id, "sent", null);
-        }
+    if (action === "priority") {
+      const job = await sendQueue.getJob(id);
+      const currentPriority = job ? priorityForJob(job) : null;
+      if (targetPriority.name === "announcement" && currentPriority?.name !== "announcement" && announcementAvailable <= 0) {
+        results.push({ id, changed: false, reason: "announcement_capacity_full", state: job ? await job.getState().catch(() => "unknown") : null, priority: currentPriority?.name || null, priorityLevel: currentPriority?.level || null });
+        continue;
       }
-    } else {
-      if (ledger) {
-        count++;
-        if (action === "cancel") {
-          sendStore.markById(ledger.id, "cancelled", "cancelled_by_admin");
-        } else if (action === "complete") {
-          sendStore.markById(ledger.id, "sent", null);
-        }
+      const result = await sendQueue.changeJobPriority(id, targetPriority.name);
+      results.push({ id, ...result, reason: result.reason || null });
+      if (result.changed) {
+        processed += 1;
+        if (ledger) sendStore.updatePriorityByJob(id, targetPriority.name);
+        if (targetPriority.name === "announcement" && currentPriority?.name !== "announcement") announcementAvailable -= 1;
       }
+      continue;
+    }
+
+    const result = await sendQueue.cancelPendingJob(id);
+    results.push({ id, changed: result.cancelled, reason: result.reason || null, state: result.state || null, priority: null, priorityLevel: null });
+    if (!result.cancelled) continue;
+    processed += 1;
+    if (ledger) {
+      if (action === "cancel") sendStore.markById(ledger.id, "cancelled", "cancelled_by_admin");
+      if (action === "complete") sendStore.markById(ledger.id, "sent", null);
     }
   }
+  const skipped = ids.length - processed;
   emitSse({
     type: "queue_bulk_action_completed",
     action,
-    count,
+    priority: targetPriority?.name || null,
+    count: processed,
+    processed,
+    skipped,
     at: new Date().toISOString()
   });
-  return { ok: true, count };
+  return { ok: true, count: processed, processed, skipped, priority: targetPriority?.name || null, results };
 });
 
 // ─── API Key Management (master / dashboard only) ────────────────────────────
@@ -3278,9 +3497,15 @@ async function reconcilePending() {
     }
     if (alive) continue;
     try {
+      const priority = normalizeSendPriority(row.priority);
       const job = await sendQueue.enqueue(
-        { to: row.to_number, text: row.text, keyId: null, keyName: row.key_name || "reconcile", priority: "normal" },
-        {}
+        {
+          to: row.to_number, text: row.text, keyId: null,
+          keyName: row.key_name || "reconcile",
+          priority: priority.name,
+          priorityLevel: priority.level
+        },
+        { priority: priority.level }
       );
       sendStore.attachJob(row.id, job.id);
       restored += 1;

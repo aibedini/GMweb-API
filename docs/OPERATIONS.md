@@ -3,11 +3,16 @@
 ## Tehran timezone and quiet hours
 
 Installers set the Linux server timezone to `Asia/Tehran`. The send worker also
-uses that timezone explicitly: normal-priority SMS jobs are durably delayed from
-02:00 through 07:59 and released at 08:00. Only fresh HIGH first attempts bypass
-this rule; delayed/retrying jobs are held until 08:00 even when HIGH.
+uses that timezone explicitly: non-critical SMS jobs are durably delayed from
+02:00 through 07:59 and released at 08:00. Only fresh CRITICAL first attempts bypass
+this rule; delayed/retrying jobs are held until 08:00 even when CRITICAL.
 The defaults can be changed with `SEND_TIMEZONE`, `SEND_QUIET_START_HOUR`, and
 `SEND_QUIET_END_HOUR`.
+
+The queue dashboard supports stable Select All/clear selection across background
+polls and bulk priority changes. Only pending jobs can be changed; active or
+terminal jobs are reported as skipped. Moving selected jobs to `announcement`
+still respects `ANNOUNCEMENT_PENDING_LIMIT`.
 
 ## Browser automation health and automatic recovery
 

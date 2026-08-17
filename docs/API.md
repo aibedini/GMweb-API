@@ -92,12 +92,20 @@ Opens a conversation and returns messages from it.
 {
   "to": "+989195292411",
   "text": "test",
-  "priority": "high"
+  "priority": "critical"
 }
 ```
 
 Returns `requestId`, `statusUrl`, and `jobId`. Store `requestId` as the stable
 shared id for polling/cancel; `jobId` is the current queue job id.
+Canonical priorities are `critical` (1), `expired` (3), `expiring` (6, default),
+and `announcement` (10). Lower levels run first and every lane is FIFO.
+
+### GET /send/capacity
+
+Returns pending counts per priority and `announcement.{limit,pending,available,
+recommendedBatchSize}`. Bulk producers must feed only the available number of
+announcements; `POST /send` returns `429 announcement_queue_full` at the cap.
 
 ### GET /send/status/:reference
 
@@ -115,3 +123,11 @@ own sends. Returns `409 not_cancellable` when the send is already active/sent.
 
 Server-sent events stream for send lifecycle, conversation changes, and browser
 recovery (`browser_recovering` / `browser_hard_restart`) events.
+
+### POST /admin/queue/jobs/bulk
+
+Dashboard/master-token endpoint for selected pending jobs. Supported actions are
+`cancel`, `complete`, and `priority`. Priority changes require one of
+`critical`, `expired`, `expiring`, or `announcement`. The response reports
+`processed`, `skipped`, and a per-job `results` array; active/terminal/missing
+jobs are skipped, and bulk changes to announcement respect its pending cap.

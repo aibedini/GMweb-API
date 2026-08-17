@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowUp, X, RefreshCw, Pause, Play, Moon, Rocket } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import type { QueueCounts, QueueJob, QueueQuietHours } from "@/lib/types";
@@ -27,8 +27,10 @@ export function QueuePage() {
   const [loading, setLoading] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [actionError, setActionError] = useState("");
+  const [actionMessage, setActionMessage] = useState("");
   const [staleSince, setStaleSince] = useState<number | null>(null);
   const [selectedJobIds, setSelectedJobIds] = useState<string[]>([]);
+  const [bulkPriority, setBulkPriority] = useState<QueueJob["priority"]>("expiring");
 
   function messageFor(err: unknown) {
     return err instanceof ApiError ? err.message : "network error";
@@ -44,11 +46,13 @@ export function QueuePage() {
       setCounts(c.counts);
       setPaused(c.paused);
       setQuietHours(c.quietHours);
-      setJobs(j.jobs);
+      const normalizedJobs = j.jobs.map((job) => ({ ...job, id: String(job.id) }));
+      setJobs(normalizedJobs);
       setDelayedHighCount(j.delayedHighCount);
       setStaleSince(null);
       // Keep only selections that still exist in the updated list
-      setSelectedJobIds((prev) => prev.filter((id) => j.jobs.some((job) => job.id === id)));
+      const validIds = new Set(normalizedJobs.map((job) => job.id));
+      setSelectedJobIds((prev) => prev.map(String).filter((id) => validIds.has(id)));
     } catch (err) {
       // Background polling failure: don't yell at the user every 8s, but do
       // surface it if it persists — an expired session otherwise looks
@@ -72,35 +76,53 @@ export function QueuePage() {
   }, true);
 
   const toggleSelectJob = useCallback((id: string) => {
+    const canonicalId = String(id);
     setSelectedJobIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+      prev.includes(canonicalId) ? prev.filter((x) => x !== canonicalId) : [...prev, canonicalId]
     );
   }, []);
 
-  const isAllSelected = jobs.length > 0 && jobs.every((job) => selectedJobIds.includes(job.id));
-  const isSomeSelected = selectedJobIds.length > 0 && !isAllSelected;
+  const visibleJobIds = useMemo(() => jobs.map((job) => String(job.id)), [jobs]);
+  const selectedSet = useMemo(() => new Set(selectedJobIds), [selectedJobIds]);
+  const visibleSelectedCount = visibleJobIds.filter((id) => selectedSet.has(id)).length;
+  const isAllSelected = visibleJobIds.length > 0 && visibleSelectedCount === visibleJobIds.length;
+  const isSomeSelected = visibleSelectedCount > 0 && !isAllSelected;
 
   const toggleSelectAll = useCallback(() => {
-    if (isAllSelected) {
-      setSelectedJobIds([]);
-    } else {
-      setSelectedJobIds(jobs.map((job) => job.id));
-    }
-  }, [isAllSelected, jobs]);
+    setSelectedJobIds((prev) => {
+      const current = new Set(prev.map(String));
+      const allVisibleSelected = visibleJobIds.length > 0 && visibleJobIds.every((id) => current.has(id));
+      if (allVisibleSelected) return prev.filter((id) => !visibleJobIds.includes(id));
+      visibleJobIds.forEach((id) => current.add(id));
+      return [...current];
+    });
+  }, [visibleJobIds]);
 
-  async function performBulkAction(action: "cancel" | "complete") {
+  async function performBulkAction(action: "cancel" | "complete" | "priority") {
     if (busyAction || selectedJobIds.length === 0) return;
-    const actionLabel = action === "cancel" ? "cancel" : "complete";
+    const actionLabel = action === "priority" ? `change priority to ${bulkPriority.toUpperCase()}` : action === "cancel" ? "cancel" : "complete";
     if (!confirm(`Are you sure you want to ${actionLabel} ${selectedJobIds.length} selected messages?`)) return;
     setBusyAction(`bulk:${action}`);
     setActionError("");
+    setActionMessage("");
     try {
-      await api<{ ok: boolean; count: number }>("/admin/queue/jobs/bulk", {
+      const result = await api<{
+        ok: boolean;
+        processed: number;
+        skipped: number;
+        results: Array<{ id: string; changed: boolean; reason?: string | null }>;
+      }>("/admin/queue/jobs/bulk", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: { ids: selectedJobIds, action }
+        body: { ids: selectedJobIds, action, ...(action === "priority" ? { priority: bulkPriority } : {}) }
       });
-      setSelectedJobIds([]);
+      const skippedIds = result.results.filter((item) => !item.changed).map((item) => String(item.id));
+      setSelectedJobIds(skippedIds);
+      if (result.skipped > 0) {
+        setActionError(`${result.processed} changed · ${result.skipped} skipped (active, missing, terminal, or announcement capacity full).`);
+      } else {
+        setActionMessage(`${result.processed} selected message${result.processed === 1 ? "" : "s"} updated.`);
+      }
       await load();
     } catch (err) {
       setActionError(`Bulk ${actionLabel} failed: ${messageFor(err)}`);
@@ -113,6 +135,7 @@ export function QueuePage() {
     if (busyAction) return;
     setBusyAction(`promote:${id}`);
     setActionError("");
+    setActionMessage("");
     try {
       await api(`/admin/queue/jobs/${id}/promote`, { method: "POST" });
       await load();
@@ -127,6 +150,7 @@ export function QueuePage() {
     if (!confirm("Cancel this queued message?")) return;
     setBusyAction(`cancel:${id}`);
     setActionError("");
+    setActionMessage("");
     try {
       await api(`/admin/queue/jobs/${id}`, { method: "DELETE" });
       await load();
@@ -145,6 +169,7 @@ export function QueuePage() {
     const target = paused ? "resume" : "pause";
     setBusyAction("toggle");
     setActionError("");
+    setActionMessage("");
     try {
       await api(`/admin/queue/${target}`, { method: "POST" });
       await load();
@@ -159,12 +184,13 @@ export function QueuePage() {
     if (busyAction) return;
     setBusyAction("release-high");
     setActionError("");
+    setActionMessage("");
     try {
       const result = await api<{ released: number }>("/admin/queue/release-delayed-high", { method: "POST" });
-      if (result.released === 0) setActionError("No delayed HIGH messages were found.");
+      if (result.released === 0) setActionError("No delayed CRITICAL messages were found.");
       await load();
     } catch (err) {
-      setActionError(`Couldn't release delayed HIGH messages: ${messageFor(err)}`);
+      setActionError(`Couldn't release delayed CRITICAL messages: ${messageFor(err)}`);
     } finally {
       setBusyAction(null);
     }
@@ -185,10 +211,10 @@ export function QueuePage() {
             size="sm"
             onClick={releaseDelayedHigh}
             disabled={delayedHighCount === 0 || busyAction !== null}
-            title="Move all delayed HIGH messages to the front and send them now"
+            title="Move all delayed CRITICAL messages to the front and send them now"
           >
             <Rocket className="size-4" />
-            {busyAction === "release-high" ? "Releasing…" : `Send delayed HIGH now (${delayedHighCount})`}
+            {busyAction === "release-high" ? "Releasing…" : `Send delayed CRITICAL now (${delayedHighCount})`}
           </Button>
           <Button variant="secondary" size="sm" onClick={togglePaused} disabled={busyAction !== null}>
             {paused ? <Play className="size-4" /> : <Pause className="size-4" />}
@@ -199,6 +225,7 @@ export function QueuePage() {
           </Button>
         </div>
         {actionError && <div className="text-xs text-destructive">{actionError}</div>}
+        {actionMessage && <div className="text-xs text-emerald-400">{actionMessage}</div>}
         {!actionError && staleSince && (
           <div className="text-xs text-destructive">
             Not updating since {new Date(staleSince).toLocaleTimeString()} — session may have expired, try reloading the page.
@@ -210,7 +237,7 @@ export function QueuePage() {
             <div>
               <div className="text-sm font-medium">Quiet hours are active</div>
               <div className="text-xs text-amber-100/75">
-                Normal SMS and every delayed retry—including HIGH—are held until {quietHours.releaseAt ? new Date(quietHours.releaseAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "08:00"} {quietHours.timeZone}. Only fresh HIGH messages send immediately.
+                Non-critical SMS and every delayed retry—including CRITICAL—are held until {quietHours.releaseAt ? new Date(quietHours.releaseAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "08:00"} {quietHours.timeZone}. Only fresh CRITICAL messages send immediately.
               </div>
             </div>
           </div>
@@ -222,7 +249,7 @@ export function QueuePage() {
         ) : (
           <div className="max-h-[60vh] divide-y divide-border overflow-y-auto">
             {/* Bulk actions bar */}
-            <div className="flex items-center justify-between border-b bg-muted/30 px-4 py-2 text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b bg-muted/30 px-4 py-2 text-xs">
               <div className="flex items-center gap-3">
                 <input
                   type="checkbox"
@@ -236,11 +263,32 @@ export function QueuePage() {
                   className="size-4 cursor-pointer rounded border-zinc-700 bg-background/50 accent-primary text-primary focus:ring-primary"
                 />
                 <span className="font-medium text-muted-foreground">
-                  {selectedJobIds.length} of {jobs.length} selected
+                  {visibleSelectedCount} of {jobs.length} selected
                 </span>
               </div>
               {selectedJobIds.length > 0 && (
                 <div className="flex items-center gap-2">
+                  <select
+                    value={bulkPriority}
+                    onChange={(event) => setBulkPriority(event.target.value as QueueJob["priority"])}
+                    disabled={busyAction !== null}
+                    aria-label="Priority for selected messages"
+                    className="h-7 rounded-md border border-border bg-background px-2 text-[11px] text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                  >
+                    <option value="critical">CRITICAL · P1</option>
+                    <option value="expired">EXPIRED · P3</option>
+                    <option value="expiring">EXPIRING · P6</option>
+                    <option value="announcement">ANNOUNCEMENT · P10</option>
+                  </select>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-[11px] font-medium"
+                    disabled={busyAction !== null}
+                    onClick={() => performBulkAction("priority")}
+                  >
+                    {busyAction === "bulk:priority" ? "Applying…" : "Apply priority"}
+                  </Button>
                   <Button
                     variant="outline"
                     size="sm"
@@ -278,7 +326,9 @@ export function QueuePage() {
                   <Badge variant={job.state === "active" ? "default" : job.state === "delayed" ? "warning" : "secondary"}>
                     {job.state}
                   </Badge>
-                  {job.priority === "high" && <Badge variant="warning">HIGH</Badge>}
+                  <Badge variant={job.priority === "critical" ? "warning" : "secondary"}>
+                    {job.priority.toUpperCase()} · P{job.priorityLevel}
+                  </Badge>
                   {job.quietHoursHeld && <Badge variant="warning">QUIET</Badge>}
                 </div>
                 <div className="min-w-0 flex-1">

@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.3.28",
+    "version": "0.3.31",
     "contact": {
       "name": "GMweb API"
     }
@@ -1042,7 +1042,7 @@
         "tags": [
           "Messaging"
         ],
-        "description": "Queue an SMS/RCS message for delivery via Google Messages.\n\n**Asynchronous by default.** The message is added to a durable Redis-backed\nqueue and processed in the background by a single worker (one browser, one\nsend at a time). The endpoint returns a stable `requestId` plus the current\nBullMQ `jobId` immediately with HTTP 202.\n\n**Track delivery via:**\n- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps\n  (`jobId` is also accepted for backwards compatibility)\n- `POST /send/cancel/{requestId}` — cancel before the worker starts sending\n- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed` / `send_cancelled`\n\n**Retries:** failed sends retry up to 3 times with exponential backoff.\n\n**Synchronous mode:** pass `\"wait\": true` to block until the send finishes\n(up to 90s) and receive the result directly. Use only for low-volume callers.\n\n**Priority:** pass `\"priority\": \"high\"` to jump the queue. A high-priority\nmessage is processed **next** (right after the send already in flight finishes),\nahead of every normal-priority message still waiting — then the queue/campaign\ncontinues as before. Use it for time-sensitive transactional messages (e.g. a\nrenewal confirmation) so they aren't stuck behind a bulk reminder campaign.\n\n**Quiet hours:** normal-priority messages are held from 02:00 through 07:59\n`Asia/Tehran` and released at 08:00. Delayed retries are also held even when\nHIGH; only a fresh high-priority first attempt bypasses quiet hours.\n\n**Rate limits (project keys):** configurable per-minute and per-hour (default 10/min, 100/hr).\n\n**Phone format:** include country code, e.g. `+989121234567`.\n\n**Auto de-dupe:** an identical `{to,text}` re-sent within ~120s (no Idempotency-Key needed) is suppressed and returns `status:\"duplicate_suppressed\"` with the original `jobId` — guards against accidental double-posting.",
+        "description": "Queue an SMS/RCS message for delivery via Google Messages.\n\n**Asynchronous by default.** The message is added to a durable Redis-backed\nqueue and processed in the background by a single worker (one browser, one\nsend at a time). The endpoint returns a stable `requestId` plus the current\nBullMQ `jobId` immediately with HTTP 202.\n\n**Track delivery via:**\n- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps\n  (`jobId` is also accepted for backwards compatibility)\n- `POST /send/cancel/{requestId}` — cancel before the worker starts sending\n- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed` / `send_cancelled`\n\n**Retries:** failed sends retry up to 3 times with exponential backoff.\n\n**Synchronous mode:** pass `\"wait\": true` to block until the send finishes\n(up to 90s) and receive the result directly. Use only for low-volume callers.\n\n**Priority lanes:** use `critical` (purchase/renewal), `expired` (already expired),\n`expiring` (near expiry; default), or `announcement` (bulk/lowest). Lower numeric\nlevels run first and every lane remains FIFO. Legacy `high` maps to `critical`;\nlegacy `normal` maps to `expiring`.\n\n**Quiet hours:** non-critical messages are held from 02:00 through 07:59\n`Asia/Tehran` and released at 08:00. Delayed retries are also held even when\nCRITICAL; only a fresh critical first attempt bypasses quiet hours.\nAnnouncements are capped at the configured pending capacity (default 200).\n\n**Rate limits (project keys):** configurable per-minute and per-hour (default 10/min, 100/hr).\n\n**Phone format:** include country code, e.g. `+989121234567`.\n\n**Auto de-dupe:** an identical `{to,text}` re-sent within ~120s (no Idempotency-Key needed) is suppressed and returns `status:\"duplicate_suppressed\"` with the original `jobId` — guards against accidental double-posting.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1072,18 +1072,32 @@
                     "description": "If true, block until the send completes (max 90s) and return the result."
                   },
                   "priority": {
-                    "type": [
-                      "string",
-                      "integer"
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "enum": [
+                          "critical",
+                          "expired",
+                          "expiring",
+                          "announcement",
+                          "high",
+                          "normal"
+                        ]
+                      },
+                      {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10
+                      }
                     ],
-                    "description": "Send priority. A fresh `\"high\"` first attempt jumps the queue and bypasses the 02:00–08:00 Asia/Tehran hold. Once delayed/retrying, every job is held until 08:00 even if HIGH. Omit or use `\"normal\"` for FIFO. A numeric 1-10 is also accepted (1-3 = high)."
+                    "description": "Priority lane: `critical`=1, `expired`=3, `expiring`=6 (default), `announcement`=10. FIFO within a lane. Legacy `high` and `normal`, plus numeric 1-10, remain accepted. Only a fresh critical attempt bypasses quiet hours."
                   }
                 }
               },
               "example": {
                 "to": "+989121234567",
-                "text": "Hello from GMweb API!",
-                "priority": "high"
+                "text": "تمدید شد",
+                "priority": "critical"
               }
             }
           }
@@ -1153,8 +1167,19 @@
                     "priority": {
                       "type": "string",
                       "enum": [
-                        "high",
-                        "normal"
+                        "critical",
+                        "expired",
+                        "expiring",
+                        "announcement"
+                      ]
+                    },
+                    "priorityLevel": {
+                      "type": "integer",
+                      "enum": [
+                        1,
+                        3,
+                        6,
+                        10
                       ]
                     },
                     "result": {
@@ -1202,8 +1227,19 @@
                     "priority": {
                       "type": "string",
                       "enum": [
-                        "high",
-                        "normal"
+                        "critical",
+                        "expired",
+                        "expiring",
+                        "announcement"
+                      ]
+                    },
+                    "priorityLevel": {
+                      "type": "integer",
+                      "enum": [
+                        1,
+                        3,
+                        6,
+                        10
                       ]
                     },
                     "deduped": {
@@ -1212,7 +1248,7 @@
                     },
                     "queuePosition": {
                       "type": "integer",
-                      "description": "Approximate number of jobs ahead (incl. active). ~0 for high priority."
+                      "description": "Approximate active and same-or-higher-priority jobs ahead."
                     },
                     "reason": {
                       "type": "string"
@@ -1266,7 +1302,8 @@
                     "error": {
                       "type": "string",
                       "enum": [
-                        "send_rate_limited"
+                        "send_rate_limited",
+                        "announcement_queue_full"
                       ]
                     },
                     "reason": {
@@ -1297,6 +1334,24 @@
                           "type": "integer"
                         }
                       }
+                    },
+                    "priority": {
+                      "type": "string"
+                    },
+                    "priorityLevel": {
+                      "type": "integer"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "pending": {
+                      "type": "integer"
+                    },
+                    "available": {
+                      "type": "integer"
+                    },
+                    "retryAfterSeconds": {
+                      "type": "integer"
                     }
                   }
                 }
@@ -1333,6 +1388,24 @@
                       "type": "string",
                       "enum": [
                         "failed"
+                      ]
+                    },
+                    "priority": {
+                      "type": "string",
+                      "enum": [
+                        "critical",
+                        "expired",
+                        "expiring",
+                        "announcement"
+                      ]
+                    },
+                    "priorityLevel": {
+                      "type": "integer",
+                      "enum": [
+                        1,
+                        3,
+                        6,
+                        10
                       ]
                     },
                     "error": {
@@ -1419,6 +1492,24 @@
                         "suppressed"
                       ]
                     },
+                    "priority": {
+                      "type": "string",
+                      "enum": [
+                        "critical",
+                        "expired",
+                        "expiring",
+                        "announcement"
+                      ]
+                    },
+                    "priorityLevel": {
+                      "type": "integer",
+                      "enum": [
+                        1,
+                        3,
+                        6,
+                        10
+                      ]
+                    },
                     "stage": {
                       "type": [
                         "null",
@@ -1460,6 +1551,27 @@
                         "null",
                         "string"
                       ]
+                    },
+                    "submittedOnce": {
+                      "type": "boolean",
+                      "description": "True only after Enter was pressed once."
+                    },
+                    "submittedAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "verificationStatus": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "confirmed_initial, confirmed_after_recheck, or manual_review_required."
+                    },
+                    "verificationAttempts": {
+                      "type": "integer",
+                      "description": "DOM confirmation checks; these never resend the message."
                     },
                     "attemptsMade": {
                       "type": "integer"
@@ -1550,6 +1662,63 @@
                           "at": {
                             "type": "string"
                           }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/send/capacity": {
+      "get": {
+        "summary": "Get send-lane capacity",
+        "tags": [
+          "Messaging"
+        ],
+        "description": "Returns pending counts for all priority lanes and the remaining announcement slots. Eve should use `announcement.available` to bound each feeder batch. Authenticated API keys may call this endpoint.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "priorities": {
+                      "type": "object",
+                      "properties": {
+                        "critical": {
+                          "type": "integer"
+                        },
+                        "expired": {
+                          "type": "integer"
+                        },
+                        "expiring": {
+                          "type": "integer"
+                        },
+                        "announcement": {
+                          "type": "integer"
+                        }
+                      }
+                    },
+                    "announcement": {
+                      "type": "object",
+                      "properties": {
+                        "limit": {
+                          "type": "integer"
+                        },
+                        "pending": {
+                          "type": "integer"
+                        },
+                        "available": {
+                          "type": "integer"
+                        },
+                        "recommendedBatchSize": {
+                          "type": "integer"
                         }
                       }
                     }
@@ -2096,6 +2265,24 @@
                               "string"
                             ]
                           },
+                          "submittedOnce": {
+                            "type": "boolean"
+                          },
+                          "submittedAt": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "verificationStatus": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "verificationAttempts": {
+                            "type": "integer"
+                          },
                           "text": {
                             "type": "string"
                           },
@@ -2112,6 +2299,24 @@
                             "type": [
                               "null",
                               "string"
+                            ]
+                          },
+                          "priority": {
+                            "type": "string",
+                            "enum": [
+                              "critical",
+                              "expired",
+                              "expiring",
+                              "announcement"
+                            ]
+                          },
+                          "priorityLevel": {
+                            "type": "integer",
+                            "enum": [
+                              1,
+                              3,
+                              6,
+                              10
                             ]
                           },
                           "status": {
@@ -2234,8 +2439,19 @@
                           "priority": {
                             "type": "string",
                             "enum": [
-                              "high",
-                              "normal"
+                              "critical",
+                              "expired",
+                              "expiring",
+                              "announcement"
+                            ]
+                          },
+                          "priorityLevel": {
+                            "type": "integer",
+                            "enum": [
+                              1,
+                              3,
+                              6,
+                              10
                             ]
                           },
                           "attemptsMade": {
@@ -2361,11 +2577,11 @@
     },
     "/admin/queue/release-delayed-high": {
       "post": {
-        "summary": "Release all deferred high-priority jobs",
+        "summary": "Release all deferred critical-priority jobs",
         "tags": [
           "Admin"
         ],
-        "description": "Moves every HIGH send that was previously delayed to the front of the queue for immediate processing. Preserves oldest-first order within the released batch. **Master token only.**",
+        "description": "Moves every CRITICAL send that was previously delayed to the front of the queue for immediate processing. Preserves oldest-first order within the released batch. The route name is retained for backwards compatibility. **Master token only.**",
         "responses": {
           "200": {
             "description": "Default Response",
@@ -2394,7 +2610,7 @@
         "tags": [
           "Admin"
         ],
-        "description": "Moves any waiting/delayed send job—normal or HIGH—to the very front for immediate processing, ahead of all other waiting messages. Clears its current delay. **Master token only.**",
+        "description": "Moves any waiting/delayed send job to CRITICAL and to the very front for immediate processing, ahead of other waiting messages. Clears its current delay. **Master token only.**",
         "parameters": [
           {
             "schema": {
@@ -2442,7 +2658,7 @@
         "tags": [
           "Admin"
         ],
-        "description": "Performs cancel or complete actions on multiple jobs in the send queue. **Master token only.**",
+        "description": "Cancels, manually completes, or changes the priority lane of multiple pending jobs. Active/terminal jobs are skipped and reported. Announcement changes respect the configured pending cap. **Master token only.**",
         "requestBody": {
           "required": true,
           "content": {
@@ -2456,6 +2672,9 @@
                 "properties": {
                   "ids": {
                     "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2000,
+                    "uniqueItems": true,
                     "items": {
                       "type": "string"
                     },
@@ -2465,9 +2684,20 @@
                     "type": "string",
                     "enum": [
                       "cancel",
-                      "complete"
+                      "complete",
+                      "priority"
                     ],
-                    "description": "Action to perform on selected jobs (cancel = Cancel, complete = Set Completed)"
+                    "description": "Action to perform on selected jobs."
+                  },
+                  "priority": {
+                    "type": "string",
+                    "enum": [
+                      "critical",
+                      "expired",
+                      "expiring",
+                      "announcement"
+                    ],
+                    "description": "Required when action=priority."
                   }
                 }
               }
@@ -2486,7 +2716,79 @@
                       "type": "boolean"
                     },
                     "count": {
+                      "type": "integer",
+                      "description": "Backwards-compatible alias of processed."
+                    },
+                    "processed": {
                       "type": "integer"
+                    },
+                    "skipped": {
+                      "type": "integer"
+                    },
+                    "priority": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "changed": {
+                            "type": "boolean"
+                          },
+                          "reason": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "state": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "priority": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "priorityLevel": {
+                            "type": [
+                              "null",
+                              "integer"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "priority_required"
+                      ]
+                    },
+                    "message": {
+                      "type": "string"
                     }
                   }
                 }

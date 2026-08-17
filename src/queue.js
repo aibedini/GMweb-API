@@ -1,4 +1,5 @@
 const { Queue, Worker, QueueEvents } = require("bullmq");
+const { normalizeSendPriority, priorityForJob } = require("./sendPriority");
 
 const QUEUE_NAME = "gmweb-send";
 const DEFERRED_HIGH_KEY = "gmweb-send:deferred-high";
@@ -33,49 +34,44 @@ class SendQueue {
     return this.queue.add("send", data, opts);
   }
 
-  async deferNormal(data, successes = 10) {
+  async deferBySuccesses(data, successes = 10) {
     const client = await this._redis();
     const sequence = Number(await client.get(SUCCESS_SEQUENCE_KEY)) || 0;
+    const priority = normalizeSendPriority(data?.priority || data?.priorityLevel);
     const job = await this.enqueue({
       ...data,
-      priority: "normal",
+      priority: priority.name,
+      priorityLevel: priority.level,
       deferCount: Number(data?.deferCount || 0) + 1
     }, {
       // Keep a real BullMQ job so the ledger and dashboard remain durable.
-      delay: HIGH_DEFER_DELAY_MS
+      delay: HIGH_DEFER_DELAY_MS,
+      priority: priority.level
     });
     const releaseAt = sequence + Math.max(1, Number(successes) || 10);
     await client.zadd(DEFERRED_HIGH_KEY, releaseAt, String(job.id));
     return { job, releaseAt };
   }
 
-  deferUntil(data, releaseAt, reason = "scheduled", { highPriority = false } = {}) {
+  deferNormal(data, successes = 10) {
+    return this.deferBySuccesses(data, successes);
+  }
+
+  deferUntil(data, releaseAt, reason = "scheduled", { priority: requestedPriority } = {}) {
     const releaseMs = releaseAt instanceof Date ? releaseAt.getTime() : Number(releaseAt);
     const delay = Math.max(1000, releaseMs - Date.now());
+    const priority = normalizeSendPriority(requestedPriority || data?.priority || data?.priorityLevel);
     return this.enqueue({
       ...data,
-      priority: highPriority ? "high" : "normal",
+      priority: priority.name,
+      priorityLevel: priority.level,
       deferReason: reason,
       deferCount: Number(data?.deferCount || 0) + 1
-    }, { delay, ...(highPriority ? { lifo: true } : {}) });
+    }, { delay, priority: priority.level });
   }
 
   async deferHigh(data, successes = 10) {
-    const client = await this._redis();
-    const sequence = Number(await client.get(SUCCESS_SEQUENCE_KEY)) || 0;
-    const job = await this.enqueue({
-      ...data,
-      priority: "high",
-      deferCount: Number(data?.deferCount || 0) + 1
-    }, {
-      lifo: true,
-      // Keep a real BullMQ job so the ledger and dashboard remain durable.
-      // recordSuccessAndReleaseHigh promotes it after the success threshold.
-      delay: HIGH_DEFER_DELAY_MS
-    });
-    const releaseAt = sequence + Math.max(1, Number(successes) || 10);
-    await client.zadd(DEFERRED_HIGH_KEY, releaseAt, String(job.id));
-    return { job, releaseAt };
+    return this.deferBySuccesses({ ...data, priority: "critical", priorityLevel: 1 }, successes);
   }
 
   async recordSuccessAndReleaseHigh() {
@@ -200,10 +196,13 @@ class SendQueue {
     const job = await this.queue.getJob(id);
     if (!job) return null;
     const state = await job.getState();
+    const priority = priorityForJob(job);
     return {
       id: job.id,
       state,                                    // waiting | active | completed | failed | delayed
       to: job.data?.to,
+      priority: priority.name,
+      priorityLevel: priority.level,
       attemptsMade: job.attemptsMade,
       maxAttempts: job.opts?.attempts || 1,
       result: job.returnvalue || null,
@@ -256,13 +255,15 @@ class SendQueue {
     for (const entry of jobs) {
       const { job, state } = entry;
       if (!job) continue;
+      const priority = priorityForJob(job);
       out.push({
         id: job.id,
         state,
         to: job.data?.to || null,
         textPreview: String(job.data?.text || "").replace(/\s+/g, " ").slice(0, 80),
         keyName: job.data?.keyName || null,
-        priority: job.data?.priority === "high" || job.opts?.lifo ? "high" : "normal",
+        priority: priority.name,
+        priorityLevel: priority.level,
         attemptsMade: job.attemptsMade || 0,
         maxAttempts: job.opts?.attempts || 1,
         failedReason: job.failedReason || null,
@@ -278,7 +279,7 @@ class SendQueue {
   }
 
   // Count across the complete pending queue, not just the dashboard's visible
-  // page. A queue may have hundreds of waiting jobs before its deferred HIGH
+  // page. A queue may have hundreds of waiting jobs before its deferred CRITICAL
   // entries, and deriving this count from the first 100 makes the release
   // button incorrectly show zero and become disabled.
   async countDeferredHighJobs() {
@@ -287,13 +288,35 @@ class SendQueue {
     for (const job of jobs) {
       if (!job) continue;
       const state = await job.getState().catch(() => "unknown");
-      const high = job.data?.priority === "high" || Boolean(job.opts?.lifo);
+      const high = priorityForJob(job).name === "critical";
       const deferred = state === "delayed" ||
         Number(job.data?.deferCount || 0) > 0 ||
         Boolean(job.data?.deferReason);
       if (high && state !== "active" && deferred) count += 1;
     }
     return count;
+  }
+
+  async countPendingByPriority(priorityName) {
+    const counts = await this.pendingCountsByPriority();
+    return counts[normalizeSendPriority(priorityName).name] || 0;
+  }
+
+  async pendingCountsByPriority() {
+    const jobs = await this.queue.getJobs(["active", "waiting", "paused", "delayed"], 0, -1, false);
+    const counts = { critical: 0, expired: 0, expiring: 0, announcement: 0 };
+    for (const job of jobs) {
+      if (job) counts[priorityForJob(job).name] += 1;
+    }
+    return counts;
+  }
+
+  async queuePositionForPriority(priorityName, excludeJobId = null) {
+    const requested = normalizeSendPriority(priorityName);
+    const active = await this.queue.getJobs(["active"], 0, -1, false);
+    const pending = await this.queue.getJobs(["waiting", "paused"], 0, -1, false);
+    const ahead = pending.filter((job) => job && String(job.id) !== String(excludeJobId) && priorityForJob(job).level <= requested.level).length;
+    return active.length + ahead;
   }
 
   // Internal-only full payloads used to migrate pre-ledger Redis backlog into
@@ -304,13 +327,15 @@ class SendQueue {
     const out = [];
     for (const job of jobs) {
       if (!job) continue;
+      const priority = priorityForJob(job);
       out.push({
         jobId: String(job.id),
         state: await job.getState().catch(() => "waiting"),
         to: job.data?.to || "",
         text: job.data?.text || "",
         keyName: job.data?.keyName || null,
-        priority: job.data?.priority === "high" || job.opts?.lifo ? "high" : "normal",
+        priority: priority.name,
+        priorityLevel: priority.level,
         idempotencyKey: job.data?._idempotencyKey || null,
         attempts: job.attemptsMade || 0,
         createdAt: job.timestamp || Date.now(),
@@ -321,8 +346,7 @@ class SendQueue {
     return out;
   }
 
-  // Bump a waiting/delayed job to the front of the line (processed next). The
-  // worker pops from the tail, so re-adding with lifo puts it at the tail.
+  // Bump a waiting/delayed job to the front of the highest-priority lane.
   // Returns the new job id, or null if the job is gone / already running.
   async promoteJob(id) {
     const job = await this.queue.getJob(id);
@@ -331,21 +355,48 @@ class SendQueue {
     if (state !== "waiting" && state !== "delayed") {
       return { promoted: false, reason: `job is ${state}`, state };
     }
-    const data = { ...job.data, priority: "high" };
+    const data = { ...job.data, priority: "critical", priorityLevel: 1 };
     // An explicit admin promotion means "send this next", even when the job
     // was previously delayed or is currently inside quiet hours.
     delete data.deferCount;
     delete data.deferReason;
     await this.forgetDeferredHigh(id);
     await job.remove();
+    // BullMQ keeps prioritized jobs in a sorted set where `lifo` does not
+    // guarantee the front. An explicit admin "send next" is therefore added
+    // to the unprioritized wait-list front; its canonical data remains CRITICAL.
     const fresh = await this.queue.add("send", data, { lifo: true });
     return { promoted: true, id: fresh.id, previousId: String(id), state: "waiting", _data: data };
   }
 
-  // Release every HIGH job that has previously been deferred. The queue is
+  // Change the lane without replacing the BullMQ job id. `changePriority`
+  // updates waiting/prioritized jobs in-place and also persists the priority
+  // field used when a delayed job becomes runnable later.
+  async changeJobPriority(id, requestedPriority) {
+    const job = await this.queue.getJob(id);
+    if (!job) return { changed: false, reason: "not_found", state: null };
+    const state = await job.getState().catch(() => "unknown");
+    if (!["waiting", "paused", "delayed"].includes(state)) {
+      return { changed: false, reason: state === "active" ? "active" : "not_pending", state };
+    }
+    const previous = priorityForJob(job);
+    const priority = normalizeSendPriority(requestedPriority);
+    const data = { ...job.data, priority: priority.name, priorityLevel: priority.level };
+    await job.updateData(data);
+    await job.changePriority({ priority: priority.level });
+    return {
+      changed: true,
+      id: String(job.id),
+      state,
+      previousPriority: previous.name,
+      priority: priority.name,
+      priorityLevel: priority.level
+    };
+  }
+
+  // Release every CRITICAL job that has previously been deferred. The queue is
   // paused while jobs are reinserted so the worker cannot consume a partially
-  // reordered batch. Reinsert newest-first: with BullMQ LIFO this leaves the
-  // oldest deferred HIGH at the very front and preserves FIFO within the batch.
+  // reordered batch. Reinsert oldest-first to preserve FIFO within the lane.
   async releaseDeferredHighJobs() {
     const wasPaused = await this.isPaused();
     if (!wasPaused) await this.pause();
@@ -357,7 +408,7 @@ class SendQueue {
       for (const job of jobs) {
         if (!job) continue;
         const state = await job.getState().catch(() => "unknown");
-        const high = job.data?.priority === "high" || Boolean(job.opts?.lifo);
+        const high = priorityForJob(job).name === "critical";
         const wasDeferred = state === "delayed" ||
           Number(job.data?.deferCount || 0) > 0 ||
           Boolean(job.data?.deferReason);
@@ -366,17 +417,17 @@ class SendQueue {
         }
       }
 
-      candidates.sort((a, b) => Number(b.job.timestamp || 0) - Number(a.job.timestamp || 0));
+      candidates.sort((a, b) => Number(a.job.timestamp || 0) - Number(b.job.timestamp || 0));
       for (const { job } of candidates) {
-        const data = { ...job.data, priority: "high" };
+        const data = { ...job.data, priority: "critical", priorityLevel: 1 };
         // This admin action explicitly makes the next attempt immediate. Clear
-        // deferral markers so quiet-hours logic treats it like a fresh HIGH;
+        // deferral markers so quiet-hours logic treats it like a fresh CRITICAL;
         // a later failed attempt is still detected through attemptsMade.
         delete data.deferCount;
         delete data.deferReason;
         await this.forgetDeferredHigh(job.id);
         await job.remove();
-        const fresh = await this.queue.add("send", data, { lifo: true });
+        const fresh = await this.queue.add("send", data, { priority: 1 });
         released.push({
           id: fresh.id,
           previousId: String(job.id),

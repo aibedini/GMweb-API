@@ -56,6 +56,7 @@ Full schemas are in [`openapi.json`](./openapi.json). The relevant subset:
 | `GET /health` | Public. Returns `{ ok, service, version }`. Used for **sync detection** (see §4). |
 | `GET /ready` | `200` when Google Messages is paired and ready; `503` otherwise. Check before sending. |
 | `POST /send` | Queue a message. Returns `202 { requestId, jobId }`. Pass `"wait": true` to block for the result. |
+| `GET /send/capacity` | Pending counts for all four lanes and remaining announcement capacity. |
 | `GET /send/status/:requestId` | Poll a send request: `queued` / `active` / `sent` / `failed` / `cancelled`. `jobId` is also accepted. |
 | `POST /send/cancel/:requestId` | Cancel a queued send before it starts. Project keys can cancel only their own sends. |
 | `GET /conversations?limit=20` | List recent conversations (title, snippet, unread, stable `href`). |
@@ -89,6 +90,33 @@ accepted for backwards compatibility, but consumers should store `requestId`
 because it remains stable even if the internal queue job changes. For simple
 callers, add `"wait": true` to get `200 { status: "completed" }` directly
 (up to 90s).
+
+After Enter is pressed, GMweb never submits that message a second time. It first
+checks for the outgoing bubble, then performs delayed DOM-only verification
+checks. Poll responses expose `submittedOnce`, `submittedAt`,
+`verificationStatus`, and `verificationAttempts`. A message confirmed during a
+later check is still `status: "sent"` with
+`verificationStatus: "confirmed_after_recheck"`. If every check is exhausted,
+the terminal status is `unverified`, the stage is
+`unverified_manual_review`, and consumers must not resend automatically because
+the phone may already have sent it.
+
+### Priority lanes and announcement feeder
+
+`POST /send` accepts four canonical lanes: `critical` (level 1: purchase and
+renewal), `expired` (3: time/volume exhausted), `expiring` (6: nearing expiry,
+also the default), and `announcement` (10: bulk/lowest). Lower levels run first,
+FIFO is preserved within every lane, and the currently active browser send is
+never interrupted. Legacy `high` maps to `critical`; legacy `normal` maps to
+`expiring`.
+
+Announcements have a pending cap controlled by `ANNOUNCEMENT_PENDING_LIMIT`
+(default 200). The consumer must retain the full campaign in its own database,
+call `GET /send/capacity`, and enqueue no more than
+`announcement.available`. A race at the limit returns
+`429 announcement_queue_full` plus `Retry-After: 60`. See
+[`EVE_SEND_PRIORITY.md`](./EVE_SEND_PRIORITY.md) for the complete Eve feeder,
+idempotency, status-machine, and migration contract.
 
 ### Cancel before send starts
 

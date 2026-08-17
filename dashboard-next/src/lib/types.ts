@@ -59,7 +59,8 @@ export interface QueueJob {
   to: string | null;
   textPreview: string;
   keyName: string | null;
-  priority: "high" | "normal";
+  priority: "critical" | "expired" | "expiring" | "announcement";
+  priorityLevel: 1 | 3 | 6 | 10;
   attemptsMade: number;
   maxAttempts: number;
   failedReason: string | null;
@@ -103,9 +104,15 @@ export interface SendHistoryItem {
   sentTo?: string | null;
   recipientEvidence?: Record<string, unknown> | null;
   conversationUrl?: string | null;
+  submittedOnce?: boolean;
+  submittedAt?: string | null;
+  verificationStatus?: string | null;
+  verificationAttempts?: number;
   text: string;
   textPreview?: string;
   keyName: string | null;
+  priority?: "critical" | "expired" | "expiring" | "announcement";
+  priorityLevel?: 1 | 3 | 6 | 10;
   jobId: string | null;
   status: string;
   stage: string | null;

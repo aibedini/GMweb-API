@@ -3,10 +3,11 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { GoogleMessagesClient } = require("../src/googleMessagesClient");
+const { GoogleMessagesClient, normalizeComparableMessage } = require("../src/googleMessagesClient");
 const { SendQueue } = require("../src/queue");
 const { SendStore } = require("../src/sendStore");
 const { sendSchedule, sendGate } = require("../src/sendSchedule");
+const { normalizeSendPriority } = require("../src/sendPriority");
 
 function client() {
   return new GoogleMessagesClient({
@@ -15,6 +16,60 @@ function client() {
     conversationCacheFile: "./data/test-conversation-cache.json"
   });
 }
+
+test("priority aliases and numeric levels map to four canonical FIFO lanes", () => {
+  assert.deepEqual(normalizeSendPriority("critical"), { name: "critical", level: 1, bypassQuietHours: true });
+  assert.equal(normalizeSendPriority("high").name, "critical");
+  assert.equal(normalizeSendPriority(2).name, "critical");
+  assert.equal(normalizeSendPriority("expired").level, 3);
+  assert.equal(normalizeSendPriority(4).name, "expired");
+  assert.equal(normalizeSendPriority("normal").name, "expiring");
+  assert.equal(normalizeSendPriority(undefined).name, "expiring");
+  assert.equal(normalizeSendPriority(8).name, "expiring");
+  assert.equal(normalizeSendPriority("announcement").level, 10);
+  assert.equal(normalizeSendPriority(9).name, "announcement");
+});
+
+test("legacy conversation href is only a candidate and must be revalidated", async () => {
+  const c = client();
+  const stages = [];
+  let existingCalls = 0;
+  let startChatCalls = 0;
+  c.ensurePage = async () => ({ url: () => "https://messages.google.com/web/conversations" });
+  c.getCachedRecipientConversation = () => null;
+  c.getLegacyRecipientCandidate = () => ({ href: "/web/conversations/legacy", title: "Saved name" });
+  c.revalidateLegacyConversation = async (_to, candidate) => candidate.href.endsWith("legacy");
+  c.openExistingConversation = async () => { existingCalls += 1; return false; };
+  c.startChatFlow = async () => { startChatCalls += 1; return false; };
+
+  const opened = await c.openForSend("+989121234567", (stage) => stages.push(stage));
+  assert.equal(opened, true);
+  assert.equal(existingCalls, 0);
+  assert.equal(startChatCalls, 0);
+  assert.deepEqual(stages, ["legacy_candidate_found"]);
+});
+
+test("rejected legacy candidate falls back to Start Chat and is not retried in later UI attempts", async () => {
+  const c = client();
+  let revalidations = 0;
+  let startChatCalls = 0;
+  c.ensurePage = async () => ({
+    url: () => "https://messages.google.com/web/conversations/wrong",
+    waitForTimeout: async () => {}
+  });
+  c.getCachedRecipientConversation = () => null;
+  c.getLegacyRecipientCandidate = () => ({ href: "/web/conversations/wrong", title: "Saved name" });
+  c.revalidateLegacyConversation = async () => { revalidations += 1; return false; };
+  c.openExistingConversation = async () => false;
+  c.startChatFlow = async () => { startChatCalls += 1; return false; };
+  c.conversationCreationRateLimited = async () => false;
+  c.openConversationByUrl = async () => false;
+
+  assert.equal(await c.openForSend("+989121234567", () => {}, { restartNewConversation: false }), false);
+  assert.equal(await c.openForSend("+989121234567", () => {}, { restartNewConversation: true }), false);
+  assert.equal(revalidations, 1);
+  assert.equal(startChatCalls, 2);
+});
 
 test("unpaired readiness failures are marked safe for pre-submit recovery", async () => {
   const c = client();
@@ -109,19 +164,21 @@ test("a selected recipient without a composer is retried from Start chat", async
   assert(stages.includes("recipient_filled"));
 });
 
-test("typeAndSend requires a new matching outgoing bubble", async () => {
+test("typeAndSend confirms a matching outgoing bubble after one Enter", async () => {
   const c = client();
-  const input = { fill: async () => {}, press: async () => {} };
+  let submits = 0;
+  const input = { fill: async () => {}, press: async () => { submits += 1; } };
   const page = {
-    evaluate: async () => 4,
-    waitForFunction: async (_fn, arg) => {
-      assert.deepEqual(arg, { before: 4, wanted: "hello world" });
-    },
+    waitForTimeout: async () => {},
     keyboard: { type: async () => {} }
   };
   c.ensurePage = async () => page;
   c.locatorFirst = async () => input;
-  assert.equal(await c.typeAndSend("hello   world"), true);
+  c.outgoingMessageMatches = async () => true;
+  const result = await c.typeAndSend("hello   world");
+  assert.equal(result.verified, true);
+  assert.equal(result.verificationStatus, "confirmed_initial");
+  assert.equal(submits, 1);
 });
 
 test("recipient option selection rejects a different phone number", async () => {
@@ -169,15 +226,27 @@ test("send fails closed when the opened conversation has no recipient evidence",
 
 test("typeAndSend never assumes sent when bubble verification fails", async () => {
   const c = client();
-  const input = { fill: async () => {}, press: async () => {} };
+  let submits = 0;
+  const input = { fill: async () => {}, press: async () => { submits += 1; } };
   const page = {
-    evaluate: async () => 2,
-    waitForFunction: async () => { throw new Error("timeout"); },
+    waitForTimeout: async () => {},
     keyboard: { type: async () => {} }
   };
   c.ensurePage = async () => page;
   c.locatorFirst = async () => input;
-  assert.equal(await c.typeAndSend("not sent"), false);
+  c.outgoingMessageMatches = async () => false;
+  c.sendVerificationInitialTimeoutMs = 0;
+  const result = await c.typeAndSend("not sent");
+  assert.equal(result.verified, false);
+  assert.equal(result.submittedOnce, true);
+  assert.equal(submits, 1);
+});
+
+test("message comparison ignores Google-injected bidi marks", () => {
+  assert.equal(
+    normalizeComparableMessage("حجم\u200f\n y47iman9750\u200b  رو به تمامه"),
+    normalizeComparableMessage("حجم y47iman9750 رو به تمامه")
+  );
 });
 
 test("an unverified submit presses Enter only once and never UI-retries", async () => {
@@ -201,7 +270,18 @@ test("an unverified submit presses Enter only once and never UI-retries", async 
     return true;
   };
   c.lastOutgoingMatches = async () => false;
-  c.typeAndSend = async () => { submits += 1; return false; };
+  c.typeAndSend = async () => {
+    submits += 1;
+    return {
+      submittedOnce: true,
+      submittedAt: "2026-08-16T16:00:00.000Z",
+      verified: false,
+      verificationStatus: "pending_recheck",
+      verificationMethod: "outgoing_bubble_dom",
+      verificationAttempts: 1
+    };
+  };
+  c.verifySubmittedMessage = async () => ({ verified: false, attempts: 3, method: "outgoing_bubble_dom_recheck" });
 
   await assert.rejects(
     c.sendMessageUnlocked({
@@ -211,8 +291,55 @@ test("an unverified submit presses Enter only once and never UI-retries", async 
   );
   assert.equal(submits, 1);
   assert.equal(stages.filter((stage) => stage === "typing").length, 1);
-  assert(stages.includes("send_unverified"));
+  assert(stages.includes("verification_pending"));
+  assert(stages.includes("unverified_manual_review"));
   assert.equal(stages.some((stage) => stage.startsWith("ui_retry_")), false);
+});
+
+test("a delayed bubble is confirmed by verification-only retries without another Enter", async () => {
+  const c = client();
+  let submits = 0;
+  const stages = [];
+  c.ensurePage = async () => ({
+    bringToFront: async () => {},
+    waitForTimeout: async () => {},
+    url: () => "https://messages.google.com/web/conversations/example"
+  });
+  c.ensurePaired = async () => {};
+  c.openForSend = async (to) => {
+    c.activeSendRecipientEvidence = {
+      cacheKey: c.recipientCacheKey(to), requestedTo: to, sentTo: to,
+      source: "test", matchedVariant: c.recipientCacheKey(to), matchedText: to,
+      conversationUrl: "https://messages.google.com/web/conversations/example"
+    };
+    return true;
+  };
+  c.lastOutgoingMatches = async () => false;
+  c.typeAndSend = async () => {
+    submits += 1;
+    return {
+      submittedOnce: true,
+      submittedAt: "2026-08-16T16:00:00.000Z",
+      verified: false,
+      verificationStatus: "pending_recheck",
+      verificationMethod: "outgoing_bubble_dom",
+      verificationAttempts: 1
+    };
+  };
+  c.verifySubmittedMessage = async (_text, { onAttempt }) => {
+    onAttempt(1);
+    return { verified: true, attempts: 1, method: "outgoing_bubble_dom_recheck" };
+  };
+
+  const result = await c.sendMessageUnlocked({
+    to: "+989121234567", text: "one submission", onStage: (stage) => stages.push(stage)
+  });
+  assert.equal(submits, 1);
+  assert.equal(result.submission.verificationStatus, "confirmed_after_recheck");
+  assert.equal(result.submission.verificationAttempts, 2);
+  assert(stages.includes("verification_pending"));
+  assert(stages.includes("verification_retry_1"));
+  assert(stages.includes("sent_after_recheck"));
 });
 
 test("a recent matching bubble prevents another Enter", async () => {
@@ -265,7 +392,7 @@ test("active cancellation stops before Enter", async () => {
   assert.equal(enterPresses, 0);
 });
 
-test("normal misses go to the queue tail and high misses wait ten successes", async () => {
+test("conversation misses preserve their canonical priority lane", async () => {
   const q = Object.create(SendQueue.prototype);
   const enqueued = [];
   const zadds = [];
@@ -282,10 +409,77 @@ test("normal misses go to the queue tail and high misses wait ten successes", as
   const normal = await q.deferNormal({ to: "1", text: "n" });
   const high = await q.deferHigh({ to: "2", text: "h" }, 10);
   assert.equal(normal.job.opts.lifo, undefined);
-  assert.equal(normal.job.data.priority, "normal");
-  assert.equal(high.job.opts.lifo, true);
+  assert.equal(normal.job.data.priority, "expiring");
+  assert.equal(normal.job.opts.priority, 6);
+  assert.equal(high.job.data.priority, "critical");
+  assert.equal(high.job.opts.priority, 1);
+  assert.equal(high.job.opts.lifo, undefined);
   assert(high.job.opts.delay > 300 * 24 * 60 * 60 * 1000);
   assert.deepEqual(zadds[1], ["gmweb-send:deferred-high", 17, high.job.id]);
+});
+
+test("capacity counts canonical and legacy jobs across all pending states", async () => {
+  const q = Object.create(SendQueue.prototype);
+  const jobs = [
+    { data: { priority: "critical" }, opts: { priority: 1 } },
+    { data: { priority: "high" }, opts: { lifo: true } },
+    { data: { priority: "expired" }, opts: { priority: 3 } },
+    { data: { priority: "normal" }, opts: {} },
+    { data: { priority: "announcement" }, opts: { priority: 10 } }
+  ];
+  q.queue = { getJobs: async () => jobs };
+
+  assert.deepEqual(await q.pendingCountsByPriority(), {
+    critical: 2,
+    expired: 1,
+    expiring: 1,
+    announcement: 1
+  });
+  assert.equal(await q.countPendingByPriority("announcement"), 1);
+});
+
+test("queue position excludes the newly enqueued job and counts same-or-higher lanes", async () => {
+  const q = Object.create(SendQueue.prototype);
+  const makeJob = (id, priority) => ({ id, data: { priority }, opts: {} });
+  q.queue = {
+    getJobs: async ([state]) => state === "active"
+      ? [makeJob("active", "expiring")]
+      : [makeJob("critical", "critical"), makeJob("self", "expired"), makeJob("announcement", "announcement")]
+  };
+
+  assert.equal(await q.queuePositionForPriority("expired", "self"), 2);
+});
+
+test("bulk priority changes pending jobs in place and skips active jobs", async () => {
+  const q = Object.create(SendQueue.prototype);
+  let updatedData = null;
+  let changedPriority = null;
+  const waiting = {
+    id: "waiting-1",
+    data: { to: "+989000000001", priority: "expiring", priorityLevel: 6 },
+    opts: { priority: 6 },
+    getState: async () => "waiting",
+    updateData: async (data) => { updatedData = data; waiting.data = data; },
+    changePriority: async (options) => { changedPriority = options; }
+  };
+  const active = {
+    id: "active-1",
+    data: { priority: "expired" },
+    opts: { priority: 3 },
+    getState: async () => "active"
+  };
+  q.queue = { getJob: async (id) => id === "waiting-1" ? waiting : active };
+
+  const changed = await q.changeJobPriority("waiting-1", "critical");
+  assert.equal(changed.changed, true);
+  assert.equal(changed.previousPriority, "expiring");
+  assert.equal(changed.priority, "critical");
+  assert.equal(updatedData.priority, "critical");
+  assert.equal(updatedData.priorityLevel, 1);
+  assert.deepEqual(changedPriority, { priority: 1 });
+
+  const skipped = await q.changeJobPriority("active-1", "announcement");
+  assert.deepEqual(skipped, { changed: false, reason: "active", state: "active" });
 });
 
 test("Tehran quiet hours block normal sends from 02:00 until 08:00", () => {
@@ -324,7 +518,8 @@ test("quiet-hour deferral creates a durable delayed normal job", async () => {
   } finally {
     Date.now = realNow;
   }
-  assert.equal(added.data.priority, "normal");
+  assert.equal(added.data.priority, "expiring");
+  assert.equal(added.data.priorityLevel, 6);
   assert.equal(added.data.deferReason, "quiet_hours");
   assert.equal(added.opts.delay, 4.5 * 60 * 60 * 1000);
 });
@@ -348,9 +543,11 @@ test("quiet-hour deferral preserves HIGH while delaying its retry", async () => 
   } finally {
     Date.now = realNow;
   }
-  assert.equal(added.data.priority, "high");
+  assert.equal(added.data.priority, "critical");
+  assert.equal(added.data.priorityLevel, 1);
   assert.equal(added.data.deferReason, "quiet_hours");
-  assert.equal(added.opts.lifo, true);
+  assert.equal(added.opts.priority, 1);
+  assert.equal(added.opts.lifo, undefined);
   assert.equal(added.opts.delay, 4.5 * 60 * 60 * 1000);
 });
 
@@ -386,12 +583,12 @@ test("bulk release moves only deferred HIGH jobs to the front, oldest first", as
   q.forgetDeferredHigh = async (id) => { forgotten.push(String(id)); };
 
   const released = await q.releaseDeferredHighJobs();
-  assert.deepEqual(removed, ["new-high", "old-high"]);
-  assert.deepEqual(forgotten, ["new-high", "old-high"]);
-  assert.deepEqual(added.map((entry) => entry.data.to), ["new-high", "old-high"]);
-  assert.equal(added.every((entry) => entry.opts.lifo === true), true);
+  assert.deepEqual(removed, ["old-high", "new-high"]);
+  assert.deepEqual(forgotten, ["old-high", "new-high"]);
+  assert.deepEqual(added.map((entry) => entry.data.to), ["old-high", "new-high"]);
+  assert.equal(added.every((entry) => entry.opts.priority === 1 && entry.opts.lifo === undefined), true);
   assert.equal("deferCount" in added[0].data, false);
-  assert.deepEqual(released.map((entry) => entry.previousId), ["new-high", "old-high"]);
+  assert.deepEqual(released.map((entry) => entry.previousId), ["old-high", "new-high"]);
   assert.equal(paused, false);
 });
 
@@ -493,10 +690,12 @@ test("single-job promotion clears delay markers and works for normal jobs", asyn
   assert.equal(result.id, "promoted");
   assert.equal(removed, true);
   assert.deepEqual(forgotten, ["normal-delayed"]);
-  assert.equal(added.data.priority, "high");
+  assert.equal(added.data.priority, "critical");
+  assert.equal(added.data.priorityLevel, 1);
   assert.equal("deferCount" in added.data, false);
   assert.equal("deferReason" in added.data, false);
   assert.equal(added.opts.lifo, true);
+  assert.equal(added.opts.priority, undefined);
 });
 
 test("consumer cancel removes only pending jobs", async () => {
@@ -596,6 +795,8 @@ test("idempotent sends receive a complete durable SQLite timeline", () => {
     assert(row.stage_at > 0);
     // Replacing a BullMQ job must not replace the public request identity.
     store.attachJob(id, "43");
+    assert.equal(store.updatePriorityByJob("42", "expired"), 1);
+    assert.equal(store.byReference(requestId).priority, "expired");
     store.markStatus("43", "sent", { attempts: 2, result: { sent: true, transport: "rcs" } });
     const completed = store.byReference(requestId);
     assert.equal(completed.job_id, "43");
@@ -755,7 +956,14 @@ test("google messages rate limit fallback scrolling mode triggers, scrolls, defe
   c.ensurePaired = async () => {};
   c.clickLoadMoreConversations = async () => true;
   c.composerReady = async () => true;
-  c.typeAndSend = async () => true;
+  c.typeAndSend = async () => ({
+    submittedOnce: true,
+    submittedAt: "2026-08-16T16:00:00.000Z",
+    verified: true,
+    verificationStatus: "confirmed_initial",
+    verificationMethod: "outgoing_bubble_dom",
+    verificationAttempts: 1
+  });
 
   // We have no cached conversation initialy
   c.sidebarConversationIndex = new Map();
