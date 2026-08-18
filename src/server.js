@@ -25,7 +25,7 @@ const app = Fastify({
 });
 
 const client = new GoogleMessagesClient(config);
-const sseClients = new Set();
+const sseClients = new Map(); // reply -> { type: "full" | "project", keyName }
 const apiKeyStore = new ApiKeyStore(
   path.join(config.rootDir, "data", "api-keys.json"),
   path.join(config.rootDir, "data", "api-requests.jsonl")
@@ -385,7 +385,7 @@ function recordAuthFailure(ip) {
 }
 
 function requireToken(request, reply, done) {
-  if (config.publicHealth && request.url === "/health") return done();
+  if (config.publicHealth && requestPath(request.url) === "/health") return done();
   if (config.dashboardEnabled && isDashboardAsset(request.url)) return done();
   if (config.dashboardEnabled && requestPath(request.url).startsWith("/vnc")) {
     if (hasDashboardAccess(request)) return done();
@@ -452,7 +452,15 @@ function requireToken(request, reply, done) {
 
 function emitSse(event) {
   const payload = `data: ${JSON.stringify(event)}\n\n`;
-  for (const reply of sseClients) {
+  for (const [reply, scope] of sseClients) {
+    // Project API keys may only receive events for their own sends. /send/status
+    // and /send/cancel already enforce this per-key isolation; the live stream
+    // must not leak other projects' recipients or message bodies. The master
+    // token and dashboard sessions still see the full stream.
+    if (scope.type === "project") {
+      const ledger = sendStore.byJob(event.jobId) || sendStore.byReference(event.requestId);
+      if (!ledger || ledger.key_name !== scope.keyName) continue;
+    }
     reply.raw.write(payload);
   }
 }
@@ -3504,6 +3512,8 @@ app.get("/events", {
       "- `browser_recovering` — a safe pre-submit reload/reconnect started or finished",
       "- `browser_hard_restart` — Chrome and API restart was scheduled after recovery failed",
       "",
+      "**Scoping:** a project API key receives only its own sends' events; the master token and dashboard sessions receive the full stream.",
+      "",
       "**Usage (JavaScript):**",
       "```js",
       "const es = new EventSource('/events', { headers: { Authorization: 'Bearer gmw_...' } });",
@@ -3523,7 +3533,10 @@ app.get("/events", {
     connection: "keep-alive"
   });
   reply.raw.write(": connected\n\n");
-  sseClients.add(reply);
+  const scope = request._projectKey
+    ? { type: "project", keyName: request._projectKey.name }
+    : { type: "full" };
+  sseClients.set(reply, scope);
 
   request.raw.on("close", () => {
     sseClients.delete(reply);

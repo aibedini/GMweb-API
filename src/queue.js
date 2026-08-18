@@ -11,7 +11,12 @@ const HIGH_DEFER_DELAY_MS = 365 * 24 * 60 * 60 * 1000;
 const connection = {
   host: process.env.REDIS_HOST || "127.0.0.1",
   port: Number(process.env.REDIS_PORT) || 6379,
-  maxRetriesPerRequest: null
+  maxRetriesPerRequest: null,
+  // Optional Redis authentication/TLS for managed or hardened Redis. Omitted
+  // when unset, so the default (no auth, plaintext to localhost) is unchanged.
+  ...(process.env.REDIS_USERNAME ? { username: process.env.REDIS_USERNAME } : {}),
+  ...(process.env.REDIS_PASSWORD ? { password: process.env.REDIS_PASSWORD } : {}),
+  ...(["1", "true", "yes", "on"].includes(String(process.env.REDIS_TLS || "").toLowerCase()) ? { tls: {} } : {})
 };
 
 class SendQueue {
