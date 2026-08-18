@@ -3113,6 +3113,56 @@ app.post("/admin/queue/release-delayed-high", {
   return { ok: true, released: results.length };
 });
 
+// Eve panel compatibility endpoint. Mirrors /admin/queue/release-delayed-high
+// but accepts the Eve request shape and returns { promoted: N } so the panel
+// can display the count without parsing admin-specific fields.
+app.post("/queue/promote-high", {
+  schema: {
+    summary: "Release delayed critical jobs (Eve-compatible)",
+    description: "Moves every delayed CRITICAL send to the front of the queue for immediate processing. Accepts Eve's request shape and returns { promoted: N }. Authenticated API keys may call this endpoint.",
+    tags: ["Messaging"],
+    body: {
+      type: "object",
+      properties: {
+        all: { type: "boolean" },
+        priority: { type: "string" },
+        states: { type: "array", items: { type: "string" } },
+        releaseDelayed: { type: "boolean" },
+        position: { type: "string" }
+      }
+    },
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          promoted: { type: "integer" }
+        }
+      },
+      404: {
+        type: "object",
+        properties: {
+          error: { type: "string" }
+        }
+      }
+    }
+  }
+}, async () => {
+  const results = await sendQueue.releaseDeferredHighJobs();
+  for (const result of results) {
+    const ledger = sendStore.byJob(result.previousId);
+    if (ledger) sendStore.attachJob(ledger.id, result.id);
+    if (result._data?._idempotencyKey && result._data?._bodyHash) {
+      await sendQueue.setIdempotencyJob(result._data._idempotencyKey, result.id, result._data._bodyHash).catch(() => {});
+    }
+  }
+  emitSse({
+    type: "queue_delayed_high_released",
+    count: results.length,
+    at: new Date().toISOString()
+  });
+  return { promoted: results.length };
+});
+
 app.post("/admin/queue/jobs/:id/promote", {
   schema: {
     summary: "Send a queued job first",
