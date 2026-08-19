@@ -61,6 +61,7 @@ module.exports = {
   sendTimeoutMs: intFromEnv(process.env.SEND_TIMEOUT_MS, 240000),
   sendVerificationInitialTimeoutMs: intFromEnv(process.env.SEND_VERIFICATION_INITIAL_TIMEOUT_MS, 15000),
   sendVerificationRetryDelaysMs: intListFromEnv(process.env.SEND_VERIFICATION_RETRY_DELAYS_MS, [3000, 10000, 20000]),
+  conversationLoadTimeoutMs: intFromEnv(process.env.CONVERSATION_LOAD_TIMEOUT_MS, 15000),
   conversationHistoryMaxBatches: intFromEnv(process.env.CONVERSATION_HISTORY_MAX_BATCHES, 80),
   conversationCacheFile: path.resolve(rootDir, process.env.CONVERSATION_CACHE_FILE || "./data/conversation-cache.json"),
   conversationIndexFile: path.resolve(rootDir, process.env.CONVERSATION_INDEX_FILE || "./data/conversation-index.json"),

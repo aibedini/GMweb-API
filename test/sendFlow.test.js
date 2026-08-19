@@ -17,6 +17,29 @@ function client() {
   });
 }
 
+// Evaluates a browser predicate against a stubbed DOM + location so
+// conversationLoaded's visibility and "left the new-conversation screen"
+// checks are exercised without launching a browser.
+function evaluateDomPredicate(fn, { url, composer = [], recipientInput = false } = {}) {
+  const composerNodes = composer.map((visible) => ({
+    offsetParent: visible ? {} : null,
+    getBoundingClientRect: () => ({ width: visible ? 200 : 0, height: visible ? 40 : 0 })
+  }));
+  const prevDocument = globalThis.document;
+  const prevLocation = globalThis.location;
+  try {
+    globalThis.document = {
+      querySelectorAll: () => composerNodes,
+      querySelector: () => (recipientInput ? { placeholder: "Type a name" } : null)
+    };
+    globalThis.location = { href: url };
+    return fn();
+  } finally {
+    globalThis.document = prevDocument;
+    globalThis.location = prevLocation;
+  }
+}
+
 test("priority aliases and numeric levels map to four canonical FIFO lanes", () => {
   assert.deepEqual(normalizeSendPriority("critical"), { name: "critical", level: 1, bypassQuietHours: true });
   assert.equal(normalizeSendPriority("high").name, "critical");
@@ -162,6 +185,73 @@ test("a selected recipient without a composer is retried from Start chat", async
   assert.equal(startChatClicks, 1);
   assert(stages.includes("restarting_start_chat"));
   assert(stages.includes("recipient_filled"));
+});
+
+test("conversationLoaded requires a visible composer off the new-conversation screen", async () => {
+  const c = client();
+  let scenario = {
+    url: "https://messages.google.com/web/conversations/abc",
+    composer: [true],
+    recipientInput: false
+  };
+  c.ensurePage = async () => ({
+    waitForFunction: async (fn) => {
+      if (evaluateDomPredicate(fn, scenario)) return true;
+      throw new Error("composer did not load");
+    }
+  });
+
+  assert.equal(await c.conversationLoaded(100), true);
+
+  // A hidden composer must not count as loaded even off the new screen.
+  scenario = {
+    url: "https://messages.google.com/web/conversations/abc",
+    composer: [false],
+    recipientInput: false
+  };
+  assert.equal(await c.conversationLoaded(100), false);
+
+  // Still on the recipient-entry screen with an active recipient input: not loaded.
+  scenario = {
+    url: "https://messages.google.com/web/conversations/new",
+    composer: [true],
+    recipientInput: true
+  };
+  assert.equal(await c.conversationLoaded(100), false);
+});
+
+test("clickRecipientOption waits for the conversation to load before reporting opened", async () => {
+  const c = client();
+  assert.equal(c.conversationLoadTimeoutMs, 15000); // default budget, not 4500
+
+  let clicked = 0;
+  let url = "https://messages.google.com/web/conversations/new";
+  let loaded = false;
+  const option = {
+    evaluate: async () => "Send to +989121234567",
+    click: async () => { clicked += 1; }
+  };
+  c.ensurePage = async () => ({
+    url: () => url,
+    waitForFunction: async (fn) => {
+      if (loaded && evaluateDomPredicate(fn, { url, composer: [true], recipientInput: false })) return true;
+      throw new Error("composer did not load");
+    }
+  });
+  c.locatorFirst = async () => option;
+
+  // Recipient committed but the conversation has not finished loading yet.
+  const pending = await c.clickRecipientOption("+989121234567");
+  assert.equal(pending.status, "selected");
+  assert.equal(clicked, 1);
+
+  // Conversation finishes loading and leaves /new: now it reports opened.
+  loaded = true;
+  url = "https://messages.google.com/web/conversations/abc";
+  const opened = await c.clickRecipientOption("+989121234567");
+  assert.equal(opened.status, "opened");
+  assert.equal(opened.evidence.conversationUrl, "https://messages.google.com/web/conversations/abc");
+  assert.equal(clicked, 2);
 });
 
 test("typeAndSend confirms a matching outgoing bubble after one Enter", async () => {

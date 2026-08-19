@@ -36,6 +36,9 @@ class GoogleMessagesClient extends EventEmitter {
     // Three in-SPA open attempts (including pacing and Google's rendering)
     // need a wider budget than ordinary browser actions.
     this.sendOperationTimeoutMs = Math.max(220000, Number(config.sendTimeoutMs || 0) - 10000);
+    // How long to wait, after committing a recipient, for the conversation to
+    // actually load (URL leaves /conversations/new and a real composer appears).
+    this.conversationLoadTimeoutMs = Number(config.conversationLoadTimeoutMs) || 15000;
     // How long ensurePaired() will wait through transient Google cookie-rotation
     // before giving up. Kept well under lockTimeoutMs so the watchdog still fires.
     this.pairedWaitMs = Number(config.pairedWaitMs) || 20000;
@@ -618,6 +621,34 @@ class GoogleMessagesClient extends EventEmitter {
         return !!document.querySelector(
           "[aria-label*='Text message' i], [aria-label*='Message' i], textarea, [contenteditable='true']"
         );
+      }, null, { timeout });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Stricter than composerReady: the conversation has actually loaded — a
+  // *visible* composer is present and we are no longer on the recipient-entry
+  // screen. A bare textarea/[contenteditable] that lingers on the loading or
+  // Start-chat screen must not count as "ready".
+  async conversationLoaded(timeout = 15000) {
+    const page = await this.ensurePage();
+    try {
+      await page.waitForFunction(() => {
+        const composer = [...document.querySelectorAll(
+          "[aria-label*='Text message' i], [aria-label*='Message' i], textarea, [contenteditable='true']"
+        )].find((node) => {
+          const rect = node.getBoundingClientRect();
+          return rect && rect.width > 0 && rect.height > 0 && node.offsetParent !== null;
+        });
+        if (!composer) return false;
+        const onNewScreen = /\/web\/conversations\/new(?:[/?#]|$)/i.test(location.href);
+        const recipientInput = document.querySelector(
+          "input[placeholder*='Type a name' i], input[placeholder*='name' i], input[type='tel'], input[aria-label*='to' i], input[aria-label*='recipient' i]"
+        );
+        // Loaded = visible composer AND we left the recipient-entry screen.
+        return onNewScreen ? !recipientInput : true;
       }, null, { timeout });
       return true;
     } catch {
@@ -1600,7 +1631,7 @@ class GoogleMessagesClient extends EventEmitter {
       const evidence = this.recipientEvidenceFromText(to, optionText, "recipient_option", page.url());
       if (!evidence) return { status: "missing", evidence: null };
       await option.click({ timeout: 1500 });
-      if (await this.composerReady(4500)) {
+      if (await this.conversationLoaded(this.conversationLoadTimeoutMs)) {
         return { status: "opened", evidence: { ...evidence, conversationUrl: page.url() } };
       }
       return { status: "selected", evidence };
