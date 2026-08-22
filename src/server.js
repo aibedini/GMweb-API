@@ -537,6 +537,47 @@ let lastHardRestartAt = 0;
 let hardRecoveryScheduled = false;
 const activeSendCancellationRequests = new Set();
 
+// --- Send power (global kill switch) ------------------------------------
+// "power-off" flips `sendPowerOn` to false and blocks EVERY send path: new
+// /send requests are rejected, the queue is paused, and any in-flight send is
+// cancelled before Enter is pressed. "power-on" restores normal operation.
+// The state is persisted to disk so an API restart cannot silently re-enable
+// sending while an operator believes it is still off.
+const sendPowerFile = path.join(config.rootDir, "data", "send-power.json");
+let sendPowerOn = true;
+let sendPowerChangedAt = Date.now();
+
+async function loadSendPower() {
+  try {
+    const parsed = JSON.parse(await fs.readFile(sendPowerFile, "utf8"));
+    if (typeof parsed.on === "boolean") {
+      sendPowerOn = parsed.on;
+      sendPowerChangedAt = Number(parsed.changedAt) || Date.now();
+      if (!sendPowerOn) app.log.warn("send power is OFF (persisted); no messages will be sent until power-on");
+    }
+  } catch { /* default on */ }
+}
+
+async function persistSendPower() {
+  try {
+    await fs.mkdir(path.dirname(sendPowerFile), { recursive: true });
+    await fs.writeFile(sendPowerFile, JSON.stringify({ on: sendPowerOn, changedAt: sendPowerChangedAt }, null, 2), "utf8");
+  } catch (error) {
+    app.log.warn({ error }, "could not persist send power state");
+  }
+}
+
+async function setSendPower(on) {
+  const changed = sendPowerOn !== on;
+  sendPowerOn = on;
+  sendPowerChangedAt = Date.now();
+  if (changed) await persistSendPower();
+  if (on) await sendQueue.resume().catch(() => {});
+  else await sendQueue.pause().catch(() => {});
+  emitSse({ type: "send_power", powerOn: on, at: new Date().toISOString() });
+  return { ok: true, powerOn: on };
+}
+
 function isBrowserAutomationWedge(error) {
   const text = String(error?.message || error || "");
   return /send_timeout|browser_lock_.*timeout|connectOverCDP.*Timeout|Target page.*closed/i.test(text);
@@ -760,6 +801,40 @@ async function deferConversationJob(job, error) {
   return { deferred: true, ...event };
 }
 
+// When the send power is off, a job that somehow reached the worker (a race
+// with the queue pause) is NOT sent. It is re-queued with a short delay so it
+// is delivered after power-on, mirroring the quiet-hours defer path.
+async function deferPowerOffJob(job) {
+  const priority = priorityForJob(job);
+  const ledger = sendStore.byJob(job.id);
+  sendStore.markStatus(job.id, "queued", { attempts: job.attemptsMade || 0 });
+  sendStore.markStage(job.id, "power_off");
+  const data = {
+    ...job.data,
+    priority: priority.name,
+    priorityLevel: priority.level,
+    _ledgerId: ledger?.id || job.data?._ledgerId || null
+  };
+  const deferred = await sendQueue.deferUntil(data, Date.now() + 30000, "power_off", { priority: priority.name });
+  if (data._ledgerId) sendStore.attachJob(data._ledgerId, deferred.id);
+  if (data._idempotencyKey && data._bodyHash) {
+    await sendQueue.setIdempotencyJob(data._idempotencyKey, deferred.id, data._bodyHash).catch(() => {});
+  }
+  const event = {
+    type: "send_deferred",
+    reason: "power_off",
+    requestId: requestIdForJob(job),
+    jobId: job.id,
+    deferredJobId: deferred.id,
+    to: job.data?.to,
+    priority: priority.name,
+    priorityLevel: priority.level,
+    at: new Date().toISOString()
+  };
+  emitSse(event);
+  return { deferred: true, ...event };
+}
+
 async function handleSendCompleted(job, result) {
   activeSendCancellationRequests.delete(String(job.id));
   if (result?.deferred) return;
@@ -880,6 +955,7 @@ async function handleSendCompleted(job, result) {
 function startSendWorker() {
   sendQueue.startWorker(
     async (job) => {
+      if (!sendPowerOn) return deferPowerOffJob(job);
       const priority = priorityForJob(job);
       // Runs in-process; shares the single Playwright browser via withBrowserLock.
       const schedule = sendGate(new Date(), {
@@ -896,7 +972,7 @@ function startSendWorker() {
           client.sendMessage({
             to: job.data.to,
             text: job.data.text,
-            shouldCancel: () => activeSendCancellationRequests.has(String(job.id)),
+            shouldCancel: () => !sendPowerOn || activeSendCancellationRequests.has(String(job.id)),
             // Per-message progress: record the stage in the ledger and stream it.
             onStage: (s) => {
               sendStore.markStage(job.id, s);
@@ -1675,7 +1751,7 @@ app.post("/admin/action", {
       properties: {
         action: {
           type: "string",
-          enum: ["vnc-on", "vnc-off", "restart-api", "restart-chrome", "browser-start", "browser-restart", "smoke"],
+          enum: ["vnc-on", "vnc-off", "restart-api", "restart-chrome", "browser-start", "browser-restart", "smoke", "power-off", "power-on"],
           description: "`restart-api` and `restart-chrome` are async (return immediately). All others are synchronous."
         }
       }
@@ -1712,7 +1788,9 @@ app.post("/admin/action", {
       "restart-chrome",
       "browser-start",
       "browser-restart",
-      "smoke"
+      "smoke",
+      "power-off",
+      "power-on"
     ])
   });
   const parsed = schema.safeParse(request.body || {});
@@ -1753,7 +1831,35 @@ app.post("/admin/action", {
     setTimeout(() => scheduleSystemctl(["restart", "gmweb-api.service"]), 2500);
     return { ok: true, action, queued: true };
   }
+  if (action === "power-off") {
+    return setSendPower(false);
+  }
+  if (action === "power-on") {
+    return setSendPower(true);
+  }
 });
+
+app.get("/admin/power", {
+  schema: {
+    summary: "Send power state",
+    description: "Returns whether sending is currently powered on. When `powerOn` is false, `POST /send` rejects every message (HTTP 503 `powered_off`) and the send queue is paused. **Master token only.**",
+    tags: ["Admin"],
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          powerOn: { type: "boolean" },
+          changedAt: { type: "string", format: "date-time" }
+        }
+      }
+    }
+  }
+}, async () => ({
+  ok: true,
+  powerOn: sendPowerOn,
+  changedAt: new Date(sendPowerChangedAt).toISOString()
+}));
 
 app.get("/ready", {
   schema: {
@@ -2113,10 +2219,26 @@ app.post("/send", {
           priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           error: { type: "string" }
         }
+      },
+      503: {
+        type: "object",
+        description: "Returned when the global send power is off (poweroff). No message is sent.",
+        properties: {
+          error: { type: "string", enum: ["powered_off"] },
+          message: { type: "string" }
+        }
       }
     }
   }
 }, async (request, reply) => {
+  // Global kill switch: when the send power is off, refuse every message — no
+  // matter the priority, key, idempotency, or remaining capacity. Nothing is
+  // queued, so nothing can be sent until a power-on is issued.
+  if (!sendPowerOn) {
+    reply.code(503).send({ error: "powered_off", message: "Sending is powered off. No messages will be sent until power-on." });
+    return;
+  }
+
   // Per-project rate limit (only applies to project API keys, not master)
   const projectKey = request._projectKey;
   if (projectKey) {
@@ -3604,8 +3726,12 @@ async function initializeBrowserAndConversationIndex({ resumeAfterWarm }) {
     });
     app.log.info({ stats }, "conversation sidebar index ready");
     if (resumeAfterWarm) {
-      await sendQueue.resume();
-      emitSse({ type: "queue_resumed", reason: "conversation_index_ready", at: new Date().toISOString() });
+      if (sendPowerOn) {
+        await sendQueue.resume();
+        emitSse({ type: "queue_resumed", reason: "conversation_index_ready", at: new Date().toISOString() });
+      } else {
+        app.log.warn("send power is OFF; queue stays paused until power-on");
+      }
     }
   } catch (error) {
     // Keep the queue paused: Start-chat fallback is still available after a
@@ -3622,6 +3748,7 @@ async function main() {
   await loadSessions();
   await apiKeyStore.load();
   await sendPacing.load();
+  await loadSendPower();
   client.refreshConversationInterval();
   const queueWasPaused = await sendQueue.isPaused().catch(() => true);
   if (!queueWasPaused) await sendQueue.pause();

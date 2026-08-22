@@ -388,7 +388,7 @@ class GoogleMessagesClient extends EventEmitter {
     const cached = this.getCachedRecipientConversation(to);
     if (cached?.href) {
       const convId = cached.href.split("/").pop();
-      if (convId && page.url().includes(convId) && await this.composerReady(1200)) {
+      if (convId && this.isExpectedConversationUrl(page.url(), cached.href) && await this.conversationLoaded(1200)) {
         this.activeSendRecipientEvidence = { ...cached.recipientEvidence, conversationUrl: page.url() };
         return true;
       }
@@ -511,7 +511,9 @@ class GoogleMessagesClient extends EventEmitter {
 
       if (opened) {
         const recipientEvidence = this.activeSendRecipientEvidence;
-        if (!recipientEvidence || recipientEvidence.cacheKey !== this.recipientCacheKey(to)) {
+        if (!recipientEvidence ||
+            recipientEvidence.cacheKey !== this.recipientCacheKey(to) ||
+            !this.isExpectedConversationUrl(page.url(), recipientEvidence.conversationUrl)) {
           stage("recipient_unverified");
           const error = new Error(`Refusing to send to ${to}: the active conversation recipient was not verified.`);
           error.code = "RECIPIENT_UNVERIFIED";
@@ -684,14 +686,14 @@ class GoogleMessagesClient extends EventEmitter {
 
     // Already viewing it?
     const convId = match.href.split("/").pop();
-    if (convId && page.url().includes(convId) && await this.composerReady(800)) {
+    if (convId && this.isExpectedConversationUrl(page.url(), match.href) && await this.conversationLoaded(800)) {
       this.activeSendRecipientEvidence = { ...evidence, conversationUrl: page.url() };
       this.cacheRecipientConversation(to, match.href, match.title || "", this.activeSendRecipientEvidence);
       return true;
     }
 
     const clicked = await this.clickConversationInSidebar(page, match.href);
-    if (clicked && await this.composerReady(6000)) {
+    if (clicked && this.isExpectedConversationUrl(page.url(), match.href) && await this.conversationLoaded(6000)) {
       this.activeSendRecipientEvidence = { ...evidence, conversationUrl: page.url() };
       this.cacheRecipientConversation(to, match.href, match.title || "", this.activeSendRecipientEvidence);
       return true;
@@ -703,7 +705,7 @@ class GoogleMessagesClient extends EventEmitter {
     // the much slower Start-chat flow.
     try {
       await page.goto(new URL(match.href, MESSAGES_URL).toString(), { waitUntil: "domcontentloaded" });
-      if (await this.composerReady(10000)) {
+      if (this.isExpectedConversationUrl(page.url(), match.href) && await this.conversationLoaded(10000)) {
         this.activeSendRecipientEvidence = { ...evidence, conversationUrl: page.url() };
         this.cacheRecipientConversation(to, match.href, match.title || "", this.activeSendRecipientEvidence);
         return true;
@@ -1465,7 +1467,15 @@ class GoogleMessagesClient extends EventEmitter {
       await link.waitFor({ state: "attached", timeout: 1500 });
       await link.scrollIntoViewIfNeeded().catch(() => {});
       await link.click();
-      return true;
+      await page.waitForFunction(
+        (expectedId) => {
+          const activeId = location.pathname.match(/\/web\/conversations\/([^/?#]+)/i)?.[1] || "";
+          return activeId === expectedId;
+        },
+        convId,
+        { timeout: this.conversationLoadTimeoutMs }
+      );
+      return this.isExpectedConversationUrl(page.url(), href);
     } catch {
       return false;
     }
@@ -1499,6 +1509,18 @@ class GoogleMessagesClient extends EventEmitter {
     return this.phoneVariants(to).some((variant) => variant.length >= 7 && titleDigits === variant);
   }
 
+  isExpectedConversationUrl(currentUrl, expectedHref) {
+    try {
+      const current = new URL(currentUrl, MESSAGES_URL);
+      const expected = new URL(expectedHref, MESSAGES_URL);
+      const currentId = current.pathname.match(/\/web\/conversations\/([^/?#]+)/i)?.[1] || "";
+      const expectedId = expected.pathname.match(/\/web\/conversations\/([^/?#]+)/i)?.[1] || "";
+      return Boolean(currentId && expectedId && currentId === expectedId && currentId.toLowerCase() !== "new");
+    } catch {
+      return false;
+    }
+  }
+
   normalizePhone(value) {
     return String(value || "").replace(/\D/g, "");
   }
@@ -1517,10 +1539,11 @@ class GoogleMessagesClient extends EventEmitter {
   }
 
   recipientEvidenceFromText(to, text, source, hrefOrUrl = "") {
-    const normalized = this.normalizePhone(text);
+    const phoneTokens = String(text || "").match(/(?:\+?\d[\d\s().-]{5,}\d)/g) || [];
+    const normalizedTokens = phoneTokens.map((token) => this.normalizePhone(token)).filter(Boolean);
     const matchedVariant = this.phoneVariants(to)
       .filter((variant) => variant.length >= 7)
-      .find((variant) => normalized.includes(variant));
+      .find((variant) => normalizedTokens.includes(variant));
     if (!matchedVariant) return null;
     let conversationUrl = "";
     try { conversationUrl = new URL(hrefOrUrl || "/", MESSAGES_URL).toString(); } catch { /* leave blank */ }

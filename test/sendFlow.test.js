@@ -287,6 +287,14 @@ test("recipient option selection rejects a different phone number", async () => 
   assert.equal(clicked, false);
 });
 
+test("recipient evidence rejects a requested number embedded in a longer number", () => {
+  const c = client();
+  assert.equal(
+    c.recipientEvidenceFromText("+989121234567", "Send to +19891212345670", "recipient_option"),
+    null
+  );
+});
+
 test("conversation lookup never matches a phone number from the message preview", () => {
   const c = client();
   const conversation = {
@@ -307,6 +315,29 @@ test("send fails closed when the opened conversation has no recipient evidence",
   });
   c.ensurePaired = async () => {};
   c.openForSend = async () => true;
+
+  await assert.rejects(
+    c.sendMessageUnlocked({ to: "+989127096919", text: "must not send" }),
+    (error) => error.code === "RECIPIENT_UNVERIFIED"
+  );
+});
+
+test("send fails closed when recipient evidence belongs to a different conversation URL", async () => {
+  const c = client();
+  c.ensurePage = async () => ({
+    bringToFront: async () => {},
+    waitForTimeout: async () => {},
+    url: () => "https://messages.google.com/web/conversations/actual"
+  });
+  c.ensurePaired = async () => {};
+  c.openForSend = async (to) => {
+    c.activeSendRecipientEvidence = {
+      cacheKey: c.recipientCacheKey(to), requestedTo: to, sentTo: to,
+      source: "stale_cache", matchedVariant: c.recipientCacheKey(to), matchedText: to,
+      conversationUrl: "https://messages.google.com/web/conversations/expected"
+    };
+    return true;
+  };
 
   await assert.rejects(
     c.sendMessageUnlocked({ to: "+989127096919", text: "must not send" }),
@@ -1018,11 +1049,12 @@ test("google messages rate limit fallback scrolling mode triggers, scrolls, defe
   let scrolls = 0;
   let clickedConversations = [];
   let isWarmed = false;
+  let currentUrl = "https://messages.google.com/web/conversations";
 
   const page = {
     bringToFront: async () => {},
     isClosed: () => false,
-    url: () => "https://messages.google.com/web/conversations",
+    url: () => currentUrl,
     waitForTimeout: async () => {},
     locator: (sel) => ({
       count: async () => 2,
@@ -1043,6 +1075,11 @@ test("google messages rate limit fallback scrolling mode triggers, scrolls, defe
   };
 
   c.ensurePage = async () => page;
+  c.clickConversationInSidebar = async (_page, href) => {
+    clickedConversations.push(href);
+    currentUrl = new URL(href, "https://messages.google.com").toString();
+    return true;
+  };
   c.ensurePaired = async () => {};
   c.clickLoadMoreConversations = async () => true;
   c.composerReady = async () => true;

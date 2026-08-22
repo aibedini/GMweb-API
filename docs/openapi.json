@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.3.33",
+    "version": "0.3.34",
     "contact": {
       "name": "GMweb API"
     }
@@ -680,7 +680,9 @@
                       "restart-chrome",
                       "browser-start",
                       "browser-restart",
-                      "smoke"
+                      "smoke",
+                      "power-off",
+                      "power-on"
                     ],
                     "description": "`restart-api` and `restart-chrome` are async (return immediately). All others are synchronous."
                   }
@@ -706,6 +708,39 @@
                     "queued": {
                       "type": "boolean",
                       "description": "True for async actions that are scheduled but not yet complete"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/power": {
+      "get": {
+        "summary": "Send power state",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Returns whether sending is currently powered on. When `powerOn` is false, `POST /send` rejects every message (HTTP 503 `powered_off`) and the send queue is paused. **Master token only.**",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "powerOn": {
+                      "type": "boolean"
+                    },
+                    "changedAt": {
+                      "type": "string",
+                      "format": "date-time"
                     }
                   }
                 }
@@ -1409,6 +1444,28 @@
                       ]
                     },
                     "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Returned when the global send power is off (poweroff). No message is sent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Returned when the global send power is off (poweroff). No message is sent.",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "powered_off"
+                      ]
+                    },
+                    "message": {
                       "type": "string"
                     }
                   }

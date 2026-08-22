@@ -65,6 +65,13 @@ Full schemas are in [`openapi.json`](./openapi.json). The relevant subset:
 | `POST /conversations/messages` | Open a conversation **and** return its messages in one call. |
 | `GET /events` | SSE stream. A project key receives only its own sends' events (`send_queued` / `send_processing` / `send_completed` / `send_failed` / `send_cancelled`). The master token and dashboard sessions receive the full stream, including `conversation_changed` and browser recovery events. |
 
+> **Send power (kill switch):** an operator can power off sending from the GMweb
+> dashboard (Controls → **Power Off**). While powered off, `POST /send` returns
+> `503 { "error": "powered_off" }` and **no message is sent under any
+> circumstances** — queued messages are held, not dropped. Sending resumes only
+> after **Power On** is pressed. Consumers should treat `503 powered_off` as
+> "retry later", never as a code or credential error.
+
 If `WEBHOOK_URL` is configured, browser recovery events are delivered to that
 receiver as well as the live SSE stream. `browser_recovering` includes the
 recovery `action` and `outcome`; `browser_hard_restart` means the Chrome and API
