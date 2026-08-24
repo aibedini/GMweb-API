@@ -400,6 +400,17 @@ function recordAuthFailure(ip) {
   bucket.attempts.push(now);
 }
 
+// Device key for the android pull bridge (/gateway/pull + /gateway/ack).
+// Top-level because the global requireToken hook (below) delegates /gateway/*
+// here — a function defined inside app.after() would not be visible to it.
+function checkDeviceKey(request) {
+  const expected = process.env.GMWEB_ANDROID_DEVICE_KEY || "";
+  if (!expected) return false;
+  const got = String(request.headers["x-api-key"] || "");
+  return got.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected));
+}
+
 function requireToken(request, reply, done) {
   if (config.publicHealth && requestPath(request.url) === "/health") return done();
   // Android pull-bridge endpoints authenticate with their own device key
@@ -1958,14 +1969,8 @@ app.post("/admin/transport", {
 // The phone long-polls /gateway/pull with its X-API-Key (GMWEB_ANDROID_DEVICE_KEY),
 // delivers the SMS over the SIM, then acks. The worker-side promise handed to
 // the outbox resolves here, so the BullMQ ledger/SSE/webhooks stay authoritative.
-
-function checkDeviceKey(request) {
-  const expected = process.env.GMWEB_ANDROID_DEVICE_KEY || "";
-  if (!expected) return false;
-  const got = String(request.headers["x-api-key"] || "");
-  return got.length === expected.length &&
-    require("node:crypto").timingSafeEqual(Buffer.from(got), Buffer.from(expected));
-}
+// NOTE: checkDeviceKey lives next to requireToken (top-level) because the
+// global preHandler hook calls it — it is NOT visible inside app.after().
 
 app.get("/gateway/pull", {
   schema: {
