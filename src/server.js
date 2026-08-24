@@ -402,6 +402,13 @@ function recordAuthFailure(ip) {
 
 function requireToken(request, reply, done) {
   if (config.publicHealth && requestPath(request.url) === "/health") return done();
+  // Android pull-bridge endpoints authenticate with their own device key
+  // (X-API-Key) inside the route handler — master/project auth doesn't apply.
+  if (requestPath(request.url).startsWith("/gateway/")) {
+    if (checkDeviceKey(request)) return done();
+    reply.code(401).send({ error: "unauthorized" });
+    return;
+  }
   if (config.dashboardEnabled && isDashboardAsset(request.url)) return done();
   if (config.dashboardEnabled && requestPath(request.url).startsWith("/vnc")) {
     if (hasDashboardAccess(request)) return done();
