@@ -25,11 +25,18 @@ const app = Fastify({
   trustProxy: true
 });
 
-// ANDROID_GATEWAY_MODE=1 swaps the Playwright/Chrome transport for the Messages
-// Android app (EVE Custom HTTP contract). The BullMQ pipeline, priority lanes,
-// ledger and API surface stay identical; only the delivery transport changes.
-const androidMode = config.androidGatewayMode === true;
-const client = androidMode ? new AndroidGatewayClient(config) : new GoogleMessagesClient(config);
+// Dual delivery transports, always both constructed. `client` is a proxy that
+// routes every call to the ACTIVE transport (chrome by default); the operator
+// switches at runtime via the dashboard Controls page (/admin/transport).
+const { createTransportSelector } = require("./transportSelector");
+const chromeClient = new GoogleMessagesClient(config);
+const androidClient = new AndroidGatewayClient(config);
+const client = createTransportSelector({
+  chromeClient,
+  androidClient,
+  filePath: path.join(config.rootDir, "data", "transport.json"),
+  logger: (msg) => app.log.info(msg)
+});
 const sseClients = new Map(); // reply -> { type: "full" | "project", keyName }
 const apiKeyStore = new ApiKeyStore(
   path.join(config.rootDir, "data", "api-keys.json"),
@@ -1725,6 +1732,7 @@ app.get("/admin/overview", {
     serviceInfo("gmweb-novnc.service")
   ]);
   const system = await readSystemMetrics();
+  const androidState = await androidClient.readyState();
 
   return {
     ok: true,
@@ -1732,6 +1740,7 @@ app.get("/admin/overview", {
     version: pkg.version,
     now: new Date().toISOString(),
     adminActionsEnabled: config.adminActionsEnabled,
+    transport: { ...client.status(), androidReady: androidState.paired, androidReason: androidState.reason || null },
     vnc: {
       proxyPath: "/vnc/vnc.html?autoconnect=true&resize=scale&path=vnc/websockify",
       target: config.vncProxyTarget,
@@ -1866,6 +1875,73 @@ app.get("/admin/power", {
   changedAt: new Date(sendPowerChangedAt).toISOString()
 }));
 
+app.get("/admin/transport", {
+  schema: {
+    summary: "Delivery transport state",
+    description: "Returns the active delivery transport (`chrome` = Google Messages for Web automation, `android` = Messages app relay) plus per-transport readiness. **Master token only.**",
+    tags: ["Admin"],
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          transport: { type: "string", enum: ["chrome", "android"] },
+          available: { type: "array", items: { type: "string" } },
+          chromeReady: { type: "boolean" },
+          androidReady: { type: "boolean" },
+          androidConfigured: { type: "boolean" }
+        }
+      }
+    }
+  }
+}, async () => {
+  const [chromeState, androidState] = await Promise.all([
+    chromeClient.readyState().catch(() => ({ paired: false })),
+    androidClient.readyState()
+  ]);
+  return {
+    ok: true,
+    transport: client.name,
+    available: ["chrome", "android"],
+    chromeReady: chromeState.paired,
+    androidReady: androidState.paired,
+    androidConfigured: androidClient.configured
+  };
+});
+
+app.post("/admin/transport", {
+  schema: {
+    summary: "Switch delivery transport",
+    description: "Switches message delivery between the paired Chrome browser and the Messages Android gateway. Persisted across restarts. **Master token only.**",
+    tags: ["Admin"],
+    body: {
+      type: "object",
+      required: ["transport"],
+      properties: { transport: { type: "string", enum: ["chrome", "android"] } }
+    },
+    response: {
+      200: {
+        type: "object",
+        properties: { ok: { type: "boolean" }, transport: { type: "string" }, available: { type: "array", items: { type: "string" } } }
+      },
+      400: { type: "object", properties: { error: { type: "string" } } }
+    }
+  }
+}, async (request, reply) => {
+  const limit = checkRateLimit(request, "admin-action", config.adminActionMax, config.adminActionWindowMs);
+  if (!limit.allowed) {
+    reply.header("retry-after", String(limit.retryAfterSeconds));
+    reply.code(429).send({ error: "rate_limited" });
+    return;
+  }
+  try {
+    const status = await client.setTransport(String(request.body?.transport || ""));
+    return { ok: true, ...status };
+  } catch (error) {
+    reply.code(400).send({ error: error.message });
+  }
+});
+
 app.get("/ready", {
   schema: {
     summary: "Readiness check",
@@ -1877,9 +1953,9 @@ app.get("/ready", {
     }
   }
 }, async (request, reply) => {
-  // Android transport: no paired browser concept — readiness is the phone's
-  // own /ready probe (reachable + default SMS app + queue running).
-  if (androidMode) {
+  // Android transport active: readiness is the phone's own /ready probe
+  // (reachable + default SMS app + queue running).
+  if (client.name === "android") {
     const state = await client.readyState();
     if (!state.paired) reply.code(503);
     return { ready: state.paired, status: state };
@@ -2251,13 +2327,13 @@ app.post("/send", {
     return;
   }
 
-  // Android transport: the phone is the only delivery path here. When it is
-  // unreachable there is nothing to queue against — fail closed like the
-  // powered_off branch so Eve treats it as "retry later", never a code error.
-  if (androidMode) {
+  // Active transport: the phone is the only delivery path in android mode.
+  // When it is unreachable there is nothing to queue against — fail closed
+  // like the powered_off branch so Eve treats it as "retry later".
+  if (client.name === "android") {
     const phone = await client.readyState();
     if (!phone.paired) {
-      reply.code(503).send({ error: "android_gateway_unreachable", message: "The Android gateway device is unreachable. No messages will be queued until it reconnects." });
+      reply.code(503).send({ error: "android_gateway_unreachable", message: "The Android gateway device is unreachable or not configured. No messages will be queued until it reconnects." });
       return;
     }
   }
@@ -3772,6 +3848,7 @@ async function main() {
   await apiKeyStore.load();
   await sendPacing.load();
   await loadSendPower();
+  await client.load();
   client.refreshConversationInterval();
   const queueWasPaused = await sendQueue.isPaused().catch(() => true);
   if (!queueWasPaused) await sendQueue.pause();

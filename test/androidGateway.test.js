@@ -95,7 +95,7 @@ test("android gateway readiness flips to 503-style paired=false when the phone d
   const server = await startStub(state);
   try {
     const client = makeClient(server.address().port);
-    assert.deepEqual(await client.readyState(), { paired: false });
+    assert.deepEqual(await client.readyState(), { paired: false, reason: "android_gateway_unreachable" });
     await assert.rejects(() => client.sendMessage({ to: "+989120000000", text: "x" }),
       /android_gateway_unreachable|android_gateway_http_503/);
   } finally {
@@ -103,6 +103,36 @@ test("android gateway readiness flips to 503-style paired=false when the phone d
   }
 });
 
-test("missing configuration throws early", () => {
-  assert.throws(() => new AndroidGatewayClient({}), /requires ANDROID_GATEWAY_BASE_URL/);
+test("missing configuration reports not-configured instead of throwing", async () => {
+  const client = new AndroidGatewayClient({});
+  assert.equal(client.configured, false);
+  assert.deepEqual(await client.readyState(), { paired: false, reason: "android_gateway_not_configured" });
+});
+
+test("transport selector routes calls to the active transport and persists switches", async () => {
+  const { createTransportSelector } = require("../src/transportSelector");
+  const fs = require("node:fs/promises");
+  const os = require("node:os");
+  const path = require("node:path");
+  const filePath = path.join(os.tmpdir(), `transport-test-${Date.now()}.json`);
+
+  const chrome = { who: "chrome", readyState: async () => ({ paired: true }) };
+  const android = new AndroidGatewayClient({});
+  const client = createTransportSelector({ chromeClient: chrome, androidClient: android, filePath });
+
+  await client.load();
+  assert.equal(client.name, "chrome");           // default with no state file
+  assert.equal(client.who, "chrome");            // proxy routes to the active transport
+  assert.deepEqual(await client.readyState(), { paired: true });
+
+  const status = await client.setTransport("android");
+  assert.equal(status.transport, "android");
+  assert.equal(client.name, "android");
+  const persisted = JSON.parse(await fs.readFile(filePath, "utf8"));
+  assert.equal(persisted.transport, "android");  // survives restarts
+
+  // Unknown transport is rejected and the active one stays untouched.
+  await assert.rejects(() => client.setTransport("carrier-pigeon"), /unknown_transport/);
+  assert.equal(client.name, "android");
+  await fs.rm(filePath, { force: true });
 });

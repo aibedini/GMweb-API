@@ -68,8 +68,9 @@ module.exports = {
   conversationIndexMaxBatches: intFromEnv(process.env.CONVERSATION_INDEX_MAX_BATCHES, 6),
   conversationIndexBudgetMs: intFromEnv(process.env.CONVERSATION_INDEX_BUDGET_MS, 45000),
   webhookUrl: process.env.WEBHOOK_URL || "",
-  // Android gateway transport (Messages app relay) — off by default.
-  androidGatewayMode: boolFromEnv(process.env.ANDROID_GATEWAY_MODE, false),
+  // Android gateway transport (Messages app relay). Active transport is chosen
+  // at runtime from the dashboard (/admin/transport) and persists in
+  // data/transport.json; these only configure the android hop itself.
   androidGatewayBaseUrl: process.env.ANDROID_GATEWAY_BASE_URL || "",
   androidGatewayApiKey: process.env.ANDROID_GATEWAY_API_KEY || "",
   androidSendTimeoutMs: intFromEnv(process.env.ANDROID_SEND_TIMEOUT_MS, 120000),

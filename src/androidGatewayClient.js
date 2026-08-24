@@ -18,9 +18,13 @@ class AndroidGatewayClient {
     this.apiKey = config.androidGatewayApiKey || "";
     this.sendTimeoutMs = Number(config.androidSendTimeoutMs || 120000);
     this.pollMs = Math.max(250, Number(config.androidStatusPollMs || 3000));
-    if (!this.baseUrl || !this.apiKey) {
-      throw new Error("ANDROID_GATEWAY_MODE requires ANDROID_GATEWAY_BASE_URL and ANDROID_GATEWAY_API_KEY");
-    }
+    // Deliberately lenient: both transports are constructed at boot even when
+    // this one is unconfigured (it simply reports paired=false until someone
+    // fills ANDROID_GATEWAY_BASE_URL/API_KEY and selects this transport).
+  }
+
+  get configured() {
+    return Boolean(this.baseUrl && this.apiKey);
   }
 
   headers(extra = {}) {
@@ -134,11 +138,12 @@ class AndroidGatewayClient {
   }
 
   async readyState() {
+    if (!this.configured) return { paired: false, reason: "android_gateway_not_configured" };
     try {
       await this.#fetchJson(`${this.baseUrl}/ready`, { timeoutMs: 8000 });
       return { paired: true };
     } catch {
-      return { paired: false };
+      return { paired: false, reason: "android_gateway_unreachable" };
     }
   }
 

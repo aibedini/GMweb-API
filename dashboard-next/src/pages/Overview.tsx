@@ -66,9 +66,14 @@ export function OverviewPage() {
   const automationOk = chromeOk && ov?.browserAutomation?.ok !== false;
   const vncOk = ov?.vnc?.ready ?? false;
   const system = ov?.system;
+  const activeTransport = (ov as (Overview & { transport?: { transport?: string } }) | null)?.transport?.transport ?? "chrome";
 
   const metrics = [
-    { k: "Pairing", node: <StatePill ok={paired} label={paired ? "Paired" : "Not paired"} />, sub: String(ov?.readiness?.status && (ov.readiness.status as { hint?: string }).hint) || "—" },
+    {
+      k: "Delivery",
+      node: <StatePill ok={paired} label={paired ? (activeTransport === "android" ? "Phone ready" : "Paired") : activeTransport === "android" ? "Phone unreachable" : "Not paired"} />,
+      sub: activeTransport === "android" ? "Android gateway · SIM delivery" : "Google Messages web · Chrome"
+    },
     { k: "API", node: <StatePill ok={apiOk} label={apiOk ? "Healthy" : "Down"} />, sub: `v${ov?.version ?? "—"} · :3030` },
     {
       k: "Chrome automation",
