@@ -1895,8 +1895,9 @@ app.get("/admin/transport", {
     }
   }
 }, async () => {
+  // Chrome exposes status()/statusForDashboard(); android exposes readyState().
   const [chromeState, androidState] = await Promise.all([
-    chromeClient.readyState().catch(() => ({ paired: false })),
+    chromeClient.statusForDashboard().then((s) => ({ paired: Boolean(s?.paired) })).catch(() => ({ paired: false })),
     androidClient.readyState()
   ]);
   return {
