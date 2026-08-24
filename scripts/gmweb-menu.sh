@@ -590,6 +590,19 @@ update_app() {
     return
   fi
 
+  # Uncommitted local edits (usually a manual hotfix applied on the box) would
+  # make `pull --ff-only` abort. Preserve them as a patch, then reset to the
+  # committed state so the update can always proceed unattended.
+  if ! run_as_app "git -C '$APP_DIR' diff --quiet || git -C '$APP_DIR' diff --cached --quiet"; then
+    local stamp_patch="/var/backups/gmweb/local-changes-$(date +%Y%m%d-%H%M%S).patch"
+    install -d -m 700 /var/backups/gmweb
+    run_as_app "git -C '$APP_DIR' diff HEAD > '$stamp_patch'"
+    echo "Local uncommitted changes found; saved to $stamp_patch and set aside."
+    echo "If a hotfix is lost after this update, re-apply from that file."
+    git -C "$APP_DIR" reset --hard --quiet
+    git -C "$APP_DIR" clean --quiet --force -- node_modules 2>/dev/null || true
+  fi
+
   run_as_app "git -C '$APP_DIR' pull --ff-only"
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
   run_as_app "cd '$APP_DIR' && npm ci --omit=dev"
