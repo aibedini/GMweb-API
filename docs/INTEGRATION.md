@@ -216,3 +216,24 @@ needs the project key) happens **only** when the version actually changed.
 > Note: a `version` bump signals "something changed." Whether it's a breaking change is
 > up to GMweb's versioning discipline — treat a **major** bump as potentially breaking and
 > review the diff of `openapi.json` before relying on new behavior.
+
+---
+
+## 5. Delivery transports (Chrome browser or Android gateway)
+
+GMweb has two interchangeable delivery transports behind the same API:
+
+| | `chrome` (default) | `android` |
+|---|---|---|
+| Delivery path | Playwright drives Google Messages for Web | Relays to the [Messages](https://github.com/aibedini/Messages) Android app over its EVE Custom HTTP contract (`POST /send`, polls `/send/status/:id` until terminal) |
+| Readiness | paired browser session | phone reachable (`GET /ready` on the device) |
+| Selection | default | dashboard → Controls → **Delivery transport**, or `POST /admin/transport {"transport":"android"}` (master token); persisted in `data/transport.json`, survives restarts |
+
+Both transports run side by side; exactly one is active. Everything a consumer
+depends on — auth, `POST /send`, priority lanes, idempotency, status polling,
+cancel, capacity, SSE/webhooks — behaves identically regardless of the active
+transport. While `android` is active, `POST /send` returns
+`503 android_gateway_unreachable` if the device probe fails (treat as "retry
+later"). Configure the android hop with `ANDROID_GATEWAY_BASE_URL` /
+`ANDROID_GATEWAY_API_KEY` (pointing at the phone directly or through a
+tunnel — Tailscale or Cloudflare Tunnel both work).
