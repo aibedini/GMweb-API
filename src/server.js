@@ -29,11 +29,15 @@ const app = Fastify({
 // routes every call to the ACTIVE transport (chrome by default); the operator
 // switches at runtime via the dashboard Controls page (/admin/transport).
 const { createTransportSelector } = require("./transportSelector");
+const { AndroidOutbox } = require("./androidOutbox");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
+// Pull mode: the phone dials OUT to the server and picks up tasks (no tunnel).
+const androidOutbox = new AndroidOutbox();
 const client = createTransportSelector({
   chromeClient,
   androidClient,
+  androidOutbox,
   filePath: path.join(config.rootDir, "data", "transport.json"),
   logger: (msg) => app.log.info(msg)
 });
@@ -1943,6 +1947,81 @@ app.post("/admin/transport", {
   }
 });
 
+// ── Android device pull bridge (phone dials OUT; no tunnel needed) ──────────
+// The phone long-polls /gateway/pull with its X-API-Key (GMWEB_ANDROID_DEVICE_KEY),
+// delivers the SMS over the SIM, then acks. The worker-side promise handed to
+// the outbox resolves here, so the BullMQ ledger/SSE/webhooks stay authoritative.
+
+function checkDeviceKey(request) {
+  const expected = process.env.GMWEB_ANDROID_DEVICE_KEY || "";
+  if (!expected) return false;
+  const got = String(request.headers["x-api-key"] || "");
+  return got.length === expected.length &&
+    require("node:crypto").timingSafeEqual(Buffer.from(got), Buffer.from(expected));
+}
+
+app.get("/gateway/pull", {
+  schema: {
+    summary: "Android device pulls the next queued send",
+    description: "Long-poll for devices in android transport pull mode. Authenticated with the device key (X-API-Key). Returns {task:null} or {task:{requestId,to,text,priority}}.",
+    tags: ["Gateway"],
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          task: {
+            type: ["object", "null"],
+            properties: {
+              requestId: { type: "string" },
+              to: { type: "string" },
+              text: { type: "string" },
+              priority: { type: "string" }
+            }
+          }
+        }
+      },
+      401: { type: "object", properties: { error: { type: "string" } } },
+      409: { type: "object", properties: { error: { type: "string" } } }
+    }
+  }
+}, async (request, reply) => {
+  if (!checkDeviceKey(request)) { reply.code(401).send({ error: "unauthorized" }); return; }
+  if (!client.outbox || !client.pullMode || client.name !== "android") {
+    reply.code(409).send({ error: "pull_mode_inactive" });
+    return;
+  }
+  const waitMs = Math.min(30000, Math.max(1000, Number(request.query?.waitMs) || 25000));
+  const task = await client.outbox.take(waitMs);
+  return { task };
+});
+
+app.post("/gateway/ack", {
+  schema: {
+    summary: "Android device reports a delivery outcome",
+    description: "Acknowledge a pulled task: ok=true marks it sent (drives ledger, SSE, webhooks); ok=false fails that attempt so BullMQ can retry.",
+    tags: ["Gateway"],
+    body: {
+      type: "object",
+      required: ["requestId", "ok"],
+      properties: {
+        requestId: { type: "string" },
+        ok: { type: "boolean" },
+        reason: { type: "string" },
+        sentAt: { type: "integer" }
+      }
+    },
+    response: {
+      200: { type: "object", properties: { ok: { type: "boolean" } } },
+      401: { type: "object", properties: { error: { type: "string" } } }
+    }
+  }
+}, async (request, reply) => {
+  if (!checkDeviceKey(request)) { reply.code(401).send({ error: "unauthorized" }); return; }
+  const { requestId, ok, reason } = request.body || {};
+  const handled = client.outbox?.ack(String(requestId || ""), Boolean(ok), { error: reason });
+  return { ok: handled === true };
+});
+
 app.get("/ready", {
   schema: {
     summary: "Readiness check",
@@ -2329,12 +2408,18 @@ app.post("/send", {
   }
 
   // Active transport: the phone is the only delivery path in android mode.
-  // When it is unreachable there is nothing to queue against — fail closed
-  // like the powered_off branch so Eve treats it as "retry later".
+  // Pull mode: the phone connects to US, so "ready" means a device has an
+  // active long-poll; push mode probes the phone directly. Fail closed with
+  // 503 like powered_off so Eve treats it as "retry later", never an error.
   if (client.name === "android") {
-    const phone = await client.readyState();
+    let phone;
+    if (client.pullMode && client.outbox) {
+      phone = { paired: client.outbox.stats().waitingPhones > 0 || client.outbox.stats().pending > 0 };
+    } else {
+      phone = await client.readyState();
+    }
     if (!phone.paired) {
-      reply.code(503).send({ error: "android_gateway_unreachable", message: "The Android gateway device is unreachable or not configured. No messages will be queued until it reconnects." });
+      reply.code(503).send({ error: "android_gateway_unreachable", message: "No Android gateway device is connected (pull) or reachable (push). No messages will be queued until a device checks in." });
       return;
     }
   }

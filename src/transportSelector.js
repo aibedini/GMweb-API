@@ -22,10 +22,15 @@ const { EventEmitter } = require("node:events");
 const TRANSPORTS = ["chrome", "android"];
 
 class TransportSelector extends EventEmitter {
-  constructor({ chromeClient, androidClient, filePath, logger }) {
+  constructor({ chromeClient, androidClient, androidOutbox, filePath, logger }) {
     super();
     this.chrome = chromeClient;
     this.android = androidClient;
+    this.outbox = androidOutbox || null;
+    // PULL mode (default when an outbox is provided): the phone dials out and
+    // picks up tasks, so the server never connects to the phone. Set
+    // GMWEB_ANDROID_PUSH=1 to fall back to direct-push (needs a tunnel).
+    this.pullMode = process.env.GMWEB_ANDROID_PUSH !== "1";
     this.filePath = filePath;
     this.log = logger || (() => {});
     this.active = "chrome";
@@ -41,7 +46,13 @@ class TransportSelector extends EventEmitter {
   }
 
   get name() { return this.active; }
-  get current() { return this.active === "android" ? this.android : this.chrome; }
+  get current() {
+    if (this.active !== "android") return this.chrome;
+    // In pull mode the worker hands the task to the outbox and waits for the
+    // phone's ack; direct-push (tunnel) keeps using the HTTP client.
+    if (this.pullMode && this.outbox) return this.outbox;
+    return this.android;
+  }
 
   async setTransport(name) {
     if (!TRANSPORTS.includes(name)) throw new Error(`unknown_transport: ${name}`);
