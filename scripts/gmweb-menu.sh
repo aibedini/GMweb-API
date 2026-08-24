@@ -609,11 +609,27 @@ update_app() {
   bash -n "$APP_DIR/scripts/gmweb-menu.sh"
   install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb
   systemctl restart "$API_SERVICE"
-  wait_for_api_ready || {
-    echo "${C_RED}API restarted but did not become ready. Check: journalctl -u $API_SERVICE -n 100${C_RESET}"
+  wait_for_api_alive || {
+    echo "${C_RED}API restarted but did not become healthy. Check: journalctl -u $API_SERVICE -n 100${C_RESET}"
     return 1
   }
   echo "${C_GREEN}Updated and restarted API.${C_RESET}"
+}
+
+# Wait for the API process to answer /health (liveness). Delivery readiness
+# (/ready) legitimately returns 503 when no transport is paired, so it must
+# never gate a successful update — that produced false update failures.
+wait_for_api_alive() {
+  local waited=0 response
+  while (( waited < 60 )); do
+    response="$(curl -fsS --max-time 5 http://127.0.0.1:3030/health 2>/dev/null || true)"
+    if printf '%s' "$response" | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+      return 0
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  return 1
 }
 
 uninstall_app() {
