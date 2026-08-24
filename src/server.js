@@ -11,6 +11,7 @@ const { execFile, spawn } = require("node:child_process");
 const { z } = require("zod");
 const config = require("./config");
 const { GoogleMessagesClient } = require("./googleMessagesClient");
+const { AndroidGatewayClient } = require("./androidGatewayClient");
 const { ApiKeyStore } = require("./apiKeys");
 const { SendQueue } = require("./queue");
 const { SendStore } = require("./sendStore");
@@ -24,7 +25,11 @@ const app = Fastify({
   trustProxy: true
 });
 
-const client = new GoogleMessagesClient(config);
+// ANDROID_GATEWAY_MODE=1 swaps the Playwright/Chrome transport for the Messages
+// Android app (EVE Custom HTTP contract). The BullMQ pipeline, priority lanes,
+// ledger and API surface stay identical; only the delivery transport changes.
+const androidMode = config.androidGatewayMode === true;
+const client = androidMode ? new AndroidGatewayClient(config) : new GoogleMessagesClient(config);
 const sseClients = new Map(); // reply -> { type: "full" | "project", keyName }
 const apiKeyStore = new ApiKeyStore(
   path.join(config.rootDir, "data", "api-keys.json"),
@@ -1872,6 +1877,13 @@ app.get("/ready", {
     }
   }
 }, async (request, reply) => {
+  // Android transport: no paired browser concept — readiness is the phone's
+  // own /ready probe (reachable + default SMS app + queue running).
+  if (androidMode) {
+    const state = await client.readyState();
+    if (!state.paired) reply.code(503);
+    return { ready: state.paired, status: state };
+  }
   // Non-blocking: cached status so /ready stays fast during send bursts.
   const status = await client.statusForDashboard();
   if (!status.paired) reply.code(503);
@@ -2237,6 +2249,17 @@ app.post("/send", {
   if (!sendPowerOn) {
     reply.code(503).send({ error: "powered_off", message: "Sending is powered off. No messages will be sent until power-on." });
     return;
+  }
+
+  // Android transport: the phone is the only delivery path here. When it is
+  // unreachable there is nothing to queue against — fail closed like the
+  // powered_off branch so Eve treats it as "retry later", never a code error.
+  if (androidMode) {
+    const phone = await client.readyState();
+    if (!phone.paired) {
+      reply.code(503).send({ error: "android_gateway_unreachable", message: "The Android gateway device is unreachable. No messages will be queued until it reconnects." });
+      return;
+    }
   }
 
   // Per-project rate limit (only applies to project API keys, not master)

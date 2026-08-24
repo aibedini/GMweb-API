@@ -68,6 +68,12 @@ module.exports = {
   conversationIndexMaxBatches: intFromEnv(process.env.CONVERSATION_INDEX_MAX_BATCHES, 6),
   conversationIndexBudgetMs: intFromEnv(process.env.CONVERSATION_INDEX_BUDGET_MS, 45000),
   webhookUrl: process.env.WEBHOOK_URL || "",
+  // Android gateway transport (Messages app relay) — off by default.
+  androidGatewayMode: boolFromEnv(process.env.ANDROID_GATEWAY_MODE, false),
+  androidGatewayBaseUrl: process.env.ANDROID_GATEWAY_BASE_URL || "",
+  androidGatewayApiKey: process.env.ANDROID_GATEWAY_API_KEY || "",
+  androidSendTimeoutMs: intFromEnv(process.env.ANDROID_SEND_TIMEOUT_MS, 120000),
+  androidStatusPollMs: intFromEnv(process.env.ANDROID_STATUS_POLL_MS, 3000),
   enableDebugRoutes: boolFromEnv(process.env.ENABLE_DEBUG_ROUTES, false),
   publicHealth: boolFromEnv(process.env.PUBLIC_HEALTH, true),
   corsOrigins: listFromEnv(process.env.CORS_ORIGIN),
