@@ -1900,7 +1900,7 @@ app.get("/admin/power", {
 app.get("/admin/transport", {
   schema: {
     summary: "Delivery transport state",
-    description: "Returns the active delivery transport (`chrome` = Google Messages for Web automation, `android` = Messages app relay) plus per-transport readiness. **Master token only.**",
+    description: "Returns the active delivery transport (`chrome` = Google Messages for Web automation, `android` = Messages app relay) plus per-transport readiness and, for android, the pull/push mode and live device connection state. **Master token only.**",
     tags: ["Admin"],
     response: {
       200: {
@@ -1911,24 +1911,48 @@ app.get("/admin/transport", {
           available: { type: "array", items: { type: "string" } },
           chromeReady: { type: "boolean" },
           androidReady: { type: "boolean" },
-          androidConfigured: { type: "boolean" }
+          androidConfigured: { type: "boolean" },
+          androidMode: { type: "string", enum: ["pull", "push"] },
+          androidDevices: { type: "integer", description: "Devices currently long-polling (pull mode)." },
+          androidPending: { type: "integer", description: "Sends waiting for a device to pick up." },
+          androidInflight: { type: "integer", description: "Sends a device is delivering right now." }
         }
       }
     }
   }
 }, async () => {
   // Chrome exposes status()/statusForDashboard(); android exposes readyState().
-  const [chromeState, androidState] = await Promise.all([
-    chromeClient.statusForDashboard().then((s) => ({ paired: Boolean(s?.paired) })).catch(() => ({ paired: false })),
-    androidClient.readyState()
-  ]);
+  const chromeState = await chromeClient.statusForDashboard()
+    .then((s) => ({ paired: Boolean(s?.paired) }))
+    .catch(() => ({ paired: false }));
+
+  const pullMode = Boolean(client.pullMode && client.outbox);
+  const stats = client.outbox ? client.outbox.stats() : { waitingPhones: 0, pending: 0, inflight: 0 };
+  let androidReady;
+  let androidConfigured;
+  if (pullMode) {
+    // Pull mode: the phone dials US. "Configured" = a device key exists to
+    // authenticate incoming devices; "ready" = a device is actively polling.
+    androidConfigured = Boolean(process.env.GMWEB_ANDROID_DEVICE_KEY);
+    androidReady = stats.waitingPhones > 0 || stats.inflight > 0;
+  } else {
+    // Push mode (tunnel): the server dials the phone at a configured URL.
+    const androidState = await androidClient.readyState();
+    androidConfigured = androidClient.configured;
+    androidReady = androidState.paired;
+  }
+
   return {
     ok: true,
     transport: client.name,
     available: ["chrome", "android"],
     chromeReady: chromeState.paired,
-    androidReady: androidState.paired,
-    androidConfigured: androidClient.configured
+    androidReady,
+    androidConfigured,
+    androidMode: pullMode ? "pull" : "push",
+    androidDevices: stats.waitingPhones,
+    androidPending: stats.pending,
+    androidInflight: stats.inflight
   };
 });
 
