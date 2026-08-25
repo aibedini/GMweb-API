@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   Play, RotateCcw, Globe, MonitorUp, MonitorX, Activity, Power, PowerOff,
   Smartphone, CheckCircle2, XCircle, AlertTriangle, Loader2,
-  RefreshCw, ArrowLeftRight, Inbox, Send as SendIcon
+  RefreshCw, ArrowLeftRight, Inbox, Send as SendIcon, Eye, Copy, KeyRound
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -179,6 +179,7 @@ export function ControlsPage() {
                   <p className="leading-relaxed text-muted-foreground">
                     The phone dials out to this server and picks up messages — no tunnel or static IP needed.
                   </p>
+                  <DeviceKeyPanel />
                   <div className="mt-2 grid grid-cols-3 gap-2">
                     <Stat icon={Smartphone} label="Devices" value={transport.androidDevices ?? 0} tone={(transport.androidDevices ?? 0) > 0 ? "ok" : "muted"} />
                     <Stat icon={Inbox} label="Waiting" value={transport.androidPending ?? 0} tone={(transport.androidPending ?? 0) > 0 ? "warn" : "muted"} />
@@ -187,13 +188,13 @@ export function ControlsPage() {
                   {!transport.androidConfigured && (
                     <p className="mt-2 flex items-start gap-1.5 text-amber-400">
                       <AlertTriangle className="mt-0.5 size-3 shrink-0" />
-                      <span>Set <code className="rounded bg-background px-1">GMWEB_ANDROID_DEVICE_KEY</code> in the server's <code className="rounded bg-background px-1">.env</code>, then point the Messages app at this server's HTTPS URL.</span>
+                      <span>No device key yet. Generate one above and paste it into the Messages app.</span>
                     </p>
                   )}
                   {transport.androidConfigured && (transport.androidDevices ?? 0) === 0 && (
                     <p className="mt-2 flex items-start gap-1.5 text-muted-foreground">
                       <AlertTriangle className="mt-0.5 size-3 shrink-0 text-amber-400" />
-                      <span>Key is set but no device is polling yet. In the Messages app → Gateway → paste this server's URL and enable the gateway.</span>
+                      <span>Key is set but no device is polling yet. In the Messages app → Gateway → paste this server's URL and the device key above, then enable the gateway.</span>
                     </p>
                   )}
                 </>
@@ -233,6 +234,96 @@ export function ControlsPage() {
 }
 
 type Tone = "ok" | "warn" | "muted";
+
+function DeviceKeyPanel() {
+  const [state, setState] = useState<{ configured: boolean; preview: string | null; source: string } | null>(null);
+  const [revealed, setRevealed] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    api<{ configured: boolean; preview: string | null; source: string }>("/admin/device-key")
+      .then(setState)
+      .catch(() => setState(null));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function reveal() {
+    if (revealed) { setRevealed(null); return; }
+    setBusy(true);
+    try {
+      const r = await api<{ ok: boolean; key: string | null }>("/admin/device-key/reveal", { method: "POST" });
+      setRevealed(r.key ?? "(no key)");
+    } catch {
+      setRevealed("(failed to load key)");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copyKey() {
+    let key = revealed;
+    if (!key) {
+      try {
+        const r = await api<{ key: string | null }>("/admin/device-key/reveal", { method: "POST" });
+        key = r.key;
+        if (key) setRevealed(key);
+      } catch { return; }
+    }
+    if (!key) return;
+    try {
+      await navigator.clipboard.writeText(key);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { /* clipboard unavailable */ }
+  }
+
+  async function rotate() {
+    if (!confirm("Generate a NEW device key? Devices using the old key will stop authenticating until you paste the new one.")) return;
+    setBusy(true);
+    try {
+      const r = await api<{ key: string }>("/admin/device-key/rotate", { method: "POST" });
+      setRevealed(r.key);
+      load();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mt-2 rounded-md border border-border bg-background/50 p-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 text-[11px] font-medium">
+          <KeyRound className="size-3 text-muted-foreground" />
+          Device key
+          <span className="text-muted-foreground">(paste into the Messages app)</span>
+        </div>
+        <div className="flex gap-1.5">
+          <Button variant="secondary" size="sm" disabled={busy || !state?.configured} onClick={reveal}>
+            <Eye className="size-3.5" /> {revealed ? "Hide" : "Show"}
+          </Button>
+          <Button variant="secondary" size="sm" disabled={busy || !state?.configured} onClick={copyKey}>
+            {copied ? <CheckCircle2 className="size-3.5 text-emerald-400" /> : <Copy className="size-3.5" />}
+            {copied ? "Copied" : "Copy"}
+          </Button>
+          <Button variant="secondary" size="sm" disabled={busy} onClick={rotate} title="Generate a new key">
+            {busy ? <Loader2 className="size-3.5 animate-spin" /> : <RotateCcw className="size-3.5" />} New
+          </Button>
+        </div>
+      </div>
+      <div className="mt-2 font-mono text-[11px] leading-relaxed">
+        {revealed ? (
+          <span className="break-all rounded bg-secondary px-2 py-1">{revealed}</span>
+        ) : state?.configured ? (
+          <span className="text-muted-foreground">{state.preview} · hidden — Show/Copy to use</span>
+        ) : (
+          <span className="text-amber-400">No device key yet — press New to generate one</span>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function TransportCard({
   icon: Icon, title, subtitle, active, busy, onClick, status,

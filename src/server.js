@@ -30,6 +30,7 @@ const app = Fastify({
 // switches at runtime via the dashboard Controls page (/admin/transport).
 const { createTransportSelector } = require("./transportSelector");
 const { AndroidOutbox } = require("./androidOutbox");
+const { DeviceKeyStore } = require("./deviceKey");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
 // Pull mode: the phone dials OUT to the server and picks up tasks (no tunnel).
@@ -40,6 +41,11 @@ const client = createTransportSelector({
   androidOutbox,
   filePath: path.join(config.rootDir, "data", "transport.json"),
   logger: (msg) => app.log.info(msg)
+});
+// Pull-bridge device key: dashboard-managed, falls back to the env value.
+const deviceKeyStore = new DeviceKeyStore({
+  filePath: path.join(config.rootDir, "data", "device-key.json"),
+  envValue: process.env.GMWEB_ANDROID_DEVICE_KEY
 });
 const sseClients = new Map(); // reply -> { type: "full" | "project", keyName }
 const apiKeyStore = new ApiKeyStore(
@@ -404,7 +410,7 @@ function recordAuthFailure(ip) {
 // Top-level because the global requireToken hook (below) delegates /gateway/*
 // here — a function defined inside app.after() would not be visible to it.
 function checkDeviceKey(request) {
-  const expected = process.env.GMWEB_ANDROID_DEVICE_KEY || "";
+  const expected = deviceKeyStore.key;
   if (!expected) return false;
   const got = String(request.headers["x-api-key"] || "");
   return got.length === expected.length &&
@@ -1954,6 +1960,63 @@ app.get("/admin/transport", {
     androidPending: stats.pending,
     androidInflight: stats.inflight
   };
+});
+
+// ── Device key management (dashboard-managed pull-bridge credential) ────────
+app.get("/admin/device-key", {
+  schema: {
+    summary: "Android device key state",
+    description: "Returns the masked device key the Messages app must present as X-API-Key on /gateway/*. **Master token only.**",
+    tags: ["Admin"],
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          configured: { type: "boolean" },
+          preview: { type: ["string", "null"] },
+          source: { type: "string", enum: ["file", "env", "none"] }
+        }
+      }
+    }
+  }
+}, async () => ({
+  ok: true,
+  configured: deviceKeyStore.configured,
+  preview: deviceKeyStore.preview(),
+  source: deviceKeyStore.source
+}));
+
+app.post("/admin/device-key/reveal", {
+  schema: {
+    summary: "Reveal the full device key",
+    description: "Returns the full key once so it can be pasted into the phone app. **Master token only.**",
+    tags: ["Admin"],
+    response: {
+      200: { type: "object", properties: { ok: { type: "boolean" }, key: { type: ["string", "null"] } } }
+    }
+  }
+}, async () => ({ ok: true, key: deviceKeyStore.key || null }));
+
+app.post("/admin/device-key/rotate", {
+  schema: {
+    summary: "Generate a new device key",
+    description: "Generates a fresh device key, persists it, and returns it once. Devices configured with the old key stop authenticating immediately — paste the new key into the app. **Master token only.**",
+    tags: ["Admin"],
+    response: {
+      200: { type: "object", properties: { ok: { type: "boolean" }, key: { type: "string" }, preview: { type: "string" } } }
+    }
+  }
+}, async (request, reply) => {
+  const limit = checkRateLimit(request, "admin-action", config.adminActionMax, config.adminActionWindowMs);
+  if (!limit.allowed) {
+    reply.header("retry-after", String(limit.retryAfterSeconds));
+    reply.code(429).send({ error: "rate_limited" });
+    return;
+  }
+  const key = await deviceKeyStore.generate();
+  app.log.info({ preview: deviceKeyStore.preview() }, "device key rotated");
+  return { ok: true, key, preview: deviceKeyStore.preview() };
 });
 
 app.post("/admin/transport", {
@@ -3970,6 +4033,7 @@ async function main() {
   await apiKeyStore.load();
   await sendPacing.load();
   await loadSendPower();
+  await deviceKeyStore.load();
   await client.load();
   client.refreshConversationInterval();
   const queueWasPaused = await sendQueue.isPaused().catch(() => true);
