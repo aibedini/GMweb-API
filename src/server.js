@@ -47,6 +47,80 @@ const deviceKeyStore = new DeviceKeyStore({
   filePath: path.join(config.rootDir, "data", "device-key.json"),
   envValue: process.env.GMWEB_ANDROID_DEVICE_KEY
 });
+
+// Endpoints that drive the Google Messages *browser* session (sidebar scrape,
+// screenshots, DOM debug) have no android equivalent yet. Fail with a
+// structured 501 instead of a TypeError->500, whichever way the caller reaches
+// them: the outbox (pull) and AndroidGatewayClient (push) simply lack these
+// methods, so absence-of-method IS the android-mode signal.
+function requireChromeMethod(name) {
+  if (typeof client[name] !== "function") {
+    const err = new Error(
+      `${name} is only available on the chrome transport (Google Messages web automation). Switch transport via /admin/transport or use the android-mode equivalents.`
+    );
+    err.statusCode = 501;
+    err.code = "chrome_only_endpoint";
+    throw err;
+  }
+}
+
+// ── Android-mode conversation views derived from the durable send ledger ─────
+// Pull-mode phones expose no sidebar to scrape yet; until device-side sync
+// lands, the ledger IS the conversation history (the SMS we delivered out).
+const LEDGER_THREAD_LIMIT_MAX = 200;
+
+function androidConversationsFromLedger(limit) {
+  const byNumber = new Map();
+  for (const r of sendStore.recent(Math.max(Number(limit) || 20, 100))) {
+    if (r.status === "suppressed" || r.status === "cancelled") continue;
+    const key = String(r.to_number || "").trim();
+    if (!key) continue;
+    const at = Number(r.updated_at || r.created_at || 0) || Date.now();
+    const existing = byNumber.get(key);
+    if (!existing || at > existing.at) {
+      byNumber.set(key, {
+        id: `sms:${key}`,
+        href: key,
+        title: key,
+        snippet: String(r.text || "").replace(/\s+/g, " ").slice(0, 80),
+        timestamp: new Date(at).toISOString(),
+        unread: false,
+        unreadCount: 0,
+        pinned: false,
+        origin: "ledger"
+      });
+    }
+  }
+  return [...byNumber.values()]
+    .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
+    .slice(0, Math.max(1, Number(limit) || 20));
+}
+
+function androidThreadFromLedger(number, limit) {
+  const wanted = String(number || "").replace(/[^\d+]/g, "");
+  const capped = Math.max(1, Math.min(Number(limit) || 50, LEDGER_THREAD_LIMIT_MAX));
+  const rows = sendStore.recent(LEDGER_THREAD_LIMIT_MAX * 5)
+    .filter((r) => String(r.to_number || "").replace(/[^\d+]/g, "") === wanted)
+    .sort((a, b) => Number(a.created_at || 0) - Number(b.created_at || 0))
+    .slice(-capped);
+  const messages = [];
+  let lastDay = "";
+  for (const r of rows) {
+    const at = Number(r.sent_at || r.finished_at || r.updated_at || r.created_at || 0) || Date.now();
+    const d = new Date(at);
+    const day = d.toISOString().slice(0, 10);
+    if (day !== lastDay) {
+      messages.push({ index: messages.length, type: "timestamp", text: day });
+      lastDay = day;
+    }
+    messages.push({ index: messages.length, type: "message", direction: "out", text: String(r.text || ""), status: r.status });
+  }
+  return {
+    conversation: { id: `sms:${wanted}`, href: wanted, title: wanted, snippet: "", timestamp: "", origin: "ledger" },
+    messages,
+    source: "ledger"
+  };
+}
 const sseClients = new Map(); // reply -> { type: "full" | "project", keyName }
 const apiKeyStore = new ApiKeyStore(
   path.join(config.rootDir, "data", "api-keys.json"),
@@ -1842,6 +1916,10 @@ app.post("/admin/action", {
   }
 
   const { action } = parsed.data;
+  if ((action === "browser-start" || action === "browser-restart") && typeof client.start !== "function") {
+    reply.code(501).send({ error: "chrome_only_endpoint", action, message: "Browser control applies to the chrome transport; the android transport runs with no local browser." });
+    return;
+  }
   if (action === "browser-start") {
     await client.start();
     return { ok: true, action, status: await client.status() };
@@ -1853,7 +1931,9 @@ app.post("/admin/action", {
   }
   if (action === "smoke") {
     const status = await client.status();
-    const conversations = await client.listConversations(3);
+    const conversations = typeof client.listConversations === "function"
+      ? await client.listConversations(3)
+      : androidConversationsFromLedger(3);
     return { ok: true, action, status, conversations };
   }
   if (action === "vnc-on") {
@@ -2199,6 +2279,7 @@ app.get("/session/screenshot", {
     response: { 200: { type: "string", format: "binary" } }
   }
 }, async (_request, reply) => {
+  requireChromeMethod("screenshot");
   const image = await client.screenshot();
   reply.type("image/png").send(image);
 });
@@ -2225,6 +2306,11 @@ app.get("/conversations", {
   }
 }, async (request) => {
   const limit = parseLimit(request.query.limit, 20, 2000);
+  // Android transport: no Google Messages sidebar to scrape. Serve a ledger
+  // derived view so dashboards/consumers keep working instead of crashing.
+  if (typeof client.listConversations !== "function") {
+    return { conversations: androidConversationsFromLedger(limit), source: "ledger" };
+  }
   return { conversations: await client.listConversations(limit) };
 });
 
@@ -2250,6 +2336,7 @@ app.get("/messages/active", {
   }
 }, async (request) => {
   const limit = parseLimit(request.query.limit, 50, 200);
+  requireChromeMethod("getActiveConversationMessages");
   return { messages: await client.getActiveConversationMessages(limit) };
 });
 
@@ -2330,11 +2417,18 @@ app.post("/conversations/messages", {
   }
 
   const { limit = 50, ...query } = parsed.data;
+  // Android transport: resolve the thread from the durable send ledger keyed
+  // by the phone number carried in href/id/title.
+  if (typeof client.getConversationMessages !== "function") {
+    const number = query.href || query.id || query.title || "";
+    return androidThreadFromLedger(number, limit);
+  }
   return client.getConversationMessages(query, limit);
 });
 
 if (config.enableDebugRoutes) {
   app.get("/debug/sidebar", async (request) => {
+    requireChromeMethod("debugSidebarElements");
     const limit = parseLimit(request.query.limit, 80, 300);
     return {
       elements: await client.debugSidebarElements(limit)
@@ -2342,6 +2436,7 @@ if (config.enableDebugRoutes) {
   });
 
   app.get("/debug/main", async (request) => {
+    requireChromeMethod("debugMainElements");
     const limit = parseLimit(request.query.limit, 120, 500);
     return {
       elements: await client.debugMainElements(limit)
@@ -3999,6 +4094,17 @@ async function backfillPendingLedger() {
 }
 
 async function initializeBrowserAndConversationIndex({ resumeAfterWarm }) {
+  // Android transport (pull mode): there is no local browser or sidebar index
+  // to warm. Previously execution fell into the catch branch below and left
+  // the queue paused forever after every restart — the "dead GMweb" failure.
+  if (typeof client.warmConversationIndex !== "function") {
+    app.log.info({ transport: client.name }, "no browser warm-up for this transport; restoring queue state");
+    if (resumeAfterWarm && sendPowerOn) {
+      await sendQueue.resume();
+      emitSse({ type: "queue_resumed", reason: "startup_resume_no_warmup", at: new Date().toISOString() });
+    }
+    return;
+  }
   try {
     await client.start();
     // Seed readiness before the long index lock. Without this, /ready has no

@@ -233,7 +233,25 @@ Both transports run side by side; exactly one is active. Everything a consumer
 depends on — auth, `POST /send`, priority lanes, idempotency, status polling,
 cancel, capacity, SSE/webhooks — behaves identically regardless of the active
 transport. While `android` is active, `POST /send` returns
-`503 android_gateway_unreachable` if the device probe fails (treat as "retry
-later"). Configure the android hop with `ANDROID_GATEWAY_BASE_URL` /
-`ANDROID_GATEWAY_API_KEY` (pointing at the phone directly or through a
-tunnel — Tailscale or Cloudflare Tunnel both work).
+`503 android_gateway_unreachable` if no device is connected (treat as "retry
+later").
+
+### Android pull mode (default)
+
+The Messages app dials OUT to GMweb (`GET /gateway/pull`, `POST /gateway/ack`)
+authenticated with the dashboard-managed device key (`X-API-Key`; manage it via
+`GET/POST /admin/device-key*`). No tunnel or inbound port is required.
+
+Transport-scoped endpoints while `android` is active:
+
+- `GET /ready`, `GET /admin/overview`, `GET /session/status` report pull-bridge
+  liveness (a device long-polling within the last 90s) instead of browser state.
+- `GET /conversations` returns a conversation list derived from the durable
+  send ledger (`source: "ledger"`) — outbound history per number.
+- `POST /conversations/messages` resolves the thread by phone number from the
+  ledger (`source: "ledger"`).
+- Browser-only endpoints (`GET /session/screenshot`,
+  `GET /messages/active`, `POST /conversations/open`, `/debug/*`,
+  admin actions `browser-start`/`browser-restart`) return **501
+  `chrome_only_endpoint`** instead of a generic error — switch transport to use
+  them.

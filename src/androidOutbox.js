@@ -18,6 +18,7 @@ class AndroidOutbox {
     this.pending = new Map();   // offered, not yet claimed by a phone
     this.inflight = new Map();  // claimed by a phone, awaiting its ack
     this.waiters = [];          // long-poll resolvers waiting for work
+    this.lastPullAt = 0;        // last time ANY device long-polled us
   }
 
   /** Worker side: hand one send to the phone and wait for its ack. */
@@ -48,6 +49,7 @@ class AndroidOutbox {
    * phone long-polls without hammering the server.
    */
   take(waitMs = 25000) {
+    this.lastPullAt = Date.now();
     const oldestKey = this.firstPendingKey();
     if (oldestKey) return Promise.resolve(this.claim(oldestKey));
     return new Promise((resolve) => {
@@ -115,8 +117,44 @@ class AndroidOutbox {
     return {
       pending: this.pending.size,
       inflight: this.inflight.size,
-      waitingPhones: this.waiters.length
+      waitingPhones: this.waiters.length,
+      lastPullAt: this.lastPullAt || null
     };
+  }
+
+  /**
+   * Readiness/status surface for the android transport. In pull mode the phone
+   * dials OUT, so there is nothing to probe — liveness IS the long-poll:
+   * a waiter open right now, or a pull seen within the last 90s (3x the
+   * default 25s long-poll). Mirrors the shape GoogleMessagesClient.status()
+   * returns so server.js call sites stay uniform.
+   */
+  readyState() {
+    const stats = this.stats();
+    const freshPull = stats.lastPullAt && (Date.now() - stats.lastPullAt) < 90000;
+    const paired = Boolean(stats.waitingPhones > 0 || freshPull);
+    return {
+      paired,
+      transport: "android-pull",
+      reason: paired ? null : "no_device_polling",
+      lastPullAt: stats.lastPullAt ? new Date(stats.lastPullAt).toISOString() : null,
+      pending: stats.pending,
+      inflight: stats.inflight,
+      waitingPhones: stats.waitingPhones
+    };
+  }
+
+  status() { return this.readyState(); }
+  statusForDashboard() { return this.readyState(); }
+  async recover() {
+    const state = this.readyState();
+    if (!state.paired) {
+      const err = new Error("android gateway: no device is long-polling; cannot recover remotely");
+      err.code = "ANDROID_GATEWAY_UNREACHABLE";
+      err.statusCode = 503;
+      throw err;
+    }
+    return state;
   }
 
   /**

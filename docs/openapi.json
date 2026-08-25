@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.3.36",
+    "version": "0.3.37",
     "contact": {
       "name": "GMweb API"
     }
@@ -756,7 +756,7 @@
         "tags": [
           "Admin"
         ],
-        "description": "Returns the active delivery transport (`chrome` = Google Messages for Web automation, `android` = Messages app relay) plus per-transport readiness. **Master token only.**",
+        "description": "Returns the active delivery transport (`chrome` = Google Messages for Web automation, `android` = Messages app relay) plus per-transport readiness and, for android, the pull/push mode and live device connection state. **Master token only.**",
         "responses": {
           "200": {
             "description": "Default Response",
@@ -789,6 +789,25 @@
                     },
                     "androidConfigured": {
                       "type": "boolean"
+                    },
+                    "androidMode": {
+                      "type": "string",
+                      "enum": [
+                        "pull",
+                        "push"
+                      ]
+                    },
+                    "androidDevices": {
+                      "type": "integer",
+                      "description": "Devices currently long-polling (pull mode)."
+                    },
+                    "androidPending": {
+                      "type": "integer",
+                      "description": "Sends waiting for a device to pick up."
+                    },
+                    "androidInflight": {
+                      "type": "integer",
+                      "description": "Sends a device is delivering right now."
                     }
                   }
                 }
@@ -858,6 +877,113 @@
                   "type": "object",
                   "properties": {
                     "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/device-key": {
+      "get": {
+        "summary": "Android device key state",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Returns the masked device key the Messages app must present as X-API-Key on /gateway/*. **Master token only.**",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "configured": {
+                      "type": "boolean"
+                    },
+                    "preview": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "file",
+                        "env",
+                        "none"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/device-key/reveal": {
+      "post": {
+        "summary": "Reveal the full device key",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Returns the full key once so it can be pasted into the phone app. **Master token only.**",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "key": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/device-key/rotate": {
+      "post": {
+        "summary": "Generate a new device key",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Generates a fresh device key, persists it, and returns it once. Devices configured with the old key stop authenticating immediately — paste the new key into the app. **Master token only.**",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "key": {
+                      "type": "string"
+                    },
+                    "preview": {
                       "type": "string"
                     }
                   }

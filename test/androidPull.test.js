@@ -45,3 +45,24 @@ test("ack for an unknown requestId is a no-op", () => {
   const outbox = new AndroidOutbox();
   assert.equal(outbox.ack("pull_nope", true), false);
 });
+
+test("readyState: paired only while a device long-polls or pulled recently", async () => {
+  const outbox = new AndroidOutbox();
+  assert.equal(outbox.readyState().paired, false, "no device yet");
+
+  const wait = outbox.take(300);              // a device starts long-polling
+  await new Promise((r) => setTimeout(r, 20));
+  const live = outbox.readyState();
+  assert.equal(live.paired, true, "open waiter counts as connected");
+  assert.equal(live.transport, "android-pull");
+  assert.equal(live.waitingPhones, 1);
+  await wait;                                  // waiter times out cleanly
+});
+
+test("readyState: fresh lastPull keeps paired true inside the 90s window", () => {
+  const outbox = new AndroidOutbox();
+  outbox.lastPullAt = Date.now() - 10_000;
+  assert.equal(outbox.readyState().paired, true, "recent pull = alive");
+  outbox.lastPullAt = Date.now() - 120_000;
+  assert.equal(outbox.readyState().paired, false, "stale pull = gone");
+});
