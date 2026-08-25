@@ -753,18 +753,20 @@ test("queue dashboard can list the complete pending queue", async () => {
     active: [makeJob("active", "active")],
     waiting: [makeJob("waiting-1", "waiting"), makeJob("waiting-2", "waiting")],
     paused: [makeJob("paused", "paused")],
-    delayed: [makeJob("delayed", "delayed")]
+    delayed: [makeJob("delayed", "delayed")],
+    // BullMQ v5 priority-lane state — must be listed like any other pending bucket
+    prioritized: [makeJob("prioritized-1", "prioritized")]
   };
   const calls = [];
   q.queue = {
     getJobs: async ([state], start, end, asc) => {
       calls.push({ state, start, end, asc });
-      return end === -1 ? byState[state].slice(start) : byState[state].slice(start, end + 1);
+      return end === -1 ? (byState[state] || []).slice(start) : (byState[state] || []).slice(start, end + 1);
     }
   };
 
   const jobs = await q.listJobs({ limit: null });
-  assert.deepEqual(jobs.map((job) => job.id), ["active", "waiting-1", "waiting-2", "paused", "delayed"]);
+  assert.deepEqual(jobs.map((job) => job.id), ["active", "waiting-1", "waiting-2", "paused", "delayed", "prioritized-1"]);
   assert.equal(calls.every((call) => call.end === -1 && call.asc === true), true);
 });
 

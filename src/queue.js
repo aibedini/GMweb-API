@@ -84,10 +84,9 @@ class SendQueue {
     const sequence = Number(await client.incr(SUCCESS_SEQUENCE_KEY));
 
     // Check if there are any waiting jobs left.
-    // BullMQ moves waiting jobs into its `paused` bucket while a queue is paused.
-    // They are still pending sends, so we check both waiting and paused.
-    const counts = await this.queue.getJobCounts("waiting", "paused");
-    const waitingCount = (counts.waiting || 0) + (counts.paused || 0);
+    // Pending sends live across waiting/paused/prioritized buckets (see counts).
+    const counts = await this.queue.getJobCounts("waiting", "paused", "prioritized");
+    const waitingCount = (counts.waiting || 0) + (counts.paused || 0) + (counts.prioritized || 0);
 
     let due;
     if (waitingCount === 0) {
@@ -219,13 +218,17 @@ class SendQueue {
   }
 
   async counts() {
-    const counts = await this.queue.getJobCounts("waiting", "paused", "active", "completed", "failed", "delayed");
+    // "prioritized" is a real BullMQ v5 state: jobs added with an explicit
+    // priority land in a sorted set instead of the plain wait list. Before
+    // 0.3.38 every counter/list here ignored it, so hundreds of perfectly
+    // queued sends showed as an EMPTY queue and could not be cancelled.
+    const counts = await this.queue.getJobCounts("waiting", "paused", "active", "completed", "failed", "delayed", "prioritized");
     // BullMQ moves waiting jobs into its `paused` bucket while a queue is
-    // paused. They are still pending sends, so expose waiting as the total
-    // pending count; retain paused separately for diagnostics.
+    // paused, and priority-lane jobs into `prioritized`. All are still
+    // pending sends, so expose waiting as the total pending count.
     return {
       ...counts,
-      waiting: (counts.waiting || 0) + (counts.paused || 0)
+      waiting: (counts.waiting || 0) + (counts.paused || 0) + (counts.prioritized || 0)
     };
   }
 
@@ -246,7 +249,7 @@ class SendQueue {
   // BullMQ's wait list is consumed from the tail, so asc=true is essential;
   // newest-first hides LIFO/admin-promoted jobs at the bottom of long queues.
   // Returns a light shape — no full message body, just a preview.
-  async listJobs({ states = ["active", "waiting", "paused", "delayed"], limit = 100 } = {}) {
+  async listJobs({ states = ["active", "waiting", "paused", "delayed", "prioritized"], limit = 100 } = {}) {
     const jobs = [];
     const unlimited = limit == null;
     let remaining = unlimited ? Infinity : Math.max(0, limit);
@@ -288,7 +291,7 @@ class SendQueue {
   // entries, and deriving this count from the first 100 makes the release
   // button incorrectly show zero and become disabled.
   async countDeferredHighJobs() {
-    const jobs = await this.queue.getJobs(["waiting", "paused", "delayed"], 0, -1, false);
+    const jobs = await this.queue.getJobs(["waiting", "paused", "delayed", "prioritized"], 0, -1, false);
     let count = 0;
     for (const job of jobs) {
       if (!job) continue;
@@ -308,7 +311,7 @@ class SendQueue {
   }
 
   async pendingCountsByPriority() {
-    const jobs = await this.queue.getJobs(["active", "waiting", "paused", "delayed"], 0, -1, false);
+    const jobs = await this.queue.getJobs(["active", "waiting", "paused", "delayed", "prioritized"], 0, -1, false);
     const counts = { critical: 0, expired: 0, expiring: 0, announcement: 0 };
     for (const job of jobs) {
       if (job) counts[priorityForJob(job).name] += 1;
@@ -319,7 +322,7 @@ class SendQueue {
   async queuePositionForPriority(priorityName, excludeJobId = null) {
     const requested = normalizeSendPriority(priorityName);
     const active = await this.queue.getJobs(["active"], 0, -1, false);
-    const pending = await this.queue.getJobs(["waiting", "paused"], 0, -1, false);
+    const pending = await this.queue.getJobs(["waiting", "paused", "prioritized"], 0, -1, false);
     const ahead = pending.filter((job) => job && String(job.id) !== String(excludeJobId) && priorityForJob(job).level <= requested.level).length;
     return active.length + ahead;
   }
@@ -328,7 +331,7 @@ class SendQueue {
   // SQLite. Never return this shape directly from an HTTP route (it contains
   // complete message text and idempotency metadata).
   async pendingJobsForLedger(limit = 1000) {
-    const jobs = await this.queue.getJobs(["active", "waiting", "paused", "delayed"], 0, Math.max(0, limit - 1), false);
+    const jobs = await this.queue.getJobs(["active", "waiting", "paused", "delayed", "prioritized"], 0, Math.max(0, limit - 1), false);
     const out = [];
     for (const job of jobs) {
       if (!job) continue;
@@ -357,7 +360,7 @@ class SendQueue {
     const job = await this.queue.getJob(id);
     if (!job) return null;
     const state = await job.getState().catch(() => "unknown");
-    if (state !== "waiting" && state !== "delayed") {
+    if (!["waiting", "delayed", "prioritized"].includes(state)) {
       return { promoted: false, reason: `job is ${state}`, state };
     }
     const data = { ...job.data, priority: "critical", priorityLevel: 1 };
@@ -381,7 +384,7 @@ class SendQueue {
     const job = await this.queue.getJob(id);
     if (!job) return { changed: false, reason: "not_found", state: null };
     const state = await job.getState().catch(() => "unknown");
-    if (!["waiting", "paused", "delayed"].includes(state)) {
+    if (!["waiting", "paused", "delayed", "prioritized"].includes(state)) {
       return { changed: false, reason: state === "active" ? "active" : "not_pending", state };
     }
     const previous = priorityForJob(job);
@@ -408,7 +411,7 @@ class SendQueue {
 
     const released = [];
     try {
-      const jobs = await this.queue.getJobs(["waiting", "paused", "delayed"], 0, -1, false);
+      const jobs = await this.queue.getJobs(["waiting", "paused", "delayed", "prioritized"], 0, -1, false);
       const candidates = [];
       for (const job of jobs) {
         if (!job) continue;
@@ -417,7 +420,7 @@ class SendQueue {
         const wasDeferred = state === "delayed" ||
           Number(job.data?.deferCount || 0) > 0 ||
           Boolean(job.data?.deferReason);
-        if (high && wasDeferred && ["waiting", "paused", "delayed"].includes(state)) {
+        if (high && wasDeferred && ["waiting", "paused", "delayed", "prioritized"].includes(state)) {
           candidates.push({ job, state });
         }
       }
@@ -452,7 +455,7 @@ class SendQueue {
     const job = await this.queue.getJob(id);
     if (!job) return { cancelled: false, reason: "not_found", state: null };
     const state = await job.getState().catch(() => "unknown");
-    if (!["waiting", "paused", "delayed"].includes(state)) {
+    if (!["waiting", "paused", "delayed", "prioritized"].includes(state)) {
       return { cancelled: false, reason: state === "active" ? "active" : "not_pending", state };
     }
     await this.forgetDeferredHigh(id);
