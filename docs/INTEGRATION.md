@@ -255,3 +255,20 @@ Transport-scoped endpoints while `android` is active:
   admin actions `browser-start`/`browser-restart`) return **501
   `chrome_only_endpoint`** instead of a generic error — switch transport to use
   them.
+
+---
+
+## 6. Administrative activity log
+
+The dashboard's **Logs** page uses `GET /admin/activity-logs` (master token or
+authenticated dashboard session only). Unlike the legacy project-key request
+log, this stream includes dashboard, master-token, project-key, device, and
+anonymous health activity. Mutating HTTP methods are also classified as
+`type: "action"` for audit review.
+
+Available filters are `type=request|action`, `category`,
+`level=info|warning|error`, `actorType`, `search`, and `limit` (maximum 1000).
+Each row includes the timestamp, category, severity, actor, method/path,
+response status, outcome, duration, request ID, IP, user agent, and safe route
+metadata. Authorization headers and request bodies are never stored. Logs are
+kept as bounded JSONL in `data/activity.jsonl` (up to 10,000 recent events).

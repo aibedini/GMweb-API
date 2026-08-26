@@ -13,6 +13,7 @@ const config = require("./config");
 const { GoogleMessagesClient } = require("./googleMessagesClient");
 const { AndroidGatewayClient } = require("./androidGatewayClient");
 const { ApiKeyStore } = require("./apiKeys");
+const { ActivityLogStore, classify: classifyActivity } = require("./activityLog");
 const { SendQueue } = require("./queue");
 const { SendStore } = require("./sendStore");
 const { SendPacingController } = require("./sendPacing");
@@ -126,6 +127,7 @@ const apiKeyStore = new ApiKeyStore(
   path.join(config.rootDir, "data", "api-keys.json"),
   path.join(config.rootDir, "data", "api-requests.jsonl")
 );
+const activityLogStore = new ActivityLogStore(path.join(config.rootDir, "data", "activity.jsonl"));
 const sendQueue = new SendQueue();
 // Durable send ledger — survives crashes, tracks per-message status, powers the
 // 24h de-dupe, and lets us rebuild the queue from disk if Redis is ever wiped.
@@ -562,6 +564,60 @@ function requireToken(request, reply, done) {
   // Missing auth (browser hitting /docs assets, dashboard session expired) is NOT brute force.
   if (token) recordAuthFailure(ip);
   reply.code(401).send({ error: "unauthorized" });
+}
+
+function activityActor(request) {
+  if (request._projectKey) return { type: "api_key", name: request._projectKey.name, id: request._projectKey.id };
+  if (requestPath(request.url).startsWith("/gateway/")) return { type: "device", name: "Android gateway" };
+  if (dashboardSession(request)) return { type: "dashboard", name: config.dashboardUsername || "Dashboard operator" };
+  if (bearerToken(request)) return { type: "master", name: "Master API token" };
+  if (requestPath(request.url).startsWith("/dashboard/")) return { type: "dashboard", name: "Dashboard visitor" };
+  return { type: "anonymous", name: "Anonymous" };
+}
+
+function shouldRecordActivity(request) {
+  const pathname = requestPath(request.url);
+  if (["/admin/activity-logs", "/admin/api-logs", "/events"].includes(pathname)) return false;
+  if (["/", "/dashboard", "/dashboard/", "/app", "/app/"].includes(pathname)) return false;
+  if (pathname.startsWith("/app/assets/")) return false;
+  return !/\.(?:js|css|png|svg|ico|map|woff2?)$/i.test(pathname);
+}
+
+function safeActivityFields(value) {
+  if (!value || typeof value !== "object") return undefined;
+  const safe = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (/token|password|secret|authorization|api.?key|text|message/i.test(key)) safe[key] = "[redacted]";
+    else safe[key] = String(raw).slice(0, 200);
+  }
+  return Object.keys(safe).length ? safe : undefined;
+}
+
+function recordActivity(request, reply, done) {
+  if (!shouldRecordActivity(request)) return done();
+  const pathname = requestPath(request.url);
+  const { category, type } = classifyActivity(pathname, request.method);
+  const durationMs = request._activityStartedAt
+    ? Number(process.hrtime.bigint() - request._activityStartedAt) / 1e6
+    : 0;
+  activityLogStore.append({
+    type,
+    category,
+    method: request.method,
+    path: pathname,
+    statusCode: reply.statusCode,
+    durationMs,
+    actor: activityActor(request),
+    ip: request.ip,
+    requestId: request.id,
+    userAgent: request.headers["user-agent"],
+    details: {
+      route: request.routeOptions?.url || null,
+      params: safeActivityFields(request.params),
+      query: safeActivityFields(request.query)
+    }
+  }).catch(() => {});
+  done();
 }
 
 function emitSse(event) {
@@ -1399,7 +1455,12 @@ app.addSchema({
 
 app.register(cors, { origin: corsOrigin });
 app.addHook("onRequest", applySecurityHeaders);
+app.addHook("onRequest", (request, _reply, done) => {
+  request._activityStartedAt = process.hrtime.bigint();
+  done();
+});
 app.addHook("preHandler", requireToken);
+app.addHook("onResponse", recordActivity);
 app.setErrorHandler((error, _request, reply) => {
   const statusCode = error.statusCode || 500;
   reply.code(statusCode).send({
@@ -4015,6 +4076,32 @@ app.get("/admin/api-logs", {
   const keyId = request.query.keyId || undefined;
   return { logs: await apiKeyStore.getLogs({ limit, keyId }) };
 });
+
+app.get("/admin/activity-logs", {
+  schema: {
+    summary: "Structured activity and action logs",
+    description: "Returns categorized request and operator action logs with actor, outcome, status, duration, request ID, and filter facets. Sensitive headers and request bodies are never recorded. **Master token only.**",
+    tags: ["Admin"],
+    querystring: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", minimum: 1, maximum: 1000, default: 200 },
+        type: { type: "string", enum: ["request", "action"] },
+        category: { type: "string", maxLength: 64 },
+        level: { type: "string", enum: ["info", "warning", "error"] },
+        actorType: { type: "string", maxLength: 32 },
+        search: { type: "string", maxLength: 200 }
+      }
+    }
+  }
+}, async (request) => activityLogStore.query({
+  limit: parseLimit(request.query.limit, 200, 1000),
+  type: request.query.type,
+  category: request.query.category,
+  level: request.query.level,
+  actorType: request.query.actorType,
+  search: request.query.search
+}));
 
 // ─────────────────────────────────────────────────────────────────────────────
 
