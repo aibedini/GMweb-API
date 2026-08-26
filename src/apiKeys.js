@@ -53,7 +53,13 @@ class ApiKeyStore {
       const { token, ...rest } = key; // strip plaintext if somehow present
       safe[id] = rest;
     }
-    fs.writeFile(this.keysFile, JSON.stringify(safe, null, 2), "utf8").catch(() => {});
+    // ATOMIC write (tmp + rename): a crash/power-cut mid-write must never
+    // truncate this file again — on 2026-08-25 a torn write emptied it to 0
+    // bytes during a CPU-saturation storm and silently deleted every key.
+    const tmp = `${this.keysFile}.tmp`;
+    fs.writeFile(tmp, JSON.stringify(safe, null, 2), "utf8")
+      .then(() => fs.rename(tmp, this.keysFile))
+      .catch(() => {});
   }
 
   create({ name, allowedIps = [], rateLimit = {} }) {

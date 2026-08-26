@@ -1843,7 +1843,16 @@ app.get("/admin/overview", {
     version: pkg.version,
     now: new Date().toISOString(),
     adminActionsEnabled: config.adminActionsEnabled,
-    transport: { ...client.status(), androidReady: androidState.paired, androidReason: androidState.reason || null },
+    // Explicit transport identity for dashboards: client.status() duck-types to
+    // the active client, whose self-reported transport string varies
+    // ("android-pull" vs "android"). `name` is always exactly chrome|android.
+    transport: {
+      name: client.name,
+      mode: client.name === "android" ? (client.pullMode ? "pull" : "push") : null,
+      ...client.status(),
+      androidReady: androidState.paired,
+      androidReason: androidState.reason || null
+    },
     vnc: {
       proxyPath: "/vnc/vnc.html?autoconnect=true&resize=scale&path=vnc/websockify",
       target: config.vncProxyTarget,

@@ -66,21 +66,33 @@ export function OverviewPage() {
   const automationOk = chromeOk && ov?.browserAutomation?.ok !== false;
   const vncOk = ov?.vnc?.ready ?? false;
   const system = ov?.system;
-  const activeTransport = (ov as (Overview & { transport?: { transport?: string } }) | null)?.transport?.transport ?? "chrome";
+  // Delivery identity comes from the server's explicit transport.name —
+  // never from client.status()'s duck-typed self-description.
+  const rawName = (ov?.transport?.name ?? "").toLowerCase();
+  const activeTransport: "chrome" | "android" =
+    rawName === "android" || rawName.includes("android") ? "android" : "chrome";
 
   const metrics = [
     {
       k: "Delivery",
       node: <StatePill ok={paired} label={paired ? (activeTransport === "android" ? "Phone ready" : "Paired") : activeTransport === "android" ? "Phone unreachable" : "Not paired"} />,
-      sub: activeTransport === "android" ? "Android gateway · SIM delivery" : "Google Messages web · Chrome"
+      sub: activeTransport === "android"
+        ? `Android gateway${ov?.transport?.mode ? ` · ${ov.transport.mode} mode` : ""} · SIM delivery`
+        : "Google Messages web · Chrome"
     },
     { k: "API", node: <StatePill ok={apiOk} label={apiOk ? "Healthy" : "Down"} />, sub: `v${ov?.version ?? "—"} · :3030` },
-    {
-      k: "Chrome automation",
-      node: <StatePill ok={automationOk} label={!chromeOk ? "Stopped" : ov?.browserAutomation?.ok === false ? "Hung" : "Healthy"} />,
-      sub: `${ov?.browserAutomation?.code ?? "not checked"}${ov?.browserAutomation?.latencyMs ? ` · ${ov.browserAutomation.latencyMs}ms` : ""}`
-    },
-    { k: "VNC", node: <StatePill ok={vncOk} label={vncOk ? "On" : "Off"} />, sub: "pairing console" },
+    activeTransport === "android"
+      ? {
+          k: "Device bridge",
+          node: <StatePill ok={Boolean(ov?.transport?.androidReady)} label={ov?.transport?.androidReady ? "Connected" : "No device"} />,
+          sub: ov?.transport?.lastPullAt ? `last pull ${new Date(ov.transport.lastPullAt).toLocaleTimeString()}` : "phone long-polls /gateway/pull"
+        }
+      : {
+          k: "Chrome automation",
+          node: <StatePill ok={automationOk} label={!chromeOk ? "Stopped" : ov?.browserAutomation?.ok === false ? "Hung" : "Healthy"} />,
+          sub: `${ov?.browserAutomation?.code ?? "not checked"}${ov?.browserAutomation?.latencyMs ? ` · ${ov.browserAutomation.latencyMs}ms` : ""}`
+        },
+    { k: "VNC", node: <StatePill ok={vncOk} label={vncOk ? "On" : "Off"} />, sub: "pairing console (chrome only)" },
   ];
 
   const queueCards: Array<{ k: string; v: number; tone: string }> = [

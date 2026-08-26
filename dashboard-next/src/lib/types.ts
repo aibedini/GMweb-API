@@ -23,6 +23,7 @@ export interface Overview {
   ok: boolean;
   version: string;
   readiness?: { ready: boolean; status?: Record<string, unknown> };
+  transport?: { name?: string; mode?: string | null; transport?: string; paired?: boolean; reason?: string | null; androidReady?: boolean; lastPullAt?: string | null };
   browserAutomation?: { ok: boolean | null; code: string; latencyMs?: number; error?: string };
   system?: {
     cpu: { cores: number; usagePercent: number; load1: number; load5: number; load15: number; loadPercent: number };
