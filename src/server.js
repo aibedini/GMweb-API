@@ -1493,14 +1493,15 @@ function enrichQueueJob(job) {
   const processedMs = Date.parse(job.processedAt || "") || ledger?.active_at || 0;
   const stageMs = ledger?.stage_at || ledger?.updated_at || 0;
   const activeForMs = job.state === "active" && processedMs ? now - processedMs : 0;
-  const waitingForMs = job.state === "waiting" || job.state === "paused" || job.state === "delayed"
+  const isPendingState = ["waiting", "paused", "delayed", "prioritized"].includes(job.state);
+  const waitingForMs = isPendingState
     ? now - createdMs : Math.max(0, processedMs - createdMs);
   const stage = ledger?.stage || null;
   const stageForMs = stageMs ? Math.max(0, now - stageMs) : 0;
   const quietHours = currentQuietHours(new Date(now));
   const quietHoursHeld = quietHours.active &&
     (job.priority !== "critical" || job.state === "delayed") &&
-    ["waiting", "paused", "delayed"].includes(job.state);
+    isPendingState;
   const visibleStage = quietHoursHeld ? "quiet_hours" : stage;
 
   let diagnosis = { code: "queued", severity: "info", message: "Waiting for its turn in the queue" };
@@ -3585,8 +3586,7 @@ app.get("/admin/queue/jobs", {
     sendQueue.countDeferredHighJobs(),
     sendQueue.counts()
   ]);
-  const total = (counts.active || 0) + (counts.waiting || 0) +
-    (counts.paused || 0) + (counts.delayed || 0);
+  const total = counts.waiting || 0; // counts() already folds paused+prioritized into waiting
   return { jobs: jobs.map(enrichQueueJob), delayedHighCount, total };
 });
 
@@ -3804,11 +3804,23 @@ app.post("/admin/queue/jobs/bulk", {
 
     const result = await sendQueue.cancelPendingJob(id);
     results.push({ id, changed: result.cancelled, reason: result.reason || null, state: result.state || null, priority: null, priorityLevel: null });
-    if (!result.cancelled) continue;
-    processed += 1;
-    if (ledger) {
-      if (action === "cancel") sendStore.markById(ledger.id, "cancelled", "cancelled_by_admin");
-      if (action === "complete") sendStore.markById(ledger.id, "sent", null);
+    if (result.cancelled) {
+      processed += 1;
+      if (ledger) {
+        if (action === "cancel") sendStore.markById(ledger.id, "cancelled", "cancelled_by_admin");
+        if (action === "complete") sendStore.markById(ledger.id, "sent", null);
+      }
+      continue;
+    }
+    // Redis lost the job (or it never existed) but the durable ledger row still
+    // says queued — cancel the ROW so boot reconciliation never re-enqueues it
+    // and the operator's "cancel everything" actually empties the queue view.
+    if (!ledger || ledger.status !== "queued") continue;
+    if (action === "cancel") {
+      sendStore.markById(ledger.id, "cancelled", "cancelled_by_admin_missing_queue_job");
+      processed += 1;
+      results.pop();
+      results.push({ id, changed: true, reason: "ledger_row_cancelled_queue_job_missing", state: null, priority: null, priorityLevel: null });
     }
   }
   const skipped = ids.length - processed;

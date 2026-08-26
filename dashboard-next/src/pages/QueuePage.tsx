@@ -160,6 +160,37 @@ export function QueuePage() {
       setBusyAction(null);
     }
   }
+
+  // One-click "empty the whole queue": cancels every listed job (the list is
+  // the complete pending set — active jobs are skipped server-side).
+  async function cancelAll() {
+    if (busyAction || jobs.length === 0) return;
+    const n = jobs.length;
+    const detail = counts ? ` (queue counter says ${counts.waiting} waiting)` : "";
+    if (!confirm(`Cancel ALL ${n} queued message${n === 1 ? "" : "s"}${detail}? Active sends finish; everything pending is removed.`)) return;
+    setBusyAction("cancel-all");
+    setActionError("");
+    setActionMessage("");
+    try {
+      let processed = 0;
+      const CHUNK = 500;
+      for (let i = 0; i < jobs.length; i += CHUNK) {
+        const chunk = jobs.slice(i, i + CHUNK).map((j) => j.id);
+        const result = await api<{ ok: boolean; processed: number; skipped: number }>("/admin/queue/jobs/bulk", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: { ids: chunk, action: "cancel" },
+        });
+        processed += result.processed ?? 0;
+      }
+      setActionMessage(`${processed} message${processed === 1 ? "" : "s"} cancelled.`);
+      await load();
+    } catch (err) {
+      setActionError(`Cancel all failed: ${messageFor(err)}`);
+    } finally {
+      setBusyAction(null);
+    }
+  }
   async function togglePaused() {
     if (busyAction) return;
     // Capture intent before the state can change under us — the alternative
@@ -207,6 +238,17 @@ export function QueuePage() {
             </span>
           )}
           <Badge variant={paused ? "warning" : "secondary"}>{paused ? "PAUSED" : "RUNNING"}</Badge>
+          <Button
+            variant="outline"
+            size="sm"
+            className="text-red-400 border-red-500/20 hover:bg-red-500/10 hover:text-red-300"
+            onClick={cancelAll}
+            disabled={jobs.length === 0 || busyAction !== null}
+            title="Cancel every message in the queue"
+          >
+            <X className="size-4" />
+            {busyAction === "cancel-all" ? "Cancelling…" : `Cancel all (${jobs.length})`}
+          </Button>
           <Button
             size="sm"
             onClick={releaseDelayedHigh}
