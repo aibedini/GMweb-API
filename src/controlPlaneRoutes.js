@@ -11,9 +11,9 @@
  * 202 (Rule 4); payload stays opaque (Phase 7 encryption, ADR-002).
  *
  * @param {import("fastify").FastifyInstance} app
- * @param {object} deps { trustRegistry, commandEngine, accountId }
+ * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, accountId }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
 
   // ── Trust Registry relay (ADR-001 LOCK 2/9) ──────────────────────────────
@@ -211,6 +211,90 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, account
     });
     if (!ok) { reply.code(409).send({ error: "illegal_transition" }); return; }
     return { ok: true };
+  });
+
+  // ── Event batch upload + cursor sync (PR-09, §54/§55, LOCK 10) ──────────
+
+  app.post("/api/v1/agent/events/batch", {
+    schema: {
+      summary: "Android Agent uploads a durable event batch (§55, partial ACK)",
+      description: [
+        "Each accepted event receives the account's next monotonic sequence (LOCK 10: per-account, never global).",
+        "Response ACKs per eventId with its serverSequence — events missing from accepted[] stay PENDING in the device outbox and retry (LOCK 13 partial ACK).",
+        "Duplicate eventIds are skipped WITHOUT consuming a sequence. Payload is opaque (encrypted in Phase 7)."
+      ].join("\n"),
+      tags: ["Agent"],
+      body: {
+        type: "object",
+        required: ["events"],
+        properties: {
+          sourceDeviceId: { type: "string", nullable: true },
+          events: {
+            type: "array",
+            maxItems: 100,
+            items: {
+              type: "object",
+              required: ["eventId", "payload"],
+              properties: {
+                eventId: { type: "string" },
+                type: { type: "string" },
+                conversationId: { type: "string", nullable: true },
+                payload: { type: "string", description: "base64 opaque envelope bytes" },
+                encoding: { type: "string", default: "envelope.v1" },
+                schemaVersion: { type: "integer", default: 1 },
+                cryptoVersion: { type: "integer", default: 0 }
+              }
+            }
+          }
+        }
+      },
+      response: {
+        200: {
+          type: "object",
+          properties: {
+            accepted: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { eventId: { type: "string" }, serverSequence: { type: "integer" } }
+              }
+            },
+            duplicates: { type: "integer" }
+          }
+        }
+      }
+    }
+  }, async (request) => {
+    const body = request.body || {};
+    const events = (Array.isArray(body.events) ? body.events : []).map((e) => ({
+      ...e,
+      payload: Buffer.isBuffer(e.payload) ? e.payload : String(e.payload || ""),
+    }));
+    return eventStore.ingestBatch({
+      accountId,
+      sourceDeviceId: body.sourceDeviceId ?? null,
+      events,
+    });
+  });
+
+  app.get("/api/v1/sync", {
+    schema: {
+      summary: "Cursor-based catch-up sync (§54) — events after a per-account cursor",
+      description: "Monotonic per-account sequences (LOCK 10). Ciphertext only. nextCursor + hasMore for pagination; clients apply events transactionally into their local store.",
+      tags: ["Sync"],
+      querystring: {
+        type: "object",
+        properties: {
+          after: { type: "integer", minimum: 0, default: 0 },
+          limit: { type: "integer", minimum: 1, maximum: 1000, default: 500 }
+        }
+      },
+      response: { 200: { type: "object", additionalProperties: true } }
+    }
+  }, async (request) => {
+    const after = Math.max(0, Number(request.query?.after) || 0);
+    const limit = Number(request.query?.limit) || 500;
+    return eventStore.after(accountId, after, limit);
   });
 }
 

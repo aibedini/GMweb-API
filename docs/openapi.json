@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.4.0",
+    "version": "0.5.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -1536,6 +1536,149 @@
                       "type": "string"
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/events/batch": {
+      "post": {
+        "summary": "Android Agent uploads a durable event batch (§55, partial ACK)",
+        "tags": [
+          "Agent"
+        ],
+        "description": "Each accepted event receives the account's next monotonic sequence (LOCK 10: per-account, never global).\nResponse ACKs per eventId with its serverSequence — events missing from accepted[] stay PENDING in the device outbox and retry (LOCK 13 partial ACK).\nDuplicate eventIds are skipped WITHOUT consuming a sequence. Payload is opaque (encrypted in Phase 7).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "events"
+                ],
+                "properties": {
+                  "sourceDeviceId": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "events": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "eventId",
+                        "payload"
+                      ],
+                      "properties": {
+                        "eventId": {
+                          "type": "string"
+                        },
+                        "type": {
+                          "type": "string"
+                        },
+                        "conversationId": {
+                          "type": "string",
+                          "nullable": true
+                        },
+                        "payload": {
+                          "type": "string",
+                          "description": "base64 opaque envelope bytes"
+                        },
+                        "encoding": {
+                          "type": "string",
+                          "default": "envelope.v1"
+                        },
+                        "schemaVersion": {
+                          "type": "integer",
+                          "default": 1
+                        },
+                        "cryptoVersion": {
+                          "type": "integer",
+                          "default": 0
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "accepted": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "eventId": {
+                            "type": "string"
+                          },
+                          "serverSequence": {
+                            "type": "integer"
+                          }
+                        }
+                      }
+                    },
+                    "duplicates": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sync": {
+      "get": {
+        "summary": "Cursor-based catch-up sync (§54) — events after a per-account cursor",
+        "tags": [
+          "Sync"
+        ],
+        "description": "Monotonic per-account sequences (LOCK 10). Ciphertext only. nextCursor + hasMore for pagination; clients apply events transactionally into their local store.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "in": "query",
+            "name": "after",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 500
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }

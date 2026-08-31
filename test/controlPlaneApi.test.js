@@ -6,6 +6,7 @@ const Fastify = require("fastify");
 const Database = require("better-sqlite3");
 const { TrustRegistry } = require("../src/trustRegistry");
 const { CommandEngine } = require("../src/commandEngine");
+const { EventStore } = require("../src/eventStore");
 const { registerControlPlaneRoutes } = require("../src/controlPlaneRoutes");
 
 // Standalone fastify instance with injected deps — no Redis, no browser, no
@@ -21,6 +22,7 @@ describe("Phase 2 control plane HTTP API", () => {
     registerControlPlaneRoutes(app, {
       trustRegistry: new TrustRegistry(db),
       commandEngine: new CommandEngine(db),
+      eventStore: new EventStore(db),
       accountId: "test-account",
     });
     await app.ready();
@@ -145,5 +147,80 @@ describe("Phase 2 control plane HTTP API", () => {
       payload: { type: "SEND_SMS", payload: "", idempotencyKey: `idem-${Date.now()}-e` },
     });
     assert.equal(res.statusCode, 400);
+  });
+
+  test("event batch upload: partial ACK with per-account serverSequences (PR-09)", async () => {
+    const up = await app.inject({
+      method: "POST", url: "/api/v1/agent/events/batch",
+      payload: {
+        sourceDeviceId: "android-1",
+        events: [
+          { eventId: `evt-${Date.now()}-1`, type: "MESSAGE_CREATED", conversationId: "conv-x", payload: Buffer.from("p1").toString("base64") },
+          { eventId: `evt-${Date.now()}-2`, type: "THREAD_READ", payload: Buffer.from("p2").toString("base64") },
+        ],
+      },
+    });
+    assert.equal(up.statusCode, 200);
+    const body = up.json();
+    assert.equal(body.accepted.length, 2);
+    // LOCK 10: per-account monotonic — first upload to this test account starts at 1
+    assert.deepEqual(body.accepted.map((a) => a.serverSequence), [1, 2]);
+  });
+
+  test("duplicate eventId in a later batch ACKs nothing new and consumes no sequence", async () => {
+    // The suite shares ONE store; anchor expectations to the CURRENT max
+    // sequence instead of absolute numbers.
+    const before = await app.inject({ method: "GET", url: "/api/v1/sync?after=0&limit=1000" });
+    const maxSeqBefore = before.json().events.reduce((m, e) => Math.max(m, e.sequence), 0);
+
+    const eventId = `evt-dup-${Date.now()}`;
+    const p1 = Buffer.from("payload-one").toString("base64");
+    const p2 = Buffer.from("payload-two").toString("base64");
+    const first = await app.inject({
+      method: "POST", url: "/api/v1/agent/events/batch",
+      payload: { events: [{ eventId, type: "T", payload: p1 }] },
+    });
+    const firstSeq = first.json().accepted[0].serverSequence;
+    assert.equal(firstSeq, maxSeqBefore + 1);
+
+    const second = await app.inject({
+      method: "POST", url: "/api/v1/agent/events/batch",
+      payload: {
+        events: [
+          { eventId, type: "T", payload: p1 }, // redelivery
+          { eventId: `${eventId}-new`, type: "T", payload: p2 },
+        ],
+      },
+    });
+    const body = second.json();
+    assert.equal(body.accepted.length, 1);
+    assert.equal(body.duplicates, 1);
+    // LOCK 10: the dup consumed NO sequence — the new event lands exactly one
+    // above its predecessor with no gap in between.
+    assert.equal(body.accepted[0].serverSequence, firstSeq + 1);
+    const store = await app.inject({ method: "GET", url: "/api/v1/sync?after=0&limit=1000" });
+    const seqs = store.json().events.map((e) => e.sequence);
+    for (let i = 1; i < seqs.length; i++) {
+      assert.equal(seqs[i], seqs[i - 1] + 1, "sequences stay contiguous (no gaps)");
+    }
+  });
+
+  test("GET /api/v1/sync returns ciphertext events with cursor pagination", async () => {
+    const sync = await app.inject({
+      method: "GET", url: "/api/v1/sync?after=0&limit=2",
+    });
+    assert.equal(sync.statusCode, 200);
+    const page = sync.json();
+    assert.equal(page.events.length, 2);
+    assert.equal(page.hasMore, true);
+    const page2 = await app.inject({
+      method: "GET", url: `/api/v1/sync?after=${page.nextCursor}&limit=10`,
+    });
+    const rest = page2.json();
+    assert.equal(rest.hasMore, false);
+    for (const ev of [...page.events, ...rest.events]) {
+      // payload must be valid base64 (opaque envelope)
+      assert.ok(Buffer.from(ev.ciphertext, "base64").length > 0);
+    }
   });
 });

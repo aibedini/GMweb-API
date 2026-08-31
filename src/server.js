@@ -34,6 +34,7 @@ const { AndroidOutbox } = require("./androidOutbox");
 const { DeviceKeyStore } = require("./deviceKey");
 const { TrustRegistry } = require("./trustRegistry");
 const { CommandEngine } = require("./commandEngine");
+const { EventStore } = require("./eventStore");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
@@ -60,6 +61,7 @@ const controlDb = new (require("better-sqlite3"))(path.join(config.rootDir, "dat
 controlDb.pragma("journal_mode = WAL");
 const trustRegistry = new TrustRegistry(controlDb);
 const commandEngine = new CommandEngine(controlDb);
+const eventStore = new EventStore(controlDb);
 const DEFAULT_ACCOUNT_ID = "default";
 
 // Endpoints that drive the Google Messages *browser* session (sidebar scrape,
@@ -511,6 +513,15 @@ function requireToken(request, reply, done) {
   // Android pull-bridge endpoints authenticate with their own device key
   // (X-API-Key) inside the route handler — master/project auth doesn't apply.
   if (requestPath(request.url).startsWith("/gateway/")) {
+    if (checkDeviceKey(request)) return done();
+    reply.code(401).send({ error: "unauthorized" });
+    return;
+  }
+  // Phase 2 (PR-08): agent bridge under /api/v1/agent/* uses the SAME device
+  // key store as /gateway/* until PR-08b swaps in per-device credentials
+  // (DeviceIdentity registration → mTLS). Route-level handler re-checks and
+  // binds the agent identity; the hook only gates unauthenticated traffic.
+  if (requestPath(request.url).startsWith("/api/v1/agent/")) {
     if (checkDeviceKey(request)) return done();
     reply.code(401).send({ error: "unauthorized" });
     return;
@@ -2291,6 +2302,7 @@ app.post("/gateway/ack", {
 registerControlPlaneRoutes(app, {
   trustRegistry,
   commandEngine,
+  eventStore,
   accountId: DEFAULT_ACCOUNT_ID,
 });
 
