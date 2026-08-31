@@ -1,9 +1,10 @@
 @import "tailwindcss";
+/* HeroUI v3 styles (plugin CSS layer) — after tailwind import per docs. */
+@import "@heroui/react/styles";
 
 /*
- * §46 Design tokens (TechSpec) — CSS custom properties so the HeroUI-style
- * theme layers can swap light/dark without touching component code. Colors
- * stay semantic (fg/muted/accent/danger), never raw brand hexes.
+ * §46 Design tokens (TechSpec) — CSS custom properties consumed both by our
+ * own inline styles and (mapped below) by HeroUI v3's semantic color system.
  */
 :root {
   --bg: #0b0c0f;
