@@ -32,6 +32,9 @@ const app = Fastify({
 const { createTransportSelector } = require("./transportSelector");
 const { AndroidOutbox } = require("./androidOutbox");
 const { DeviceKeyStore } = require("./deviceKey");
+const { TrustRegistry } = require("./trustRegistry");
+const { CommandEngine } = require("./commandEngine");
+const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
 // Pull mode: the phone dials OUT to the server and picks up tasks (no tunnel).
@@ -48,6 +51,16 @@ const deviceKeyStore = new DeviceKeyStore({
   filePath: path.join(config.rootDir, "data", "device-key.json"),
   envValue: process.env.GMWEB_ANDROID_DEVICE_KEY
 });
+
+// ── Phase 2 (ADR-001/004): Trust Registry relay + durable Command Engine ────
+// GMweb relays Android-signed trust statements and owns the durable command
+// store. Account v1: a single-account deployment — the dashboard operator IS
+// the account (account_id constant until passkey auth lands in Phase 4).
+const controlDb = new (require("better-sqlite3"))(path.join(config.rootDir, "data", "control-plane.db"));
+controlDb.pragma("journal_mode = WAL");
+const trustRegistry = new TrustRegistry(controlDb);
+const commandEngine = new CommandEngine(controlDb);
+const DEFAULT_ACCOUNT_ID = "default";
 
 // Endpoints that drive the Google Messages *browser* session (sidebar scrape,
 // screenshots, DOM debug) have no android equivalent yet. Fail with a
@@ -2270,6 +2283,15 @@ app.post("/gateway/ack", {
   const { requestId, ok, reason } = request.body || {};
   const handled = client.outbox?.ack(String(requestId || ""), Boolean(ok), { error: reason });
   return { ok: handled === true };
+});
+
+// ── Phase 2 Control Plane (ADR-001/004, TechSpec §51–58) ────────────────────
+// Trust relay + durable commands + agent bridge — logic lives in
+// controlPlaneRoutes.js (modular-monolith boundary; injectable deps).
+registerControlPlaneRoutes(app, {
+  trustRegistry,
+  commandEngine,
+  accountId: DEFAULT_ACCOUNT_ID,
 });
 
 app.get("/ready", {

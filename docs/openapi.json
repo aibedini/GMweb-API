@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.3.41",
+    "version": "0.4.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -1119,6 +1119,413 @@
             }
           },
           "401": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/trust/statements": {
+      "post": {
+        "summary": "Relay an Android-signed trust statement (ADR-001)",
+        "tags": [
+          "Trust"
+        ],
+        "description": "Android Trust Root posts DEVICE_APPROVED/DEVICE_REVOKED/etc statements with monotonic trustSequence. GMweb relays them; clients verify rootSignature locally. Monotonic per account, no gaps, idempotent redelivery.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "applied": {
+                      "type": "boolean"
+                    },
+                    "trustSequence": {
+                      "type": "integer"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "Signed trust statements after a cursor",
+        "tags": [
+          "Trust"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "in": "query",
+            "name": "after",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/v1/trust/snapshot": {
+      "get": {
+        "summary": "Latest Android-signed trust snapshot (ADR-001 LOCK 9)",
+        "tags": [
+          "Trust"
+        ],
+        "description": "rootPublicKey + trustSequence + active DeviceCertificates + revocations. Every client verifies signatures locally; no key is trusted merely because GMweb returned it.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/commands": {
+      "post": {
+        "summary": "Create a durable command (TechSpec §56)",
+        "tags": [
+          "Commands"
+        ],
+        "description": "Every client write (send/mark-read/…) is a command row committed before the 202 returns.\nIdempotent by (account, idempotencyKey): a redelivered key returns the ORIGINAL command with created=false.\npayload (base64) stays opaque to GMweb (encrypted in Phase 7; ADR-002).\nNo endpoint ever claims SENT/DELIVERED — carrier truth comes from Android evidence (Rule 1).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "type",
+                  "payload"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "example": "SEND_SMS"
+                  },
+                  "payload": {
+                    "type": "string",
+                    "description": "base64-encoded opaque payload bytes"
+                  },
+                  "encoding": {
+                    "type": "string",
+                    "default": "application/json"
+                  },
+                  "schemaVersion": {
+                    "type": "integer",
+                    "default": 1
+                  },
+                  "cryptoVersion": {
+                    "type": "integer",
+                    "default": 0
+                  },
+                  "idempotencyKey": {
+                    "type": "string",
+                    "description": "client UUID; REQUIRED by real clients"
+                  },
+                  "targetAgentId": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "clientSignature": {
+                    "type": "string",
+                    "nullable": true,
+                    "description": "base64; verified by Android (PR-08)"
+                  },
+                  "expiresAt": {
+                    "type": "integer",
+                    "nullable": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "commandId": {
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string"
+                    },
+                    "created": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "Command queue depth by state (per-account counts)",
+        "tags": [
+          "Commands"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/v1/commands/{id}": {
+      "get": {
+        "summary": "Command status (lifecycle per §41)",
+        "tags": [
+          "Commands"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/commands/claim": {
+      "post": {
+        "summary": "Android Agent claims queued commands (long-poll friendly)",
+        "tags": [
+          "Agent"
+        ],
+        "description": "Atomically flips claimed rows QUEUED→DELIVERED_TO_AGENT. Payload stays opaque. Agent reports lifecycle via /status.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "agentId": {
+                    "type": "string",
+                    "description": "device/agent identity (device-key auth until PR-08 mTLS)"
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 25
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "commands": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/commands/{id}/status": {
+      "post": {
+        "summary": "Android Agent reports command lifecycle status (§58)",
+        "tags": [
+          "Agent"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "state"
+                ],
+                "properties": {
+                  "state": {
+                    "type": "string",
+                    "enum": [
+                      "ACCEPTED",
+                      "EXECUTING",
+                      "COMPLETED",
+                      "FAILED"
+                    ]
+                  },
+                  "result": {
+                    "type": "string",
+                    "nullable": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
             "description": "Default Response",
             "content": {
               "application/json": {
