@@ -7,6 +7,8 @@ import {
   unsubscribeFromPush,
   removeSubscriptionFromServer,
 } from "../lib/push";
+import { fetchAuthStatus, type AuthStatus } from "../lib/auth";
+import LoginScreen from "../screens/LoginScreen";
 
 /**
  * web-01 shell (TechSpec §5 Phase 4 start): three honest screens —
@@ -28,6 +30,28 @@ export default function App() {
   const [trust, setTrust] = useState<TrustSnapshot | null>(null);
   const [version, setVersion] = useState<string>("");
   const [pushState, setPushState] = useState<string>("");
+  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
+  const [authed, setAuthed] = useState<boolean | null>(null); // null = checking
+
+  // Passkey-first gate (§33/§34): /api/v1/auth/* is public, so the login
+  // screen can decide enroll-vs-authenticate. Everything else behind the
+  // session cookie issued by the passkey ceremony.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const s = await fetchAuthStatus();
+        setAuthStatus(s);
+        // If no passkey exists yet → show login (bootstrap). If configured →
+        // still show login; the session cookie will be issued by the ceremony.
+        // (API calls in Sync/Trust tabs work once authed; pre-auth they show
+        // honest errors.)
+        setAuthed(false);
+      } catch {
+        setAuthStatus(null);
+        setAuthed(false);
+      }
+    })();
+  }, []);
 
   const refresh = async () => {
     setCursor(await getCursor());
@@ -67,13 +91,30 @@ export default function App() {
     }
   };
 
+  // Passkey gate: show LoginScreen until a passkey ceremony completes.
+  if (authed === false && authStatus) {
+    return <LoginScreen onDone={() => setAuthed(true)} />;
+  }
+
   return (
     <div className="mx-auto flex h-full max-w-3xl flex-col">
       <header className="flex items-center justify-between border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
         <h1 className="text-lg font-semibold">Messages</h1>
-        <span className="text-xs" style={{ color: "var(--muted-fg)" }}>
-          GMweb {version}
-        </span>
+        <div className="flex items-center gap-3">
+          {authStatus?.passkeyConfigured && (
+            <button
+              onClick={() => setAuthed(false)}
+              className="text-xs"
+              style={{ color: "var(--muted-fg)" }}
+              title="Lock the session and return to sign-in"
+            >
+              Lock
+            </button>
+          )}
+          <span className="text-xs" style={{ color: "var(--muted-fg)" }}>
+            GMweb {version}
+          </span>
+        </div>
       </header>
 
       <nav className="flex gap-1 px-4 py-2">

@@ -36,6 +36,7 @@ const { TrustRegistry } = require("./trustRegistry");
 const { CommandEngine } = require("./commandEngine");
 const { EventStore } = require("./eventStore");
 const { WebPushService } = require("./webPush");
+const { PasskeyService } = require("./passkeys");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
@@ -72,6 +73,13 @@ const eventStore = new EventStore(controlDb, {
 });
 const webPushService = new WebPushService(controlDb, {
   vapidKeyPath: path.join(config.rootDir, "data", "webpush-vapid.json"),
+});
+// Phase 4 (§21): passkey RP config — rpID/origin must match the public origin
+// the browser sees (env-driven; defaults suit local development).
+const passkeyService = new PasskeyService(controlDb, {
+  rpName: "GMweb Messages",
+  rpID: process.env.WEBAUTHN_RP_ID || "localhost",
+  origin: process.env.WEBAUTHN_ORIGIN || "http://localhost:3030",
 });
 const DEFAULT_ACCOUNT_ID = "default";
 
@@ -2483,6 +2491,97 @@ app.get("/api/v1/push/subscriptions", {
     tags: ["Push"]
   }
 }, async () => ({ subscriptions: webPushService.listSubscriptions(), count: webPushService.count() }));
+
+// ── Phase 4: Passkey (WebAuthn) auth (§21–§24) ──────────────────────────────
+// Bootstrap model: the FIRST registration is allowed without an existing
+// session ONLY while no credential is enrolled (first-run); afterwards,
+// registration (adding a new passkey) and credential listing/removal require
+// an authenticated session (Bearer, dashboard session, or passkey cookie).
+// Authentication issues the SAME gmweb_session cookie the dashboard uses, so
+// requireToken accepts it unchanged (§21 Passkey-first, §23 cookie-only).
+
+function issuePasskeySession(reply, request) {
+  const session = createDashboardSession(request);
+  reply.header(
+    "set-cookie",
+    `${dashboardSessionCookieName}=${encodeURIComponent(session.sessionId)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(config.dashboardSessionTtlMs / 1000)}${config.dashboardCookieSecure ? "; Secure" : ""}`
+  );
+  return { csrfToken: session.csrfToken };
+}
+
+app.get("/api/v1/auth/status", {
+  schema: {
+    summary: "Passkey-first status (§21): enroll or authenticate?",
+    tags: ["Auth"]
+  }
+}, async () => ({
+  passkeyConfigured: passkeyService.hasCredentials(),
+  next: passkeyService.hasCredentials() ? "authentication" : "registration", // first-run bootstrap
+}));
+
+app.get("/api/v1/auth/passkey/register/options", {
+  schema: { summary: "WebAuthn registration options (§21)", tags: ["Auth"] }
+}, async (request, reply) => {
+  // First-run bootstrap: enrollment without auth only while the registry is empty.
+  if (passkeyService.hasCredentials() && !hasDashboardAccess(request)) {
+    reply.code(401).send({ error: "unauthorized" });
+    return;
+  }
+  return passkeyService.registrationOptions();
+});
+
+app.post("/api/v1/auth/passkey/register/verify", {
+  schema: { summary: "Verify attestation and enroll the credential (§22/§23)", tags: ["Auth"], body: { type: "object" } }
+}, async (request, reply) => {
+  if (passkeyService.hasCredentials() && !hasDashboardAccess(request)) {
+    reply.code(401).send({ error: "unauthorized" });
+    return;
+  }
+  try {
+    const result = await passkeyService.verifyRegistration(request.body, "operator");
+    const issued = issuePasskeySession(reply, request); // enroll = sign-in (§21 flow)
+    return { ok: result.ok, credentialId: result.credentialId, csrfToken: issued.csrfToken };
+  } catch (error) {
+    reply.code(400).send({ error: error.message });
+  }
+});
+
+app.get("/api/v1/auth/passkey/auth/options", {
+  schema: { summary: "WebAuthn authentication options (§21)", tags: ["Auth"] }
+}, async () => passkeyService.authenticationOptions());
+
+app.post("/api/v1/auth/passkey/auth/verify", {
+  schema: { summary: "Verify assertion → issue session cookie (§23)", tags: ["Auth"], body: { type: "object" } }
+}, async (request, reply) => {
+  try {
+    const result = await passkeyService.verifyAuthentication(request.body);
+    const issued = issuePasskeySession(reply, request);
+    return { ok: result.ok, csrfToken: issued.csrfToken };
+  } catch (error) {
+    reply.code(401).send({ error: error.message });
+  }
+});
+
+app.get("/api/v1/auth/credentials", {
+  schema: { summary: "List enrolled passkeys (§84 Security Center)", tags: ["Auth"] }
+}, async (request, reply) => {
+  if (!hasDashboardAccess(request)) { reply.code(401).send({ error: "unauthorized" }); return; }
+  return { credentials: passkeyService.listCredentials() };
+});
+
+app.post("/api/v1/auth/credentials/remove", {
+  schema: {
+    summary: "Remove an enrolled passkey (§24 step-up: authenticated session required)",
+    tags: ["Auth"],
+    body: { type: "object", required: ["credentialId"], properties: { credentialId: { type: "string" } } }
+  }
+}, async (request, reply) => {
+  if (!hasDashboardAccess(request)) { reply.code(401).send({ error: "unauthorized" }); return; }
+  const removed = passkeyService.removeCredential(request.body?.credentialId);
+  if (!removed) { reply.code(404).send({ error: "credential_not_found" }); return; }
+  // §26-adjacent honesty: if the registry is now empty, next flow is bootstrap again.
+  return { ok: true, passkeyConfigured: passkeyService.hasCredentials() };
+});
 
 app.get("/ready", {
   schema: {
