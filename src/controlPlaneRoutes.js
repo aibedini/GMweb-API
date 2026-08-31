@@ -11,9 +11,9 @@
  * 202 (Rule 4); payload stays opaque (Phase 7 encryption, ADR-002).
  *
  * @param {import("fastify").FastifyInstance} app
- * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId }
+ * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
 
   // ── Trust Registry relay (ADR-001 LOCK 2/9) ──────────────────────────────

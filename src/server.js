@@ -37,6 +37,8 @@ const { CommandEngine } = require("./commandEngine");
 const { EventStore } = require("./eventStore");
 const { WebPushService } = require("./webPush");
 const { PasskeyService } = require("./passkeys");
+const { AgentAuthService } = require("./agentAuth");
+const { registerAgentIdentityRoutes } = require("./agentIdentityRoutes");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
@@ -81,7 +83,38 @@ const passkeyService = new PasskeyService(controlDb, {
   rpID: process.env.WEBAUTHN_RP_ID || "localhost",
   origin: process.env.WEBAUTHN_ORIGIN || "http://localhost:3030",
 });
+// PR-08b: per-device agent identities (ADR-001) — the agent bridge upgrades
+// from the shared device key to per-device ECDSA signatures.
+const agentAuthService = new AgentAuthService(controlDb);
 const DEFAULT_ACCOUNT_ID = "default";
+
+/**
+ * PR-08b per-device gate for /api/v1/agent/* (ADR-001): accept EITHER the
+ * legacy shared device key (bootstrap/compat) OR a per-device ECDSA
+ * signature (X-Agent-Auth + X-Agent-TS, 90s window, replay cache). When an
+ * identity IS enrolled for the claimed deviceId, the signature is REQUIRED —
+ * the shared key alone no longer authorizes that device. Returns the bound
+ * deviceId or null.
+ */
+function authorizeAgent(request, rawBody) {
+  const header = String(request.headers["x-agent-auth"] || "");
+  if (header) {
+    const result = agentAuthService.verifyAgentHeader(request, rawBody);
+    if (!result.ok) return null;
+    return result.deviceId;
+  }
+  // Legacy fallback: shared device key (pre-PR-08b agents). Only valid while
+  // the agent has NOT enrolled a signature identity — an enrolled device
+  // must sign.
+  if (checkDeviceKey(request)) {
+    const claimed = request.headers["x-agent-id"];
+    if (claimed && agentAuthService.getIdentity(String(claimed))) {
+      return null; // enrolled device MUST use signatures
+    }
+    return "legacy-shared-agent";
+  }
+  return null;
+}
 
 // Endpoints that drive the Google Messages *browser* session (sidebar scrape,
 // screenshots, DOM debug) have no android equivalent yet. Fail with a
@@ -2408,7 +2441,11 @@ registerControlPlaneRoutes(app, {
   commandEngine,
   eventStore,
   accountId: DEFAULT_ACCOUNT_ID,
+  authorizeAgent,
 });
+
+// PR-08b: per-device identity registration (device-key bootstrap → ECDSA).
+registerAgentIdentityRoutes(app, { agentAuthService });
 
 // web-01 (§44): narrow realtime channel for the PWA — {type:"sync.available"}
 // only. Auth: master token / dashboard session via requireToken (project keys

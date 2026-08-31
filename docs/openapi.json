@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.9.0",
+    "version": "0.10.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -1682,6 +1682,86 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/identity": {
+      "post": {
+        "summary": "Register/refresh agent identity keys (PR-05 → PR-08b)",
+        "tags": [
+          "Agent"
+        ],
+        "description": "Device-key authenticated bootstrap: the agent posts its publicKeys block\n(signing required; encryption/trustRoot optional) and a stable deviceId.\nSubsequent /api/v1/agent/* calls are authenticated per-device with\nX-Agent-Auth ECDSA signatures over the canonical request string.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "deviceId",
+                  "publicKeys"
+                ],
+                "properties": {
+                  "deviceId": {
+                    "type": "string"
+                  },
+                  "protocolVersion": {
+                    "type": "integer",
+                    "default": 1
+                  },
+                  "publicKeys": {
+                    "type": "object",
+                    "required": [
+                      "signing"
+                    ],
+                    "properties": {
+                      "signing": {
+                        "type": "string",
+                        "description": "base64 uncompressed EC point"
+                      },
+                      "encryption": {
+                        "type": "string"
+                      },
+                      "trustRoot": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/identities": {
+      "get": {
+        "summary": "List enrolled agent identities (Privacy: keys not returned)",
+        "tags": [
+          "Agent"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
           }
         }
       }
