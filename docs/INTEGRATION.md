@@ -162,6 +162,35 @@ When GMweb changes:
 
 ---
 
+## 3b. Control Plane API v1 (`/api/v1/*`) — the strategic surface
+
+Since v0.4.0, GMweb also exposes the **Messaging Platform Control Plane**
+(ADR-004: GMweb = Control Plane; Messages Android = Data Plane; Eve = Business
+Plane client). These endpoints are the **strategic** integration surface —
+new consumers should prefer them over the legacy `/send` bridge:
+
+| Method & path | Purpose | Auth |
+|---|---|---|
+| `POST /api/v1/commands` | **Durable command** (send/mark-read/…): committed to the store **before** the `202` returns. Body `{type, payload(base64), idempotencyKey, targetAgentId?, expiresAt?}` → `202 {commandId, state, created}`. Idempotent: replaying an `idempotencyKey` returns the ORIGINAL command with `created:false` — safe retries, never double sends. | Bearer (master) |
+| `GET /api/v1/commands/:id` | Lifecycle: `QUEUED → DELIVERED_TO_AGENT → ACCEPTED_BY_AGENT → EXECUTING → COMPLETED/FAILED/EXPIRED` (§41). **Never** claims carrier `SENT/DELIVERED` — those words come only from Android evidence. | Bearer |
+| `GET /api/v1/commands` | Queue depth by state. | Bearer |
+| `POST /api/v1/agent/commands/claim` | **Android Agent only** (device key). Atomically claims queued commands. | `X-API-Key` device key |
+| `POST /api/v1/agent/commands/:id/status` | Agent reports `ACCEPTED/EXECUTING/COMPLETED/FAILED`; guarded transitions, illegal jumps → `409`. | device key |
+| `POST /api/v1/agent/events/batch` | Agent uploads opaque event batches; response **partial-ACKs** per `eventId` with the assigned `serverSequence`; missing IDs stay pending on the device and retry. Duplicate IDs are skipped **without consuming a sequence**. | device key |
+| `GET /api/v1/sync?after=&limit=` | **Cursor catch-up sync**: opaque ciphertext events with monotonic **per-account** sequences, `{events, nextCursor, hasMore}`. Apply transactionally into your local store; the cursor is your only sync state. | Bearer |
+| `GET /api/v1/sse` | Realtime **invalidation signal only** (`{type:"sync.available"}` — zero content, §44). On signal: re-pull `/api/v1/sync` with your cursor. EventSource cannot send headers → `?token=<apiToken>` is accepted (constant-time compared). Durability is never dependent on this stream. | Bearer or `?token=` |
+| `GET /api/v1/push/public-key` | VAPID public key for Web Push subscription. | Bearer |
+| `POST /api/v1/push/subscribe` / `unsubscribe` | Register/remove a push subscription (§89). **Content-less wake-ups only** (§30): notifications never carry message content. | Bearer |
+| `GET /api/v1/push/subscriptions` | List subscriptions (endpoint hashes truncated for privacy). | Bearer |
+| `POST /api/v1/trust/statements` / `GET /api/v1/trust/{snapshot,statements}` | Signed Trust Registry relay (ADR-001): Android signs, GMweb only stores/relays; **clients verify `rootSignature` locally** — GMweb cannot mint or revoke devices. | Bearer |
+
+**Eve compatibility:** the legacy `POST /send` and `/gateway/*` flows are
+unchanged and remain fully supported; per ADR-004 they will become thin
+adapters over the command engine (`POST /api/v1/commands`) later, without
+breaking production consumers.
+
+---
+
 ## 4. Hybrid sync (static file + auto re-fetch)
 
 The consuming project keeps a **local committed copy** of `openapi.json`, and at runtime
