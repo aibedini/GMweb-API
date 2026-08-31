@@ -151,6 +151,9 @@ const dashboardSessionCookieName = "gmweb_session";
 const dashboardPasswordCookieName = "gmweb_login";
 const dashboardDir = path.join(config.rootDir, "public", "dashboard");
 const spaDir = path.join(config.rootDir, "public", "dashboard-next");
+// web-01 (ADR-004): the NEW secure PWA — independent Vite artifact from
+// web/, served under /web. dashboard-next stays legacy until retirement.
+const webAppDir = path.join(config.rootDir, "public", "web-app");
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -458,7 +461,10 @@ function isDashboardAsset(requestUrl) {
     pathname === "/dashboard/logout" || pathname === "/dashboard/session" ||
     pathname.startsWith("/dashboard/") ||
     // New React console (Vite SPA) served as static assets under /app.
-    pathname === "/app" || pathname.startsWith("/app/");
+    pathname === "/app" || pathname.startsWith("/app/") ||
+    // web-01: the NEW secure PWA under /web (bypasses master-token auth like
+    // the legacy consoles; its own auth layer lands with passkeys in Phase 4).
+    pathname === "/web" || pathname.startsWith("/web/");
 }
 
 // Routes only accessible by master token or dashboard session (not project keys)
@@ -1717,6 +1723,50 @@ async function sendSpaFile(reply, relPath) {
   }
 }
 
+// web-01: serve the NEW secure PWA (public/web-app) under /web with a strict
+// CSP (TechSpec §20): self-only scripts/styles, no inline/eval, no frames.
+// The hashed-asset Vite output never needs inline code.
+function webAppSecurityHeaders(reply) {
+  reply.header(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self'",
+      "img-src 'self' data:",
+      "connect-src 'self'",
+      "object-src 'none'",
+      "base-uri 'none'",
+      "frame-ancestors 'none'",
+      "form-action 'self'",
+    ].join("; ")
+  );
+  reply.header("X-Content-Type-Options", "nosniff");
+  reply.header("Referrer-Policy", "no-referrer");
+}
+
+async function sendWebAppFile(reply, relPath) {
+  const clean = String(relPath || "").replace(/\\/g, "/");
+  if (clean.includes("..")) { reply.code(404).send("Not found"); return; }
+  const candidate = clean && clean !== "/" ? path.join(webAppDir, clean) : path.join(webAppDir, "index.html");
+  const ext = path.extname(candidate);
+  try {
+    const body = await fs.readFile(candidate);
+    webAppSecurityHeaders(reply);
+    reply.type(contentTypes[ext] || "application/octet-stream").send(body);
+  } catch {
+    // SPA fallback for client-side routing (never for missing assets — but the
+    // strict path check above already blocks traversal).
+    try {
+      const html = await fs.readFile(path.join(webAppDir, "index.html"));
+      webAppSecurityHeaders(reply);
+      reply.type("text/html; charset=utf-8").send(html);
+    } catch {
+      reply.code(404).send("Web app not built. Run: npm --prefix web run build");
+    }
+  }
+}
+
 app.get("/health", {
   schema: {
     summary: "Health check",
@@ -1751,6 +1801,10 @@ if (config.dashboardEnabled) {
   app.get("/app", { schema: { hide: true } }, async (_request, reply) => sendSpaFile(reply, "index.html"));
   app.get("/app/", { schema: { hide: true } }, async (_request, reply) => sendSpaFile(reply, "index.html"));
   app.get("/app/*", { schema: { hide: true } }, async (request, reply) => sendSpaFile(reply, request.params["*"]));
+  // web-01: the NEW secure PWA under /web (strict CSP §20, own artifact).
+  app.get("/web", { schema: { hide: true } }, async (_request, reply) => sendWebAppFile(reply, "index.html"));
+  app.get("/web/", { schema: { hide: true } }, async (_request, reply) => sendWebAppFile(reply, "index.html"));
+  app.get("/web/*", { schema: { hide: true } }, async (request, reply) => sendWebAppFile(reply, request.params["*"]));
 
   app.get("/dashboard/session", async (request) => {
     const session = dashboardSession(request);

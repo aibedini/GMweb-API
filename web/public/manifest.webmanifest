@@ -1,0 +1,11 @@
+{
+  "name": "Messages",
+  "short_name": "Messages",
+  "description": "Secure cross-device messaging client for the GMweb control plane.",
+  "start_url": "/web/",
+  "scope": "/web/",
+  "display": "standalone",
+  "background_color": "#0b0c0f",
+  "theme_color": "#0b0c0f",
+  "icons": []
+}

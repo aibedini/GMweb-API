@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+/*
+ * §46 Design tokens (TechSpec) — CSS custom properties so the HeroUI-style
+ * theme layers can swap light/dark without touching component code. Colors
+ * stay semantic (fg/muted/accent/danger), never raw brand hexes.
+ */
+:root {
+  --bg: #0b0c0f;
+  --card: #14161b;
+  --fg: #e7e9ee;
+  --muted-fg: #9aa1ad;
+  --border: #262a33;
+  --accent: #4f7cf7;
+  --danger: #e5484d;
+  --ok: #46a758;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f8fa;
+    --card: #ffffff;
+    --fg: #17181c;
+    --muted-fg: #6b7280;
+    --border: #e2e4ea;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, Vazirmatn, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* §50 Motion — subtle only; Reduced Motion is honoured. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
