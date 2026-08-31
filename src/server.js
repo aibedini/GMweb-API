@@ -535,6 +535,10 @@ function checkDeviceKey(request) {
 
 function requireToken(request, reply, done) {
   if (config.publicHealth && requestPath(request.url) === "/health") return done();
+  // Phase 4 (§21): passkey login flow endpoints must be reachable BEFORE any
+  // session exists — status, both option generators, and the auth verify.
+  // The verify handlers themselves gate on challenge single-use + UV flag.
+  if (requestPath(request.url).startsWith("/api/v1/auth/")) return done();
   // Android pull-bridge endpoints authenticate with their own device key
   // (X-API-Key) inside the route handler — master/project auth doesn't apply.
   if (requestPath(request.url).startsWith("/gateway/")) {
@@ -2522,7 +2526,9 @@ app.get("/api/v1/auth/status", {
 app.get("/api/v1/auth/passkey/register/options", {
   schema: { summary: "WebAuthn registration options (§21)", tags: ["Auth"] }
 }, async (request, reply) => {
-  // First-run bootstrap: enrollment without auth only while the registry is empty.
+  // First-run bootstrap: enrollment without auth only while the registry is
+  // empty. Afterwards, hasDashboardAccess gates (requireToken already let the
+  // request through, so hasDashboardAccess decides via Bearer/session).
   if (passkeyService.hasCredentials() && !hasDashboardAccess(request)) {
     reply.code(401).send({ error: "unauthorized" });
     return;
