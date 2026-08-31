@@ -16,6 +16,14 @@ import { syncNow, listRecentEvents, getCursor, resetLocal, subscribeSyncAvailabl
 import { buildConversations, eventsForAggregate, renderMessage } from "../lib/inbox";
 import { fetchTrustSnapshot, health, type TrustSnapshot } from "../lib/api";
 import {
+  listCredentials,
+  removeCredential,
+  listAgentIdentities,
+  listPushSubscriptions,
+  type CredentialRow,
+  type IdentityRow,
+} from "../lib/security";
+import {
   pushSupported,
   subscribeToPush,
   unsubscribeFromPush,
@@ -23,7 +31,7 @@ import {
 } from "../lib/push";
 import { fetchAuthStatus, passkeyLogin, type AuthStatus } from "../lib/auth";
 
-type TabKey = "inbox" | "sync" | "trust" | "debug";
+type TabKey = "inbox" | "sync" | "trust" | "security" | "debug";
 
 const TYPE_COLOR: Record<string, "default" | "success" | "warning" | "danger" | "accent"> = {
   MESSAGE_CREATED: "accent",
@@ -45,6 +53,10 @@ export default function App() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [credentials, setCredentials] = useState<CredentialRow[] | null>(null);
+  const [identities, setIdentities] = useState<IdentityRow[] | null>(null);
+  const [pushCount, setPushCount] = useState<number | null>(null);
+  const [securityErr, setSecurityErr] = useState<string | null>(null);
 
   const refresh = async () => {
     setCursor(await getCursor());
@@ -112,6 +124,23 @@ export default function App() {
     [events, selected],
   );
 
+  const refreshSecurity = async () => {
+    setSecurityErr(null);
+    try {
+      setCredentials(await listCredentials());
+    } catch { setCredentials(null); }
+    try {
+      setIdentities(await listAgentIdentities());
+    } catch { setIdentities(null); }
+    try {
+      setPushCount((await listPushSubscriptions()).count);
+    } catch { setPushCount(null); }
+  };
+
+  useEffect(() => {
+    if (authed) void refreshSecurity();
+  }, [authed]);
+
   // Passkey gate — §21 passkey-first. Bootstrap shown with its own copy via
   // the same Login pane (server declares next step).
   if (authed === false) {
@@ -178,6 +207,7 @@ export default function App() {
           <Tab id="inbox">Inbox</Tab>
           <Tab id="sync">Sync</Tab>
           <Tab id="trust">Trust</Tab>
+          <Tab id="security">Security</Tab>
           <Tab id="debug">Debug</Tab>
         </TabList>
 
@@ -323,6 +353,101 @@ export default function App() {
               )}
             </CardContent>
           </Card>
+        </TabPanel>
+
+        {/* ── Security Center (§84) ───────────────────────────────────── */}
+        <TabPanel id="security">
+          <div className="space-y-3 py-3">
+            {securityErr && (
+              <p className="text-xs" style={{ color: "var(--danger)" }}>{securityErr}</p>
+            )}
+
+            <Card>
+              <CardContent className="p-4">
+                <p className="text-sm font-medium">Passkeys (§21)</p>
+                {!credentials && (
+                  <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
+                    Sign in to view enrolled passkeys.
+                  </p>
+                )}
+                {credentials && credentials.length === 0 && (
+                  <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
+                    No passkeys enrolled yet.
+                  </p>
+                )}
+                {credentials && credentials.length > 0 && (
+                  <ul className="mt-2 space-y-2">
+                    {credentials.map((c) => (
+                      <li key={c.credentialId} className="flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: "var(--border)" }}>
+                        <div className="min-w-0">
+                          <div className="font-mono">{c.label || c.credentialId.slice(0, 20) + "…"}</div>
+                          <div style={{ color: "var(--muted-fg)" }}>
+                            added {new Date(c.createdAt).toLocaleDateString()}
+                            {c.lastUsedAt ? ` · last used ${new Date(c.lastUsedAt).toLocaleDateString()}` : " · never used"}
+                          </div>
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          onPress={() =>
+                            void (async () => {
+                              try {
+                                await removeCredential(c.credentialId);
+                                await refreshSecurity();
+                              } catch (e) {
+                                setSecurityErr(e instanceof Error ? e.message : "remove failed");
+                              }
+                            })()
+                          }
+                        >
+                          Remove
+                        </Button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardContent className="p-4">
+                <p className="text-sm font-medium">Android Agent Identities (ADR-001)</p>
+                {!identities && (
+                  <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
+                    Unavailable (auth required) or none enrolled.
+                  </p>
+                )}
+                {identities && identities.length === 0 && (
+                  <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
+                    No agent has enrolled per-device keys yet (agents auto-enroll on next registration).
+                  </p>
+                )}
+                {identities && identities.length > 0 && (
+                  <ul className="mt-2 space-y-1 text-xs">
+                    {identities.map((i) => (
+                      <li key={i.device_id} className="flex items-center justify-between rounded-lg border px-3 py-2" style={{ borderColor: "var(--border)" }}>
+                        <span className="font-mono">{i.device_id}</span>
+                        <span style={{ color: "var(--muted-fg)" }}>
+                          v{i.protocol_version} · {new Date(i.registered_at).toLocaleDateString()}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardContent className="p-4">
+                <p className="text-sm font-medium">Push Subscriptions (§89)</p>
+                <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
+                  {pushCount === null
+                    ? "Unavailable (auth required)."
+                    : `${pushCount} device(s) registered for content-less wake-ups.`}
+                </p>
+              </CardContent>
+            </Card>
+          </div>
         </TabPanel>
 
         {/* ── Debug ───────────────────────────────────────────────────── */}
