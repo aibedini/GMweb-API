@@ -117,3 +117,56 @@ export async function resetLocal(): Promise<void> {
     t.onerror = () => reject(t.error);
   });
 }
+
+/**
+ * §44: subscribe to the control plane's NARROW invalidation signal.
+ * The stream never carries message content — on every {type:"sync.available"}
+ * we re-run syncNow() with the durable cursor. The browser's EventSource
+ * auto-reconnects; backoff is its job, correctness is ours.
+ *
+ * Returns a disposer (for React effects / StrictMode double-mount).
+ */
+export function subscribeSyncAvailable(onSynced: (applied: number) => void): () => void {
+  let closed = false;
+  let es: EventSource | null = null;
+  let connecting: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (closed) return;
+    es = new EventSource("/api/v1/sse");
+    es.onmessage = (msg) => {
+      try {
+        const evt = JSON.parse(msg.data) as { type?: string; newEvents?: number };
+        if (evt.type === "sync.available") {
+          void syncNow()
+            .then((applied) => {
+              if (applied > 0) onSynced(applied);
+            })
+            .catch(() => {
+              /* cursor sync retries on the next signal or manual pull */
+            });
+        }
+      } catch {
+        /* ignore malformed frames — the cursor is the truth */
+      }
+    };
+    // EventSource retries on its own; we only rebuild after a hard close.
+    es.onerror = () => {
+      es?.close();
+      es = null;
+      if (!closed && connecting === null) {
+        connecting = setTimeout(() => {
+          connecting = null;
+          connect();
+        }, 5_000);
+      }
+    };
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    if (connecting !== null) clearTimeout(connecting);
+    es?.close();
+  };
+}

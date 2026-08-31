@@ -35,6 +35,7 @@ const { DeviceKeyStore } = require("./deviceKey");
 const { TrustRegistry } = require("./trustRegistry");
 const { CommandEngine } = require("./commandEngine");
 const { EventStore } = require("./eventStore");
+const { WebPushService } = require("./webPush");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
@@ -61,7 +62,17 @@ const controlDb = new (require("better-sqlite3"))(path.join(config.rootDir, "dat
 controlDb.pragma("journal_mode = WAL");
 const trustRegistry = new TrustRegistry(controlDb);
 const commandEngine = new CommandEngine(controlDb);
-const eventStore = new EventStore(controlDb);
+const eventStore = new EventStore(controlDb, {
+  // §44+§45: durability first, then two best-effort realtime hints —
+  // (a) in-process SSE fan-out, (b) content-less Web Push wake-ups.
+  onEventsAccepted: (count) => {
+    emitControlEvent({ type: "sync.available", newEvents: count, at: new Date().toISOString() });
+    void webPushService.notifySyncAvailable(count).catch(() => {});
+  },
+});
+const webPushService = new WebPushService(controlDb, {
+  vapidKeyPath: path.join(config.rootDir, "data", "webpush-vapid.json"),
+});
 const DEFAULT_ACCOUNT_ID = "default";
 
 // Endpoints that drive the Google Messages *browser* session (sidebar scrape,
@@ -557,6 +568,19 @@ function requireToken(request, reply, done) {
       return done();
     }
   }
+  // web-01 bridge (pre-passkey, §23-honest): native EventSource cannot send
+  // headers, so the control-plane SSE accepts ?token=<apiToken> as a
+  // constant-time equivalent of the Bearer header. TEMPORARY until the PWA
+  // gets its own passkey session (Phase 4) — then this bridge is deleted.
+  if (requestPath(request.url) === "/api/v1/sse" && config.apiToken) {
+    const q = String(request.query?.token || "");
+    if (
+      q.length === config.apiToken.length &&
+      crypto.timingSafeEqual(Buffer.from(q), Buffer.from(config.apiToken))
+    ) {
+      return done();
+    }
+  }
 
   // Dashboard session — full access
   const session = dashboardSession(request);
@@ -662,6 +686,20 @@ function emitSse(event) {
       if (!ledger || ledger.key_name !== scope.keyName) continue;
     }
     reply.raw.write(payload);
+  }
+}
+
+// web-01 (§44): the PWA's realtime channel is a NARROW invalidation signal —
+// never message content. EventUploader's batch ACK calls emitControlEvent,
+// which fans out to /api/v1/sse subscribers as {type:"sync.available"} and
+// clients re-pull /api/v1/sync with their cursor. Durability is untouched:
+// if the SSE drops, the cursor sync still catches everything up.
+const controlSseClients = new Set();
+
+function emitControlEvent(event) {
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  for (const reply of controlSseClients) {
+    try { reply.raw.write(payload); } catch { controlSseClients.delete(reply); }
   }
 }
 
@@ -2359,6 +2397,92 @@ registerControlPlaneRoutes(app, {
   eventStore,
   accountId: DEFAULT_ACCOUNT_ID,
 });
+
+// web-01 (§44): narrow realtime channel for the PWA — {type:"sync.available"}
+// only. Auth: master token / dashboard session via requireToken (project keys
+// have no meaning in the single-account control plane yet).
+app.get("/api/v1/sse", {
+  schema: {
+    summary: "Control plane SSE — sync.available invalidation signal (§44)",
+    description: [
+      "Emits {type:\"sync.available\", lastEventId} whenever new events land in the encrypted event store.",
+      "**Never carries message content** — clients re-pull /api/v1/sync with their cursor (durability lives there)."
+    ].join("\n"),
+    tags: ["Sync"],
+    produces: ["text/event-stream"],
+    response: { 200: { type: "string", description: "SSE stream" } }
+  }
+}, async (request, reply) => {
+  reply.raw.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive"
+  });
+  reply.raw.write(": connected\n\n");
+  controlSseClients.add(reply);
+  request.raw.on("close", () => controlSseClients.delete(reply));
+});
+
+// ── web-01 Web Push (§45/§89, content-less wake-ups) ────────────────────────
+
+app.get("/api/v1/push/public-key", {
+  schema: {
+    summary: "VAPID public key for PushSubscription (§45)",
+    tags: ["Push"],
+    response: { 200: { type: "object", properties: { publicKey: { type: "string" } } } }
+  }
+}, async () => ({ publicKey: webPushService.publicKey() }));
+
+app.post("/api/v1/push/subscribe", {
+  schema: {
+    summary: "Register a Web Push subscription (§89 — bound, prunable)",
+    description: "Subscription is stored keyed by a hash of the endpoint (the raw URL may contain capability tokens). Content-less pushes only — §30 default.",
+    tags: ["Push"],
+    body: {
+      type: "object",
+      required: ["endpoint", "keys"],
+      properties: {
+        endpoint: { type: "string" },
+        keys: {
+          type: "object",
+          required: ["p256dh", "auth"],
+          properties: { p256dh: { type: "string" }, auth: { type: "string" } }
+        }
+      }
+    },
+    response: { 200: { type: "object", properties: { ok: { type: "boolean" } } }, 400: { type: "object", properties: { error: { type: "string" } } } }
+  }
+}, async (request, reply) => {
+  try {
+    webPushService.upsertSubscription({
+      endpoint: request.body?.endpoint,
+      keys: request.body?.keys,
+      userAgent: request.headers["user-agent"],
+    });
+    return { ok: true };
+  } catch (error) {
+    reply.code(400).send({ error: error.message });
+  }
+});
+
+app.post("/api/v1/push/unsubscribe", {
+  schema: {
+    summary: "Remove a Web Push subscription (logout/revoke, §89)",
+    tags: ["Push"],
+    body: { type: "object", required: ["endpoint"], properties: { endpoint: { type: "string" } } },
+    response: { 200: { type: "object", properties: { ok: { type: "boolean" }, removed: { type: "boolean" } } } }
+  }
+}, async (request) => ({
+  ok: true,
+  removed: webPushService.removeSubscription(request.body?.endpoint),
+}));
+
+app.get("/api/v1/push/subscriptions", {
+  schema: {
+    summary: "List push subscriptions (Privacy: endpoint hashes truncated)",
+    tags: ["Push"]
+  }
+}, async () => ({ subscriptions: webPushService.listSubscriptions(), count: webPushService.count() }));
 
 app.get("/ready", {
   schema: {

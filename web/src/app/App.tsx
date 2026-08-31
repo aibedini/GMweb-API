@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
-import { syncNow, listRecentEvents, getCursor, resetLocal, type StoredEvent } from "../lib/sync";
+import { syncNow, listRecentEvents, getCursor, resetLocal, subscribeSyncAvailable, type StoredEvent } from "../lib/sync";
 import { fetchTrustSnapshot, health, type TrustSnapshot } from "../lib/api";
+import {
+  pushSupported,
+  subscribeToPush,
+  unsubscribeFromPush,
+  removeSubscriptionFromServer,
+} from "../lib/push";
 
 /**
  * web-01 shell (TechSpec §5 Phase 4 start): three honest screens —
@@ -21,6 +27,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [trust, setTrust] = useState<TrustSnapshot | null>(null);
   const [version, setVersion] = useState<string>("");
+  const [pushState, setPushState] = useState<string>("");
 
   const refresh = async () => {
     setCursor(await getCursor());
@@ -37,6 +44,13 @@ export default function App() {
       }
       await refresh();
     })();
+    // §44: realtime invalidation — the SSE signal is narrow (no content);
+    // the durable cursor sync does the actual catching up.
+    const dispose = subscribeSyncAvailable((applied) => {
+      setApplied(applied);
+      void refresh();
+    });
+    return dispose;
   }, []);
 
   const pull = async () => {
@@ -168,6 +182,66 @@ export default function App() {
         {tab === "debug" && (
           <section className="space-y-3">
             <div className="rounded-xl border p-4 text-sm" style={{ background: "var(--card)", borderColor: "var(--border)" }}>
+              <p className="font-medium">Web Push (§45)</p>
+              <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
+                Content-less wake-ups only (§30 default): notifications say
+                «N new events — open to sync» and never carry message content.
+                Permission is requested only by this explicit click.
+              </p>
+              <div className="mt-3 flex gap-2">
+                <button
+                  onClick={() =>
+                    void (async () => {
+                      setPushState("…");
+                      try {
+                        if (!pushSupported()) {
+                          setPushState("unsupported browser");
+                          return;
+                        }
+                        const res = await fetch("/api/v1/push/public-key");
+                        const { publicKey } = (await res.json()) as { publicKey: string };
+                        const sub = await subscribeToPush(publicKey);
+                        if (!sub) {
+                          setPushState("permission denied / unsupported");
+                          return;
+                        }
+                        const ok = await import("../lib/push").then((m) => m.sendSubscriptionToServer(sub));
+                        setPushState(ok ? "subscribed ✓" : "subscribe upload failed");
+                      } catch (e) {
+                        setPushState(e instanceof Error ? e.message : "error");
+                      }
+                    })()
+                  }
+                  className="rounded-md px-3 py-1.5 text-xs"
+                  style={{ background: "var(--accent)", color: "white" }}
+                >
+                  Enable push
+                </button>
+                <button
+                  onClick={() =>
+                    void (async () => {
+                      const reg = await navigator.serviceWorker?.getRegistration("/web/");
+                      const sub = await reg?.pushManager.getSubscription();
+                      if (sub) {
+                        await removeSubscriptionFromServer(sub.endpoint);
+                        await unsubscribeFromPush();
+                      }
+                      setPushState("unsubscribed");
+                    })()
+                  }
+                  className="rounded-md px-3 py-1.5 text-xs"
+                  style={{ border: "1px solid var(--border)", color: "var(--muted-fg)" }}
+                >
+                  Disable
+                </button>
+              </div>
+              {pushState && (
+                <p className="mt-2 text-xs" style={{ color: "var(--ok)" }}>
+                  {pushState}
+                </p>
+              )}
+            </div>
+            <div className="rounded-xl border p-4 text-sm" style={{ background: "var(--card)", borderColor: "var(--border)" }}>
               <p className="font-medium">Local store</p>
               <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
                 IndexedDB «gmweb-messages» — events + cursor. Reset re-syncs from zero
@@ -182,7 +256,7 @@ export default function App() {
               </button>
             </div>
             <p className="text-xs" style={{ color: "var(--muted-fg)" }}>
-              web-01 shell · sync + trust surfaces live · passkeys/Inbox/SSE land in
+              web-01 shell · sync + SSE + trust + push surfaces live · passkeys/Inbox land in
               Phase 4 per TechSpec §5 — payloads stay opaque until the Phase 7 crypto review.
             </p>
           </section>

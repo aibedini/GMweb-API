@@ -17,8 +17,13 @@
 class EventStore {
   /**
    * @param {import("better-sqlite3").Database} db
+   * @param {object} [opts] { onEventsAccepted?: (count:number) => void }
+   *        onEventsAccepted: realtime hook (§44) — fired AFTER commit with the
+   *        number of newly accepted events, so the SSE layer can emit
+   *        {type:"sync.available"}. The store itself stays transport-blind.
    */
-  constructor(db) {
+  constructor(db, opts = {}) {
+    this.onEventsAccepted = opts.onEventsAccepted || null;
     this.db = db;
     db.exec(`
       CREATE TABLE IF NOT EXISTS event_counters (
@@ -115,7 +120,13 @@ class EventStore {
       }
       return { accepted, duplicates };
     });
-    return accept(events);
+    const result = accept(events);
+    // §44 invalidation hook — AFTER the transaction committed (durable first,
+    // realtime second). Never throws into the HTTP path.
+    if (result.accepted.length > 0 && this.onEventsAccepted) {
+      try { this.onEventsAccepted(result.accepted.length); } catch { /* swallow */ }
+    }
+    return result;
   }
 
   /** Cursor sync (§54): events after a per-account sequence cursor. */
