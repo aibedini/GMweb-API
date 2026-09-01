@@ -31,6 +31,16 @@ class AgentAuthService {
    */
   constructor(db) {
     this.db = db;
+    // BLOCKER 3 migration: existing databases predate device_role. SQLite
+    // has no ADD COLUMN IF NOT EXISTS — inspect pragma and alter if needed.
+    try {
+      const cols = db.prepare("PRAGMA table_info(agent_identities)").all();
+      if (cols.length > 0 && !cols.some((c) => c.name === "device_role")) {
+        db.exec("ALTER TABLE agent_identities ADD COLUMN device_role TEXT NOT NULL DEFAULT 'LEGACY_AGENT'");
+      }
+    } catch {
+      // fresh DB — the CREATE TABLE below already includes the column
+    }
     db.exec(`
       CREATE TABLE IF NOT EXISTS agent_identities (
         device_id          TEXT PRIMARY KEY,
