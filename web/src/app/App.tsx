@@ -29,7 +29,14 @@ import {
   unsubscribeFromPush,
   removeSubscriptionFromServer,
 } from "../lib/push";
-import { fetchAuthStatus, passkeyLogin, type AuthStatus } from "../lib/auth";
+import { fetchAuthStatus } from "../lib/auth";
+import { PairingScreen } from "../screens/PairingScreen";
+
+// ADR-007 §1: first-run is LINKED-DEVICE pairing, never passkey bootstrap.
+// Until the user pairs (or holds a valid linked-device session), the app
+// shows the QR pairing screen. Passkey stays available later behind
+// Security Center (§7) — never as a first-run gate.
+const HAS_LINKED_SESSION = "linked_device_session";
 
 type TabKey = "inbox" | "sync" | "trust" | "security" | "debug";
 
@@ -50,7 +57,6 @@ export default function App() {
   const [trust, setTrust] = useState<TrustSnapshot | null>(null);
   const [version, setVersion] = useState<string>("");
   const [pushState, setPushState] = useState<string>("");
-  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [credentials, setCredentials] = useState<CredentialRow[] | null>(null);
@@ -72,11 +78,11 @@ export default function App() {
         setVersion("unreachable");
       }
       try {
+        // ADR-007: an UNLINKED browser (no passkey session cookie) starts at
+        // the QR pairing screen; a passkey session from a previous ceremony
+        // still counts as an authed linked session.
         const s = await fetchAuthStatus();
-        setAuthStatus(s);
-        // A passkey session cookie from a previous ceremony still counts:
-        // the guarded /api/v1/trust/snapshot 404-vs-200 doubles as our probe.
-        setAuthed(s.next === "authentication" ? null : false);
+        setAuthed(s.next === "authentication" ? true : false);
       } catch {
         setAuthed(false);
       }
@@ -96,20 +102,6 @@ export default function App() {
     try {
       const n = await syncNow();
       setApplied(n);
-      await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const login = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await passkeyLogin();
-      setAuthed(true);
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -141,42 +133,18 @@ export default function App() {
     if (authed) void refreshSecurity();
   }, [authed]);
 
-  // Passkey gate — §21 passkey-first. Bootstrap shown with its own copy via
-  // the same Login pane (server declares next step).
-  if (authed === false) {
+  // ADR-007 §1 state machine: UNLINKED → SHOW_QR → PAIRING_PENDING →
+  // PAIRING_APPROVED → READY. The old passkey gate (authed === false →
+  // "Create a passkey…") is REMOVED: passkey is optional post-pairing
+  // hardening behind Security Center, never the bootstrap of trust.
+  if (authed === false || authed === null) {
     return (
-      <div className="flex h-full items-center justify-center">
-        <Card className="w-full max-w-md">
-          <CardContent className="flex flex-col gap-4 p-6">
-            <h1 className="text-2xl font-semibold">Messages</h1>
-            <p className="text-sm" style={{ color: "var(--muted-fg)" }}>
-              {authStatus?.next === "registration"
-                ? "First run: create a passkey on this device to secure the account (§21)."
-                : "Sign in with your passkey — no password, ever."}
-            </p>
-            <Button
-              size="lg"
-              variant="primary"
-              isDisabled={busy}
-              onPress={() => void login()}
-            >
-              {busy
-                ? "Waiting for authenticator…"
-                : authStatus?.next === "registration"
-                  ? "Set up this device (passkey)"
-                  : "Continue with Passkey"}
-            </Button>
-            {error && (
-              <p className="text-xs" style={{ color: "var(--danger)" }}>
-                {error}
-              </p>
-            )}
-            <p className="text-xs" style={{ color: "var(--muted-fg)" }}>
-              TOTP / recovery fallback lands with the Security Center screens.
-            </p>
-          </CardContent>
-        </Card>
-      </div>
+      <PairingScreen
+        onLinked={() => {
+          sessionStorage.setItem(HAS_LINKED_SESSION, "1");
+          setAuthed(true);
+        }}
+      />
     );
   }
 
