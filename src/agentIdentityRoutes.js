@@ -49,8 +49,11 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
       response: { 200: { type: "object", properties: { ok: { type: "boolean" } } } }
     }
   }, async (request) => {
+    // FIX 5b (review): role is NEVER taken from the client. The service
+    // assigns PRIMARY_TRUST_AGENT to the first enrolled agent automatically.
     const { deviceId, publicKeys, protocolVersion } = request.body || {};
-    return agentAuthService.registerIdentity({ deviceId, publicKeys, protocolVersion });
+    const result = agentAuthService.registerIdentity({ deviceId, publicKeys, protocolVersion });
+    return { ...result, role: result.role };
   });
 
   app.get("/api/v1/agent/identities", {

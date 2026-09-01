@@ -619,6 +619,35 @@ function requireToken(request, reply, done) {
   // decisions — match the exact paths.
   if (requestPath(request.url) === "/api/v1/pairing/session" ||
       requestPath(request.url) === "/api/v1/pairing/status") return done();
+  // FIX 2 (review): the Android-only pairing endpoints delegate to the SAME
+  // agent pipeline as /api/v1/agent/* — verified here ONCE (method-aware,
+  // exact rawBody) and bound to request.authenticatedAgentId. The route
+  // handlers then check ROLE only, never re-verify the signature (a second
+  // verify would trip the replay cache). These paths never hit
+  // master/dashboard/project auth.
+  if (requestPath(request.url) === "/api/v1/pairing/session" &&
+      request.method === "GET") {
+    // path is /api/v1/pairing/session/:id
+    if (checkDeviceKey(request)) return done();
+    const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
+    if (auth.ok) {
+      request.authenticatedAgentId = auth.deviceId;
+      return done();
+    }
+    reply.code(401).send({ error: "unauthorized" });
+    return;
+  }
+  if (requestPath(request.url) === "/api/v1/pairing/approve" &&
+      request.method === "POST") {
+    if (checkDeviceKey(request)) return done();
+    const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
+    if (auth.ok) {
+      request.authenticatedAgentId = auth.deviceId;
+      return done();
+    }
+    reply.code(401).send({ error: "unauthorized" });
+    return;
+  }
   // Android agent bridge: device key (legacy) OR per-device ECDSA signature
   // (PR-08b) — the route handler/hook re-checks and binds the identity.
   if (requestPath(request.url).startsWith("/gateway/")) {

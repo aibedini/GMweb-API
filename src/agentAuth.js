@@ -70,11 +70,42 @@ class AgentAuthService {
     this.recentStamps = []; // [timestamp, deviceId] ring for duplicate rejection
   }
 
-  /** Registration payload (PR-05 publicKeys block) → durable identity. */
-  registerIdentity({ deviceId, publicKeys, protocolVersion = 1, role = "LEGACY_AGENT" }) {
+  /** Registration payload (PR-05 publicKeys block) → durable identity.
+   *  FIX 5 (review): clients cannot self-declare roles. Policy: the FIRST
+   *  enrolled agent becomes PRIMARY_TRUST_AGENT; later agents stay
+   *  LEGACY_AGENT (no self-promotion). Re-registering the existing primary
+   *  keeps its role. Ops force-change goes through promotePrimary(). */
+  registerIdentity({ deviceId, publicKeys, protocolVersion = 1 }) {
     if (!deviceId || !publicKeys?.signing) {
       throw new Error("deviceId and publicKeys.signing are required");
     }
+    const existing = this.getStmt.get(String(deviceId));
+    const existingRole = existing ? String(existing.device_role || "LEGACY_AGENT") : null;
+    let role;
+    if (existingRole === "PRIMARY_TRUST_AGENT") {
+      role = "PRIMARY_TRUST_AGENT";
+    } else {
+      const primaries = this.db
+        .prepare("SELECT COUNT(*) AS n FROM agent_identities WHERE device_role = 'PRIMARY_TRUST_AGENT'")
+        .get();
+      role = primaries.n === 0 ? "PRIMARY_TRUST_AGENT" : "LEGACY_AGENT";
+    }
+    this._register(deviceId, publicKeys, protocolVersion, role);
+    return { ok: true, role };
+  }
+
+  /** Server-side-only role promotion (ops migration), never client-driven. */
+  promotePrimary(deviceId) {
+    const identity = this.getStmt.get(String(deviceId));
+    if (!identity) throw new Error("unknown device");
+    this._register(deviceId, {
+      signing: identity.signing_public_key,
+      encryption: identity.encryption_public_key,
+      trustRoot: identity.trust_root_public_key,
+    }, identity.protocol_version, "PRIMARY_TRUST_AGENT");
+  }
+
+  _register(deviceId, publicKeys, protocolVersion, role) {
     this.upsertStmt.run({
       device_id: String(deviceId),
       signing_public_key: String(publicKeys.signing),
@@ -82,9 +113,8 @@ class AgentAuthService {
       trust_root_public_key: publicKeys.trustRoot ? String(publicKeys.trustRoot) : null,
       registered_at: Date.now(),
       protocol_version: Number(protocolVersion) || 1,
-      device_role: String(role || "LEGACY_AGENT"),
+      device_role: String(role),
     });
-    return { ok: true };
   }
 
   listIdentities() {
@@ -148,14 +178,24 @@ class AgentAuthService {
       .createHash("sha256")
       .update(Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody || "")))
       .digest("hex");
-    const canonical = `POST\n${request.url.split("?")[0]}\n${bodyHash}\nX-AGENT-TS:${ts}\n`;
+    const method = String(request.method || "POST").toUpperCase();
+    const canonical = `${method}\n${request.url.split("?")[0]}\n${bodyHash}\nX-AGENT-TS:${ts}\n`;
 
     try {
-      const keyObject = crypto.createPublicKey({
-        key: Buffer.from(identity.signing_public_key, "base64"),
-        format: "der",
-        type: "spki",
-      });
+      // FIX 4 (wire format): Android v1 sent the RAW uncompressed P-256 point
+      // (0x04||X||Y, 65 bytes); tests/SPKI migration use DER SPKI. Accept both:
+      // raw points are wrapped into a SubjectPublicKeyInfo before import.
+      const keyBytes = Buffer.from(identity.signing_public_key, "base64");
+      let keyObject;
+      if (keyBytes.length === 65 && keyBytes[0] === 0x04) {
+        const spki = Buffer.concat([
+          Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex"),
+          keyBytes,
+        ]);
+        keyObject = crypto.createPublicKey({ key: spki, format: "der", type: "spki" });
+      } else {
+        keyObject = crypto.createPublicKey({ key: keyBytes, format: "der", type: "spki" });
+      }
       const ok = crypto.verify(
         "sha256",
         Buffer.from(canonical, "utf8"),

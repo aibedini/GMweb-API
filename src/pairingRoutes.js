@@ -42,18 +42,17 @@ function serverOrigin(request, config) {
  * method+path+body, expired/replayed timestamps, unknown devices. The bound
  * deviceId is attached as request.authenticatedAgentId.
  */
-function requireAgentSignature(request, reply, agentAuthService, done) {
-  const header = String(request.headers["x-agent-auth"] || "");
-  if (!header) {
-    reply.code(401).send({ error: "agent signature required" });
+/**
+ * FIX 2b (review): the global preHandler hook has ALREADY verified the
+ * agent signature (single verification — a second verify would falsely
+ * trip the replay cache). Routes now only confirm the binding exists and
+ * enforce the role.
+ */
+function requireAgentSignature(request, reply, _agentAuthService, done) {
+  if (!request.authenticatedAgentId) {
+    reply.code(401).send({ error: "agent signature required (not authenticated)" });
     return false;
   }
-  const result = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
-  if (!result.ok) {
-    reply.code(401).send({ error: "unauthorized", reason: result.reason });
-    return false;
-  }
-  request.authenticatedAgentId = result.deviceId;
   done();
   return true;
 }

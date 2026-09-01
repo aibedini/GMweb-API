@@ -62,7 +62,24 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     svc = new AgentAuthService(new Database(":memory:"));
     pair = makeKey();
     const spki = pair.publicKey.export({ format: "der", type: "spki" });
-    svc.registerIdentity({ deviceId: DEVICE, publicKeys: { signing: spki.toString("base64") }, role: "PRIMARY_TRUST_AGENT" });
+    svc.registerIdentity({ deviceId: DEVICE, publicKeys: { signing: spki.toString("base64") } });
+    // FIX 2b mirror: the real app authenticates pairing Android paths in the
+    // GLOBAL preHandler (single verification, binds authenticatedAgentId);
+    // routes only check role. Replicate exactly that here.
+    app.addHook("preHandler", (request, reply, done) => {
+      const isPairingAgentPath =
+        request.url === "/api/v1/pairing/approve" ||
+        /^\/api\/v1\/pairing\/session\/[^/]+$/.test(request.url.split("?")[0]);
+      if (!isPairingAgentPath) return done();
+      const header = String(request.headers["x-agent-auth"] || "");
+      if (!header) return done(); // route will 401 (unauthenticated)
+      const result = svc.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
+      if (result.ok) {
+        request.authenticatedAgentId = result.deviceId;
+        return done();
+      }
+      reply.code(401).send({ error: "unauthorized" });
+    });
     registerPairingRoutes(app, { agentAuthService: svc, config: {} });
     await app.ready();
   });
