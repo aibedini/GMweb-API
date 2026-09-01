@@ -38,19 +38,22 @@ class AgentAuthService {
         encryption_public_key TEXT,
         trust_root_public_key TEXT,
         registered_at      INTEGER NOT NULL,
-        protocol_version   INTEGER NOT NULL DEFAULT 1
+        protocol_version   INTEGER NOT NULL DEFAULT 1,
+        -- BLOCKER 3: only PRIMARY_TRUST_AGENT may approve web pairings.
+        device_role        TEXT NOT NULL DEFAULT 'LEGACY_AGENT'
       );
     `);
     this.upsertStmt = db.prepare(
       `INSERT INTO agent_identities (device_id, signing_public_key, encryption_public_key,
-         trust_root_public_key, registered_at, protocol_version)
+         trust_root_public_key, registered_at, protocol_version, device_role)
        VALUES (@device_id, @signing_public_key, @encryption_public_key,
-         @trust_root_public_key, @registered_at, @protocol_version)
+         @trust_root_public_key, @registered_at, @protocol_version, @device_role)
        ON CONFLICT(device_id) DO UPDATE SET
          signing_public_key = excluded.signing_public_key,
          encryption_public_key = excluded.encryption_public_key,
          trust_root_public_key = excluded.trust_root_public_key,
-         protocol_version = excluded.protocol_version`
+         protocol_version = excluded.protocol_version,
+         device_role = excluded.device_role`
     );
     this.getStmt = db.prepare(`SELECT * FROM agent_identities WHERE device_id = ?`);
     this.listStmt = db.prepare(`SELECT device_id, registered_at, protocol_version FROM agent_identities`);
@@ -58,7 +61,7 @@ class AgentAuthService {
   }
 
   /** Registration payload (PR-05 publicKeys block) → durable identity. */
-  registerIdentity({ deviceId, publicKeys, protocolVersion = 1 }) {
+  registerIdentity({ deviceId, publicKeys, protocolVersion = 1, role = "LEGACY_AGENT" }) {
     if (!deviceId || !publicKeys?.signing) {
       throw new Error("deviceId and publicKeys.signing are required");
     }
@@ -69,6 +72,7 @@ class AgentAuthService {
       trust_root_public_key: publicKeys.trustRoot ? String(publicKeys.trustRoot) : null,
       registered_at: Date.now(),
       protocol_version: Number(protocolVersion) || 1,
+      device_role: String(role || "LEGACY_AGENT"),
     });
     return { ok: true };
   }
@@ -79,6 +83,25 @@ class AgentAuthService {
 
   getIdentity(deviceId) {
     return this.getStmt.get(String(deviceId)) || null;
+  }
+
+  /** BLOCKER 3: explicit role for the identity (PRIMARY_TRUST_AGENT etc.). */
+  getRole(deviceId) {
+    const identity = this.getIdentity(deviceId);
+    return identity ? String(identity.device_role || "LEGACY_AGENT") : null;
+  }
+
+  /** Promote an existing device to a role (e.g. first Android → primary). */
+  setRole(deviceId, role) {
+    this.upsertStmt.run({
+      device_id: String(deviceId),
+      signing_public_key: String(this.getIdentity(deviceId)?.signing_public_key || ""),
+      encryption_public_key: this.getIdentity(deviceId)?.encryption_public_key || null,
+      trust_root_public_key: this.getIdentity(deviceId)?.trust_root_public_key || null,
+      registered_at: Date.now(),
+      protocol_version: this.getIdentity(deviceId)?.protocol_version || 1,
+      device_role: String(role),
+    });
   }
 
   /**

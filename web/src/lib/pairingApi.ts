@@ -27,7 +27,7 @@ export interface CreateSessionResponse extends PairingSession {
 export type PairingStatus =
   | { state: "PENDING"; expiresAt: number }
   | { state: "EXPIRED" }
-  | { state: "APPROVED"; certificate: string; deviceId: string; approvedAt: number };
+  | { state: "APPROVED"; certificate: string; deviceId: string; transcriptHash: string; trustRootPublicKey: string; approvedAt: number };
 
 export async function createSession(transcript: {
   webDeviceId: string;

@@ -62,7 +62,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     svc = new AgentAuthService(new Database(":memory:"));
     pair = makeKey();
     const spki = pair.publicKey.export({ format: "der", type: "spki" });
-    svc.registerIdentity({ deviceId: DEVICE, publicKeys: { signing: spki.toString("base64") } });
+    svc.registerIdentity({ deviceId: DEVICE, publicKeys: { signing: spki.toString("base64") }, role: "PRIMARY_TRUST_AGENT" });
     registerPairingRoutes(app, { agentAuthService: svc, config: {} });
     await app.ready();
   });
@@ -91,6 +91,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     assert.equal(res.statusCode, 200);
     return res.json();
   };
+  const TRUST_ROOT_PUB = "TRUST-ROOT-PUBLIC-KEY-B64";
 
   const signApprove = (session, cert, opts = {}) => {
     const body = JSON.stringify({
@@ -98,6 +99,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
       certificate: cert,
       deviceId: "web-test-1",
       transcriptHash: pairing.hashOf(pairing.getSession(session.pairingSessionId)),
+      trustRootPublicKey: TRUST_ROOT_PUB,
     });
     const buf = Buffer.from(body);
     const ts = opts.ts ?? Date.now();
@@ -128,7 +130,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     const created = await createSession();
     const res = await app.inject({
       method: "GET",
-      url: `/api/v1/pairing/status?pairingSessionId=${encodeURIComponent(created.pairingSessionId)}`,
+      url: `/api/v1/pairing/status?pairingSessionId=${encodeURIComponent(created.pairingSessionId)}&pollSecret=${encodeURIComponent(created.pollSecret)}`,
     });
     assert.equal(res.statusCode, 200);
     assert.equal(res.json().state, "PENDING");
@@ -145,7 +147,13 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/v1/pairing/approve",
-      payload: { pairingSessionId: created.pairingSessionId, certificate: "C", deviceId: "web-test-1", transcriptHash: "h" },
+      payload: {
+        pairingSessionId: created.pairingSessionId,
+        certificate: "C",
+        deviceId: "web-test-1",
+        transcriptHash: "h",
+        trustRootPublicKey: "TRUST",
+      },
     });
     assert.equal(res.statusCode, 401);
   });
@@ -162,12 +170,9 @@ describe("ADR-007 pairing security boundary (route level)", () => {
   test("tampered body after signing is 401", async () => {
     const created = await createSession();
     const req = signApprove(created, "CERT-TAMPER");
-    req.payload = Buffer.from(JSON.stringify({
-      pairingSessionId: created.pairingSessionId,
-      certificate: "CERT-TAMPERED-AFTER-SIGN",
-      deviceId: "web-test-1",
-      transcriptHash: pairing.hashOf(pairing.getSession(created.pairingSessionId)),
-    }));
+    const parsed = JSON.parse(req.payload.toString());
+    parsed.certificate = "CERT-TAMPERED-AFTER-SIGN"; // change AFTER signing
+    req.payload = Buffer.from(JSON.stringify(parsed));
     const res = await app.inject(req);
     assert.equal(res.statusCode, 401);
   });
@@ -179,6 +184,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
       certificate: "CERT",
       deviceId: "web-test-1",
       transcriptHash: pairing.hashOf(pairing.getSession(created.pairingSessionId)),
+      trustRootPublicKey: "TRUST",
     });
     const buf = Buffer.from(body);
     const ts = Date.now();
@@ -229,6 +235,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
       certificate: "CERT",
       deviceId: "ghost-device",
       transcriptHash: pairing.hashOf(pairing.getSession(created.pairingSessionId)),
+      trustRootPublicKey: "TRUST",
     });
     const buf = Buffer.from(body);
     const ts = Date.now();
@@ -254,6 +261,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
         certificate: "CERT",
         deviceId: "web-test-1",
         transcriptHash: "h",
+        trustRootPublicKey: "TRUST",
       },
     });
     assert.equal(res.statusCode, 401);
@@ -302,9 +310,10 @@ describe("ADR-007 pairing security boundary (route level)", () => {
   test("approve stores the Android-signed transcriptHash for web comparison", async () => {
     const created = await createSession();
     const sessionHash = pairing.hashOf(pairing.getSession(created.pairingSessionId));
-    await app.inject(signApprove(created, "CERT-H", { }));
-    const consumed = pairing.consumeApproval(created.pairingSessionId);
+    await app.inject(signApprove(created, "CERT-H", {}));
+    const consumed = pairing.consumeApproval(created.pairingSessionId, created.pollSecret);
     assert.equal(consumed.transcriptHash, sessionHash);
+    assert.equal(consumed.trustRootPublicKey, "TRUST-ROOT-PUBLIC-KEY-B64");
   });
 
   // ── P1-1 / P1-3 ─────────────────────────────────────────────────────────

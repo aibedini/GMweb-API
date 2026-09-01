@@ -59,6 +59,18 @@ function requireAgentSignature(request, reply, agentAuthService, done) {
 }
 
 function registerPairingRoutes(app, { agentAuthService, config }) {
+  // BLOCKER 7: production origin is fail-closed. Header-derived origins are
+  // only allowed outside production (trustProxy + forwarded headers must not
+  // decide the root-trust transcript).
+  const isProduction = process.env.NODE_ENV === "production";
+  const configuredOrigin = process.env.PUBLIC_WEB_ORIGIN || (config && config.publicWebOrigin);
+  if (isProduction) {
+    if (!configuredOrigin || !configuredOrigin.startsWith("https://")) {
+      throw new Error(
+        "PUBLIC_WEB_ORIGIN must be set to an HTTPS URL in production (ADR-007 BLOCKER 7) — refusing to start"
+      );
+    }
+  }
   // ── Web: create pairing session + get QR transcript (anonymous OK) ─────
   app.post("/api/v1/pairing/session", {
     bodyLimit: 8 * 1024, // P1-3: strict body cap on the public endpoint
@@ -87,6 +99,7 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
             pairingSessionId: { type: "string" },
             expiresAt: { type: "number" },
             ttlSeconds: { type: "number" },
+            pollSecret: { type: "string" }, // response schema strips unknown fields without this
             qr: { type: "object", additionalProperties: true },
           },
         },
@@ -104,10 +117,16 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
     }
     const created = pairing.createSession(request.body || {}, {
       ip: request.ip,
-      origin: serverOrigin(request, config),
+      origin: configuredOrigin || serverOrigin(request, config),
     });
     const session = pairing.getSession(created.pairingSessionId);
-    return { ...created, qr: pairing.qrPayload(session) };
+    return {
+      pairingSessionId: created.pairingSessionId,
+      expiresAt: created.expiresAt,
+      ttlSeconds: created.ttlSeconds,
+      pollSecret: created.pollSecret, // shown to web ONCE; QR carries only the id
+      qr: pairing.qrPayload(session),
+    };
   });
 
   // ── Web: poll pairing status (anonymous OK; single-use consume) ────────
@@ -121,19 +140,26 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
       tags: ["Pairing"],
       querystring: {
         type: "object",
-        required: ["pairingSessionId"],
-        properties: { pairingSessionId: { type: "string" } },
+        required: ["pairingSessionId", "pollSecret"],
+        properties: {
+          pairingSessionId: { type: "string" },
+          pollSecret: { type: "string", maxLength: 128 },
+        },
       },
       response: { 200: { type: "object", additionalProperties: true } },
     },
   }, async (request) => {
     const id = request.query.pairingSessionId;
+    const pollSecret = request.query.pollSecret;
     const session = pairing.getSession(id);
-    if (!session) return { state: "EXPIRED" };
+    if (!session || !pairing.pollSecretMatches(session, pollSecret)) {
+      // Wrong/missing pollSecret: treat as EXPIRED without leaking state.
+      return { state: "EXPIRED" };
+    }
     if (session.state === "PENDING") {
       return { state: "PENDING", expiresAt: session.expiresAt };
     }
-    const consumed = pairing.consumeApproval(id);
+    const consumed = pairing.consumeApproval(id, pollSecret);
     if (!consumed) return { state: "EXPIRED" };
     return { state: "APPROVED", ...consumed };
   });
@@ -183,13 +209,14 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
       tags: ["Pairing"],
       body: {
         type: "object",
-        required: ["pairingSessionId", "certificate", "deviceId", "transcriptHash"],
+        required: ["pairingSessionId", "certificate", "deviceId", "transcriptHash", "trustRootPublicKey"],
         additionalProperties: false,
         properties: {
           pairingSessionId: { type: "string", maxLength: 128 },
           certificate: { type: "string", maxLength: 16384 },
           deviceId: { type: "string", maxLength: 128 },
           transcriptHash: { type: "string", maxLength: 128 },
+          trustRootPublicKey: { type: "string", maxLength: 512 },
         },
       },
       response: { 200: { type: "object", properties: { ok: { type: "boolean" } } } },
@@ -200,11 +227,21 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
       gateDone = true;
     });
     if (!ok || !gateDone) return reply;
+    // BLOCKER 3: not every Android identity may approve a web device. Only
+    // the account's registered PRIMARY_TRUST_AGENT (explicit role on the
+    // identity record) passes; anything else is rejected even with a valid
+    // signature.
+    const role = agentAuthService.getRole(request.authenticatedAgentId);
+    if (role !== "PRIMARY_TRUST_AGENT") {
+      reply.code(403).send({ error: "forbidden: device is not the primary trust agent" });
+      return reply;
+    }
     const body = request.body || {};
     return pairing.approveSession(body.pairingSessionId, {
       certificate: body.certificate,
       deviceId: body.deviceId,
       transcriptHash: body.transcriptHash,
+      trustRootPublicKey: body.trustRootPublicKey,
     });
   });
 }

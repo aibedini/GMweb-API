@@ -1,68 +1,53 @@
 /**
- * ADR-007 P0-7 — web-side certificate verification (fail closed).
+ * ADR-007 BLOCKER 1/7 — pairing runtime certificate verification.
  *
- * PAIRING_APPROVED is NOT trusted until this module verifies:
- *   - the certificate binding (deviceId, transcript hash, origin, key
- *     binding to OUR local keys)
- *   - the root signature over the canonical certificate bytes, with the
- *     Trust Root public key.
+ * The runtime flow is now:
+ *   PAIRING_PENDING -> CERTIFICATE_RECEIVED -> parse -> verify transcript
+ *   binding -> verify rootSignature (Trust Root key pinned from the approval)
+ *   -> CERTIFICATE_VERIFIED -> persist -> BOOTSTRAPPING_KEYS -> READY.
  *
- * Until the Trust Root public key distribution lands (it arrives WITH the
- * pairing protocol's first Android release), this module runs in
- * VERIFICATION-PENDING mode: the UI must show CERTIFICATE_RECEIVED, not
- * READY. Nothing message-related unlocks from a merely RECEIVED certificate.
+ * Every failure is FAIL CLOSED: onLinked() fires only after
+ * CERTIFICATE_VERIFIED, and no sync/SSE/push access is started otherwise.
  */
 
-export interface DeviceCertificate {
-  accountId: string;
-  deviceId: string;
-  deviceType: string; // "WEB_PWA"
-  signingPublicKey: string;
-  encryptionPublicKey: string;
-  capabilities: string[];
-  historyGrant: string;
-  trustSequence: number;
-  issuedAt: number;
-  expiresAt: number;
-  pairingTranscriptHash: string;
-  origin: string;
-  rootSignature: string;
-}
+import { verifyRootSignature, type DeviceCertificate } from "./trustRoot";
 
 export type CertState =
   | { step: "CERTIFICATE_RECEIVED" }
   | { step: "CERTIFICATE_VERIFIED"; cert: DeviceCertificate }
   | { step: "REJECTED"; reason: string };
 
+export interface VerifyContext {
+  deviceId: string;
+  transcriptHash: string;
+  origin: string;
+  signingPublicKeyB64: string;
+  encryptionPublicKeyB64: string;
+  trustRootPublicKeyB64: string; // pinned from the pairing approval payload
+}
+
 /**
- * Structural binding checks that are possible without the Trust Root key:
- * every field must match what THIS pairing exchange produced. Any mismatch
- * = substitution attack = fail closed.
+ * Verify a received certificate end-to-end (structural + cryptographic).
+ * Order matters: cheap structural checks first, then root signature.
  */
-export function verifyCertificateBinding(
+export async function verifyCertificate(
   cert: DeviceCertificate,
-  expected: {
-    deviceId: string;
-    transcriptHash: string;
-    origin: string;
-    signingPublicKeyB64: string;
-    encryptionPublicKeyB64: string;
-  },
-): CertState {
+  ctx: VerifyContext,
+): Promise<CertState> {
   const checks: Array<[boolean, string]> = [
-    [cert.deviceId === expected.deviceId, "deviceId mismatch"],
+    [cert.deviceId === ctx.deviceId, "deviceId mismatch"],
     [cert.deviceType === "WEB_PWA", "deviceType must be WEB_PWA"],
     [
-      cert.pairingTranscriptHash === expected.transcriptHash,
+      cert.pairingTranscriptHash === ctx.transcriptHash,
       "pairingTranscriptHash mismatch (substitution?)",
     ],
-    [cert.origin === expected.origin, "certificate origin mismatch"],
+    [cert.origin === ctx.origin, "certificate origin mismatch"],
     [
-      cert.signingPublicKey === expected.signingPublicKeyB64,
+      cert.signingPublicKey === ctx.signingPublicKeyB64,
       "signingPublicKey is not OUR key (key substitution?)",
     ],
     [
-      cert.encryptionPublicKey === expected.encryptionPublicKeyB64,
+      cert.encryptionPublicKey === ctx.encryptionPublicKeyB64,
       "encryptionPublicKey is not OUR key",
     ],
     [Array.isArray(cert.capabilities) && cert.capabilities.length > 0, "capabilities missing"],
@@ -72,43 +57,11 @@ export function verifyCertificateBinding(
   for (const [ok, reason] of checks) {
     if (!ok) return { step: "REJECTED", reason };
   }
+  // Cryptographic: Trust Root signature over canonical bytes.
+  const sigOk = await verifyRootSignature(cert, ctx.trustRootPublicKeyB64);
+  if (!sigOk) return { step: "REJECTED", reason: "rootSignature verification failed" };
   return { step: "CERTIFICATE_VERIFIED", cert };
 }
 
-/**
- * Full cryptographic verification (rootSignature over canonical bytes).
- * ACTIVE once the Trust Root public key is distributed to the web client;
- * until then the caller MUST treat the certificate as
- * CERTIFICATE_RECEIVED (not verified) — fail closed.
- */
-export async function verifyRootSignature(
-  cert: DeviceCertificate,
-  trustRootPublicKey: CryptoKey,
-): Promise<boolean> {
-  // Canonical bytes: JSON with fixed key order (mirrors the Android side).
-  const canonical = JSON.stringify({
-    accountId: cert.accountId,
-    deviceId: cert.deviceId,
-    deviceType: cert.deviceType,
-    signingPublicKey: cert.signingPublicKey,
-    encryptionPublicKey: cert.encryptionPublicKey,
-    capabilities: cert.capabilities,
-    historyGrant: cert.historyGrant,
-    trustSequence: cert.trustSequence,
-    issuedAt: cert.issuedAt,
-    expiresAt: cert.expiresAt,
-    pairingTranscriptHash: cert.pairingTranscriptHash,
-    origin: cert.origin,
-  });
-  try {
-    const sigBytes = Uint8Array.from(atob(cert.rootSignature), (c) => c.charCodeAt(0));
-    return await crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" },
-      trustRootPublicKey,
-      sigBytes,
-      new TextEncoder().encode(canonical),
-    );
-  } catch {
-    return false;
-  }
-}
+/** Canonical certificate bytes (mirror of PrimaryTrustRoot.kt). */
+export { canonicalCertificate } from "./trustRoot";

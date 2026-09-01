@@ -114,6 +114,12 @@ function transcriptHash(t) {
  */
 function createSession(p, ctx) {
   gc();
+  // HARDENING: a poll secret is generated server-side and returned to the
+  // web client exactly once. Only its SHA-256 is stored; the QR never
+  // carries it (Android never sees it). /pairing/status requires it, so a
+  // QR screenshot cannot consume the approval race-style.
+  const pollSecret = newId(24);
+  const pollSecretHash = crypto.createHash("sha256").update(pollSecret).digest("hex");
   const ip = String((ctx && ctx.ip) || "unknown");
   // P1-3 — per-IP + global caps.
   let set = perIp.get(ip);
@@ -160,6 +166,7 @@ function createSession(p, ctx) {
     createdAt: now(),
     expiresAt: now() + PAIRING_TTL_MS,
     ip,
+    pollSecretHash,
     state: "PENDING", // PENDING → APPROVED → CONSUMED
     approved: null,
   };
@@ -171,6 +178,7 @@ function createSession(p, ctx) {
     pairingSessionId: session.pairingSessionId,
     expiresAt: session.expiresAt,
     ttlSeconds: Math.round(PAIRING_TTL_MS / 1000),
+    pollSecret, // returned ONCE to the creating browser (never stored raw)
   };
 }
 
@@ -184,7 +192,7 @@ function getSession(pairingSessionId) {
  * (P0-2 lives in pairingRoutes.js). The transcriptHash here is the one
  * Android signed; the web compares it against its own re-computation.
  */
-function approveSession(pairingSessionId, { certificate, deviceId, transcriptHash }) {
+function approveSession(pairingSessionId, { certificate, deviceId, transcriptHash, trustRootPublicKey }) {
   gc();
   const s = sessions.get(String(pairingSessionId || ""));
   if (!s) {
@@ -208,16 +216,35 @@ function approveSession(pairingSessionId, { certificate, deviceId, transcriptHas
     deviceId: String(deviceId).slice(0, 128),
     // P0-8: hash Android signed — the web MUST match it locally.
     transcriptHash: String(transcriptHash || "").slice(0, 128),
+    // BLOCKER 1: the Android Trust Root public key is pinned here so the web
+    // can verify rootSignature itself (obtain/pin from pairing bootstrap).
+    trustRootPublicKey: String(trustRootPublicKey || "").slice(0, 512),
     approvedAt: now(),
   };
   return { ok: true, state: s.state };
 }
 
+/** Constant-time compare for poll secrets. */
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a || ""));
+  const bb = Buffer.from(String(b || ""));
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+/** True when [pollSecret] matches the session's stored hash. */
+function pollSecretMatches(session, pollSecret) {
+  if (!session || !pollSecret) return false;
+  const hash = crypto.createHash("sha256").update(String(pollSecret)).digest("hex");
+  return safeEqual(hash, session.pollSecretHash);
+}
+
 /** Web consumes the approval once (session destroyed after). */
-function consumeApproval(pairingSessionId) {
+function consumeApproval(pairingSessionId, pollSecret) {
   gc();
   const s = sessions.get(String(pairingSessionId || ""));
   if (!s) return null;
+  if (!pollSecretMatches(s, pollSecret)) return null;
   if (s.state !== "APPROVED" || !s.approved) return null;
   sessions.delete(String(pairingSessionId));
   const set = perIp.get(s.ip);
@@ -230,6 +257,7 @@ function consumeApproval(pairingSessionId) {
     certificate: s.approved.certificate,
     deviceId: s.approved.deviceId,
     transcriptHash: s.approved.transcriptHash,
+    trustRootPublicKey: s.approved.trustRootPublicKey,
     approvedAt: s.approved.approvedAt,
   };
 }
@@ -254,6 +282,11 @@ function hashOf(session) {
   return transcriptHash(session);
 }
 
+/** Canonical transcript BYTES (Android re-hashes these independently). */
+function canonicalBytes(session) {
+  return canonicalTranscript(session);
+}
+
 function _reset() {
   sessions.clear();
   perIp.clear();
@@ -272,5 +305,7 @@ module.exports = {
   consumeApproval,
   qrPayload,
   hashOf,
+  canonicalBytes,
+  pollSecretMatches,
   _reset,
 };

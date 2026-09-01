@@ -49,11 +49,11 @@ test("approve flips PENDING → APPROVED exactly once", () => {
 test("status consume is single-use (certificate returned exactly once)", () => {
   const created = pairing.createSession(transcript(), ctx());
   pairing.approveSession(created.pairingSessionId, { certificate: "CERT", deviceId: "web-abc-123" });
-  const first = pairing.consumeApproval(created.pairingSessionId);
+  const first = pairing.consumeApproval(created.pairingSessionId, created.pollSecret);
   assert.equal(first.certificate, "CERT");
   // Session destroyed after the first consume.
   assert.equal(pairing.getSession(created.pairingSessionId), null);
-  assert.equal(pairing.consumeApproval(created.pairingSessionId), null);
+  assert.equal(pairing.consumeApproval(created.pairingSessionId, created.pollSecret), null);
 });
 
 test("expired sessions cannot be approved or fetched", () => {

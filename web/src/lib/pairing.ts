@@ -14,6 +14,8 @@ import {
   type PairingQrPayload,
 } from "./pairingApi";
 import { getOrCreateDeviceKeys } from "./deviceKeys";
+import { verifyCertificate } from "./certVerify";
+import type { DeviceCertificate } from "./trustRoot";
 
 export type PairingState =
   | "UNLINKED"
@@ -27,8 +29,8 @@ export interface PairingHandle {
   session: PairingSession;
   qr: PairingQrPayload;
   webDeviceId: string;
-  /** Poll until approved/expired. Resolves with the signed certificate. */
-  wait: () => Promise<{ certificate: string; deviceId: string }>;
+  /** Poll until approved; resolves ONLY after CERTIFICATE_VERIFIED. */
+  wait: () => Promise<{ certificate: string; deviceId: string; verified: boolean }>;
   cancel: () => void;
 }
 
@@ -86,20 +88,39 @@ export async function beginPairing(): Promise<PairingHandle> {
     cancelled = true;
   };
 
-  const wait = (): Promise<{ certificate: string; deviceId: string }> =>
+  const wait = (): Promise<{ certificate: string; deviceId: string; verified: boolean }> =>
     new Promise((resolve, reject) => {
       const poll = async () => {
         if (cancelled) return reject(new Error("pairing cancelled"));
         try {
           const status = await getPairingStatus(pairingSession.pairingSessionId);
           if (status.state === "APPROVED" && status.certificate) {
-            // §5 — verify the binding BEFORE trusting it. (Signature crypto
-            // verification lands with the trust-root key distribution; here we
-            // pin the structural binding the ADR requires.)
-            if (status.deviceId !== webDeviceId) {
-              return reject(new Error("certificate deviceId does not match this browser"));
+            // BLOCKER 1 — full verification chain, fail closed:
+            // CERTIFICATE_RECEIVED -> binding checks -> rootSignature
+            // (Trust Root key pinned from the approval payload)
+            // -> CERTIFICATE_VERIFIED. Nothing resolves without it.
+            let cert: DeviceCertificate;
+            try {
+              cert = JSON.parse(status.certificate) as DeviceCertificate;
+            } catch {
+              return reject(new Error("certificate is not valid JSON"));
             }
-            return resolve({ certificate: status.certificate, deviceId: status.deviceId });
+            const state = await verifyCertificate(cert, {
+              deviceId: webDeviceId,
+              transcriptHash: status.transcriptHash,
+              origin: qr.origin,
+              signingPublicKeyB64: keys.signingPublicKeyB64,
+              encryptionPublicKeyB64: keys.encryptionPublicKeyB64,
+              trustRootPublicKeyB64: status.trustRootPublicKey,
+            });
+            if (state.step === "REJECTED") {
+              return reject(new Error(`certificate rejected: ${state.reason}`));
+            }
+            return resolve({
+              certificate: status.certificate,
+              deviceId: status.deviceId,
+              verified: true,
+            });
           }
           if (status.state === "EXPIRED") return reject(new Error("QR expired — start again"));
           setTimeout(poll, 2000);
