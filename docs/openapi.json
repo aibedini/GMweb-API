@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.13.0",
+    "version": "0.13.2",
     "contact": {
       "name": "GMweb API"
     }
@@ -1772,7 +1772,7 @@
         "tags": [
           "Pairing"
         ],
-        "description": "ADR-007 §2: the web client generates its keypairs locally and posts the transcript. The session is single-use, TTL 120s, origin-bound, accountless until Android approves.",
+        "description": "ADR-007 §2/P0-5: the web client generates its keypairs locally and posts the transcript. Origin is SERVER-owned (ignored from the client). Single-use, TTL 120s, capacity-bounded.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1786,26 +1786,27 @@
                   "ephemeralPublicKey",
                   "nonce"
                 ],
+                "additionalProperties": false,
                 "properties": {
                   "webDeviceId": {
                     "type": "string",
                     "maxLength": 128
                   },
                   "webSigningPublicKey": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 512
                   },
                   "webEncryptionPublicKey": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 512
                   },
                   "ephemeralPublicKey": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 512
                   },
                   "nonce": {
-                    "type": "string"
-                  },
-                  "origin": {
                     "type": "string",
-                    "maxLength": 256
+                    "maxLength": 128
                   }
                 }
               }
@@ -1829,6 +1830,9 @@
                     "ttlSeconds": {
                       "type": "number"
                     },
+                    "pollSecret": {
+                      "type": "string"
+                    },
                     "qr": {
                       "type": "object",
                       "additionalProperties": true
@@ -1847,7 +1851,7 @@
         "tags": [
           "Pairing"
         ],
-        "description": "ADR-007 §5: returns {state:'PENDING'} while waiting; on approval returns the Android-signed DeviceCertificate ONCE (single-use) and destroys the session.",
+        "description": "ADR-007 §5: returns {state:'PENDING'} while waiting; on approval returns the Android-signed DeviceCertificate + transcriptHash ONCE and destroys the session. The web MUST verify the certificate binding locally before trusting it.",
         "parameters": [
           {
             "schema": {
@@ -1855,6 +1859,15 @@
             },
             "in": "query",
             "name": "pairingSessionId",
+            "required": true
+          },
+          {
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "in": "query",
+            "name": "pollSecret",
             "required": true
           }
         ],
@@ -1879,7 +1892,7 @@
         "tags": [
           "Pairing"
         ],
-        "description": "ADR-007 §3: Android fetches what it is about to approve. Auth: agent bridge (device key or X-Agent-Auth) — enforced by the global requireToken hook.",
+        "description": "ADR-007 §3/P0-1: Android-only. Requires a valid X-Agent-Auth signature bound to this exact request (method, path, body-hash, timestamp).",
         "parameters": [
           {
             "schema": {
@@ -1911,7 +1924,7 @@
         "tags": [
           "Pairing"
         ],
-        "description": "ADR-007 §4: only the primary trust device (Android agent bridge auth) may approve. GMweb relays the signed DeviceCertificate; it never grants trust by itself.",
+        "description": "ADR-007 §4/P0-2: trust-root operation. Requires a valid enrolled Android agent identity + X-Agent-Auth signature over the EXACT raw body (method+path+sha256(body)+timestamp, replay-protected). Master token / dashboard session / project API keys are NOT accepted as trust approvers.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1921,11 +1934,15 @@
                 "required": [
                   "pairingSessionId",
                   "certificate",
-                  "deviceId"
+                  "deviceId",
+                  "transcriptHash",
+                  "trustRootPublicKey"
                 ],
+                "additionalProperties": false,
                 "properties": {
                   "pairingSessionId": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 128
                   },
                   "certificate": {
                     "type": "string",
@@ -1934,6 +1951,14 @@
                   "deviceId": {
                     "type": "string",
                     "maxLength": 128
+                  },
+                  "transcriptHash": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "trustRootPublicKey": {
+                    "type": "string",
+                    "maxLength": 512
                   }
                 }
               }
