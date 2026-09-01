@@ -4,6 +4,7 @@
 
 export interface PairingSession {
   pairingSessionId: string;
+  pollSecret: string;
   expiresAt: number;
   ttlSeconds: number;
 }
@@ -49,8 +50,13 @@ export async function createSession(transcript: {
   return res.json();
 }
 
-export async function getPairingStatus(pairingSessionId: string): Promise<PairingStatus> {
-  const res = await fetch(`/api/v1/pairing/status?pairingSessionId=${encodeURIComponent(pairingSessionId)}`);
+export async function getPairingStatus(
+  pairingSessionId: string,
+  pollSecret: string,
+): Promise<PairingStatus> {
+  const res = await fetch(
+    `/api/v1/pairing/status?pairingSessionId=${encodeURIComponent(pairingSessionId)}&pollSecret=${encodeURIComponent(pollSecret)}`,
+  );
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(body.error || `status HTTP ${res.status}`);

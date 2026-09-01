@@ -79,6 +79,7 @@ export async function beginPairing(): Promise<PairingHandle> {
   const qr = created.qr;
   const pairingSession: PairingSession = {
     pairingSessionId: created.pairingSessionId,
+    pollSecret: created.pollSecret,
     expiresAt: created.expiresAt,
     ttlSeconds: created.ttlSeconds,
   };
@@ -93,7 +94,7 @@ export async function beginPairing(): Promise<PairingHandle> {
       const poll = async () => {
         if (cancelled) return reject(new Error("pairing cancelled"));
         try {
-          const status = await getPairingStatus(pairingSession.pairingSessionId);
+          const status = await getPairingStatus(pairingSession.pairingSessionId, pairingSession.pollSecret);
           if (status.state === "APPROVED" && status.certificate) {
             // BLOCKER 1 — full verification chain, fail closed:
             // CERTIFICATE_RECEIVED -> binding checks -> rootSignature
