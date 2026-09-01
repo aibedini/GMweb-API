@@ -46,18 +46,19 @@ if (!app.hasContentTypeParser("application/json")) {
     },
   );
 }
-// Raw-body capture is ALSO installed as an onRequest-preceding addHook via
-// the plugin-safe path below (works regardless of which parser won):
-app.addHook("onRequest", (request, _reply, done) => {
+// NOTE: no stream-level hook here — when the winning JSON parser has
+// parseAs:"buffer" the parsed body IS the raw bytes, so rawBody is set in
+// a preHandler (below). A stream hook would hang: the parser already
+// consumed the stream, so 'end' never fires on it.
+app.addHook("preHandler", (request, _reply, done) => {
   if (request.rawBody === undefined) {
-    const chunks = [];
-    request.raw.on("data", (c) => chunks.push(c));
-    request.raw.on("end", () => {
-      request.rawBody = Buffer.concat(chunks);
-      done();
-    });
-    request.raw.on("error", () => done());
-    return;
+    if (Buffer.isBuffer(request.body)) {
+      request.rawBody = request.body;
+    } else if (request.body !== undefined) {
+      request.rawBody = Buffer.from(JSON.stringify(request.body), "utf8");
+    } else {
+      request.rawBody = Buffer.alloc(0);
+    }
   }
   done();
 });
