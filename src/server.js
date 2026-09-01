@@ -31,19 +31,33 @@ const app = Fastify({
 // timing — hook-based capture deadlocks under fastify.inject). request.rawBody
 // then feeds AgentAuthService verification for every /api/v1/agent/* and
 // pairing-approve call.
-app.addContentTypeParser(
-  "application/json",
-  { parseAs: "buffer" },
-  (req, body, done) => {
-    req.rawBody = body;
-    try {
-      done(null, JSON.parse(body.toString("utf8") || "{}"));
-    } catch (e) {
-      e.statusCode = 400;
-      done(e);
+try {
+  app.addContentTypeParser(
+    "application/json",
+    { parseAs: "buffer" },
+    (req, body, done) => {
+      req.rawBody = body;
+      try {
+        done(null, JSON.parse(body.toString("utf8") || "{}"));
+      } catch (e) {
+        e.statusCode = 400;
+        done(e);
+      }
+    },
+  );
+} catch (e) {
+  // @fastify/http-proxy (or another plugin) already registered a JSON
+  // parser in this boot ordering — keep ours as a preHandler fallback so
+  // rawBody is still available for AgentAuth verification.
+  app.addHook("preHandler", (request, _reply, done) => {
+    if (request.rawBody === undefined && Buffer.isBuffer(request.body)) {
+      request.rawBody = request.body;
+    } else if (request.rawBody === undefined && request.body !== undefined) {
+      request.rawBody = Buffer.from(JSON.stringify(request.body), "utf8");
     }
-  },
-);
+    done();
+  });
+}
 
 // Dual delivery transports, always both constructed. `client` is a proxy that
 // routes every call to the ACTIVE transport (chrome by default); the operator
