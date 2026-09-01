@@ -572,19 +572,22 @@ function requireToken(request, reply, done) {
   // session exists — status, both option generators, and the auth verify.
   // The verify handlers themselves gate on challenge single-use + UV flag.
   if (requestPath(request.url).startsWith("/api/v1/auth/")) return done();
-  // Android pull-bridge endpoints authenticate with their own device key
-  // (X-API-Key) inside the route handler — master/project auth doesn't apply.
+  // Android agent bridge: device key (legacy) OR per-device ECDSA signature
+  // (PR-08b) — the route handler/hook re-checks and binds the identity.
   if (requestPath(request.url).startsWith("/gateway/")) {
     if (checkDeviceKey(request)) return done();
     reply.code(401).send({ error: "unauthorized" });
     return;
   }
-  // Phase 2 (PR-08): agent bridge under /api/v1/agent/* uses the SAME device
-  // key store as /gateway/* until PR-08b swaps in per-device credentials
-  // (DeviceIdentity registration → mTLS). Route-level handler re-checks and
-  // binds the agent identity; the hook only gates unauthenticated traffic.
+  // Phase 2 (PR-08) + PR-08b: agent bridge under /api/v1/agent/* accepts the
+  // shared device key (legacy/compat) OR per-device ECDSA signatures
+  // (X-Agent-Auth, verified in controlPlaneRoutes/agentAuth.js). Identity
+  // registration (/api/v1/agent/identity) is device-key bootstrap only.
   if (requestPath(request.url).startsWith("/api/v1/agent/")) {
     if (checkDeviceKey(request)) return done();
+    const probe = { headers: request.headers, url: request.url };
+    const auth = agentAuthService.verifyAgentHeader(probe, Buffer.alloc(0));
+    if (auth.ok) return done();
     reply.code(401).send({ error: "unauthorized" });
     return;
   }
