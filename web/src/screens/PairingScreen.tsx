@@ -111,13 +111,14 @@ export function PairingScreen({ onLinked }: { onLinked: () => void }) {
               <Chip size="sm" variant="soft" color={secondsLeft > 20 ? "default" : "warning"}>
                 QR expires in {mm}:{ss}
               </Chip>
-              {showCode ? (
-                <code className="rounded px-3 py-2 text-sm" style={{ background: "var(--border)" }}>
-                  {handle.qr.nonce.slice(0, 4)} {handle.qr.nonce.slice(4, 8)}
-                </code>
-              ) : (
+              {showCode && (
+                <p className="text-xs" style={{ color: "var(--muted-fg)" }}>
+                  Pairing code fallback is coming in a later release — use the QR code.
+                </p>
+              )}
+              {!showCode && (
                 <Button variant="ghost" size="sm" onPress={() => setShowCode(true)}>
-                  Can't scan? Use pairing code
+                  Can't scan?
                 </Button>
               )}
             </>

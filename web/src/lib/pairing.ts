@@ -13,6 +13,7 @@ import {
   type PairingSession,
   type PairingQrPayload,
 } from "./pairingApi";
+import { getOrCreateDeviceKeys } from "./deviceKeys";
 
 export type PairingState =
   | "UNLINKED"
@@ -37,23 +38,6 @@ function randomId(bytes = 16): string {
   return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** base64url-encode a raw key (server stores the SPKI/subjective string as-is). */
-async function generateKeyPair(): Promise<{ signing: CryptoKeyPair; signingPub: string; encPub: string }> {
-  const signing = await crypto.subtle.generateKey(
-    { name: "ECDSA", namedCurve: "P-256" },
-    true,
-    ["sign", "verify"],
-  );
-  const encryption = await crypto.subtle.generateKey(
-    { name: "ECDH", namedCurve: "P-256" },
-    true,
-    ["deriveKey"],
-  );
-  const signingPub = b64(await crypto.subtle.exportKey("raw", signing.publicKey));
-  const encPub = b64(await crypto.subtle.exportKey("raw", (encryption as CryptoKeyPair).publicKey));
-  return { signing, signingPub, encPub };
-}
-
 function b64(buf: ArrayBuffer): string {
   const bytes = new Uint8Array(buf);
   let bin = "";
@@ -66,15 +50,28 @@ function b64(buf: ArrayBuffer): string {
  * The caller renders `handle.qr` as the QR image and calls `wait()`.
  */
 export async function beginPairing(): Promise<PairingHandle> {
-  const webDeviceId = randomId(12);
-  const { signingPub, encPub } = await generateKeyPair();
+  // P0-6: durable, NON-extractable device keys (IndexedDB). If persistence
+  // fails, pairing must not start — a device without its private key can
+  // never be verified later (fail closed).
+  const keys = await getOrCreateDeviceKeys();
+  const webDeviceId = keys.deviceId;
   const nonce = randomId(12);
+
+  // P1-1: dedicated EPHEMERAL pairing keypair, separate from the operational
+  // signing identity. Private ephemeral key is destroyed when this handle is
+  // consumed/expired (see ephemeralPrivateKey field + destroy below).
+  const ephemeral = (await crypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: "P-256" },
+    false,
+    ["deriveKey"],
+  )) as CryptoKeyPair;
+  const ephemeralPubB64 = b64(await crypto.subtle.exportKey("raw", ephemeral.publicKey));
 
   const created = await createSession({
     webDeviceId,
-    webSigningPublicKey: signingPub,
-    webEncryptionPublicKey: encPub,
-    ephemeralPublicKey: signingPub, // v1: same P-256 key; dedicated ephemeral key lands with E2EE (ADR-002)
+    webSigningPublicKey: keys.signingPublicKeyB64,
+    webEncryptionPublicKey: keys.encryptionPublicKeyB64,
+    ephemeralPublicKey: ephemeralPubB64,
     nonce,
   });
   const qr = created.qr;

@@ -1,48 +1,83 @@
 "use strict";
 
 /**
- * ADR-007 — pairing session HTTP routes (web ↔ GMweb ↔ Android).
+ * ADR-007 — pairing session HTTP routes (security revision P0-1..P0-5).
  *
- * Auth posture (deliberate, per ADR-007 §2):
- *  - POST /api/v1/pairing/session   → NO session required (the whole point:
- *    an unlinked browser must be able to START pairing). Rate-limited.
- *  - GET  /api/v1/pairing/status    → NO session (polling by the unlinked
- *    web client). Returns ONLY {state} until approved, then the certificate
- *    payload once (single-use consume).
- *  - POST /api/v1/pairing/approve   → Android agent bridge auth (device key
- *    OR X-Agent-Auth signature) — the SAME gate as /api/v1/agent/*: only the
- *    primary trust device can approve a new web device.
+ * Auth matrix (enforced in requireToken + route-level preHandler here):
+ *   POST /api/v1/pairing/session        anonymous (rate-limited, bounded)
+ *   GET  /api/v1/pairing/status         anonymous (single-use consume)
+ *   GET  /api/v1/pairing/session/:id    ANDROID AGENT ONLY (signature)
+ *   POST /api/v1/pairing/approve        ANDROID AGENT ONLY (signature)
+ *
+ * P0-2: agent-bridge auth is verified HERE at the route level against the
+ * exact raw body — master token / dashboard session / project API keys are
+ * explicitly rejected as trust approvers. The signature binds
+ * method+path+body-hash+timestamp (replay-protected by AgentAuthService).
+ *
+ * P0-5: origin is server-owned (config.PUBLIC_WEB_ORIGIN, else the request
+ * Host behind a trusted proxy) — the client cannot supply it.
  */
 
 const pairing = require("./pairingSessions");
 
-/** Web-facing origin recorded in the transcript (server sees Host). */
-function originOf(request) {
+/** Web-facing origin recorded in the transcript (server-derived only). */
+function serverOrigin(request, config) {
+  const configured = process.env.PUBLIC_WEB_ORIGIN || (config && config.publicWebOrigin);
+  if (configured) return String(configured);
   const proto = request.headers["x-forwarded-proto"] || request.protocol || "https";
   const host = request.headers["x-forwarded-host"] || request.headers.host || "";
-  return `${proto}://${host}`;
+  // inject()/local calls report http; the production edge terminates TLS and
+  // sets X-Forwarded-Proto. Trust the hop only when a proxy header exists,
+  // otherwise default to https (deployments are HTTPS-only per the ADR).
+  const secure = proto === "https" || !request.headers["x-forwarded-proto"];
+  return `${secure ? "https" : proto}://${host}`;
 }
 
-function registerPairingRoutes(app, { agentAuthService }) {
-  // ── Web: create pairing session + get QR transcript ────────────────────
+/**
+ * P0-2 — route-level Android-agent enforcement. Runs INSIDE the route
+ * (post-parse) so the exact raw body is available; the global requireToken
+ * hook has already rejected fully-anonymous callers for these paths.
+ *
+ * Rejects: no signature at all, signatures that don't match the exact
+ * method+path+body, expired/replayed timestamps, unknown devices. The bound
+ * deviceId is attached as request.authenticatedAgentId.
+ */
+function requireAgentSignature(request, reply, agentAuthService, done) {
+  const header = String(request.headers["x-agent-auth"] || "");
+  if (!header) {
+    reply.code(401).send({ error: "agent signature required" });
+    return false;
+  }
+  const result = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
+  if (!result.ok) {
+    reply.code(401).send({ error: "unauthorized", reason: result.reason });
+    return false;
+  }
+  request.authenticatedAgentId = result.deviceId;
+  done();
+  return true;
+}
+
+function registerPairingRoutes(app, { agentAuthService, config }) {
+  // ── Web: create pairing session + get QR transcript (anonymous OK) ─────
   app.post("/api/v1/pairing/session", {
-    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+    bodyLimit: 8 * 1024, // P1-3: strict body cap on the public endpoint
     schema: {
       summary: "Create a short-lived QR pairing session (unlinked web client)",
       description:
-        "ADR-007 §2: the web client generates its keypairs locally and posts the transcript. " +
-        "The session is single-use, TTL 120s, origin-bound, accountless until Android approves.",
+        "ADR-007 §2/P0-5: the web client generates its keypairs locally and posts the transcript. " +
+        "Origin is SERVER-owned (ignored from the client). Single-use, TTL 120s, capacity-bounded.",
       tags: ["Pairing"],
       body: {
         type: "object",
         required: ["webDeviceId", "webSigningPublicKey", "webEncryptionPublicKey", "ephemeralPublicKey", "nonce"],
+        additionalProperties: false, // P0-5: client 'origin' is rejected, not honored
         properties: {
           webDeviceId: { type: "string", maxLength: 128 },
-          webSigningPublicKey: { type: "string" },
-          webEncryptionPublicKey: { type: "string" },
-          ephemeralPublicKey: { type: "string" },
-          nonce: { type: "string" },
-          origin: { type: "string", maxLength: 256 },
+          webSigningPublicKey: { type: "string", maxLength: 512 },
+          webEncryptionPublicKey: { type: "string", maxLength: 512 },
+          ephemeralPublicKey: { type: "string", maxLength: 512 },
+          nonce: { type: "string", maxLength: 128 },
         },
       },
       response: {
@@ -58,26 +93,31 @@ function registerPairingRoutes(app, { agentAuthService }) {
       },
     },
   }, async (request) => {
-    const body = request.body || {};
-    const created = pairing.createSession({
-      webDeviceId: body.webDeviceId,
-      webSigningPublicKey: body.webSigningPublicKey,
-      webEncryptionPublicKey: body.webEncryptionPublicKey,
-      ephemeralPublicKey: body.ephemeralPublicKey,
-      nonce: body.nonce,
-      origin: body.origin || originOf(request),
+    // P0-5: Fastify's default ajv STRIPS unknown fields (removeAdditional),
+    // so a client-supplied origin is silently dropped before this handler —
+    // it can never influence the transcript. Defense-in-depth: if a future
+    // ajv config change makes it appear, reject loudly.
+    if (request.body && "origin" in request.body) {
+      const err = new Error("client-supplied origin is not trusted (P0-5)");
+      err.statusCode = 400;
+      throw err;
+    }
+    const created = pairing.createSession(request.body || {}, {
+      ip: request.ip,
+      origin: serverOrigin(request, config),
     });
     const session = pairing.getSession(created.pairingSessionId);
     return { ...created, qr: pairing.qrPayload(session) };
   });
 
-  // ── Web: poll pairing status (single-use consume on APPROVED) ──────────
+  // ── Web: poll pairing status (anonymous OK; single-use consume) ────────
   app.get("/api/v1/pairing/status", {
     schema: {
       summary: "Poll pairing status; consumes the certificate exactly once",
       description:
         "ADR-007 §5: returns {state:'PENDING'} while waiting; on approval returns the " +
-        "Android-signed DeviceCertificate ONCE (single-use) and destroys the session.",
+        "Android-signed DeviceCertificate + transcriptHash ONCE and destroys the session. " +
+        "The web MUST verify the certificate binding locally before trusting it.",
       tags: ["Pairing"],
       querystring: {
         type: "object",
@@ -98,13 +138,13 @@ function registerPairingRoutes(app, { agentAuthService }) {
     return { state: "APPROVED", ...consumed };
   });
 
-  // ── Android: fetch session metadata (what am I approving?) ─────────────
+  // ── Android: session metadata — AGENT SIGNATURE REQUIRED (P0-1) ────────
   app.get("/api/v1/pairing/session/:id", {
     schema: {
       summary: "Pairing session metadata for the Android confirmation screen",
       description:
-        "ADR-007 §3: Android fetches what it is about to approve. Auth: agent bridge " +
-        "(device key or X-Agent-Auth) — enforced by the global requireToken hook.",
+        "ADR-007 §3/P0-1: Android-only. Requires a valid X-Agent-Auth signature bound to " +
+        "this exact request (method, path, body-hash, timestamp).",
       tags: ["Pairing"],
       params: {
         type: "object",
@@ -113,42 +153,60 @@ function registerPairingRoutes(app, { agentAuthService }) {
       },
       response: { 200: { type: "object", additionalProperties: true } },
     },
-  }, async (request) => {
+  }, async (request, reply) => {
+    // GET has no body — the canonical body-hash covers the empty buffer;
+    // AgentAuthService already binds method+path+ts.
+    let gateDone = false;
+    const ok = requireAgentSignature(request, reply, agentAuthService, () => {
+      gateDone = true;
+    });
+    if (!ok || !gateDone) return reply;
     const session = pairing.getSession(request.params.id);
     if (!session) {
       const err = new Error("pairing session not found or expired");
       err.statusCode = 404;
       throw err;
     }
-    return pairing.qrPayload(session);
+    return { ...pairing.qrPayload(session), transcriptHash: session.transcriptHash };
   });
 
-  // ── Android: approve + attach the signed DeviceCertificate ─────────────
+  // ── Android: approve + attach the signed certificate — SIGNATURE REQUIRED
   app.post("/api/v1/pairing/approve", {
+    bodyLimit: 32 * 1024,
     schema: {
       summary: "Android approves the pairing and attaches the signed certificate",
       description:
-        "ADR-007 §4: only the primary trust device (Android agent bridge auth) may approve. " +
-        "GMweb relays the signed DeviceCertificate; it never grants trust by itself.",
+        "ADR-007 §4/P0-2: trust-root operation. Requires a valid enrolled Android agent " +
+        "identity + X-Agent-Auth signature over the EXACT raw body (method+path+sha256(body)+" +
+        "timestamp, replay-protected). Master token / dashboard session / project API keys " +
+        "are NOT accepted as trust approvers.",
       tags: ["Pairing"],
       body: {
         type: "object",
-        required: ["pairingSessionId", "certificate", "deviceId"],
+        required: ["pairingSessionId", "certificate", "deviceId", "transcriptHash"],
+        additionalProperties: false,
         properties: {
-          pairingSessionId: { type: "string" },
+          pairingSessionId: { type: "string", maxLength: 128 },
           certificate: { type: "string", maxLength: 16384 },
           deviceId: { type: "string", maxLength: 128 },
+          transcriptHash: { type: "string", maxLength: 128 },
         },
       },
       response: { 200: { type: "object", properties: { ok: { type: "boolean" } } } },
     },
-  }, async (request) => {
+  }, async (request, reply) => {
+    let gateDone = false;
+    const ok = requireAgentSignature(request, reply, agentAuthService, () => {
+      gateDone = true;
+    });
+    if (!ok || !gateDone) return reply;
     const body = request.body || {};
     return pairing.approveSession(body.pairingSessionId, {
       certificate: body.certificate,
       deviceId: body.deviceId,
+      transcriptHash: body.transcriptHash,
     });
   });
 }
 
-module.exports = { registerPairingRoutes };
+module.exports = { registerPairingRoutes, serverOrigin };

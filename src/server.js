@@ -26,6 +26,25 @@ const app = Fastify({
   trustProxy: true
 });
 
+// ADR-007 P0-2/P0-3: the canonical signature contract includes the EXACT raw
+// request body hash. Capture raw bytes in a content-type parser (the reliable
+// timing — hook-based capture deadlocks under fastify.inject). request.rawBody
+// then feeds AgentAuthService verification for every /api/v1/agent/* and
+// pairing-approve call.
+app.addContentTypeParser(
+  "application/json",
+  { parseAs: "buffer" },
+  (req, body, done) => {
+    req.rawBody = body;
+    try {
+      done(null, JSON.parse(body.toString("utf8") || "{}"));
+    } catch (e) {
+      e.statusCode = 400;
+      done(e);
+    }
+  },
+);
+
 // Dual delivery transports, always both constructed. `client` is a proxy that
 // routes every call to the ACTIVE transport (chrome by default); the operator
 // switches at runtime via the dashboard Controls page (/admin/transport).
@@ -573,11 +592,15 @@ function requireToken(request, reply, done) {
   // session exists — status, both option generators, and the auth verify.
   // The verify handlers themselves gate on challenge single-use + UV flag.
   if (requestPath(request.url).startsWith("/api/v1/auth/")) return done();
-  // ADR-007 §2: pairing session create/status are reachable from an UNLINKED
-  // browser (that is the whole point); they are rate-limited, single-use,
-  // TTL-bound, and approval itself is agent-bridge gated (Android only).
-  if (requestPath(request.url).startsWith("/api/v1/pairing/session") ||
-      requestPath(request.url).startsWith("/api/v1/pairing/status")) return done();
+  // ADR-007 P0-1 (security fix): EXACTLY two pairing surfaces are reachable
+  // without a session — the unlinked browser's create/status calls. They are
+  // rate-limited + capacity-bound + TTL-bound (pairingSessions.js). The
+  // Android-only endpoints (GET /pairing/session/:id, POST /pairing/approve)
+  // are NOT exempted here: they require agent-bridge auth, enforced at the
+  // route level below (P0-2). Prefix exemption is not used for trust
+  // decisions — match the exact paths.
+  if (requestPath(request.url) === "/api/v1/pairing/session" ||
+      requestPath(request.url) === "/api/v1/pairing/status") return done();
   // Android agent bridge: device key (legacy) OR per-device ECDSA signature
   // (PR-08b) — the route handler/hook re-checks and binds the identity.
   if (requestPath(request.url).startsWith("/gateway/")) {
@@ -589,11 +612,17 @@ function requireToken(request, reply, done) {
   // shared device key (legacy/compat) OR per-device ECDSA signatures
   // (X-Agent-Auth, verified in controlPlaneRoutes/agentAuth.js). Identity
   // registration (/api/v1/agent/identity) is device-key bootstrap only.
+  // P0-3 (ADR-007 security fix): the signature is verified against the EXACT
+  // raw request body captured in onRequest — the old Buffer.alloc(0) probe
+  // verified "a signature exists" without binding it to this request. The
+  // bound deviceId is exposed as request.authenticatedAgentId for handlers.
   if (requestPath(request.url).startsWith("/api/v1/agent/")) {
     if (checkDeviceKey(request)) return done();
-    const probe = { headers: request.headers, url: request.url };
-    const auth = agentAuthService.verifyAgentHeader(probe, Buffer.alloc(0));
-    if (auth.ok) return done();
+    const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
+    if (auth.ok) {
+      request.authenticatedAgentId = auth.deviceId;
+      return done();
+    }
     reply.code(401).send({ error: "unauthorized" });
     return;
   }
@@ -2457,7 +2486,7 @@ registerControlPlaneRoutes(app, {
 registerAgentIdentityRoutes(app, { agentAuthService });
 
 // ADR-007: primary-device QR pairing relay (web ← Android approval).
-registerPairingRoutes(app, { agentAuthService });
+registerPairingRoutes(app, { agentAuthService, config });
 
 // web-01 (§44): narrow realtime channel for the PWA — {type:"sync.available"}
 // only. Auth: master token / dashboard session via requireToken (project keys
