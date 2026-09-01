@@ -40,6 +40,7 @@ const { PasskeyService } = require("./passkeys");
 const { AgentAuthService } = require("./agentAuth");
 const { registerAgentIdentityRoutes } = require("./agentIdentityRoutes");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
+const { registerPairingRoutes } = require("./pairingRoutes");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
 // Pull mode: the phone dials OUT to the server and picks up tasks (no tunnel).
@@ -572,6 +573,11 @@ function requireToken(request, reply, done) {
   // session exists — status, both option generators, and the auth verify.
   // The verify handlers themselves gate on challenge single-use + UV flag.
   if (requestPath(request.url).startsWith("/api/v1/auth/")) return done();
+  // ADR-007 §2: pairing session create/status are reachable from an UNLINKED
+  // browser (that is the whole point); they are rate-limited, single-use,
+  // TTL-bound, and approval itself is agent-bridge gated (Android only).
+  if (requestPath(request.url).startsWith("/api/v1/pairing/session") ||
+      requestPath(request.url).startsWith("/api/v1/pairing/status")) return done();
   // Android agent bridge: device key (legacy) OR per-device ECDSA signature
   // (PR-08b) — the route handler/hook re-checks and binds the identity.
   if (requestPath(request.url).startsWith("/gateway/")) {
@@ -2449,6 +2455,9 @@ registerControlPlaneRoutes(app, {
 
 // PR-08b: per-device identity registration (device-key bootstrap → ECDSA).
 registerAgentIdentityRoutes(app, { agentAuthService });
+
+// ADR-007: primary-device QR pairing relay (web ← Android approval).
+registerPairingRoutes(app, { agentAuthService });
 
 // web-01 (§44): narrow realtime channel for the PWA — {type:"sync.available"}
 // only. Auth: master token / dashboard session via requireToken (project keys
