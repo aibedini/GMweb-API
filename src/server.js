@@ -1640,7 +1640,22 @@ app.addHook("onRequest", (request, _reply, done) => {
 });
 app.addHook("preHandler", requireToken);
 app.addHook("onResponse", recordActivity);
-app.setErrorHandler((error, _request, reply) => {
+app.setErrorHandler((error, request, reply) => {
+  // If the reply was already sent (e.g. a streaming/raw handler finished the
+  // response and a later code path threw — FST_ERR_REP_ALREADY_SENT), we must
+  // NOT send again: re-sending throws ERR_HTTP_HEADERS_SENT, which is
+  // uncaught and kills the process (the 502 restart loop seen in prod).
+  if (
+    reply.sent === true ||
+    error.code === "FST_ERR_REP_ALREADY_SENT" ||
+    /ERR_HTTP_HEADERS_SENT/i.test(String(error.message))
+  ) {
+    request.log.warn(
+      { err: error.message, url: request.raw.url },
+      "error after reply sent — suppressed (no double-send)"
+    );
+    return reply;
+  }
   const statusCode = error.statusCode || 500;
   reply.code(statusCode).send({
     error: statusCode >= 500 ? "internal_error" : "request_error",
