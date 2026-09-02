@@ -1722,6 +1722,13 @@ if (config.dashboardEnabled) {
   // application/json parser at load, which previously collided with our
   // raw-body parser at the root. A child plugin isolates both.
   app.register(async function vncProxyScope(child) {
+    // With the root-level exact-body parser installed, the child inherits
+    // an application/json parser snapshot; @fastify/http-proxy registers
+    // its own — remove the inherited one first to avoid
+    // FST_ERR_CTP_ALREADY_PRESENT.
+    if (child.hasContentTypeParser("application/json")) {
+      child.removeContentTypeParser("application/json");
+    }
     child.register(proxy, {
       upstream: config.vncProxyTarget,
       wsUpstream: config.vncProxyTarget.replace(/^http/i, "ws"),
