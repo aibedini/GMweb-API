@@ -167,23 +167,14 @@ export function QueuePage() {
     if (busyAction || jobs.length === 0) return;
     const n = jobs.length;
     const detail = counts ? ` (queue counter says ${counts.waiting} waiting)` : "";
-    if (!confirm(`Cancel ALL ${n} queued message${n === 1 ? "" : "s"}${detail}? Active sends finish; everything pending is removed.`)) return;
+    if (!confirm(`EMERGENCY STOP: power off delivery and cancel ALL ${n} queued message${n === 1 ? "" : "s"}${detail}? A message already sent to a phone cannot be recalled.`)) return;
     setBusyAction("cancel-all");
     setActionError("");
     setActionMessage("");
     try {
-      let processed = 0;
-      const CHUNK = 500;
-      for (let i = 0; i < jobs.length; i += CHUNK) {
-        const chunk = jobs.slice(i, i + CHUNK).map((j) => j.id);
-        const result = await api<{ ok: boolean; processed: number; skipped: number }>("/admin/queue/jobs/bulk", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: { ids: chunk, action: "cancel" },
-        });
-        processed += result.processed ?? 0;
-      }
-      setActionMessage(`${processed} message${processed === 1 ? "" : "s"} cancelled.`);
+      const result = await api<{ ok: boolean; cancelled: number; active: number }>("/admin/queue/emergency-stop", { method: "POST" });
+      const active = result.active ? ` ${result.active} active send${result.active === 1 ? " was" : "s were"} signalled to stop.` : "";
+      setActionMessage(`Emergency stop active. ${result.cancelled} queued message${result.cancelled === 1 ? "" : "s"} cancelled.${active}`);
       await load();
     } catch (err) {
       setActionError(`Cancel all failed: ${messageFor(err)}`);
@@ -244,10 +235,10 @@ export function QueuePage() {
             className="text-red-400 border-red-500/20 hover:bg-red-500/10 hover:text-red-300"
             onClick={cancelAll}
             disabled={jobs.length === 0 || busyAction !== null}
-            title="Cancel every message in the queue"
+            title="Emergency stop: power off delivery and cancel every queued message"
           >
             <X className="size-4" />
-            {busyAction === "cancel-all" ? "Cancelling…" : `Cancel all (${jobs.length})`}
+            {busyAction === "cancel-all" ? "Stopping…" : `Emergency stop (${jobs.length})`}
           </Button>
           <Button
             size="sm"

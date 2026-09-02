@@ -67,6 +67,8 @@ Full schemas are in [`openapi.json`](./openapi.json). The relevant subset:
 
 Queue operations distinguish a durable operator **manual pause** from a temporary startup pause and the send-power kill switch. A restart resumes delivery only when power is on and the operator has not manually paused the queue. `GET /admin/queue` reports `paused`, `manualPause`, `powerOn`, the active transport, and Android pull/outbox liveness to diagnose queued sends.
 
+For an operational incident, `POST /admin/queue/emergency-stop` powers delivery off, persists the manual pause, and cancels the complete pending queue. It cannot recall a message already submitted to a phone.
+
 > **Send power (kill switch):** an operator can power off sending from the GMweb
 > dashboard (Controls → **Power Off**). While powered off, `POST /send` returns
 > `503 { "error": "powered_off" }` and **no message is sent under any

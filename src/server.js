@@ -4003,6 +4003,43 @@ app.post("/admin/queue/resume", {
   return { ok: true, paused: false, manualPause: false };
 });
 
+app.post("/admin/queue/emergency-stop", {
+  schema: {
+    summary: "Emergency-stop delivery and cancel all pending sends",
+    description: "Immediately powers sending off, persists a manual queue pause, and cancels every waiting, paused, prioritized, or delayed send. An already active send is signalled to stop before submission, but cannot be recalled if a device has already sent it. **Master token only.**",
+    tags: ["Admin"],
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" }, powerOn: { type: "boolean" }, paused: { type: "boolean" }, manualPause: { type: "boolean" },
+          cancelled: { type: "integer" }, active: { type: "integer", description: "Jobs already active when the stop began." }
+        }
+      }
+    }
+  }
+}, async () => {
+  // Set the durable kill switch before enumerating jobs. No later /send call
+  // may enqueue work, and the queue is paused before cancellation begins.
+  await setSendPower(false);
+  await setManualQueuePause(true);
+  const jobs = await sendQueue.listJobs({
+    states: ["waiting", "paused", "prioritized", "delayed"],
+    limit: null
+  });
+  let cancelled = 0;
+  for (const job of jobs) {
+    const result = await sendQueue.cancelPendingJob(job.id);
+    if (!result.cancelled) continue;
+    cancelled += 1;
+    const ledger = sendStore.byJob(job.id);
+    if (ledger) sendStore.markById(ledger.id, "cancelled", "cancelled_by_emergency_stop");
+  }
+  const active = (await sendQueue.counts()).active || 0;
+  emitSse({ type: "queue_emergency_stopped", cancelled, active, at: new Date().toISOString() });
+  return { ok: true, powerOn: false, paused: true, manualPause: true, cancelled, active };
+});
+
 app.get("/admin/sends", {
   schema: {
     summary: "Send ledger (durable)",

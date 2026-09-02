@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.13.4",
+    "version": "0.13.5",
     "contact": {
       "name": "GMweb API"
     }
@@ -3821,6 +3821,48 @@
                     },
                     "manualPause": {
                       "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/queue/emergency-stop": {
+      "post": {
+        "summary": "Emergency-stop delivery and cancel all pending sends",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Immediately powers sending off, persists a manual queue pause, and cancels every waiting, paused, prioritized, or delayed send. An already active send is signalled to stop before submission, but cannot be recalled if a device has already sent it. **Master token only.**",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "powerOn": {
+                      "type": "boolean"
+                    },
+                    "paused": {
+                      "type": "boolean"
+                    },
+                    "manualPause": {
+                      "type": "boolean"
+                    },
+                    "cancelled": {
+                      "type": "integer"
+                    },
+                    "active": {
+                      "type": "integer",
+                      "description": "Jobs already active when the stop began."
                     }
                   }
                 }
