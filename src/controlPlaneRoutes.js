@@ -17,6 +17,64 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
 
   // ── Trust Registry relay (ADR-001 LOCK 2/9) ──────────────────────────────
+  // P0-4 (contract): the ANDROID-primary path is /api/v1/agent/trust/* —
+  // the browser-facing /api/v1/trust/* stays GET-only (see requireToken).
+  // The handler is shared; both paths demand the PRIMARY_TRUST_AGENT.
+  const trustStatementHandler = async (request, reply) => {
+    // SECURITY (review): trust writes are ANDROID-PRIMARY-ONLY. The linked
+    // browser (READ_MESSAGES) is auth'd for GET /trust/* — it must never be
+    // able to POST a statement, even though rootSignature is what actually
+    // protects the registry (defense in depth: authorization AND crypto).
+    const agent = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (!agent || agent.role !== "PRIMARY_TRUST_AGENT") {
+      reply.code(403).send({ error: "trust writes require the authenticated PRIMARY_TRUST_AGENT" });
+      return;
+    }
+    const statement = request.body?.statement || request.body;
+    // P0-3: rootSignature MUST be present — GMweb is a verified relay, not a
+    // signature-free bucket.
+    if (!statement.rootSignature) {
+      reply.code(400).send({ error: "missing_rootSignature" });
+      return;
+    }
+    if (!statement.statementId) {
+      reply.code(400).send({ error: "missing_statementId" });
+      return;
+    }
+    // NOTE: statement.deviceId is the SUBJECT device (e.g. the web browser
+    // being approved) — the AUTHOR is always the authenticated Trust Root
+    // agent (checked above). rootSignature provides cryptographic binding;
+    // web clients verify it independently before trusting.
+    const result = trustRegistry.applyStatement({ accountId, statement });
+    return { ok: true, ...result };
+  };
+  const trustStatementSchema = {
+    schema: {
+      summary: "Android-signed trust statement (PRIMARY_TRUST_AGENT only)",
+      description: "Android Trust Root posts DEVICE_APPROVED/DEVICE_REVOKED/etc statements with monotonic trustSequence. GMweb relays them; clients verify rootSignature locally. Monotonic per account, no gaps, idempotent redelivery.",
+      tags: ["Trust"],
+      body: { type: "object" },
+      response: {
+        200: { type: "object", properties: { ok: { type: "boolean" }, applied: { type: "boolean" }, trustSequence: { type: "integer" }, reason: { type: "string" } } },
+        400: { type: "object", properties: { error: { type: "string" } } }
+      }
+    }
+  };
+
+  app.post("/api/v1/agent/trust/statements", trustStatementSchema, async (request, reply) => {
+    const statement = request.body?.statement || request.body;
+    const agent = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (!agent || agent.role !== "PRIMARY_TRUST_AGENT") {
+      reply.code(403).send({ error: "trust writes require the authenticated PRIMARY_TRUST_AGENT" });
+      return;
+    }
+    if (!statement.rootSignature || !statement.statementId) {
+      reply.code(400).send({ error: "missing_rootSignature_or_statementId" });
+      return;
+    }
+    const result = trustRegistry.applyStatement({ accountId, statement });
+    return { ok: true, ...result };
+  });
 
   app.post("/api/v1/trust/statements", {
     schema: {
