@@ -625,9 +625,9 @@ function requireToken(request, reply, done) {
   // handlers then check ROLE only, never re-verify the signature (a second
   // verify would trip the replay cache). These paths never hit
   // master/dashboard/project auth.
-  if (requestPath(request.url) === "/api/v1/pairing/session" &&
+  if (requestPath(request.url).startsWith("/api/v1/pairing/session/") &&
       request.method === "GET") {
-    // path is /api/v1/pairing/session/:id
+    // path is /api/v1/pairing/session/:id (param route — prefix match)
     if (checkDeviceKey(request)) return done();
     const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
     if (auth.ok) {
@@ -4734,4 +4734,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { app };
+module.exports = { app, deviceKeyStore, agentAuthService };
