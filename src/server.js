@@ -2544,6 +2544,9 @@ app.get("/api/v1/sse", {
   reply.raw.write(": connected\n\n");
   controlSseClients.add(reply);
   request.raw.on("close", () => controlSseClients.delete(reply));
+  // Hijack the response: Fastify must NOT try to send/serialize after we
+  // already wrote raw SSE headers (ERR_HTTP_HEADERS_SENT crash loop).
+  return reply;
 });
 
 // ── web-01 Web Push (§45/§89, content-less wake-ups) ────────────────────────
