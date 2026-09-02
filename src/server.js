@@ -35,26 +35,39 @@ const app = Fastify({
 // old `if (!app.hasContentTypeParser(...))` guard never installed ours —
 // rawBody was then reconstructed via JSON.stringify in the preHandler,
 // which is NOT byte-identical to what the Android agent signed (key order /
-// whitespace differ) → signature_mismatch on pairing approve. We now
-// EXPLICITLY REPLACE the built-in parser: capture exact inbound bytes,
-// then delegate to Fastify's own parser (same strict/prototype-pollution
-// behavior) for request.body.
-// @fastify/http-proxy re-registers application/json at its own load time and
-// collides with any root-level replacement, so we DON'T swap the parser.
-// Instead: a passive onRequest listener buffers the exact inbound bytes
-// (it never consumes the stream — the built-in parser still parses normally)
-// and the preHandler exposes them as request.rawBody. No reconstructed
-// JSON.stringify bytes ever reach signature verification.
-// (the replaced parser above always sets rawBody for JSON bodies; the
-// preHandler fallback below covers non-JSON/empty cases. Signed requests
-// must NEVER get reconstructed bytes — but with parseAs:"string" ours
-// always sets rawBody, so this only fills empty bodies.)
-app.addHook("preHandler", (request, _reply, done) => {
-  if (request.rawBody === undefined) {
-    request.rawBody = Buffer.alloc(0);
-  }
-  done();
-});
+// whitespace differ) → signature_mismatch on pairing approve.
+// PHASE A1 (review 041b509): the passive-listener design was a REGRESSION —
+// there was no actual capture, so signed POSTs verified against
+// Buffer.alloc(0) and always failed with signature_mismatch on real devices.
+// We EXPLICITLY REPLACE the built-in parser again (same as e68a537): capture
+// the exact inbound bytes, then delegate to Fastify's own parser (identical
+// strict/prototype-pollution behavior) for request.body.
+// @fastify/http-proxy re-registers application/json at its own load; that is
+// handled by registering the proxy inside an encapsulated child scope (see
+// vncProxyScope below) so the root-level parser swap is safe.
+function installExactJsonBodyCapture(app) {
+  const defaultJsonParser = app.getDefaultJsonParser("error", "error");
+  app.removeContentTypeParser("application/json");
+  app.addContentTypeParser(
+    "application/json",
+    { parseAs: "string" },
+    (req, body, done) => {
+      req.rawBody = Buffer.from(body, "utf8");
+      defaultJsonParser(req, body, done);
+    }
+  );
+  // Fallback for bodies that bypass the JSON parser (non-JSON/empty):
+  // signed requests must NEVER receive reconstructed bytes — empty stays
+  // empty and fails closed in signature verification.
+  app.addHook("preHandler", (request, _reply, done) => {
+    if (request.rawBody === undefined) {
+      request.rawBody = Buffer.alloc(0);
+    }
+    done();
+  });
+}
+installExactJsonBodyCapture(app);
+module.exports.installExactJsonBodyCapture = installExactJsonBodyCapture;
 
 // Dual delivery transports, always both constructed. `client` is a proxy that
 // routes every call to the ACTIVE transport (chrome by default); the operator
@@ -626,8 +639,16 @@ function requireToken(request, reply, done) {
   // Trust-sensitive pairing routes → pairingGate (signature-required,
   // single verification, role binding). Extracted to its own module so the
   // E2E composition test exercises the EXACT production decision logic.
-  pairingGate(agentAuthService, request, reply, done);
-  // (pairingGate calls done itself for non-pairing paths)
+  // PHASE A2 (review 041b509): pairing routes get EXACTLY ONE auth decision —
+  // the gate's done()/reply must terminate this hook. Without `return`,
+  // execution fell through to the agent/dashboard/token branches below and
+  // could double-handle the request (double-send / replay-cache trips).
+  if (
+    requestPath(request.url).startsWith("/api/v1/pairing/session/") ||
+    requestPath(request.url) === "/api/v1/pairing/approve"
+  ) {
+    return pairingGate(agentAuthService, request, reply, done);
+  }
 
   // Android agent bridge: device key (legacy) OR per-device ECDSA signature
   // (PR-08b) — the route handler/hook re-checks and binds the identity.
