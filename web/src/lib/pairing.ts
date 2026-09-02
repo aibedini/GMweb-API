@@ -134,3 +134,58 @@ export async function beginPairing(): Promise<PairingHandle> {
 
   return { session: pairingSession, qr, webDeviceId, wait, cancel };
 }
+
+// ── POST-PAIR SECURE BOOTSTRAP ────────────────────────────────────────────
+// After CERTIFICATE_VERIFIED, the browser proves possession of its
+// non-extractable operational signing key by signing the server challenge's
+// canonical bytes (GMweb-Link-Session-v1), then exchanges them for an
+// HttpOnly linked-device session cookie. sessionStorage fake is gone.
+export async function completeLinkedSession(
+  pairingSessionId: string,
+  pollSecret: string,
+  deviceId: string,
+  _certificate: string,
+  origin: string,
+): Promise<{ ok: boolean; deviceId: string; capabilities: string[] }> {
+  // Learn the single-use challenge from the dedicated peek endpoint the single-use challenge from the dedicated peek endpoint
+  // (pollSecret-authenticated; peeking never burns — only /complete does).
+  const q = new URLSearchParams({ pollSecret });
+  const chRes = await fetch(`/api/v1/pairing/challenge?${q}`, { credentials: "include" });
+  if (!chRes.ok) throw new Error(`challenge unavailable: HTTP ${chRes.status}`);
+  const ch = await chRes.json();
+  const challenge = ch.challenge as string;
+  const issuedAt = ch.issuedAt as number;
+  const canonical = new TextEncoder().encode(
+    ["GMweb-Link-Session-v1", deviceId, challenge, origin, String(issuedAt)].join("\n"),
+  );
+  const sig = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    await getSigningKey(),
+    canonical,
+  );
+  const res = await fetch("/api/v1/pairing/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({
+      pairingSessionId,
+      pollSecret,
+      deviceId,
+      challenge,
+      signature: b64(sig),
+      certificate: ch.certificate,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(`complete failed: HTTP ${res.status} ${body.error ?? ""}`);
+  }
+  return res.json();
+}
+
+/** Non-extractable operational signing key handle (deviceKeys storage). */
+async function getSigningKey(): Promise<CryptoKey> {
+  const { getOrCreateDeviceKeys } = await import("./deviceKeys");
+  const keys = await getOrCreateDeviceKeys();
+  return keys.signingPrivateKey;
+}

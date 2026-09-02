@@ -12,7 +12,15 @@ import QRCode from "qrcode";
 import { Button, Card, Chip } from "@heroui/react";
 import { beginPairing, type PairingHandle } from "../lib/pairing";
 
-export function PairingScreen({ onLinked }: { onLinked: () => void }) {
+export interface LinkContext {
+  pairingSessionId: string;
+  pollSecret: string;
+  deviceId: string;
+  certificate: string;
+  origin: string;
+}
+
+export function PairingScreen({ onLinked }: { onLinked: (link?: LinkContext) => void | Promise<void> }) {
   const [handle, setHandle] = useState<PairingHandle | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
@@ -33,7 +41,15 @@ export function PairingScreen({ onLinked }: { onLinked: () => void }) {
       setQrDataUrl(await QRCode.toDataURL(payload, { width: 240, margin: 1 }));
       void h
         .wait()
-        .then(() => onLinked())
+        .then((link: { certificate: string; deviceId: string; verified: boolean }) =>
+          onLinked({
+            pairingSessionId: h.session.pairingSessionId,
+            pollSecret: h.session.pollSecret,
+            deviceId: link.deviceId,
+            certificate: link.certificate,
+            origin: h.qr.origin,
+          }),
+        )
         .catch((e) => {
           if (!/cancel/i.test(String(e))) setError(e.message);
           startedRef.current = false;

@@ -270,6 +270,35 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
     });
   });
 
+  // ── POST-PAIR SECURE BOOTSTRAP: challenge peek (pollSecret-bound) ────────
+  // The browser reads its single-use challenge AFTER certificate
+  // verification (approval already consumed). pollSecret authenticates;
+  // peeking never burns — only /complete burns it.
+  app.get("/api/v1/pairing/challenge", {
+    schema: {
+      summary: "Fetch the single-use link-session challenge (post-approval)",
+      tags: ["Pairing"],
+      querystring: {
+        type: "object",
+        required: ["pollSecret"],
+        properties: { pollSecret: { type: "string", maxLength: 128 } },
+      },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    const rec = pairing.peekChallenge(request.query.pollSecret);
+    if (!rec) {
+      reply.code(404).send({ error: "invalid_or_expired_challenge" });
+      return reply;
+    }
+    return {
+      challenge: rec.challenge,
+      issuedAt: rec.issuedAt,
+      deviceId: rec.deviceId,
+      certificate: rec.certificate,
+    };
+  });
+
   // ── POST-PAIR SECURE BOOTSTRAP: browser proves key possession ────────────
   // Anonymous route, but every request must present the pairing session's
   // single-use challenge + a signature from the browser's OPERATIONAL key
@@ -312,7 +341,7 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
     }
   }, async (request, reply) => {
     const body = request.body || {};
-    const taken = pairing.takeChallenge(body.pairingSessionId, body.pollSecret);
+    const taken = pairing.peekChallenge(body.pollSecret);
     if (!taken || taken.challenge !== body.challenge) {
       reply.code(401).send({ error: "invalid_or_expired_challenge" });
       return reply;
@@ -342,7 +371,7 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
     // certificate's signing public key (SPKI DER Base64 or raw point).
     const origin = serverOrigin(request, request.server._gmwebConfig || {});
     const canonical = pairing.challengeCanonical(
-      taken.deviceId, body.challenge, origin, taken.challengeIssuedAt || ""
+      taken.deviceId, body.challenge, origin, taken.issuedAt || ""
     );
     const ok = verifyP256(canonical, body.signature, certSigPub);
     if (!ok) {
@@ -358,7 +387,7 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
 
     // Burn the challenge ONLY after every verification passed (a failed
     // verify must not lock the browser out of a legitimate retry).
-    if (!pairing.consumeChallenge(body.pairingSessionId, body.pollSecret)) {
+    if (!pairing.burnChallenge(body.pollSecret)) {
       reply.code(409).send({ error: "challenge_already_used" });
       return reply;
     }

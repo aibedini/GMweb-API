@@ -56,13 +56,16 @@ test("complete: challenge signature issues HttpOnly linked session with capabili
     trustRootPublicKey: "dHJ1c3Q=",
   });
 
-  // 3. Take the challenge (what the browser learns via a status-like call).
-  const taken = pairing.takeChallenge(ps, pollSecret);
-  assert.ok(taken && taken.challenge, "challenge issued at approve");
+  // 2b. Web consumes the certificate (normal flow) — the challenge must
+  // SURVIVE consumption for the later /complete exchange.
+  const consumed = pairing.consumeApproval(ps, pollSecret);
+  assert.ok(consumed, "approval consumed");
+  const taken = pairing.peekChallenge(pollSecret);
+  assert.ok(taken && taken.challenge, "challenge survives consumption");
 
   // 4. Browser signs the canonical challenge with its private key.
   const canonical = pairing.challengeCanonical(
-    taken.deviceId, taken.challenge, "https://gmweb.example", taken.challengeIssuedAt
+    taken.deviceId, taken.challenge, "https://gmweb.example", taken.issuedAt
   );
   const signature = sign(browserKeys.privateKey, canonical);
 

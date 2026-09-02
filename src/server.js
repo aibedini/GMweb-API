@@ -631,6 +631,7 @@ function requireToken(request, reply, done) {
   // POST-PAIR: linked-session introspection is public — the route itself
   // reports authenticated:false when no valid cookie is present.
   if (requestPath(request.url) === "/api/v1/linked-session") return done();
+  if (requestPath(request.url) === "/api/v1/pairing/challenge") return done();
   // FIX 2 (review): the Android-only pairing endpoints delegate to the SAME
   // agent pipeline as /api/v1/agent/* — verified here ONCE (method-aware,
   // exact rawBody) and bound to request.authenticatedAgentId. The route

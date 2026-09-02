@@ -29,14 +29,13 @@ import {
   unsubscribeFromPush,
   removeSubscriptionFromServer,
 } from "../lib/push";
-import { fetchAuthStatus } from "../lib/auth";
+import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
 
 // ADR-007 §1: first-run is LINKED-DEVICE pairing, never passkey bootstrap.
 // Until the user pairs (or holds a valid linked-device session), the app
 // shows the QR pairing screen. Passkey stays available later behind
 // Security Center (§7) — never as a first-run gate.
-const HAS_LINKED_SESSION = "linked_device_session";
 
 type TabKey = "inbox" | "sync" | "trust" | "security" | "debug";
 
@@ -57,7 +56,11 @@ export default function App() {
   const [trust, setTrust] = useState<TrustSnapshot | null>(null);
   const [version, setVersion] = useState<string>("");
   const [pushState, setPushState] = useState<string>("");
+  // POST-PAIR state machine (ticket): UNLINKED → PAIRING_APPROVED →
+  // CERTIFICATE_VERIFIED → CREATING_LINKED_SESSION → BOOTSTRAPPING_SYNC →
+  // READY. `authed` now MEANS "linked-device session cookie valid".
   const [authed, setAuthed] = useState<boolean | null>(null);
+  const [bootstrapState, setBootstrapState] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [credentials, setCredentials] = useState<CredentialRow[] | null>(null);
   const [identities, setIdentities] = useState<IdentityRow[] | null>(null);
@@ -77,16 +80,31 @@ export default function App() {
       } catch {
         setVersion("unreachable");
       }
+      // POST-PAIR: linked state comes from the linked-device session cookie
+      // (GET /api/v1/linked-session). A global passkey existing on the
+      // account does NOT mean THIS browser is trusted.
       try {
-        // ADR-007: an UNLINKED browser (no passkey session cookie) starts at
-        // the QR pairing screen; a passkey session from a previous ceremony
-        // still counts as an authed linked session.
-        const s = await fetchAuthStatus();
-        setAuthed(s.next === "authentication" ? true : false);
+        const res = await fetch("/api/v1/linked-session", { credentials: "include" });
+        const st = await res.json();
+        setAuthed(st.authenticated === true);
       } catch {
         setAuthed(false);
       }
-      await refresh();
+    })();
+  }, []);
+
+  // SSE + sync bootstrap ONLY when linkedSessionReady — never before auth.
+  useEffect(() => {
+    if (!authed) return;
+    void (async () => {
+      try {
+        setBootstrapState("BOOTSTRAPPING_SYNC");
+        await syncNow();
+        await refresh();
+        setBootstrapState("READY");
+      } catch {
+        setBootstrapState(null);
+      }
     })();
     // §44 realtime invalidation — narrow signal; cursor sync catches up.
     const dispose = subscribeSyncAvailable((applied) => {
@@ -94,7 +112,7 @@ export default function App() {
       void refresh();
     });
     return dispose;
-  }, []);
+  }, [authed]);
 
   const pull = async () => {
     setBusy(true);
@@ -140,9 +158,23 @@ export default function App() {
   if (authed === false || authed === null) {
     return (
       <PairingScreen
-        onLinked={() => {
-          sessionStorage.setItem(HAS_LINKED_SESSION, "1");
-          setAuthed(true);
+        onLinked={async (link?: { pairingSessionId: string; pollSecret: string; deviceId: string; certificate: string; origin: string }) => {
+          // CERTIFICATE_VERIFIED already happened in pairing.wait(). Now:
+          // prove key possession → HttpOnly session → sync bootstrap.
+          setBootstrapState("CREATING_LINKED_SESSION");
+          try {
+            if (link) {
+              await completeLinkedSession(
+                link.pairingSessionId, link.pollSecret, link.deviceId,
+                link.certificate, link.origin,
+              );
+            }
+            setBootstrapState("LINKED_SESSION_CREATED");
+            setAuthed(true);
+          } catch (e) {
+            setBootstrapState(null);
+            setError(e instanceof Error ? e.message : String(e));
+          }
         }}
       />
     );
@@ -154,6 +186,11 @@ export default function App() {
         <h1 className="text-lg font-semibold">Messages</h1>
         <div className="flex items-center gap-3">
           <span className="text-xs" style={{ color: "var(--muted-fg)" }}>v{version}</span>
+          {bootstrapState && bootstrapState !== "READY" && (
+            <Chip size="sm" variant="soft">
+              {bootstrapState === "CREATING_LINKED_SESSION" ? "Linking…" : "Syncing…"}
+            </Chip>
+          )}
           <Chip size="sm" variant="soft" color={cursor > 0 ? "success" : "default"}>
             cursor {cursor}
           </Chip>

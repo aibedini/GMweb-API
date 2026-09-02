@@ -284,6 +284,31 @@ function pollSecretMatches(session, pollSecret) {
   return safeEqual(hash, session.pollSecretHash);
 }
 
+/**
+ * Challenges that survived certificate consumption (POST-PAIR SECURE
+ * BOOTSTRAP). Keyed by pollSecretHash so only the browser that created the
+ * pairing session can read/burn its challenge. TTL 10 min.
+ */
+const pendingChallenges = new Map(); // pollSecretHash -> {challenge, deviceId, certificate, issuedAt, expiresAt}
+
+/** Peek the challenge after approval (does NOT burn). */
+function peekChallenge(pollSecret) {
+  gc();
+  const h = challengeHash(pollSecret);
+  const rec = pendingChallenges.get(h);
+  if (!rec || Date.now() - rec.issuedAt > 10 * 60 * 1000) return null;
+  return { ...rec };
+}
+
+/** Burn the challenge after signature verification (single use). */
+function burnChallenge(pollSecret) {
+  return pendingChallenges.delete(challengeHash(pollSecret));
+}
+
+function challengeHash(pollSecret) {
+  return crypto.createHash("sha256").update(String(pollSecret || "")).digest("hex");
+}
+
 /** Web consumes the approval once (session destroyed after). */
 function consumeApproval(pairingSessionId, pollSecret) {
   gc();
@@ -291,6 +316,15 @@ function consumeApproval(pairingSessionId, pollSecret) {
   if (!s) return null;
   if (!pollSecretMatches(s, pollSecret)) return null;
   if (s.state !== "APPROVED" || !s.approved) return null;
+  // POST-PAIR: park the single-use challenge so it survives consumption —
+  // the browser still needs it for /pairing/complete after local verify.
+  pendingChallenges.set(challengeHash(pollSecret), {
+    challenge: s.approved.sessionChallenge,
+    deviceId: s.approved.deviceId,
+    certificate: s.approved.certificate,
+    trustRootPublicKey: s.approved.trustRootPublicKey,
+    issuedAt: s.approved.challengeIssuedAt,
+  });
   sessions.delete(String(pairingSessionId));
   const set = perIp.get(s.ip);
   if (set) {
@@ -348,7 +382,8 @@ module.exports = {
   getSession,
   approveSession,
   challengeCanonical,
-  takeChallenge,
+  peekChallenge,
+  burnChallenge,
   consumeChallenge,
   consumeApproval,
   qrPayload,
