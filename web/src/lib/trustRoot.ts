@@ -46,7 +46,9 @@ export function canonicalCertificate(
     pairingTranscriptHash: c.pairingTranscriptHash,
     origin: c.origin,
   };
-  return JSON.stringify(o);
+  // org.json (Android) escapes forward slashes by default — the signature
+  // covers the ESCAPED bytes. Mirror that byte-for-byte.
+  return JSON.stringify(o).replace(/\//g, "\\/");
 }
 
 /**
