@@ -249,13 +249,16 @@ class SendQueue {
   // BullMQ's wait list is consumed from the tail, so asc=true is essential;
   // newest-first hides LIFO/admin-promoted jobs at the bottom of long queues.
   // Returns a light shape — no full message body, just a preview.
-  async listJobs({ states = ["active", "waiting", "paused", "delayed", "prioritized"], limit = 100 } = {}) {
+  async listJobs({ states = ["active", "waiting", "paused", "delayed", "prioritized"], limit = 100, offset = 0 } = {}) {
     const jobs = [];
     const unlimited = limit == null;
+    const skip = Math.max(0, Number(offset) || 0); // P0: pagination cursor
     let remaining = unlimited ? Infinity : Math.max(0, limit);
     for (const state of states) {
       if (remaining === 0) break;
-      const stateJobs = await this.queue.getJobs([state], 0, unlimited ? -1 : remaining - 1, true);
+      const start = skip;
+      const end = unlimited ? -1 : skip + remaining - 1;
+      const stateJobs = await this.queue.getJobs([state], start, end, true);
       jobs.push(...stateJobs.map((job) => ({ job, state })));
       if (!unlimited) remaining -= stateJobs.length;
     }

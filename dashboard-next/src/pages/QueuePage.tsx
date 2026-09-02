@@ -31,34 +31,47 @@ export function QueuePage() {
   const [staleSince, setStaleSince] = useState<number | null>(null);
   const [selectedJobIds, setSelectedJobIds] = useState<string[]>([]);
   const [bulkPriority, setBulkPriority] = useState<QueueJob["priority"]>("expiring");
+  // P0 operator-safety load states: stats vs rows are independent. "Queue is
+  // empty" may only render when a load SUCCEEDED and the authoritative
+  // total is actually 0.
+  const [statsLoadedOnce, setStatsLoadedOnce] = useState(false);
+  const [jobsLoadedOnce, setJobsLoadedOnce] = useState(false);
+  const [jobsFailed, setJobsFailed] = useState(false);
 
   function messageFor(err: unknown) {
     return err instanceof ApiError ? err.message : "network error";
   }
 
+  // P0 (operator safety): stats are AUTHORITATIVE and load independently —
+  // a jobs-list failure must never hide "9,877 pending". Jobs are a PAGINATED
+  // first page (never ?all=true — with a 10K backlog that request was
+  // destroying the dashboard every 8s).
   const load = useCallback(async () => {
     setLoading(true);
+    // Stats first, independent of rows.
     try {
-      const [c, j] = await Promise.all([
-        api<{ counts: QueueCounts; paused: boolean; quietHours: QueueQuietHours }>("/admin/queue", { headers: { "Content-Type": "text/plain" } }),
-        api<{ jobs: QueueJob[]; delayedHighCount: number }>("/admin/queue/jobs?all=true", { headers: { "Content-Type": "text/plain" } }),
-      ]);
+      const c = await api<{ counts: QueueCounts; paused: boolean; quietHours: QueueQuietHours }>("/admin/queue", { headers: { "Content-Type": "text/plain" } });
       setCounts(c.counts);
       setPaused(c.paused);
       setQuietHours(c.quietHours);
+      setStatsLoadedOnce(true);
+    } catch {
+      setStaleSince((prev) => prev ?? Date.now());
+    }
+    // Rows: first page only.
+    try {
+      const j = await api<{ jobs: QueueJob[]; total?: number; delayedHighCount?: number }>("/admin/queue/jobs?limit=100", { headers: { "Content-Type": "text/plain" } });
       const normalizedJobs = j.jobs.map((job) => ({ ...job, id: String(job.id) }));
       setJobs(normalizedJobs);
-      setDelayedHighCount(j.delayedHighCount);
+      setDelayedHighCount(j.delayedHighCount ?? 0);
+      setJobsLoadedOnce(true);
+      setJobsFailed(false);
       setStaleSince(null);
-      // Keep only selections that still exist in the updated list
       const validIds = new Set(normalizedJobs.map((job) => job.id));
       setSelectedJobIds((prev) => prev.map(String).filter((id) => validIds.has(id)));
-    } catch (err) {
-      // Background polling failure: don't yell at the user every 8s, but do
-      // surface it if it persists — an expired session otherwise looks
-      // exactly like "the queue is frozen" with no indication why.
+    } catch {
+      setJobsFailed(true);
       setStaleSince((prev) => prev ?? Date.now());
-      throw err;
     } finally {
       setLoading(false);
     }
@@ -234,11 +247,11 @@ export function QueuePage() {
             size="sm"
             className="text-red-400 border-red-500/20 hover:bg-red-500/10 hover:text-red-300"
             onClick={cancelAll}
-            disabled={jobs.length === 0 || busyAction !== null}
+            disabled={(counts ? (counts.waiting + counts.paused + (counts.delayed ?? 0) === 0) && counts.active === 0 : !jobsLoadedOnce) || busyAction !== null}
             title="Emergency stop: power off delivery and cancel every queued message"
           >
             <X className="size-4" />
-            {busyAction === "cancel-all" ? "Stopping…" : `Emergency stop (${jobs.length})`}
+            {busyAction === "cancel-all" ? "Stopping…" : `Emergency stop (${counts ? (counts.waiting + counts.paused + (counts.delayed ?? 0)).toLocaleString() + " pending" : jobs.length + " loaded"})`}
           </Button>
           <Button
             size="sm"
@@ -277,8 +290,26 @@ export function QueuePage() {
         )}
       </CardHeader>
       <CardContent className="p-0">
-        {jobs.length === 0 ? (
+        {jobs.length === 0 && jobsFailed ? (
+          /* P0: counts say pending exists but rows failed to load — NEVER
+             claim "empty" (that lied during the 10K backlog incident). */
+          <div className="p-6 text-center text-sm">
+            <div className="font-medium text-amber-400">
+              {counts ? `${(counts.waiting + counts.paused + (counts.delayed ?? 0)).toLocaleString()} pending messages` : "Pending messages unknown"}
+            </div>
+            <div className="mt-1 text-muted-foreground">
+              Unable to load queue details. Delivery is still paused/off.
+            </div>
+            <Button size="sm" variant="secondary" className="mt-3" onClick={() => void load().catch(() => {})}>
+              Retry
+            </Button>
+          </div>
+        ) : jobs.length === 0 && loading ? (
+          <div className="p-6 text-center text-sm text-muted-foreground">Loading queue…</div>
+        ) : jobs.length === 0 && statsLoadedOnce && counts && counts.waiting + counts.paused + (counts.delayed ?? 0) === 0 && counts.active === 0 ? (
           <div className="p-6 text-center text-sm text-muted-foreground">Queue is empty.</div>
+        ) : jobs.length === 0 ? (
+          <div className="p-6 text-center text-sm text-muted-foreground">Loading queue…</div>
         ) : (
           <div className="max-h-[60vh] divide-y divide-border overflow-y-auto">
             {/* Bulk actions bar */}

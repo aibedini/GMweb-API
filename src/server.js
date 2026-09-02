@@ -4099,9 +4099,14 @@ app.post("/admin/queue/emergency-stop", {
     const ledger = sendStore.byJob(job.id);
     if (ledger) sendStore.markById(ledger.id, "cancelled", "cancelled_by_emergency_stop");
   }
+  // Durable ledger sweep (P0): cancel remaining 'queued' rows so the boot
+  // rebuild can never resurrect cancelled sends (Redis-cancel alone left a
+  // restart window). Active rows are NEVER touched — already-submitted
+  // messages keep their true lifecycle.
+  const ledgerCancelled = sendStore.cancelAllQueued("cancelled_by_emergency_stop");
   const active = (await sendQueue.counts()).active || 0;
-  emitSse({ type: "queue_emergency_stopped", cancelled, active, at: new Date().toISOString() });
-  return { ok: true, powerOn: false, paused: true, manualPause: true, cancelled, active };
+  emitSse({ type: "queue_emergency_stopped", cancelled, ledgerCancelled, active, at: new Date().toISOString() });
+  return { ok: true, powerOn: false, paused: true, manualPause: true, cancelled, ledgerCancelled, active };
 });
 
 app.get("/admin/sends", {
@@ -4206,7 +4211,8 @@ app.get("/admin/queue/jobs", {
       type: "object",
       properties: {
         limit: { type: "integer", minimum: 1, maximum: 500, default: 100 },
-        all: { type: "boolean", default: false }
+        all: { type: "boolean", default: false },
+        offset: { type: "integer", minimum: 0, default: 0 }
       }
     },
     response: {
@@ -4261,14 +4267,28 @@ app.get("/admin/queue/jobs", {
     }
   }
 }, async (request) => {
-  const limit = request.query.all ? null : parseLimit(request.query.limit, 100, 500);
+  // P0 (operator safety, 10K-backlog incident): `all=true` returned the whole
+  // queue every 8s and froze the dashboard. The dashboard no longer sends it;
+  // the parameter remains for API compatibility but the response is ALWAYS
+  // capped at 500 rows. Pagination: offset cursor.
+  const cappedLimit = request.query.all
+    ? 500
+    : Math.min(parseLimit(request.query.limit, 100, 500), 500);
+  const offset = Math.max(0, Number(request.query.offset) || 0);
   const [jobs, delayedHighCount, counts] = await Promise.all([
-    sendQueue.listJobs({ limit }),
+    sendQueue.listJobs({ limit: cappedLimit, offset }),
     sendQueue.countDeferredHighJobs(),
     sendQueue.counts()
   ]);
   const total = counts.waiting || 0; // counts() already folds paused+prioritized into waiting
-  return { jobs: jobs.map(enrichQueueJob), delayedHighCount, total };
+  const nextOffset = offset + jobs.length;
+  return {
+    jobs: jobs.map(enrichQueueJob),
+    delayedHighCount,
+    total,
+    hasMore: nextOffset < total,
+    nextCursor: String(nextOffset),
+  };
 });
 
 app.post("/admin/queue/release-delayed-high", {

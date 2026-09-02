@@ -199,6 +199,28 @@ class SendStore {
     this._setById.run({ id, status, error, now: Date.now() });
   }
 
+  /**
+   * P0 (emergency-stop durability): cancel every ledger row still sitting in
+   * 'queued' — NOT 'active' (an active row may already be submitted to the
+   * device; its true lifecycle must be preserved). This closes the
+   * boot-rebuild gap: cancelled rows can never be re-enqueued after restart.
+   * @returns {number} rows cancelled
+   */
+  cancelAllQueued(reason = "cancelled_by_emergency_stop") {
+    const now = Date.now();
+    const info = this.db
+      .prepare(
+        `UPDATE sends
+            SET status='cancelled',
+                error=?,
+                updated_at=?,
+                finished_at=?
+          WHERE status='queued'`
+      )
+      .run(reason, now, now);
+    return info.changes || 0;
+  }
+
   // Record the granular send stage (which step the message is on right now).
   markStage(jobId, stage) {
     if (!jobId) return;
