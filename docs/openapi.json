@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.13.6",
+    "version": "0.13.7",
     "contact": {
       "name": "GMweb API"
     }
@@ -1144,6 +1144,66 @@
         }
       }
     },
+    "/api/v1/agent/trust/statements": {
+      "post": {
+        "summary": "Android-signed trust statement (PRIMARY_TRUST_AGENT only)",
+        "tags": [
+          "Trust"
+        ],
+        "description": "Android Trust Root posts DEVICE_APPROVED/DEVICE_REVOKED/etc statements with monotonic trustSequence. GMweb relays them; clients verify rootSignature locally. Monotonic per account, no gaps, idempotent redelivery.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "applied": {
+                      "type": "boolean"
+                    },
+                    "trustSequence": {
+                      "type": "integer"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/trust/statements": {
       "post": {
         "summary": "Relay an Android-signed trust statement (ADR-001)",
@@ -1257,6 +1317,27 @@
                       "type": "string"
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/linked-devices": {
+      "get": {
+        "summary": "Linked-device session telemetry (server observations)",
+        "tags": [
+          "Trust"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }
@@ -1757,6 +1838,34 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string",
+                      "enum": [
+                        "device_key_mismatch",
+                        "device_key_not_configured"
+                      ]
+                    },
+                    "expectedKeyPreview": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -1985,6 +2094,38 @@
                       "type": "boolean"
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/pairing/challenge": {
+      "get": {
+        "summary": "Fetch the single-use link-session challenge (post-approval)",
+        "tags": [
+          "Pairing"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "in": "query",
+            "name": "pollSecret",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }
@@ -4210,6 +4351,16 @@
             },
             "in": "query",
             "name": "all",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "in": "query",
+            "name": "offset",
             "required": false
           }
         ],

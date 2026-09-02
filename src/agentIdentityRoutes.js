@@ -46,7 +46,17 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
           }
         }
       },
-      response: { 200: { type: "object", properties: { ok: { type: "boolean" } } } }
+      response: {
+        200: { type: "object", properties: { ok: { type: "boolean" } } },
+        401: {
+          type: "object",
+          properties: {
+            error: { type: "string" },
+            reason: { type: "string", enum: ["device_key_mismatch", "device_key_not_configured"] },
+            expectedKeyPreview: { type: ["string", "null"] },
+          },
+        },
+      }
     }
   }, async (request) => {
     // FIX 5b (review): role is NEVER taken from the client. The service

@@ -706,6 +706,10 @@ function requireToken(request, reply, done) {
   // bound deviceId is exposed as request.authenticatedAgentId for handlers.
   if (requestPath(request.url).startsWith("/api/v1/agent/")) {
     if (checkDeviceKey(request)) return done();
+    if (requestPath(request.url) === "/api/v1/agent/identity") {
+      reply.code(401).send(deviceKeyStore.authFailure());
+      return;
+    }
     const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
     if (auth.ok) {
       request.authenticatedAgentId = auth.deviceId;

@@ -36,6 +36,15 @@ class DeviceKeyStore {
     return this.configured ? `${this.key.slice(0, 5)}…${this.key.slice(-4)}` : null;
   }
 
+  /** Safe, actionable bootstrap failure; never exposes the key itself. */
+  authFailure() {
+    return {
+      error: "unauthorized",
+      reason: this.configured ? "device_key_mismatch" : "device_key_not_configured",
+      expectedKeyPreview: this.preview(),
+    };
+  }
+
   async generate() {
     this.key = `devk_${crypto.randomBytes(24).toString("base64url")}`;
     this.source = "file";
