@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/app/app.tsx","./src/lib/api.ts","./src/lib/auth.ts","./src/lib/certverify.ts","./src/lib/devicekeys.ts","./src/lib/inbox.ts","./src/lib/pairing.ts","./src/lib/pairingapi.ts","./src/lib/push.ts","./src/lib/security.ts","./src/lib/sync.ts","./src/lib/trustroot.ts","./src/screens/pairingscreen.tsx"],"version":"5.9.3"}

@@ -1992,6 +1992,124 @@
         }
       }
     },
+    "/api/v1/pairing/complete": {
+      "post": {
+        "summary": "Exchange the pairing challenge for a linked-device session",
+        "tags": [
+          "Pairing"
+        ],
+        "description": "Called by the browser after it verified the Android-signed DeviceCertificate locally.\nThe browser signs the canonical challenge (GMweb-Link-Session-v1) with the same\noperational signing key bound in the certificate. Single-use challenge.\nSuccess sets the HttpOnly linked-session cookie.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "pairingSessionId",
+                  "pollSecret",
+                  "deviceId",
+                  "challenge",
+                  "signature"
+                ],
+                "properties": {
+                  "pairingSessionId": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "pollSecret": {
+                    "type": "string",
+                    "maxLength": 256
+                  },
+                  "deviceId": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "challenge": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "signature": {
+                    "type": "string",
+                    "maxLength": 512
+                  },
+                  "certificate": {
+                    "type": "string",
+                    "maxLength": 16384
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "deviceId": {
+                      "type": "string"
+                    },
+                    "capabilities": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/linked-session": {
+      "get": {
+        "summary": "Linked-device session state (cookie-authenticated)",
+        "tags": [
+          "Pairing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "authenticated": {
+                      "type": "boolean"
+                    },
+                    "deviceId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "capabilities": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "trustSequence": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sse": {
       "get": {
         "summary": "Control plane SSE — sync.available invalidation signal (§44)",

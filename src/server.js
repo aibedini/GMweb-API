@@ -1,5 +1,7 @@
 const Fastify = require("fastify");
 const cors = require("@fastify/cors");
+const cookie = require("@fastify/cookie");
+const linkedSessions = require("./linkedSessions");
 const proxy = require("@fastify/http-proxy");
 const swagger = require("@fastify/swagger");
 const swaggerUi = require("@fastify/swagger-ui");
@@ -648,6 +650,35 @@ function requireToken(request, reply, done) {
     requestPath(request.url) === "/api/v1/pairing/approve"
   ) {
     return pairingGate(agentAuthService, request, reply, done);
+  }
+  // POST-PAIR SECURE BOOTSTRAP: the linked-device session class —
+  // capability-scoped, NEVER master/admin. Paths are whitelisted by
+  // capability; everything else falls through to the normal auth ladder
+  // (and typically 401s for a browser that only holds this cookie).
+  const linkedCookie = request.cookies
+    ? request.cookies[linkedSessions.COOKIE_NAME]
+    : "";
+  const linkedSession = linkedSessions.resolve(linkedCookie);
+  if (linkedSession && requestPath(request.url).startsWith("/api/v1/")) {
+    const p = requestPath(request.url);
+    const caps = linkedSession.capabilities || [];
+    const allowed =
+      (caps.includes("READ_MESSAGES") &&
+        (p === "/api/v1/sync" ||
+          p === "/api/v1/sse" ||
+          p === "/api/v1/linked-session" ||
+          p.startsWith("/api/v1/trust/"))) ||
+      (caps.includes("SEND_MESSAGES") &&
+        (p === "/api/v1/commands" || p.startsWith("/api/v1/commands/"))) ||
+      p === "/api/v1/linked-session"; // introspection always allowed
+    if (allowed) {
+      request.linkedDevice = linkedSession;
+      return done();
+    }
+    // A linked browser must not silently fall through to bearer auth with
+    // its cookie — fail closed for out-of-scope paths.
+    reply.code(403).send({ error: "capability_denied" });
+    return;
   }
 
   // Android agent bridge: device key (legacy) OR per-device ECDSA signature
@@ -1686,6 +1717,7 @@ app.addSchema({
 });
 
 app.register(cors, { origin: corsOrigin });
+app.register(cookie, {});
 app.addHook("onRequest", applySecurityHeaders);
 app.addHook("onRequest", (request, _reply, done) => {
   request._activityStartedAt = process.hrtime.bigint();

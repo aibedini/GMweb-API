@@ -211,6 +211,9 @@ function approveSession(pairingSessionId, { certificate, deviceId, transcriptHas
     throw err;
   }
   s.state = "APPROVED";
+  // POST-PAIR SECURE BOOTSTRAP: a single-use challenge bound to the device,
+  // consumed by POST /api/v1/pairing/complete where the browser proves
+  // possession of its (non-extractable) signing key. Short expiry.
   s.approved = {
     certificate: String(certificate).slice(0, 16384),
     deviceId: String(deviceId).slice(0, 128),
@@ -219,9 +222,51 @@ function approveSession(pairingSessionId, { certificate, deviceId, transcriptHas
     // BLOCKER 1: the Android Trust Root public key is pinned here so the web
     // can verify rootSignature itself (obtain/pin from pairing bootstrap).
     trustRootPublicKey: String(trustRootPublicKey || "").slice(0, 512),
+    sessionChallenge: crypto.randomBytes(32).toString("hex"),
+    challengeIssuedAt: now(),
     approvedAt: now(),
   };
   return { ok: true, state: s.state };
+}
+
+/** Consume (null out) the challenge — called ONLY by /pairing/complete
+ *  after signature verification succeeds. Returns true if it was present. */
+function consumeChallenge(pairingSessionId, pollSecret) {
+  gc();
+  const s = sessions.get(String(pairingSessionId || ""));
+  if (!s || !pollSecretMatches(s, pollSecret)) return false;
+  if (s.state !== "APPROVED" || !s.approved || !s.approved.sessionChallenge) return false;
+  s.approved.sessionChallenge = null;
+  return true;
+}
+
+/** Canonical challenge bytes the browser signs (shared contract v1). */
+function challengeCanonical(deviceId, challenge, origin, issuedAt) {
+  return Buffer.from(
+    ["GMweb-Link-Session-v1", deviceId, challenge, origin, String(issuedAt)].join("\n"),
+    "utf8"
+  );
+}
+
+/** Single-use challenge consumption for session issuance. */
+function takeChallenge(pairingSessionId, pollSecret) {
+  gc();
+  const s = sessions.get(String(pairingSessionId || ""));
+  if (!s || !pollSecretMatches(s, pollSecret)) return null;
+  if (s.state !== "APPROVED" || !s.approved) return null;
+  if (now() - s.approved.challengeIssuedAt > 10 * 60 * 1000) {
+    sessions.delete(String(pairingSessionId));
+    return null;
+  }
+  const c = s.approved.sessionChallenge;
+  if (!c) return null; // already consumed (single use)
+  return {
+    challenge: c,
+    deviceId: s.approved.deviceId,
+    certificate: s.approved.certificate,
+    trustRootPublicKey: s.approved.trustRootPublicKey,
+    challengeIssuedAt: s.approved.challengeIssuedAt,
+  };
 }
 
 /** Constant-time compare for poll secrets. */
@@ -302,6 +347,9 @@ module.exports = {
   createSession,
   getSession,
   approveSession,
+  challengeCanonical,
+  takeChallenge,
+  consumeChallenge,
   consumeApproval,
   qrPayload,
   hashOf,

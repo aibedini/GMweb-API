@@ -18,7 +18,33 @@
  * Host behind a trusted proxy) — the client cannot supply it.
  */
 
+
+/**
+ * ECDSA P-256 / SHA-256 verification accepting BOTH wire formats used by
+ * Android (raw uncompressed point 0x04||X||Y and DER SPKI Base64).
+ */
+function verifyP256(data, sigB64, pubB64) {
+  try {
+    const keyBytes = Buffer.from(String(pubB64 || ""), "base64");
+    let keyObject;
+    if (keyBytes.length === 65 && keyBytes[0] === 0x04) {
+      const spki = Buffer.concat([
+        Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex"),
+        keyBytes,
+      ]);
+      keyObject = crypto.createPublicKey({ key: spki, format: "der", type: "spki" });
+    } else {
+      keyObject = crypto.createPublicKey({ key: keyBytes, format: "der", type: "spki" });
+    }
+    return crypto.verify("sha256", data, keyObject, Buffer.from(String(sigB64 || ""), "base64"));
+  } catch {
+    return false;
+  }
+}
+
 const pairing = require("./pairingSessions");
+const linkedSessions = require("./linkedSessions");
+const crypto = require("crypto");
 
 /** Web-facing origin recorded in the transcript (server-derived only). */
 function serverOrigin(request, config) {
@@ -242,6 +268,145 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
       transcriptHash: body.transcriptHash,
       trustRootPublicKey: body.trustRootPublicKey,
     });
+  });
+
+  // ── POST-PAIR SECURE BOOTSTRAP: browser proves key possession ────────────
+  // Anonymous route, but every request must present the pairing session's
+  // single-use challenge + a signature from the browser's OPERATIONAL key
+  // over the canonical challenge bytes. GMweb verifies and issues an
+  // HttpOnly Secure SameSite=Strict linked-device session cookie.
+  // Capability-scoped: the session inherits exactly the certificate's caps.
+  app.post("/api/v1/pairing/complete", {
+    config: { rateLimit: { max: 10, timeWindow: 60000 } },
+    schema: {
+      summary: "Exchange the pairing challenge for a linked-device session",
+      description: [
+        "Called by the browser after it verified the Android-signed DeviceCertificate locally.",
+        "The browser signs the canonical challenge (GMweb-Link-Session-v1) with the same",
+        "operational signing key bound in the certificate. Single-use challenge.",
+        "Success sets the HttpOnly linked-session cookie.",
+      ].join("\n"),
+      tags: ["Pairing"],
+      body: {
+        type: "object",
+        required: ["pairingSessionId", "pollSecret", "deviceId", "challenge", "signature"],
+        properties: {
+          pairingSessionId: { type: "string", maxLength: 128 },
+          pollSecret: { type: "string", maxLength: 256 },
+          deviceId: { type: "string", maxLength: 128 },
+          challenge: { type: "string", maxLength: 128 },
+          signature: { type: "string", maxLength: 512 },
+          certificate: { type: "string", maxLength: 16384 }
+        }
+      },
+      response: {
+        200: {
+          type: "object",
+          properties: {
+            ok: { type: "boolean" },
+            deviceId: { type: "string" },
+            capabilities: { type: "array", items: { type: "string" } }
+          }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const body = request.body || {};
+    const taken = pairing.takeChallenge(body.pairingSessionId, body.pollSecret);
+    if (!taken || taken.challenge !== body.challenge) {
+      reply.code(401).send({ error: "invalid_or_expired_challenge" });
+      return reply;
+    }
+    if (body.deviceId !== taken.deviceId) {
+      reply.code(403).send({ error: "device_mismatch" });
+      return reply;
+    }
+
+    // Extract the certificate's signing key + capabilities (defensive parse).
+    let cert = null;
+    try { cert = JSON.parse(taken.certificate); } catch { cert = null; }
+    const certSigPub = cert && (cert.signingPublicKey || (cert.publicKeys && cert.publicKeys && cert.publicKeys.signing)) || "";
+    const caps = cert && Array.isArray(cert.capabilities) ? cert.capabilities : [];
+    const capNames = ["READ_MESSAGES","SEND_MESSAGES","MANAGE_DEVICES","READ_OTP","READ_BANK_SECURITY","READ_PASSWORD_RESET","READ_AUTH_CODES","READ_FINANCIAL_NOTIFICATIONS"];
+    const capabilities = caps.filter((c) => capNames.includes(String(c)));
+    if (!capabilities.includes("READ_MESSAGES")) {
+      reply.code(403).send({ error: "certificate_lacks_read_capability" });
+      return reply;
+    }
+    if (!certSigPub || !body.signature) {
+      reply.code(401).send({ error: "signature_required" });
+      return reply;
+    }
+
+    // Canonical challenge bytes + ECDSA P-256 verification against the
+    // certificate's signing public key (SPKI DER Base64 or raw point).
+    const origin = serverOrigin(request, request.server._gmwebConfig || {});
+    const canonical = pairing.challengeCanonical(
+      taken.deviceId, body.challenge, origin, taken.challengeIssuedAt || ""
+    );
+    const ok = verifyP256(canonical, body.signature, certSigPub);
+    if (!ok) {
+      reply.code(401).send({ error: "signature_mismatch", reason: "challenge_signature_invalid" });
+      return reply;
+    }
+
+    // Require the browser to present the SAME certificate Android approved.
+    if (body.certificate && String(body.certificate) !== taken.certificate) {
+      reply.code(403).send({ error: "certificate_mismatch" });
+      return reply;
+    }
+
+    // Burn the challenge ONLY after every verification passed (a failed
+    // verify must not lock the browser out of a legitimate retry).
+    if (!pairing.consumeChallenge(body.pairingSessionId, body.pollSecret)) {
+      reply.code(409).send({ error: "challenge_already_used" });
+      return reply;
+    }
+    const token = linkedSessions.issue(taken.deviceId, capabilities);
+    reply.setCookie(linkedSessions.COOKIE_NAME, token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "strict",
+      path: "/",
+      maxAge: Math.floor(linkedSessions.SESSION_TTL_MS / 1000),
+    });
+    return {
+      ok: true,
+      deviceId: taken.deviceId,
+      capabilities,
+    };
+  });
+
+  // Linked-session introspection for browser startup (replaces passkey
+  // as the linked-state signal).
+  app.get("/api/v1/linked-session", {
+    schema: {
+      summary: "Linked-device session state (cookie-authenticated)",
+      tags: ["Pairing"],
+      response: {
+        200: {
+          type: "object",
+          properties: {
+            authenticated: { type: "boolean" },
+            deviceId: { type: ["string", "null"] },
+            capabilities: { type: "array", items: { type: "string" } },
+            trustSequence: { type: "integer" }
+          }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const token = request.cookies ? request.cookies[linkedSessions.COOKIE_NAME] : "";
+    const session = linkedSessions.resolve(token);
+    if (!session) {
+      return { authenticated: false, deviceId: null, capabilities: [], trustSequence: 0 };
+    }
+    return {
+      authenticated: true,
+      deviceId: session.deviceId,
+      capabilities: session.capabilities,
+      trustSequence: session.trustSequence,
+    };
   });
 }
 
