@@ -4,6 +4,8 @@ data/
 .vscode/
 *.log
 *.code-workspace
+.codex-temp-gmweb-repair-key
+.codex-temp-gmweb-repair-key.pub
 
 # graphify regenerable cache (graph itself is committed)
 graphify-out/cache/
