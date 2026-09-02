@@ -24,6 +24,14 @@ describe("Phase 2 control plane HTTP API", () => {
       commandEngine: new CommandEngine(db),
       eventStore: new EventStore(db),
       accountId: "test-account",
+      // Test auth stub: request header X-Test-Agent-Role simulates the
+      // server's real authorizeAgent (signature → {deviceId, role}).
+      linkedSessions: require("../src/linkedSessions"),
+      authorizeAgent: (request) => {
+        const role = request.headers["x-test-agent-role"];
+        const deviceId = request.headers["x-test-agent-device"] || "test-agent";
+        return role ? { deviceId, role } : null;
+      },
     });
     await app.ready();
   });
@@ -122,14 +130,19 @@ describe("Phase 2 control plane HTTP API", () => {
     const mk = (n) => ({
       statement: { trustSequence: n, statementId: `s${n}`, operation: "DEVICE_APPROVED", deviceId: "d1", rootSignature: `sig${n}` },
     });
-    const ok1 = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(1) });
+    // SECURITY: without agent auth (browser/anonymous) trust POST is 403.
+    const anon = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(1) });
+    assert.equal(anon.statusCode, 403);
+
+    const H = { "x-test-agent-role": "PRIMARY_TRUST_AGENT", "x-test-agent-device": "trust-root-device" };
+    const ok1 = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(1), headers: H });
     assert.equal(ok1.json().applied, true);
 
-    const gap = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(3) });
+    const gap = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(3), headers: H });
     assert.equal(gap.json().applied, false);
     assert.equal(gap.json().reason, "sequence_gap");
 
-    const ok2 = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(2) });
+    const ok2 = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(2), headers: H });
     assert.equal(ok2.json().applied, true);
 
     const list = await app.inject({ method: "GET", url: "/api/v1/trust/statements?after=0" });

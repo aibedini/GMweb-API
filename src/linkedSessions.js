@@ -43,7 +43,9 @@ function issue(deviceId, capabilities, trustSequence = 0) {
 function resolve(token) {
   gc();
   if (!token) return null;
-  return sessions.get(hashToken(token)) || null;
+  const session = sessions.get(hashToken(token));
+  if (session) touch(token);
+  return session;
 }
 
 /** Revoke everything for a device (Android DEVICE_REVOKED). */
@@ -54,6 +56,39 @@ function revokeDevice(deviceId) {
   }
 }
 
+/**
+ * Server-observed telemetry for Android (no tokens ever). Presence window:
+ * a device is "online now" if it resolved its session in the last 90s.
+ */
+function telemetry() {
+  gc();
+  const now = Date.now();
+  const byDevice = new Map();
+  for (const [h, s] of sessions) {
+    const seen = lastSeen.get(h) || s.createdAt;
+    const entry = byDevice.get(s.deviceId) || {
+      deviceId: s.deviceId,
+      sessionActive: true,
+      lastSeenAt: seen,
+      sessionExpiresAt: s.createdAt + SESSION_TTL_MS,
+      onlineNow: false,
+    };
+    entry.lastSeenAt = Math.max(entry.lastSeenAt, seen);
+    entry.onlineNow = now - seen < 90_000;
+    byDevice.set(s.deviceId, entry);
+  }
+  return [...byDevice.values()];
+}
+
+// throttled last-seen (max once per 45s per session token)
+const lastSeen = new Map();
+function touch(token) {
+  const now = Date.now();
+  const h = hashToken(token);
+  const prev = lastSeen.get(h) || 0;
+  if (now - prev > 45_000) lastSeen.set(h, now);
+}
+
 function gc() {
   const cutoff = Date.now() - SESSION_TTL_MS;
   for (const [h, s] of sessions) {
@@ -61,4 +96,4 @@ function gc() {
   }
 }
 
-module.exports = { COOKIE_NAME, SESSION_TTL_MS, issue, resolve, revokeDevice };
+module.exports = { COOKIE_NAME, SESSION_TTL_MS, issue, resolve, revokeDevice, telemetry };

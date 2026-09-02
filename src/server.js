@@ -148,7 +148,10 @@ function authorizeAgent(request, rawBody) {
   if (header) {
     const result = agentAuthService.verifyAgentHeader(request, rawBody);
     if (!result.ok) return null;
-    return result.deviceId;
+    return {
+      deviceId: result.deviceId,
+      role: agentAuthService.getRole(result.deviceId),
+    };
   }
   // Legacy fallback: shared device key (pre-PR-08b agents). Only valid while
   // the agent has NOT enrolled a signature identity — an enrolled device
@@ -158,7 +161,7 @@ function authorizeAgent(request, rawBody) {
     if (claimed && agentAuthService.getIdentity(String(claimed))) {
       return null; // enrolled device MUST use signatures
     }
-    return "legacy-shared-agent";
+    return { deviceId: "legacy-shared-agent", role: "LEGACY_AGENT" };
   }
   return null;
 }
@@ -668,6 +671,7 @@ function requireToken(request, reply, done) {
     const caps = linkedSession.capabilities || [];
     const allowed =
       (caps.includes("READ_MESSAGES") &&
+        request.method === "GET" &&
         (p === "/api/v1/sync" ||
           p === "/api/v1/sse" ||
           p === "/api/v1/linked-session" ||
@@ -2627,6 +2631,7 @@ registerControlPlaneRoutes(app, {
   eventStore,
   accountId: DEFAULT_ACCOUNT_ID,
   authorizeAgent,
+  linkedSessions,
 });
 
 // PR-08b: per-device identity registration (device-key bootstrap → ECDSA).

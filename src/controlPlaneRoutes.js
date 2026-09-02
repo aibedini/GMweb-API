@@ -13,7 +13,7 @@
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
 
   // ── Trust Registry relay (ADR-001 LOCK 2/9) ──────────────────────────────
@@ -29,8 +29,21 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         400: { type: "object", properties: { error: { type: "string" } } }
       }
     }
-  }, async (request) => {
+  }, async (request, reply) => {
+    // SECURITY (review): trust writes are ANDROID-PRIMARY-ONLY. The linked
+    // browser (READ_MESSAGES) is auth'd for GET /trust/* — it must never be
+    // able to POST a statement, even though rootSignature is what actually
+    // protects the registry (defense in depth: authorization AND crypto).
+    const agent = authorizeAgent(request);
+    if (!agent || agent.role !== "PRIMARY_TRUST_AGENT") {
+      reply.code(403).send({ error: "trust writes require the authenticated PRIMARY_TRUST_AGENT" });
+      return;
+    }
     const statement = request.body?.statement || request.body;
+    // NOTE: statement.deviceId is the SUBJECT device (e.g. the web browser
+    // being approved) — the AUTHOR is always the authenticated Trust Root
+    // agent (checked above). rootSignature provides cryptographic binding;
+    // web clients verify it independently before trusting.
     const result = trustRegistry.applyStatement({ accountId, statement });
     return { ok: true, ...result };
   });
@@ -63,6 +76,25 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   }, async (request) => {
     const after = Math.max(0, Number(request.query?.after) || 0);
     return { statements: trustRegistry.statementsAfter(accountId, after) };
+  });
+
+  // ── POST-PAIR: linked-device presence telemetry (Android-authenticated) ──
+  // SERVER OBSERVATIONS only — Android merges with its local signed trust
+  // state; GMweb is never the trust authority.
+  app.get("/api/v1/agent/linked-devices", {
+    schema: {
+      summary: "Linked-device session telemetry (server observations)",
+      tags: ["Trust"],
+      response: { 200: { type: "object", additionalProperties: true } }
+    }
+  }, async (request, reply) => {
+    const agent = authorizeAgent(request);
+    if (!agent) {
+      reply.code(401).send({ error: "agent signature required" });
+      return;
+    }
+    const devices = linkedSessions.telemetry();
+    return { devices };
   });
 
   // ── Commands (Rule 4: durable before 202) ────────────────────────────────
