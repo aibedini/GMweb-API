@@ -31,34 +31,30 @@ const app = Fastify({
 // timing — hook-based capture deadlocks under fastify.inject). request.rawBody
 // then feeds AgentAuthService verification for every /api/v1/agent/* and
 // pairing-approve call.
-if (!app.hasContentTypeParser("application/json")) {
-  app.addContentTypeParser(
-    "application/json",
-    { parseAs: "buffer" },
-    (req, body, done) => {
-      req.rawBody = body;
-      try {
-        done(null, JSON.parse(body.toString("utf8") || "{}"));
-      } catch (e) {
-        e.statusCode = 400;
-        done(e);
-      }
-    },
-  );
-}
-// NOTE: no stream-level hook here — when the winning JSON parser has
-// parseAs:"buffer" the parsed body IS the raw bytes, so rawBody is set in
-// a preHandler (below). A stream hook would hang: the parser already
-// consumed the stream, so 'end' never fires on it.
+// REVIEW P0 FIX: Fastify ships a built-in application/json parser, so the
+// old `if (!app.hasContentTypeParser(...))` guard never installed ours —
+// rawBody was then reconstructed via JSON.stringify in the preHandler,
+// which is NOT byte-identical to what the Android agent signed (key order /
+// whitespace differ) → signature_mismatch on pairing approve. We now
+// EXPLICITLY REPLACE the built-in parser: capture exact inbound bytes,
+// then delegate to Fastify's own parser (same strict/prototype-pollution
+// behavior) for request.body.
+const defaultJsonParser = app.getDefaultJsonParser("error", "error");
+app.removeContentTypeParser("application/json");
+app.addContentTypeParser(
+  "application/json",
+  { parseAs: "string" },
+  (req, body, done) => {
+    req.rawBody = Buffer.from(body, "utf8");
+    defaultJsonParser(req, body, done);
+  },
+);
+// Raw-body no longer needs reconstructing — the parser above always sets it
+// for JSON bodies. Non-JSON/empty bodies (GET etc.) get an empty buffer so
+// the canonical signature contract still has deterministic bytes.
 app.addHook("preHandler", (request, _reply, done) => {
   if (request.rawBody === undefined) {
-    if (Buffer.isBuffer(request.body)) {
-      request.rawBody = request.body;
-    } else if (request.body !== undefined) {
-      request.rawBody = Buffer.from(JSON.stringify(request.body), "utf8");
-    } else {
-      request.rawBody = Buffer.alloc(0);
-    }
+    request.rawBody = Buffer.alloc(0);
   }
   done();
 });

@@ -264,4 +264,93 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
     // The security property: shared key alone must never approve (200).
     assert.ok(res.statusCode === 401 || res.statusCode === 400, `got ${res.statusCode}`);
   });
+
+  test("RAW-BODY CONTRACT: signature over exact bytes verifies; different serialization of same JSON rejects", async () => {
+    const created = (
+      await app.inject({
+        method: "POST",
+        url: "/api/v1/pairing/session",
+        payload: {
+          webDeviceId: "web-e2e",
+          webSigningPublicKey: "PK-S",
+          webEncryptionPublicKey: "PK-E",
+          ephemeralPublicKey: "PK-P",
+          nonce: "n-e2e-9",
+        },
+      })
+    ).json();
+
+    // Android-style approve body — EXACT bytes the client will sign.
+    const exactRawBody = JSON.stringify({
+      pairingSessionId: created.pairingSessionId,
+      certificate: "CERT-RAWBODY",
+      deviceId: "web-e2e",
+      transcriptHash: "h",
+      trustRootPublicKey: "TRUST",
+    });
+
+    const approveUrl = "/api/v1/pairing/approve";
+
+    // 1) signature over the EXACT raw bytes → must verify. inject sends the
+    // raw string as-is with the explicit content-type.
+    const res1 = await app.inject({
+      method: "POST",
+      url: approveUrl,
+      payload: exactRawBody,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": String(Buffer.byteLength(exactRawBody, "utf8")),
+        ...signRequest(pair, DEVICE, "POST", approveUrl, Buffer.from(exactRawBody, "utf8")),
+      },
+    });
+    assert.equal(res1.statusCode, 200, `exact-bytes approve failed: ${res1.payload.slice(0, 140)}`);
+
+    // 2) same semantic JSON, different serialization (spaces + key order) —
+    //    signature from (1) reused → MUST reject (raw-body binding).
+    const differentSerialization = JSON.stringify(
+      {
+        trustRootPublicKey: "TRUST",
+        transcriptHash: "h",
+        deviceId: "web-e2e",
+        certificate: "CERT-RAWBODY",
+        pairingSessionId: created.pairingSessionId,
+      },
+      null,
+      2, // pretty-printed: different bytes, same semantics
+    );
+    // Fresh session (the previous one was consumed).
+    const created2 = (
+      await app.inject({
+        method: "POST",
+        url: "/api/v1/pairing/session",
+        payload: {
+          webDeviceId: "web-e2e",
+          webSigningPublicKey: "PK-S",
+          webEncryptionPublicKey: "PK-E",
+          ephemeralPublicKey: "PK-P",
+          nonce: "n-e2e-10",
+        },
+      })
+    ).json();
+    const tamperedBody = differentSerialization.replace(
+      created.pairingSessionId,
+      created2.pairingSessionId,
+    );
+    const res2 = await app.inject({
+      method: "POST",
+      url: approveUrl,
+      payload: tamperedBody,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "content-length": String(Buffer.byteLength(tamperedBody, "utf8")),
+        // signature computed over the ORIGINAL exact bytes — must mismatch
+        ...signRequest(pair, DEVICE, "POST", approveUrl, Buffer.from(exactRawBody, "utf8")),
+      },
+    });
+    assert.equal(
+      res2.statusCode,
+      401,
+      `re-serialized body with old signature must reject: ${res2.payload.slice(0, 140)}`,
+    );
+  });
 });
