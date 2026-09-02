@@ -796,7 +796,7 @@ function emitSse(event) {
       const ledger = sendStore.byJob(event.jobId) || sendStore.byReference(event.requestId);
       if (!ledger || ledger.key_name !== scope.keyName) continue;
     }
-    reply.raw.write(payload);
+    try { reply.raw.write(payload); } catch { sseClients.delete(reply); }
   }
 }
 
@@ -2551,16 +2551,19 @@ app.get("/api/v1/sse", {
     response: { 200: { type: "string", description: "SSE stream" } }
   }
 }, async (request, reply) => {
+  // P0 (review): raw streaming REQUIRES explicit lifecycle hijack —
+  // "return reply" alone does NOT stop Fastify from later serializing.
+  reply.hijack();
+
   reply.raw.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
     connection: "keep-alive"
   });
   reply.raw.write(": connected\n\n");
+
   controlSseClients.add(reply);
   request.raw.on("close", () => controlSseClients.delete(reply));
-  // Hijack the response: Fastify must NOT try to send/serialize after we
-  // already wrote raw SSE headers (ERR_HTTP_HEADERS_SENT crash loop).
   return reply;
 });
 
@@ -4582,6 +4585,10 @@ app.get("/events", {
     response: { 200: { type: "string", description: "SSE stream" } }
   }
 }, async (request, reply) => {
+  // P0 (review): same lifecycle hijack as /api/v1/sse — without it Fastify
+  // double-sends and crashes the process (Eve/dashboard can trigger this).
+  reply.hijack();
+
   reply.raw.writeHead(200, {
     "content-type": "text/event-stream",
     "cache-control": "no-cache",
@@ -4596,6 +4603,7 @@ app.get("/events", {
   request.raw.on("close", () => {
     sseClients.delete(reply);
   });
+  return reply;
 });
 
 }); // end app.after — routes are now registered after swagger's onRoute hook
