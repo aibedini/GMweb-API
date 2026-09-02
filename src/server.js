@@ -625,27 +625,29 @@ function requireToken(request, reply, done) {
   // handlers then check ROLE only, never re-verify the signature (a second
   // verify would trip the replay cache). These paths never hit
   // master/dashboard/project auth.
+  // REVIEW FIX: trust-sensitive pairing routes are SIGNATURE-REQUIRED. The
+  // shared device key (X-API-Key) must never authorize them — an earlier
+  // `checkDeviceKey → done()` shortcut skipped signature verification, left
+  // authenticatedAgentId unset, and the route then 401'd the real agent.
   if (requestPath(request.url).startsWith("/api/v1/pairing/session/") &&
       request.method === "GET") {
     // path is /api/v1/pairing/session/:id (param route — prefix match)
-    if (checkDeviceKey(request)) return done();
     const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
     if (auth.ok) {
       request.authenticatedAgentId = auth.deviceId;
       return done();
     }
-    reply.code(401).send({ error: "unauthorized" });
+    reply.code(401).send({ error: "unauthorized", reason: auth.reason });
     return;
   }
   if (requestPath(request.url) === "/api/v1/pairing/approve" &&
       request.method === "POST") {
-    if (checkDeviceKey(request)) return done();
     const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
     if (auth.ok) {
       request.authenticatedAgentId = auth.deviceId;
       return done();
     }
-    reply.code(401).send({ error: "unauthorized" });
+    reply.code(401).send({ error: "unauthorized", reason: auth.reason });
     return;
   }
   // Android agent bridge: device key (legacy) OR per-device ECDSA signature

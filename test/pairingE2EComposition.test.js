@@ -186,4 +186,82 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
       `missing pollSecret must not leak state (got ${res.statusCode}: ${res.payload.slice(0, 80)})`,
     );
   });
+
+  test("REGRESSION: X-API-Key alongside valid signature → 200 (key ignored, not bypass)", async () => {
+    const created = (
+      await app.inject({
+        method: "POST",
+        url: "/api/v1/pairing/session",
+        payload: {
+          webDeviceId: "web-e2e",
+          webSigningPublicKey: "PK-S",
+          webEncryptionPublicKey: "PK-E",
+          ephemeralPublicKey: "PK-P",
+          nonce: "n-e2e-6",
+        },
+      })
+    ).json();
+    const url = `/api/v1/pairing/session/${created.pairingSessionId}`;
+    const res = await app.inject({
+      method: "GET",
+      url,
+      headers: {
+        "x-api-key": "test-device-key",
+        ...signRequest(pair, DEVICE, "GET", url, Buffer.alloc(0)),
+      },
+    });
+    assert.equal(res.statusCode, 200, `expected 200, got ${res.statusCode}: ${res.payload.slice(0, 120)}`);
+  });
+
+  test("REGRESSION: valid X-API-Key WITHOUT signature → 401 (never authorizes trust)", async () => {
+    const created = (
+      await app.inject({
+        method: "POST",
+        url: "/api/v1/pairing/session",
+        payload: {
+          webDeviceId: "web-e2e",
+          webSigningPublicKey: "PK-S",
+          webEncryptionPublicKey: "PK-E",
+          ephemeralPublicKey: "PK-P",
+          nonce: "n-e2e-7",
+        },
+      })
+    ).json();
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/v1/pairing/session/${created.pairingSessionId}`,
+      headers: { "x-api-key": "test-device-key" },
+    });
+    assert.equal(res.statusCode, 401, "shared device key must never authorize pairing trust");
+  });
+
+  test("REGRESSION: approve with X-API-Key only → 401", async () => {
+    const created = (
+      await app.inject({
+        method: "POST",
+        url: "/api/v1/pairing/session",
+        payload: {
+          webDeviceId: "web-e2e",
+          webSigningPublicKey: "PK-S",
+          webEncryptionPublicKey: "PK-E",
+          ephemeralPublicKey: "PK-P",
+          nonce: "n-e2e-8",
+        },
+      })
+    ).json();
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/v1/pairing/approve",
+      headers: { "x-api-key": "test-device-key", "content-type": "application/json" },
+      payload: {
+        pairingSessionId: created.pairingSessionId,
+        certificate: "CERT",
+        deviceId: "web-e2e",
+        transcriptHash: "h",
+        trustRootPublicKey: "TRUST",
+      },
+    });
+    // The security property: shared key alone must never approve (200).
+    assert.ok(res.statusCode === 401 || res.statusCode === 400, `got ${res.statusCode}`);
+  });
 });
