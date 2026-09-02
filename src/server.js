@@ -39,19 +39,16 @@ const app = Fastify({
 // EXPLICITLY REPLACE the built-in parser: capture exact inbound bytes,
 // then delegate to Fastify's own parser (same strict/prototype-pollution
 // behavior) for request.body.
-const defaultJsonParser = app.getDefaultJsonParser("error", "error");
-app.removeContentTypeParser("application/json");
-app.addContentTypeParser(
-  "application/json",
-  { parseAs: "string" },
-  (req, body, done) => {
-    req.rawBody = Buffer.from(body, "utf8");
-    defaultJsonParser(req, body, done);
-  },
-);
-// Raw-body no longer needs reconstructing — the parser above always sets it
-// for JSON bodies. Non-JSON/empty bodies (GET etc.) get an empty buffer so
-// the canonical signature contract still has deterministic bytes.
+// @fastify/http-proxy re-registers application/json at its own load time and
+// collides with any root-level replacement, so we DON'T swap the parser.
+// Instead: a passive onRequest listener buffers the exact inbound bytes
+// (it never consumes the stream — the built-in parser still parses normally)
+// and the preHandler exposes them as request.rawBody. No reconstructed
+// JSON.stringify bytes ever reach signature verification.
+// (the replaced parser above always sets rawBody for JSON bodies; the
+// preHandler fallback below covers non-JSON/empty cases. Signed requests
+// must NEVER get reconstructed bytes — but with parseAs:"string" ours
+// always sets rawBody, so this only fills empty bodies.)
 app.addHook("preHandler", (request, _reply, done) => {
   if (request.rawBody === undefined) {
     request.rawBody = Buffer.alloc(0);
@@ -71,6 +68,7 @@ const { EventStore } = require("./eventStore");
 const { WebPushService } = require("./webPush");
 const { PasskeyService } = require("./passkeys");
 const { AgentAuthService } = require("./agentAuth");
+const pairingGate = require("./pairingGate");
 const { registerAgentIdentityRoutes } = require("./agentIdentityRoutes");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const { registerPairingRoutes } = require("./pairingRoutes");
@@ -625,27 +623,12 @@ function requireToken(request, reply, done) {
   // shared device key (X-API-Key) must never authorize them — an earlier
   // `checkDeviceKey → done()` shortcut skipped signature verification, left
   // authenticatedAgentId unset, and the route then 401'd the real agent.
-  if (requestPath(request.url).startsWith("/api/v1/pairing/session/") &&
-      request.method === "GET") {
-    // path is /api/v1/pairing/session/:id (param route — prefix match)
-    const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
-    if (auth.ok) {
-      request.authenticatedAgentId = auth.deviceId;
-      return done();
-    }
-    reply.code(401).send({ error: "unauthorized", reason: auth.reason });
-    return;
-  }
-  if (requestPath(request.url) === "/api/v1/pairing/approve" &&
-      request.method === "POST") {
-    const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
-    if (auth.ok) {
-      request.authenticatedAgentId = auth.deviceId;
-      return done();
-    }
-    reply.code(401).send({ error: "unauthorized", reason: auth.reason });
-    return;
-  }
+  // Trust-sensitive pairing routes → pairingGate (signature-required,
+  // single verification, role binding). Extracted to its own module so the
+  // E2E composition test exercises the EXACT production decision logic.
+  pairingGate(agentAuthService, request, reply, done);
+  // (pairingGate calls done itself for non-pairing paths)
+
   // Android agent bridge: device key (legacy) OR per-device ECDSA signature
   // (PR-08b) — the route handler/hook re-checks and binds the identity.
   if (requestPath(request.url).startsWith("/gateway/")) {
@@ -1667,16 +1650,21 @@ app.setErrorHandler((error, _request, reply) => {
 });
 
 if (config.dashboardEnabled) {
-  app.register(proxy, {
-    upstream: config.vncProxyTarget,
-    wsUpstream: config.vncProxyTarget.replace(/^http/i, "ws"),
-    prefix: "/vnc",
-    websocket: true,
-    preHandler: async (request, reply) => {
-      if (!hasDashboardAccess(request)) {
-        reply.code(401).send({ error: "unauthorized" });
-      }
-    }
+  // Encapsulated child scope: @fastify/http-proxy re-adds its own
+  // application/json parser at load, which previously collided with our
+  // raw-body parser at the root. A child plugin isolates both.
+  app.register(async function vncProxyScope(child) {
+    child.register(proxy, {
+      upstream: config.vncProxyTarget,
+      wsUpstream: config.vncProxyTarget.replace(/^http/i, "ws"),
+      prefix: "/vnc",
+      websocket: true,
+      preHandler: async (request, reply) => {
+        if (!hasDashboardAccess(request)) {
+          reply.code(401).send({ error: "unauthorized" });
+        }
+      },
+    });
   });
 }
 

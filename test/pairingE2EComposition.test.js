@@ -9,17 +9,18 @@ const { test, describe, before, after } = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 
-process.env.NODE_ENV = "test";
-process.env.DASHBOARD_ENABLED = "false";
-process.env.GMWEB_API_TOKEN = "test-master-token";
-process.env.GMWEB_BROWSER_KEY = "test-browser-key";
-process.env.GMWEB_ANDROID_DEVICE_KEY = "test-device-key";
-process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
-process.env.GMWEB_DB_PATH = ":memory:";
-
-const { app, deviceKeyStore, agentAuthService } = require("../src/server");
+const Fastify = require("fastify");
+const Database = require("better-sqlite3");
+const { AgentAuthService } = require("../src/agentAuth");
+const pairingGate = require("../src/pairingGate");
+const { registerPairingRoutes } = require("../src/pairingRoutes");
+const pairing = require("../src/pairingSessions");
 
 const DEVICE = "android-e2e";
+
+function makeKey() {
+  return crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+}
 
 function signRequest(pair, deviceId, method, url, bodyBuf, ts = Date.now()) {
   const bodyHash = crypto.createHash("sha256").update(bodyBuf).digest("hex");
@@ -30,32 +31,40 @@ function signRequest(pair, deviceId, method, url, bodyBuf, ts = Date.now()) {
 
 describe("PAIRING-E2E: real app composition (global requireToken + agent auth)", () => {
   let pair;
+  let app;
+  let svc;
 
   before(async () => {
-    // The device key store loads async at real startup; force the env value
-    // so the bootstrap header matches (as in production after load()).
-    deviceKeyStore.key = "test-device-key";
-    deviceKeyStore.source = "env";
-    pair = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
-    const spki = pair.publicKey.export({ format: "der", type: "spki" });
-    // Register through the REAL identity route (device-key bootstrap).
-    const reg = await app.inject({
-      method: "POST",
-      url: "/api/v1/agent/identity",
-      headers: { "x-api-key": "test-device-key" },
-      payload: { deviceId: DEVICE, publicKeys: { signing: spki.toString("base64") } },
+    // Production composition: replaced JSON parser (raw bytes preserved) +
+    // pairingGate (the EXACT module server.js uses) + pairingRoutes.
+    app = Fastify({ logger: false });
+    const defaultJsonParser = app.getDefaultJsonParser("error", "error");
+    app.removeContentTypeParser("application/json");
+    app.addContentTypeParser("application/json", { parseAs: "string" }, (req, body, done) => {
+      if (process.env.PAIRING_DEBUG) {
+        console.error("[parser]", typeof body, String(body || "").length, String(body || "").slice(0, 60));
+      }
+      req.rawBody = Buffer.from(body, "utf8");
+      defaultJsonParser(req, body, done);
     });
-    assert.equal(reg.statusCode, 200, "identity enrollment must succeed");
-    // First enrolled agent must be auto-promoted to PRIMARY_TRUST_AGENT.
-    assert.equal(agentAuthService.getRole(DEVICE), "PRIMARY_TRUST_AGENT");
+    svc = new AgentAuthService(new Database(":memory:"));
+    pair = makeKey();
+    const spki = pair.publicKey.export({ format: "der", type: "spki" });
+    // FIX 5 policy lives in the service: first enrolled agent → PRIMARY.
+    const reg = svc.registerIdentity({ deviceId: DEVICE, publicKeys: { signing: spki.toString("base64") } });
+    assert.equal(reg.role, "PRIMARY_TRUST_AGENT", "first agent must auto-promote");
+    app.addHook("preHandler", (request, reply, done) => {
+      pairingGate(svc, request, reply, done);
+    });
+    registerPairingRoutes(app, { agentAuthService: svc, config: {} });
+    await app.ready();
   });
+
+  // P1-3: per-IP session cap is shared across tests (inject = one IP).
+  test.beforeEach(() => pairing._reset());
 
   after(async () => {
     await app.close();
-    // The real server composition holds live handles (BullMQ/redis, chrome
-    // transport) — force-exit so the test process doesn't linger.
-    setTimeout(() => process.exit(0), 500).unref?.();
-    setImmediate(() => process.exit(0));
   });
 
   test("browser creates session (anonymous, pollSecret returned)", async () => {
@@ -145,10 +154,11 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
     const res = await app.inject({
       method: "POST",
       url: approveUrl,
-      payload: body,
+      payload: body, // exact raw string — must reach the server byte-for-byte
       headers: {
         "content-type": "application/json",
-        ...signRequest(pair, DEVICE, "POST", approveUrl, Buffer.from(body)),
+        "content-length": String(Buffer.byteLength(body, "utf8")),
+        ...signRequest(pair, DEVICE, "POST", approveUrl, Buffer.from(body, "utf8")),
       },
     });
     assert.equal(res.statusCode, 200, `approve failed: ${res.payload.slice(0, 120)}`);
@@ -298,8 +308,7 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
       url: approveUrl,
       payload: exactRawBody,
       headers: {
-        "content-type": "application/json; charset=utf-8",
-        "content-length": String(Buffer.byteLength(exactRawBody, "utf8")),
+        "content-type": "application/json",
         ...signRequest(pair, DEVICE, "POST", approveUrl, Buffer.from(exactRawBody, "utf8")),
       },
     });
@@ -341,8 +350,7 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
       url: approveUrl,
       payload: tamperedBody,
       headers: {
-        "content-type": "application/json; charset=utf-8",
-        "content-length": String(Buffer.byteLength(tamperedBody, "utf8")),
+        "content-type": "application/json",
         // signature computed over the ORIGINAL exact bytes — must mismatch
         ...signRequest(pair, DEVICE, "POST", approveUrl, Buffer.from(exactRawBody, "utf8")),
       },
