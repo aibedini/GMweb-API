@@ -895,6 +895,11 @@ const activeSendCancellationRequests = new Set();
 const sendPowerFile = path.join(config.rootDir, "data", "send-power.json");
 let sendPowerOn = true;
 let sendPowerChangedAt = Date.now();
+// BullMQ persists its paused bit in Redis. That is transport state, not
+// operator intent: a crash during startup must not leave delivery paused.
+const queueManualPauseFile = path.join(config.rootDir, "data", "queue-manual-pause.json");
+let queueManualPause = false;
+let queueManualPauseChangedAt = Date.now();
 
 async function loadSendPower() {
   try {
@@ -916,12 +921,39 @@ async function persistSendPower() {
   }
 }
 
+async function loadManualQueuePause() {
+  try {
+    const parsed = JSON.parse(await fs.readFile(queueManualPauseFile, "utf8"));
+    if (typeof parsed.paused === "boolean") {
+      queueManualPause = parsed.paused;
+      queueManualPauseChangedAt = Number(parsed.changedAt) || Date.now();
+      if (queueManualPause) app.log.warn("send queue is manually paused (persisted)");
+    }
+  } catch { /* default: operators have not manually paused delivery */ }
+}
+
+async function persistManualQueuePause() {
+  await fs.mkdir(path.dirname(queueManualPauseFile), { recursive: true });
+  await fs.writeFile(queueManualPauseFile, JSON.stringify({
+    paused: queueManualPause,
+    changedAt: queueManualPauseChangedAt
+  }, null, 2), "utf8");
+}
+
+async function setManualQueuePause(paused) {
+  queueManualPause = paused;
+  queueManualPauseChangedAt = Date.now();
+  await persistManualQueuePause();
+  if (paused || !sendPowerOn) await sendQueue.pause();
+  else await sendQueue.resume();
+}
+
 async function setSendPower(on) {
   const changed = sendPowerOn !== on;
   sendPowerOn = on;
   sendPowerChangedAt = Date.now();
   if (changed) await persistSendPower();
-  if (on) await sendQueue.resume().catch(() => {});
+  if (on && !queueManualPause) await sendQueue.resume().catch(() => {});
   else await sendQueue.pause().catch(() => {});
   emitSse({ type: "send_power", powerOn: on, at: new Date().toISOString() });
   return { ok: true, powerOn: on };
@@ -2319,7 +2351,8 @@ app.get("/admin/transport", {
           androidMode: { type: "string", enum: ["pull", "push"] },
           androidDevices: { type: "integer", description: "Devices currently long-polling (pull mode)." },
           androidPending: { type: "integer", description: "Sends waiting for a device to pick up." },
-          androidInflight: { type: "integer", description: "Sends a device is delivering right now." }
+          androidInflight: { type: "integer", description: "Sends a device is delivering right now." },
+          androidLastPullAt: { type: ["string", "null"], format: "date-time", description: "Most recent Android pull in pull mode." }
         }
       }
     }
@@ -2331,14 +2364,15 @@ app.get("/admin/transport", {
     .catch(() => ({ paired: false }));
 
   const pullMode = Boolean(client.pullMode && client.outbox);
+  const androidState = client.outbox?.readyState?.() || null;
   const stats = client.outbox ? client.outbox.stats() : { waitingPhones: 0, pending: 0, inflight: 0 };
   let androidReady;
   let androidConfigured;
   if (pullMode) {
     // Pull mode: the phone dials US. "Configured" = a device key exists to
     // authenticate incoming devices; "ready" = a device is actively polling.
-    androidConfigured = Boolean(process.env.GMWEB_ANDROID_DEVICE_KEY);
-    androidReady = stats.waitingPhones > 0 || stats.inflight > 0;
+    androidConfigured = deviceKeyStore.configured;
+    androidReady = Boolean(androidState?.paired);
   } else {
     // Push mode (tunnel): the server dials the phone at a configured URL.
     const androidState = await androidClient.readyState();
@@ -2356,7 +2390,8 @@ app.get("/admin/transport", {
     androidMode: pullMode ? "pull" : "push",
     androidDevices: stats.waitingPhones,
     androidPending: stats.pending,
-    androidInflight: stats.inflight
+    androidInflight: stats.inflight,
+    androidLastPullAt: androidState?.lastPullAt || null
   };
 });
 
@@ -3128,7 +3163,7 @@ app.post("/send", {
   if (client.name === "android") {
     let phone;
     if (client.pullMode && client.outbox) {
-      phone = { paired: client.outbox.stats().waitingPhones > 0 || client.outbox.stats().pending > 0 };
+      phone = client.outbox.readyState();
     } else {
       phone = await client.readyState();
     }
@@ -3788,6 +3823,19 @@ app.get("/admin/queue", {
         type: "object",
         properties: {
           paused: { type: "boolean" },
+          manualPause: { type: "boolean" },
+          powerOn: { type: "boolean" },
+          activeTransport: { type: "string", enum: ["chrome", "android"] },
+          android: {
+            type: "object",
+            properties: {
+              ready: { type: "boolean" },
+              waitingPhones: { type: "integer" },
+              lastPullAt: { type: ["string", "null"] },
+              pending: { type: "integer" },
+              inflight: { type: "integer" }
+            }
+          },
           quietHours: {
             type: "object",
             properties: {
@@ -3820,8 +3868,21 @@ app.get("/admin/queue", {
 }, async () => {
   const qc = await sendQueue.counts();
   const dbStats = sendStore.stats();
+  const android = client.outbox?.readyState?.() || {
+    paired: false, waitingPhones: 0, lastPullAt: null, pending: 0, inflight: 0
+  };
   return {
     paused: await sendQueue.isPaused(),
+    manualPause: queueManualPause,
+    powerOn: sendPowerOn,
+    activeTransport: client.name,
+    android: {
+      ready: Boolean(android.paired),
+      waitingPhones: android.waitingPhones,
+      lastPullAt: android.lastPullAt,
+      pending: android.pending,
+      inflight: android.inflight
+    },
     counts: {
       ...qc,
       completed: dbStats.sent,
@@ -3914,14 +3975,14 @@ app.post("/admin/queue/pause", {
     response: {
       200: {
         type: "object",
-        properties: { ok: { type: "boolean" }, paused: { type: "boolean" } }
+        properties: { ok: { type: "boolean" }, paused: { type: "boolean" }, manualPause: { type: "boolean" } }
       }
     }
   }
 }, async () => {
-  await sendQueue.pause();
+  await setManualQueuePause(true);
   emitSse({ type: "queue_paused", reason: "manual", at: new Date().toISOString() });
-  return { ok: true, paused: true };
+  return { ok: true, paused: true, manualPause: true };
 });
 
 app.post("/admin/queue/resume", {
@@ -3932,14 +3993,14 @@ app.post("/admin/queue/resume", {
     response: {
       200: {
         type: "object",
-        properties: { ok: { type: "boolean" }, paused: { type: "boolean" } }
+        properties: { ok: { type: "boolean" }, paused: { type: "boolean" }, manualPause: { type: "boolean" } }
       }
     }
   }
 }, async () => {
-  await sendQueue.resume();
+  await setManualQueuePause(false);
   emitSse({ type: "queue_resumed", at: new Date().toISOString() });
-  return { ok: true, paused: false };
+  return { ok: true, paused: false, manualPause: false };
 });
 
 app.get("/admin/sends", {
@@ -4661,7 +4722,7 @@ async function initializeBrowserAndConversationIndex({ resumeAfterWarm }) {
   // the queue paused forever after every restart — the "dead GMweb" failure.
   if (typeof client.warmConversationIndex !== "function") {
     app.log.info({ transport: client.name }, "no browser warm-up for this transport; restoring queue state");
-    if (resumeAfterWarm && sendPowerOn) {
+    if (resumeAfterWarm && sendPowerOn && !queueManualPause) {
       await sendQueue.resume();
       emitSse({ type: "queue_resumed", reason: "startup_resume_no_warmup", at: new Date().toISOString() });
     }
@@ -4678,11 +4739,11 @@ async function initializeBrowserAndConversationIndex({ resumeAfterWarm }) {
     });
     app.log.info({ stats }, "conversation sidebar index ready");
     if (resumeAfterWarm) {
-      if (sendPowerOn) {
+      if (sendPowerOn && !queueManualPause) {
         await sendQueue.resume();
         emitSse({ type: "queue_resumed", reason: "conversation_index_ready", at: new Date().toISOString() });
       } else {
-        app.log.warn("send power is OFF; queue stays paused until power-on");
+        app.log.warn({ sendPowerOn, queueManualPause }, "queue stays paused by operator intent");
       }
     }
   } catch (error) {
@@ -4701,16 +4762,18 @@ async function main() {
   await apiKeyStore.load();
   await sendPacing.load();
   await loadSendPower();
+  await loadManualQueuePause();
   await deviceKeyStore.load();
   await client.load();
   client.refreshConversationInterval();
-  const queueWasPaused = await sendQueue.isPaused().catch(() => true);
-  if (!queueWasPaused) await sendQueue.pause();
+  // Always acquire a transient startup pause. BullMQ's persisted paused state
+  // is not operator intent and must never decide whether we resume later.
+  await sendQueue.pause();
   startSendWorker();
   await backfillPendingLedger().catch((error) => app.log.warn({ error: error.message }, "ledger backfill failed"));
   await reconcilePending().catch((error) => app.log.warn({ error: error.message }, "reconcile failed"));
   await app.listen({ host: config.host, port: config.port });
-  initializeBrowserAndConversationIndex({ resumeAfterWarm: !queueWasPaused });
+  initializeBrowserAndConversationIndex({ resumeAfterWarm: true });
 }
 
 let shutdownStarted = false;

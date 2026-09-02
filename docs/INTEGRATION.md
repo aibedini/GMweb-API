@@ -65,6 +65,8 @@ Full schemas are in [`openapi.json`](./openapi.json). The relevant subset:
 | `POST /conversations/messages` | Open a conversation **and** return its messages in one call. |
 | `GET /events` | SSE stream. A project key receives only its own sends' events (`send_queued` / `send_processing` / `send_completed` / `send_failed` / `send_cancelled`). The master token and dashboard sessions receive the full stream, including `conversation_changed` and browser recovery events. |
 
+Queue operations distinguish a durable operator **manual pause** from a temporary startup pause and the send-power kill switch. A restart resumes delivery only when power is on and the operator has not manually paused the queue. `GET /admin/queue` reports `paused`, `manualPause`, `powerOn`, the active transport, and Android pull/outbox liveness to diagnose queued sends.
+
 > **Send power (kill switch):** an operator can power off sending from the GMweb
 > dashboard (Controls → **Power Off**). While powered off, `POST /send` returns
 > `503 { "error": "powered_off" }` and **no message is sent under any
