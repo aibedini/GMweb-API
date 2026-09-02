@@ -1,4 +1,4 @@
-"""Debug: why does git pull abort? Show the untracked/modified conflicts."""
+"""Debug stuck pairing: journalctl tail + direct local curl on the VPS."""
 import sys
 import paramiko
 
@@ -9,14 +9,18 @@ with open(r"C:\Users\Mahna\AppData\Local\Temp\gmweb_ssh_pw.txt", "r", encoding="
     PASSWORD = f.read().strip()
 
 REMOTE = r'''
-cd /opt/gmweb-api
-echo "== full status =="
-git status | head -25
-echo "== pull verbose =="
-git pull --ff-only origin main 2>&1 | head -15
+echo "== service =="
+systemctl is-active gmweb-api
+echo "== local direct pairing POST =="
+timeout 10 curl -s -o /tmp/pair.json -w "%{http_code} in %{time_total}s\n" -X POST http://127.0.0.1:3000/api/v1/pairing/session \
+  -H 'Content-Type: application/json' \
+  -d '{"webDeviceId":"t1","webSigningPublicKey":"PK-sign","webEncryptionPublicKey":"PK-enc","ephemeralPublicKey":"PK-eph","nonce":"n1"}'
+head -c 300 /tmp/pair.json; echo
+echo "== recent errors =="
+journalctl -u gmweb-api -n 20 --no-pager | grep -E "level\":50|Error" | tail -5
 '''
 
-def run(ssh, cmd, timeout=300):
+def run(ssh, cmd, timeout=90):
     stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
     out = stdout.read().decode("utf-8", "replace")
     err = stderr.read().decode("utf-8", "replace")
@@ -28,5 +32,5 @@ ssh.connect(HOST, username=USER, password=PASSWORD, timeout=30, look_for_keys=Fa
 code, out, err = run(ssh, REMOTE)
 print(out)
 if err.strip():
-    print("[stderr]", err[-600:])
+    print("[stderr]", err[-400:])
 ssh.close()
