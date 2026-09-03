@@ -590,17 +590,18 @@ update_app() {
     return
   fi
 
-  # Uncommitted local edits (usually a manual hotfix applied on the box) would
-  # make `pull --ff-only` abort. Preserve them as a patch, then reset to the
-  # committed state so the update can always proceed unattended.
-  if ! run_as_app "git -C '$APP_DIR' diff --quiet || git -C '$APP_DIR' diff --cached --quiet"; then
-    local stamp_patch="/var/backups/gmweb/local-changes-$(date +%Y%m%d-%H%M%S).patch"
-    install -d -m 700 /var/backups/gmweb
-    run_as_app "git -C '$APP_DIR' diff HEAD > '$stamp_patch'"
-    echo "Local uncommitted changes found; saved to $stamp_patch and set aside."
-    echo "If a hotfix is lost after this update, re-apply from that file."
-    git -C "$APP_DIR" reset --hard --quiet
-    git -C "$APP_DIR" clean --quiet --force -- node_modules 2>/dev/null || true
+  # Production checkouts can contain both manual edits and generated,
+  # untracked frontend assets. Either kind can block a fast-forward update.
+  # Stash both, but leave ignored runtime state (notably .env/node_modules)
+  # untouched. The stash remains available for explicit recovery; applying it
+  # automatically would restore stale build output over the new release.
+  local local_status stash_ref
+  local_status="$(run_as_app "git -C '$APP_DIR' status --porcelain --untracked-files=normal")"
+  if [[ -n "$local_status" ]]; then
+    run_as_app "git -C '$APP_DIR' stash push --include-untracked --message 'gmweb pre-update $(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+    stash_ref="$(run_as_app "git -C '$APP_DIR' rev-parse --short refs/stash")"
+    echo "Local changes and generated files saved in Git stash $stash_ref."
+    echo "Inspect later with: git -C '$APP_DIR' stash show --stat"
   fi
 
   run_as_app "git -C '$APP_DIR' pull --ff-only"

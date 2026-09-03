@@ -94,6 +94,12 @@ dependencies with `npm ci --omit=dev`, and restarts only `gmweb-api.service`;
 Chrome, its paired profile, Redis, and the durable SQLite send ledger stay in
 place.
 
+If the checkout contains manual edits or untracked generated frontend assets,
+the updater first stores both in a named Git stash and prints its short ID.
+Ignored runtime files such as `.env` and `node_modules` stay in place. The
+stash is not automatically re-applied over the new release; inspect it later
+with `git -C /opt/gmweb-api stash show --stat`.
+
 Older archive-based installations have no `.git` directory. Option 11 detects
 that automatically and performs a one-time safe conversion: it clones `main`
 into a staging directory, validates dependencies and syntax, pauses and drains
