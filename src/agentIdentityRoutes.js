@@ -77,6 +77,12 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
       protocolVersion,
       forcePrimary: request.identityBootstrapAuthorized === true,
     });
+    request._pairingDiagnostic = {
+      stage: "ANDROID_IDENTITY_REGISTRATION",
+      status: "SUCCESS",
+      reason: request.identityBootstrapAuthorized === true ? "pairing_bootstrap" : "identity_refreshed",
+      deviceId,
+    };
     return { ...result, role: result.role };
   });
 

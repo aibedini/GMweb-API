@@ -90,6 +90,16 @@ function requireAgentSignature(request, reply, _agentAuthService, done) {
   return true;
 }
 
+function markPairing(request, stage, status, reason, identifiers = {}) {
+  request._pairingDiagnostic = {
+    stage,
+    status,
+    reason,
+    sessionId: identifiers.sessionId,
+    deviceId: identifiers.deviceId,
+  };
+}
+
 function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIdentity = () => false }) {
   // BLOCKER 7: production origin is fail-closed. Header-derived origins are
   // only allowed outside production (trustProxy + forwarded headers must not
@@ -153,6 +163,13 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
       identityBootstrap: canBootstrapIdentity(request),
     });
     const session = pairing.getSession(created.pairingSessionId);
+    markPairing(
+      request,
+      "WEB_SESSION_CREATED",
+      "SUCCESS",
+      created.identityBootstrapToken ? "admin_bootstrap_enabled" : "anonymous_qr",
+      { sessionId: created.pairingSessionId, deviceId: request.body?.webDeviceId },
+    );
     return {
       pairingSessionId: created.pairingSessionId,
       expiresAt: created.expiresAt,
@@ -192,13 +209,21 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
     const session = pairing.getSession(id);
     if (!session || !pairing.pollSecretMatches(session, pollSecret)) {
       // Wrong/missing pollSecret: treat as EXPIRED without leaking state.
+      markPairing(request, "WEB_STATUS_POLL", "FAILED", "invalid_or_expired_session", { sessionId: id });
       return { state: "EXPIRED" };
     }
     if (session.state === "PENDING") {
       return { state: "PENDING", expiresAt: session.expiresAt };
     }
     const consumed = pairing.consumeApproval(id, pollSecret);
-    if (!consumed) return { state: "EXPIRED" };
+    if (!consumed) {
+      markPairing(request, "WEB_STATUS_POLL", "FAILED", "approval_unavailable", { sessionId: id });
+      return { state: "EXPIRED" };
+    }
+    markPairing(request, "WEB_APPROVAL_RECEIVED", "SUCCESS", "certificate_received", {
+      sessionId: id,
+      deviceId: consumed.deviceId,
+    });
     return { state: "APPROVED", ...consumed };
   });
 
@@ -227,10 +252,18 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
     if (!ok || !gateDone) return reply;
     const session = pairing.getSession(request.params.id);
     if (!session) {
+      markPairing(request, "ANDROID_METADATA_FETCH", "FAILED", "session_not_found_or_expired", {
+        sessionId: request.params.id,
+        deviceId: request.authenticatedAgentId,
+      });
       const err = new Error("pairing session not found or expired");
       err.statusCode = 404;
       throw err;
     }
+    markPairing(request, "ANDROID_METADATA_FETCH", "SUCCESS", "metadata_returned", {
+      sessionId: request.params.id,
+      deviceId: request.authenticatedAgentId,
+    });
     return { ...pairing.qrPayload(session), transcriptHash: session.transcriptHash };
   });
 
@@ -271,16 +304,33 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
     // signature.
     const role = agentAuthService.getRole(request.authenticatedAgentId);
     if (role !== "PRIMARY_TRUST_AGENT") {
+      markPairing(request, "ANDROID_SERVER_APPROVAL", "FAILED", "not_primary_trust_agent", {
+        sessionId: request.body?.pairingSessionId,
+        deviceId: request.authenticatedAgentId,
+      });
       reply.code(403).send({ error: "forbidden: device is not the primary trust agent" });
       return reply;
     }
     const body = request.body || {};
-    return pairing.approveSession(body.pairingSessionId, {
-      certificate: body.certificate,
-      deviceId: body.deviceId,
-      transcriptHash: body.transcriptHash,
-      trustRootPublicKey: body.trustRootPublicKey,
-    });
+    try {
+      const approved = pairing.approveSession(body.pairingSessionId, {
+        certificate: body.certificate,
+        deviceId: body.deviceId,
+        transcriptHash: body.transcriptHash,
+        trustRootPublicKey: body.trustRootPublicKey,
+      });
+      markPairing(request, "ANDROID_SERVER_APPROVAL", "SUCCESS", "server_approved", {
+        sessionId: body.pairingSessionId,
+        deviceId: body.deviceId,
+      });
+      return approved;
+    } catch (error) {
+      markPairing(request, "ANDROID_SERVER_APPROVAL", "FAILED", error.message || "approval_failed", {
+        sessionId: body.pairingSessionId,
+        deviceId: body.deviceId,
+      });
+      throw error;
+    }
   });
 
   // ── POST-PAIR SECURE BOOTSTRAP: challenge peek (pollSecret-bound) ────────
@@ -301,9 +351,11 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
   }, async (request, reply) => {
     const rec = pairing.peekChallenge(request.query.pollSecret);
     if (!rec) {
+      markPairing(request, "WEB_LINK_CHALLENGE", "FAILED", "invalid_or_expired_challenge");
       reply.code(404).send({ error: "invalid_or_expired_challenge" });
       return reply;
     }
+    markPairing(request, "WEB_LINK_CHALLENGE", "SUCCESS", "challenge_returned", { deviceId: rec.deviceId });
     return {
       challenge: rec.challenge,
       issuedAt: rec.issuedAt,
@@ -356,10 +408,18 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
     const body = request.body || {};
     const taken = pairing.peekChallenge(body.pollSecret);
     if (!taken || taken.challenge !== body.challenge) {
+      markPairing(request, "WEB_LINK_SESSION", "FAILED", "invalid_or_expired_challenge", {
+        sessionId: body.pairingSessionId,
+        deviceId: body.deviceId,
+      });
       reply.code(401).send({ error: "invalid_or_expired_challenge" });
       return reply;
     }
     if (body.deviceId !== taken.deviceId) {
+      markPairing(request, "WEB_LINK_SESSION", "FAILED", "device_mismatch", {
+        sessionId: body.pairingSessionId,
+        deviceId: body.deviceId,
+      });
       reply.code(403).send({ error: "device_mismatch" });
       return reply;
     }
@@ -372,10 +432,18 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
     const capNames = ["READ_MESSAGES","SEND_MESSAGES","MANAGE_DEVICES","READ_OTP","READ_BANK_SECURITY","READ_PASSWORD_RESET","READ_AUTH_CODES","READ_FINANCIAL_NOTIFICATIONS"];
     const capabilities = caps.filter((c) => capNames.includes(String(c)));
     if (!capabilities.includes("READ_MESSAGES")) {
+      markPairing(request, "WEB_LINK_SESSION", "FAILED", "certificate_lacks_read_capability", {
+        sessionId: body.pairingSessionId,
+        deviceId: body.deviceId,
+      });
       reply.code(403).send({ error: "certificate_lacks_read_capability" });
       return reply;
     }
     if (!certSigPub || !body.signature) {
+      markPairing(request, "WEB_LINK_SESSION", "FAILED", "signature_required", {
+        sessionId: body.pairingSessionId,
+        deviceId: body.deviceId,
+      });
       reply.code(401).send({ error: "signature_required" });
       return reply;
     }
@@ -388,12 +456,20 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
     );
     const ok = verifyP256(canonical, body.signature, certSigPub);
     if (!ok) {
+      markPairing(request, "WEB_LINK_SESSION", "FAILED", "challenge_signature_invalid", {
+        sessionId: body.pairingSessionId,
+        deviceId: body.deviceId,
+      });
       reply.code(401).send({ error: "signature_mismatch", reason: "challenge_signature_invalid" });
       return reply;
     }
 
     // Require the browser to present the SAME certificate Android approved.
     if (body.certificate && String(body.certificate) !== taken.certificate) {
+      markPairing(request, "WEB_LINK_SESSION", "FAILED", "certificate_mismatch", {
+        sessionId: body.pairingSessionId,
+        deviceId: body.deviceId,
+      });
       reply.code(403).send({ error: "certificate_mismatch" });
       return reply;
     }
@@ -401,6 +477,10 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
     // Burn the challenge ONLY after every verification passed (a failed
     // verify must not lock the browser out of a legitimate retry).
     if (!pairing.burnChallenge(body.pollSecret)) {
+      markPairing(request, "WEB_LINK_SESSION", "FAILED", "challenge_already_used", {
+        sessionId: body.pairingSessionId,
+        deviceId: body.deviceId,
+      });
       reply.code(409).send({ error: "challenge_already_used" });
       return reply;
     }
@@ -411,6 +491,10 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
       sameSite: "strict",
       path: "/",
       maxAge: Math.floor(linkedSessions.SESSION_TTL_MS / 1000),
+    });
+    markPairing(request, "WEB_LINK_SESSION", "SUCCESS", "linked_session_issued", {
+      sessionId: body.pairingSessionId,
+      deviceId: taken.deviceId,
     });
     return {
       ok: true,

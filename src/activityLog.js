@@ -15,6 +15,7 @@ function classify(pathname, method) {
   else if (routePath.startsWith("/conversations")) category = "conversations";
   else if (routePath.startsWith("/browser") || routePath.startsWith("/session")) category = "browser";
   else if (routePath.startsWith("/gateway") || routePath.startsWith("/admin/transport") || routePath.startsWith("/admin/device-key")) category = "transport";
+  else if (routePath.startsWith("/api/v1/pairing") || routePath.startsWith("/api/v1/pwa/token-login") || routePath === "/api/v1/agent/identity") category = "pairing";
   else if (routePath.startsWith("/admin/api-key")) category = "security";
   else if (routePath.startsWith("/dashboard")) category = "authentication";
   else if (routePath.startsWith("/admin/settings")) category = "settings";

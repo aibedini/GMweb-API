@@ -9,6 +9,8 @@ test("classifies operational routes and mutating actions", () => {
   assert.deepEqual(classify("/admin/queue/pause", "POST"), { category: "messaging", type: "action" });
   assert.deepEqual(classify("/admin/api-keys", "GET"), { category: "security", type: "request" });
   assert.deepEqual(classify("/browser/restart", "POST"), { category: "browser", type: "action" });
+  assert.deepEqual(classify("/api/v1/pairing/approve", "POST"), { category: "pairing", type: "action" });
+  assert.deepEqual(classify("/api/v1/agent/identity", "POST"), { category: "pairing", type: "action" });
 });
 
 test("stores structured rows and returns filtered facets", async (t) => {

@@ -87,6 +87,7 @@ const pairingGate = require("./pairingGate");
 const { registerAgentIdentityRoutes } = require("./agentIdentityRoutes");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const { registerPairingRoutes } = require("./pairingRoutes");
+const { registerPwaAuthRoutes } = require("./pwaAuthRoutes");
 const pairingSessions = require("./pairingSessions");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
@@ -572,10 +573,11 @@ function isDashboardAsset(requestUrl) {
 
 // Routes only accessible by master token or dashboard session (not project keys)
 const ADMIN_ONLY_PREFIXES = ["/admin/", "/browser/", "/session/", "/dashboard/", "/vnc", "/docs"];
+const ADMIN_ONLY_EXACT_PATHS = new Set(["/api/v1/pairing/diagnostics"]);
 
 function isAdminOnlyPath(url) {
   const p = requestPath(url);
-  return ADMIN_ONLY_PREFIXES.some((prefix) => p.startsWith(prefix));
+  return ADMIN_ONLY_EXACT_PATHS.has(p) || ADMIN_ONLY_PREFIXES.some((prefix) => p.startsWith(prefix));
 }
 
 // Brute-force protection: track auth failures per IP
@@ -623,6 +625,10 @@ function requireToken(request, reply, done) {
   // session exists — status, both option generators, and the auth verify.
   // The verify handlers themselves gate on challenge single-use + UV flag.
   if (requestPath(request.url).startsWith("/api/v1/auth/")) return done();
+  // Public only in the routing sense: this exact endpoint performs its own
+  // constant-time master-token verification and rate limiting before issuing
+  // a restricted HttpOnly PWA session.
+  if (requestPath(request.url) === "/api/v1/pwa/token-login") return done();
   // ADR-007 P0-1 (security fix): EXACTLY two pairing surfaces are reachable
   // without a session — the unlinked browser's create/status calls. They are
   // rate-limited + capacity-bound + TTL-bound (pairingSessions.js). The
@@ -679,6 +685,8 @@ function requireToken(request, reply, done) {
           p.startsWith("/api/v1/trust/"))) ||
       (caps.includes("SEND_MESSAGES") &&
         (p === "/api/v1/commands" || p.startsWith("/api/v1/commands/"))) ||
+      (caps.includes("READ_PAIRING_DIAGNOSTICS") &&
+        request.method === "GET" && p === "/api/v1/pairing/diagnostics") ||
       p === "/api/v1/linked-session"; // introspection always allowed
     if (allowed) {
       request.linkedDevice = linkedSession;
@@ -712,13 +720,34 @@ function requireToken(request, reply, done) {
       if (bootstrapToken) {
         if (pairingSessions.consumeIdentityBootstrap(bootstrapSession, bootstrapToken)) {
           request.identityBootstrapAuthorized = true;
+          request._pairingDiagnostic = {
+            stage: "ANDROID_IDENTITY_AUTH",
+            status: "SUCCESS",
+            reason: "pairing_bootstrap_valid",
+            sessionId: bootstrapSession,
+          };
           return done();
         }
+        request._pairingDiagnostic = {
+          stage: "ANDROID_IDENTITY_AUTH",
+          status: "FAILED",
+          reason: "invalid_pairing_bootstrap",
+          sessionId: bootstrapSession,
+        };
         reply.code(401).send({ error: "unauthorized", reason: "invalid_pairing_bootstrap" });
         return;
       }
     }
-    if (checkDeviceKey(request)) return done();
+    if (checkDeviceKey(request)) {
+      if (requestPath(request.url) === "/api/v1/agent/identity") {
+        request._pairingDiagnostic = {
+          stage: "ANDROID_IDENTITY_AUTH",
+          status: "SUCCESS",
+          reason: "device_key_valid",
+        };
+      }
+      return done();
+    }
     if (requestPath(request.url) === "/api/v1/agent/identity") {
       // An already-enrolled Android identity refreshes its own public keys
       // with the same per-device signature used by all other agent routes.
@@ -729,11 +758,22 @@ function requireToken(request, reply, done) {
       );
       if (auth.ok) {
         request.authenticatedAgentId = auth.deviceId;
+        request._pairingDiagnostic = {
+          stage: "ANDROID_IDENTITY_AUTH",
+          status: "SUCCESS",
+          reason: "agent_signature_valid",
+          deviceId: auth.deviceId,
+        };
         return done();
       }
       const failure = request.headers["x-agent-auth"]
         ? { error: "unauthorized", reason: auth.reason }
         : deviceKeyStore.authFailure();
+      request._pairingDiagnostic = {
+        stage: "ANDROID_IDENTITY_AUTH",
+        status: "FAILED",
+        reason: failure.reason || "identity_auth_failed",
+      };
       reply.code(401).send(failure);
       return;
     }
@@ -824,6 +864,7 @@ function requireToken(request, reply, done) {
 
 function activityActor(request) {
   if (request._projectKey) return { type: "api_key", name: request._projectKey.name, id: request._projectKey.id };
+  if (request.linkedDevice) return { type: "device", name: "Linked PWA", id: shortLogHash(request.linkedDevice.deviceId) };
   if (requestPath(request.url).startsWith("/gateway/")) return { type: "device", name: "Android gateway" };
   if (dashboardSession(request)) return { type: "dashboard", name: config.dashboardUsername || "Dashboard operator" };
   if (bearerToken(request)) return { type: "master", name: "Master API token" };
@@ -833,7 +874,7 @@ function activityActor(request) {
 
 function shouldRecordActivity(request) {
   const pathname = requestPath(request.url);
-  if (["/admin/activity-logs", "/admin/api-logs", "/events"].includes(pathname)) return false;
+  if (["/admin/activity-logs", "/admin/api-logs", "/api/v1/pairing/diagnostics", "/events"].includes(pathname)) return false;
   if (["/", "/dashboard", "/dashboard/", "/app", "/app/"].includes(pathname)) return false;
   if (pathname.startsWith("/app/assets/")) return false;
   return !/\.(?:js|css|png|svg|ico|map|woff2?)$/i.test(pathname);
@@ -849,6 +890,22 @@ function safeActivityFields(value) {
   return Object.keys(safe).length ? safe : undefined;
 }
 
+function shortLogHash(value) {
+  if (!value) return null;
+  return crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 12);
+}
+
+function safePairingDiagnostic(value) {
+  if (!value || typeof value !== "object") return undefined;
+  return {
+    stage: String(value.stage || "UNKNOWN").replace(/[^A-Z0-9_]/gi, "_").slice(0, 64),
+    status: String(value.status || "UNKNOWN").replace(/[^A-Z0-9_]/gi, "_").slice(0, 32),
+    reason: String(value.reason || "").replace(/[\r\n\t]/g, " ").slice(0, 160) || null,
+    sessionIdHash: shortLogHash(value.sessionId),
+    deviceIdHash: shortLogHash(value.deviceId),
+  };
+}
+
 function recordActivity(request, reply, done) {
   if (!shouldRecordActivity(request)) return done();
   const pathname = requestPath(request.url);
@@ -856,12 +913,18 @@ function recordActivity(request, reply, done) {
   const durationMs = request._activityStartedAt
     ? Number(process.hrtime.bigint() - request._activityStartedAt) / 1e6
     : 0;
+  const pairing = safePairingDiagnostic(request._pairingDiagnostic);
+  if (pairing) {
+    const logMethod = reply.statusCode >= 400 ? "warn" : "info";
+    app.log[logMethod]({ pairing, path: pathname, statusCode: reply.statusCode }, "pairing state");
+  }
   activityLogStore.append({
     type,
     category,
     method: request.method,
     path: pathname,
     statusCode: reply.statusCode,
+    title: pairing ? `Pairing ${pairing.stage}: ${pairing.reason || pairing.status}` : undefined,
     durationMs,
     actor: activityActor(request),
     ip: request.ip,
@@ -870,7 +933,8 @@ function recordActivity(request, reply, done) {
     details: {
       route: request.routeOptions?.url || null,
       params: safeActivityFields(request.params),
-      query: safeActivityFields(request.query)
+      query: safeActivityFields(request.query),
+      ...(pairing ? { pairing } : {})
     }
   }).catch(() => {});
   done();
@@ -2067,6 +2131,36 @@ async function sendWebAppFile(reply, relPath) {
   }
 }
 
+async function webAppDeploymentInfo() {
+  try {
+    const [versionText, indexText, stat] = await Promise.all([
+      fs.readFile(path.join(webAppDir, "version.json"), "utf8"),
+      fs.readFile(path.join(webAppDir, "index.html"), "utf8"),
+      fs.stat(path.join(webAppDir, "index.html")),
+    ]);
+    const build = JSON.parse(versionText);
+    const script = indexText.match(/\/web\/assets\/(index-[^"']+\.js)/)?.[1] || null;
+    return {
+      ok: Boolean(build.version && script),
+      version: String(build.version || "unknown"),
+      script,
+      matchesApi: build.version === pkg.version,
+      builtAt: stat.mtime.toISOString(),
+      path: "/web",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      version: null,
+      script: null,
+      matchesApi: false,
+      builtAt: null,
+      path: "/web",
+      reason: error.code === "ENOENT" ? "pwa_not_built" : "pwa_manifest_invalid",
+    };
+  }
+}
+
 app.get("/health", {
   schema: {
     summary: "Health check",
@@ -2220,6 +2314,7 @@ app.get("/admin/overview", {
             }
           },
           browserAutomation: { type: "object", additionalProperties: true },
+          webApp: { type: "object", additionalProperties: true },
           system: {
             type: "object",
             properties: {
@@ -2275,6 +2370,7 @@ app.get("/admin/overview", {
   ]);
   const system = await readSystemMetrics();
   const androidState = await androidClient.readyState();
+  const webApp = await webAppDeploymentInfo();
 
   return {
     ok: true,
@@ -2300,6 +2396,7 @@ app.get("/admin/overview", {
     },
     readiness,
     browserAutomation,
+    webApp,
     system,
     services
   };
@@ -2674,6 +2771,30 @@ registerPairingRoutes(app, {
   config,
   canBootstrapIdentity: (request) => hasDashboardAccess(request),
 });
+
+registerPwaAuthRoutes(app, {
+  apiToken: config.apiToken,
+  linkedSessions,
+  checkRateLimit,
+  loginMax: Math.min(config.dashboardLoginMax, 10),
+  loginWindowMs: config.dashboardLoginWindowMs,
+});
+
+app.get("/api/v1/pairing/diagnostics", {
+  schema: {
+    summary: "Recent sanitized pairing diagnostics",
+    description: "Admin-only audit trail for pairing/identity/PWA recovery. IDs are hashed and credentials are never recorded.",
+    tags: ["Pairing"],
+    querystring: {
+      type: "object",
+      properties: { limit: { type: "integer", minimum: 1, maximum: 200, default: 50 } },
+    },
+    response: { 200: { type: "object", additionalProperties: true } },
+  },
+}, async (request) => activityLogStore.query({
+  limit: Math.min(Math.max(Number(request.query?.limit) || 50, 1), 200),
+  category: "pairing",
+}));
 
 // web-01 (§44): narrow realtime channel for the PWA — {type:"sync.available"}
 // only. Auth: master token / dashboard session via requireToken (project keys

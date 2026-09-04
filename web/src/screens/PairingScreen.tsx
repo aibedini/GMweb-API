@@ -1,16 +1,8 @@
-/**
- * ADR-007 — first-run Linked-Device pairing screen.
- *
- * UX contract (§1): the ONLY first-run surface is "Link this browser to your
- * phone" with a QR + countdown + pairing-code fallback. No passkey, no
- * account password, no TOTP, no recovery codes. Passkey returns later as
- * OPTIONAL hardening behind Security Center (§7).
- */
-
 import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { Button, Card, Chip } from "@heroui/react";
-import { beginPairing, type PairingHandle } from "../lib/pairing";
+import { beginPairing, type PairingHandle, type PairingProgress } from "../lib/pairing";
+import { loginWithAdminToken } from "../lib/adminAccess";
 
 export interface LinkContext {
   pairingSessionId: string;
@@ -20,125 +12,223 @@ export interface LinkContext {
   origin: string;
 }
 
-export function PairingScreen({ onLinked }: { onLinked: (link?: LinkContext) => void | Promise<void> }) {
+type UiStage = PairingProgress | "CREATING_LINKED_SESSION" | "TOKEN_LOGIN" | "LINKED" | "FAILED";
+
+const STAGE_LABELS: Record<UiStage, string> = {
+  PREPARING_KEYS: "Preparing browser keys",
+  CREATING_SESSION: "Creating pairing session",
+  AWAITING_ANDROID: "Waiting for Android scan",
+  ANDROID_APPROVED: "Android approved",
+  VERIFYING_CERTIFICATE: "Verifying device certificate",
+  CERTIFICATE_VERIFIED: "Certificate verified",
+  CREATING_LINKED_SESSION: "Creating secure browser session",
+  TOKEN_LOGIN: "Checking GMweb admin token",
+  LINKED: "Linked",
+  FAILED: "Stopped with an error",
+};
+
+interface PairingScreenProps {
+  apiVersion: string;
+  pwaVersion: string;
+  scriptFile: string;
+  onLinked: (link: LinkContext) => void | Promise<void>;
+  onRecoveryLinked: () => void | Promise<void>;
+}
+
+export function PairingScreen({
+  apiVersion,
+  pwaVersion,
+  scriptFile,
+  onLinked,
+  onRecoveryLinked,
+}: PairingScreenProps) {
   const [handle, setHandle] = useState<PairingHandle | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [showCode, setShowCode] = useState(false);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  void canvasRef;
+  const [stage, setStage] = useState<UiStage>("PREPARING_KEYS");
+  const [showAlternative, setShowAlternative] = useState(false);
+  const [adminToken, setAdminToken] = useState("");
+  const [tokenBusy, setTokenBusy] = useState(false);
   const startedRef = useRef(false);
+  const compatible = apiVersion === pwaVersion;
 
   const start = async () => {
+    if (startedRef.current || !compatible) return;
     setError(null);
     startedRef.current = true;
     try {
-      const h = await beginPairing();
+      const h = await beginPairing((next) => setStage(next));
       setHandle(h);
       setSecondsLeft(Math.max(0, Math.round((h.qr.expiresAt - Date.now()) / 1000)));
-      const payload = JSON.stringify(h.qr);
-      setQrDataUrl(await QRCode.toDataURL(payload, { width: 240, margin: 1 }));
-      void h
-        .wait()
-        .then((link: { certificate: string; deviceId: string; verified: boolean }) =>
-          onLinked({
-            pairingSessionId: h.session.pairingSessionId,
-            pollSecret: h.session.pollSecret,
-            deviceId: link.deviceId,
-            certificate: link.certificate,
-            origin: h.qr.origin,
-          }),
-        )
-        .catch((e) => {
-          if (!/cancel/i.test(String(e))) setError(e.message);
-          startedRef.current = false;
-          setHandle(null);
+      setQrDataUrl(await QRCode.toDataURL(JSON.stringify(h.qr), { width: 240, margin: 1 }));
+      void h.wait().then(async (link) => {
+        setStage("CREATING_LINKED_SESSION");
+        await onLinked({
+          pairingSessionId: h.session.pairingSessionId,
+          pollSecret: h.session.pollSecret,
+          deviceId: link.deviceId,
+          certificate: link.certificate,
+          origin: h.qr.origin,
         });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+        setStage("LINKED");
+      }).catch((cause: unknown) => {
+        if (!/cancel/i.test(String(cause))) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+          setStage("FAILED");
+        }
+        startedRef.current = false;
+        setHandle(null);
+        setQrDataUrl(null);
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setStage("FAILED");
       startedRef.current = false;
     }
   };
 
   useEffect(() => {
-    void start();
+    if (compatible) void start();
+    // start is guarded by startedRef; StrictMode must not create two sessions.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [compatible]);
 
-  // countdown + auto-refresh at expiry
   useEffect(() => {
     if (!handle) return;
-    const t = setInterval(() => {
-      setSecondsLeft((s) => {
-        if (s <= 1) {
-          clearInterval(t);
+    const timer = window.setInterval(() => {
+      setSecondsLeft((current) => {
+        if (current <= 1) {
+          window.clearInterval(timer);
+          handle.cancel();
           setHandle(null);
           setQrDataUrl(null);
+          setError("QR expired. Generate a fresh code or use the admin-token option.");
+          setStage("FAILED");
           startedRef.current = false;
           return 0;
         }
-        return s - 1;
+        return current - 1;
       });
     }, 1000);
-    return () => clearInterval(t);
+    return () => window.clearInterval(timer);
   }, [handle]);
+
+  const useAdminToken = async () => {
+    const submitted = adminToken.trim();
+    if (!submitted || tokenBusy) return;
+    setAdminToken("");
+    setTokenBusy(true);
+    setError(null);
+    setStage("TOKEN_LOGIN");
+    handle?.cancel();
+    try {
+      await loginWithAdminToken(submitted);
+      await onRecoveryLinked();
+      setStage("LINKED");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setStage("FAILED");
+    } finally {
+      setTokenBusy(false);
+    }
+  };
 
   const mm = String(Math.floor(secondsLeft / 60)).padStart(2, "0");
   const ss = String(secondsLeft % 60).padStart(2, "0");
 
   return (
-    <div className="flex h-full items-center justify-center">
-      <Card className="w-full max-w-md">
-        <div className="flex flex-col items-center gap-4 p-8">
-          <h1 className="text-2xl font-semibold">Messages</h1>
-          <p className="text-base font-medium">Link to your Android</p>
+    <div className="min-h-full overflow-y-auto px-4 py-8">
+      <Card className="mx-auto w-full max-w-lg">
+        <div className="flex flex-col items-center gap-4 p-6 sm:p-8">
+          <div className="text-center">
+            <h1 className="text-2xl font-semibold">Messages</h1>
+            <p className="mt-1 text-base font-medium">Link this browser</p>
+          </div>
 
-          {qrDataUrl ? (
-            <img src={qrDataUrl} alt="Pairing QR code" width={240} height={240} />
-          ) : error ? (
-            <div className="flex flex-col items-center gap-3">
-              <p className="text-sm" style={{ color: "var(--danger)" }}>
-                {error}
-              </p>
-              <Button
-                variant="primary"
-                onPress={() => {
-                  setError(null);
-                  void start();
-                }}
-              >
-                Try again
-              </Button>
+          <div className="flex flex-wrap justify-center gap-2 text-xs">
+            <Chip size="sm" variant="soft" color={compatible ? "success" : "danger"}>API {apiVersion}</Chip>
+            <Chip size="sm" variant="soft" color={compatible ? "success" : "danger"}>PWA {pwaVersion}</Chip>
+            <Chip size="sm" variant="soft">{scriptFile}</Chip>
+          </div>
+
+          {!compatible && (
+            <div className="w-full rounded-lg border p-3 text-sm" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
+              Deployment mismatch: the API and loaded PWA are different versions. Hard-refresh after the server update before pairing.
             </div>
-          ) : (
-            <p className="text-sm" style={{ color: "var(--muted-fg)" }}>
-              Preparing pairing session…
-            </p>
           )}
 
-          {handle && qrDataUrl && (
-            <>
-              <p className="text-center text-sm" style={{ color: "var(--muted-fg)" }}>
-                Open Messages on your Android phone
-                <br />
-                Settings → Linked devices → <b>Link new device</b>
-              </p>
-              <Chip size="sm" variant="soft" color={secondsLeft > 20 ? "default" : "warning"}>
-                QR expires in {mm}:{ss}
-              </Chip>
-              {showCode && (
-                <p className="text-xs" style={{ color: "var(--muted-fg)" }}>
-                  Pairing code fallback is coming in a later release — use the QR code.
-                </p>
-              )}
-              {!showCode && (
-                <Button variant="ghost" size="sm" onPress={() => setShowCode(true)}>
-                  Can't scan?
-                </Button>
-              )}
-            </>
+          {compatible && qrDataUrl && <img src={qrDataUrl} alt="Pairing QR code" width={240} height={240} />}
+
+          {compatible && !qrDataUrl && !error && (
+            <p className="text-sm" style={{ color: "var(--muted-fg)" }}>{STAGE_LABELS[stage]}…</p>
           )}
+
+          {error && (
+            <div className="w-full rounded-lg border p-3 text-sm" style={{ borderColor: "var(--danger)" }}>
+              <p className="font-medium" style={{ color: "var(--danger)" }}>{STAGE_LABELS[stage]}</p>
+              <p className="mt-1 break-words" style={{ color: "var(--muted-fg)" }}>{error}</p>
+            </div>
+          )}
+
+          {compatible && (
+            <div className="flex w-full flex-col items-center gap-3">
+              <p className="text-center text-sm" style={{ color: "var(--muted-fg)" }}>
+                Current stage: <b style={{ color: "var(--fg)" }}>{STAGE_LABELS[stage]}</b>
+                {handle ? <><br />Session {handle.session.pairingSessionId.slice(0, 10)}…</> : null}
+              </p>
+              {handle && qrDataUrl && (
+                <>
+                  <Chip
+                    size="sm"
+                    variant="soft"
+                    color={handle.qr.identityBootstrapToken ? "success" : "warning"}
+                  >
+                    {handle.qr.identityBootstrapToken ? "Fresh Android identity enabled" : "Existing Android identity only"}
+                  </Chip>
+                  <p className="text-center text-sm" style={{ color: "var(--muted-fg)" }}>
+                    Android Messages → Settings → Linked devices → <b>Link new device</b>
+                  </p>
+                  {!handle.qr.identityBootstrapToken && (
+                    <p className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--border)", color: "var(--muted-fg)" }}>
+                      This anonymous QR cannot enroll a fresh/reinstalled Android identity. Sign in to the GMweb dashboard before generating it, or use the admin-token option below.
+                    </p>
+                  )}
+                  <Chip size="sm" variant="soft" color={secondsLeft > 20 ? "default" : "warning"}>QR expires in {mm}:{ss}</Chip>
+                </>
+              )}
+              {!handle && !tokenBusy && (
+                <Button variant="primary" onPress={() => void start()}>Generate fresh QR</Button>
+              )}
+            </div>
+          )}
+
+          <div className="w-full border-t pt-4" style={{ borderColor: "var(--border)" }}>
+            <Button variant="ghost" size="sm" className="w-full" onPress={() => setShowAlternative((value) => !value)}>
+              {showAlternative ? "Hide alternative" : "Can't scan? Use GMweb admin token"}
+            </Button>
+            {showAlternative && (
+              <form className="mt-3 space-y-3" onSubmit={(event) => { event.preventDefault(); void useAdminToken(); }}>
+                <p className="text-xs" style={{ color: "var(--muted-fg)" }}>
+                  Paste the active token shown by <code>gmweb token</code>. It is exchanged once for a restricted HttpOnly session and is never saved in browser storage.
+                </p>
+                <input
+                  aria-label="GMweb admin token"
+                  type="password"
+                  value={adminToken}
+                  onChange={(event) => setAdminToken(event.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder="GMweb admin token"
+                  className="h-11 w-full rounded-lg border bg-transparent px-3 text-sm outline-none focus:ring-2"
+                  style={{ borderColor: "var(--border)" }}
+                />
+                <Button type="submit" variant="primary" className="w-full" isDisabled={!adminToken.trim() || tokenBusy}>
+                  {tokenBusy ? "Checking token…" : "Open Messages securely"}
+                </Button>
+              </form>
+            )}
+          </div>
         </div>
       </Card>
     </div>

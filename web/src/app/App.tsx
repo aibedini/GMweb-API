@@ -31,6 +31,8 @@ import {
 } from "../lib/push";
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
+import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
+import { fetchPairingDiagnostics, type PairingDiagnostic } from "../lib/adminAccess";
 
 // ADR-007 §1: first-run is LINKED-DEVICE pairing, never passkey bootstrap.
 // Until the user pairs (or holds a valid linked-device session), the app
@@ -66,6 +68,8 @@ export default function App() {
   const [identities, setIdentities] = useState<IdentityRow[] | null>(null);
   const [pushCount, setPushCount] = useState<number | null>(null);
   const [securityErr, setSecurityErr] = useState<string | null>(null);
+  const [pairingDiagnostics, setPairingDiagnostics] = useState<PairingDiagnostic[] | null>(null);
+  const scriptFile = useMemo(() => loadedScriptFile(), []);
 
   const refresh = async () => {
     setCursor(await getCursor());
@@ -151,6 +155,11 @@ export default function App() {
     if (authed) void refreshSecurity();
   }, [authed]);
 
+  useEffect(() => {
+    if (!authed) return;
+    void fetchPairingDiagnostics().then(setPairingDiagnostics).catch(() => setPairingDiagnostics(null));
+  }, [authed]);
+
   // ADR-007 §1 state machine: UNLINKED → SHOW_QR → PAIRING_PENDING →
   // PAIRING_APPROVED → READY. The old passkey gate (authed === false →
   // "Create a passkey…") is REMOVED: passkey is optional post-pairing
@@ -158,6 +167,9 @@ export default function App() {
   if (authed === false || authed === null) {
     return (
       <PairingScreen
+        apiVersion={version || "checking"}
+        pwaVersion={PWA_BUILD_VERSION}
+        scriptFile={scriptFile}
         onLinked={async (link?: { pairingSessionId: string; pollSecret: string; deviceId: string; certificate: string; origin: string }) => {
           // CERTIFICATE_VERIFIED already happened in pairing.wait(). Now:
           // prove key possession → HttpOnly session → sync bootstrap.
@@ -183,6 +195,15 @@ export default function App() {
             throw e instanceof Error ? e : new Error(String(e));
           }
         }}
+        onRecoveryLinked={async () => {
+          const probe = await fetch("/api/v1/linked-session", { credentials: "include" });
+          const session = await probe.json().catch(() => ({}));
+          if (!probe.ok || session.authenticated !== true) {
+            throw new Error("Restricted PWA session cookie was not established");
+          }
+          setBootstrapState("LINKED_SESSION_CREATED");
+          setAuthed(true);
+        }}
       />
     );
   }
@@ -192,7 +213,9 @@ export default function App() {
       <header className="flex items-center justify-between border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
         <h1 className="text-lg font-semibold">Messages</h1>
         <div className="flex items-center gap-3">
-          <span className="text-xs" style={{ color: "var(--muted-fg)" }}>v{version}</span>
+          <span className="text-xs" style={{ color: "var(--muted-fg)" }} title={`PWA ${PWA_BUILD_VERSION} · ${scriptFile}`}>
+            API {version} · PWA {PWA_BUILD_VERSION} · {scriptFile}
+          </span>
           {bootstrapState && bootstrapState !== "READY" && (
             <Chip size="sm" variant="soft">
               {bootstrapState === "CREATING_LINKED_SESSION" ? "Linking…" : "Syncing…"}
@@ -465,6 +488,50 @@ export default function App() {
         {/* ── Debug ───────────────────────────────────────────────────── */}
         <TabPanel id="debug">
           <div className="space-y-3 py-3">
+            <Card>
+              <CardContent className="p-4 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="font-medium">Pairing diagnostics</p>
+                    <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
+                      Sanitized stages and reasons. Device/session IDs are hashed; tokens, signatures and certificates are never logged.
+                    </p>
+                  </div>
+                  <Button size="sm" variant="outline" onPress={() => void fetchPairingDiagnostics().then(setPairingDiagnostics).catch(() => setPairingDiagnostics(null))}>
+                    Refresh
+                  </Button>
+                </div>
+                {pairingDiagnostics === null ? (
+                  <p className="mt-3 text-xs" style={{ color: "var(--muted-fg)" }}>
+                    Detailed pairing logs require the restricted admin-token session or dashboard/master access.
+                  </p>
+                ) : pairingDiagnostics.length === 0 ? (
+                  <p className="mt-3 text-xs" style={{ color: "var(--muted-fg)" }}>No pairing events recorded yet.</p>
+                ) : (
+                  <div className="mt-3 max-h-64 space-y-2 overflow-y-auto">
+                    {pairingDiagnostics.map((row) => {
+                      const pairing = row.details?.pairing;
+                      return (
+                        <div key={row.id} className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--border)" }}>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <b>{pairing?.stage || row.title}</b>
+                            <span style={{ color: row.statusCode >= 400 ? "var(--danger)" : "var(--ok)" }}>
+                              {pairing?.status || row.statusCode}
+                            </span>
+                          </div>
+                          <p className="mt-1" style={{ color: "var(--muted-fg)" }}>
+                            {new Date(row.ts).toLocaleString()} · {pairing?.reason || row.path}
+                            {pairing?.deviceIdHash ? ` · device ${pairing.deviceIdHash}` : ""}
+                            {pairing?.sessionIdHash ? ` · session ${pairing.sessionIdHash}` : ""}
+                          </p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
             <Card>
               <CardContent className="p-4 text-sm">
                 <p className="font-medium">Web Push (§45)</p>

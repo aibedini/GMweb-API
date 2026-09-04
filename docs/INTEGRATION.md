@@ -179,6 +179,8 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `GET /api/v1/commands/:id` | Lifecycle: `QUEUED → DELIVERED_TO_AGENT → ACCEPTED_BY_AGENT → EXECUTING → COMPLETED/FAILED/EXPIRED` (§41). **Never** claims carrier `SENT/DELIVERED` — those words come only from Android evidence. | Bearer |
 | `GET /api/v1/commands` | Queue depth by state. | Bearer |
 | `POST /api/v1/agent/identity` | Bootstrap/refresh Android's stable device identity and public keys. Existing identities sign the exact request with `X-Agent-Auth`. A fresh/recovery pairing can instead use the short-lived, session-bound bootstrap capability embedded in an admin-authorized QR. | Agent signature, pairing bootstrap, or legacy device key |
+| `POST /api/v1/pwa/token-login` | QR-independent recovery: exchange the active GMweb master token once for a 7-day, restricted HttpOnly PWA session. The PWA does not persist the submitted token. | Token in JSON body; HTTPS only, rate-limited |
+| `GET /api/v1/pairing/diagnostics` | Recent sanitized pairing state/reason trail. Session/device identifiers are hashed; credentials, signatures, certificates and message content are never logged. | Dashboard/master, or restricted admin-recovery PWA session |
 | `POST /api/v1/agent/commands/claim` | **Android Agent only** (device key). Atomically claims queued commands. | `X-API-Key` device key |
 | `POST /api/v1/agent/commands/:id/status` | Agent reports `ACCEPTED/EXECUTING/COMPLETED/FAILED`; guarded transitions, illegal jumps → `409`. | device key |
 | `POST /api/v1/agent/events/batch` | Agent uploads opaque event batches; response **partial-ACKs** per `eventId` with the assigned `serverSequence`; missing IDs stay pending on the device and retry. Duplicate IDs are skipped **without consuming a sequence**. | device key |
@@ -213,6 +215,24 @@ GMweb accepts both ECDSA encodings at their actual runtime boundaries: Android
 certificate signatures are ASN.1 DER and browser WebCrypto challenge signatures
 are IEEE-P1363 `r||s`. The UI becomes linked only after the final cookie probe
 returns `authenticated:true`.
+
+If Android identity bootstrap is unavailable or QR pairing is blocked, `/web`
+also offers **Use GMweb admin token**. Obtain the active value with `gmweb token`
+on the server. The browser sends it once over same-origin HTTPS to
+`POST /api/v1/pwa/token-login`; GMweb returns a restricted HttpOnly,
+`Secure`, `SameSite=Strict` cookie with message read/send and sanitized pairing
+diagnostic capabilities. This recovery session cannot call the Android-only
+metadata or approval routes, so it does not weaken the signed trust boundary.
+
+The `/web` bootstrap screen displays three deployment identifiers: the live API
+version from `/health`, the PWA build version embedded by Vite, and the exact
+hashed `index-*.js` file currently loaded. Pairing is stopped when API and PWA
+versions differ. Pairing stages and safe failure reasons are stored in
+`data/activity.jsonl`, appear in Dashboard → Logs under category `pairing`, and
+are also available in the PWA Debug tab for admin-recovery sessions.
+Dashboard Overview independently reads `/web/version.json` and the deployed
+HTML, so it reports the PWA build version, exact script filename, build time,
+and API/PWA match status without trusting the browser cache.
 
 ---
 

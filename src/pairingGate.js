@@ -23,7 +23,20 @@ module.exports = function pairingAgentGate(agentAuthService, request, reply, don
   const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
   if (auth.ok) {
     request.authenticatedAgentId = auth.deviceId;
+    request._pairingDiagnostic = {
+      stage: isApprove ? "ANDROID_APPROVE_AUTH" : "ANDROID_METADATA_AUTH",
+      status: "SUCCESS",
+      reason: "agent_signature_valid",
+      deviceId: auth.deviceId,
+      sessionId: isSessionLookup ? path.slice("/api/v1/pairing/session/".length) : undefined,
+    };
     return done();
   }
+  request._pairingDiagnostic = {
+    stage: isApprove ? "ANDROID_APPROVE_AUTH" : "ANDROID_METADATA_AUTH",
+    status: "FAILED",
+    reason: auth.reason || "agent_signature_invalid",
+    sessionId: isSessionLookup ? path.slice("/api/v1/pairing/session/".length) : undefined,
+  };
   reply.code(401).send({ error: "unauthorized", reason: auth.reason });
 };

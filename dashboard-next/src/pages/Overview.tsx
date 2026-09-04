@@ -81,6 +81,11 @@ export function OverviewPage() {
         : "Google Messages web · Chrome"
     },
     { k: "API", node: <StatePill ok={apiOk} label={apiOk ? "Healthy" : "Down"} />, sub: `v${ov?.version ?? "—"} · :3030` },
+    {
+      k: "Web PWA",
+      node: <StatePill ok={Boolean(ov?.webApp?.ok && ov.webApp.matchesApi)} label={ov?.webApp?.ok ? (ov.webApp.matchesApi ? "Current" : "Version mismatch") : "Not built"} />,
+      sub: ov?.webApp?.ok ? `v${ov.webApp.version} · ${ov.webApp.script}` : (ov?.webApp?.reason || "/web unavailable"),
+    },
     activeTransport === "android"
       ? {
           k: "Device bridge",
@@ -111,7 +116,7 @@ export function OverviewPage() {
         </Button>
       </div>
 
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
         {metrics.map((m) => (
           <SpotlightCard key={m.k} className="p-4">
             <div className="text-xs uppercase tracking-wide text-muted-foreground">{m.k}</div>

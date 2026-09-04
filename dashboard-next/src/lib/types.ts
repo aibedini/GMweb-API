@@ -25,6 +25,7 @@ export interface Overview {
   readiness?: { ready: boolean; status?: Record<string, unknown> };
   transport?: { name?: string; mode?: string | null; transport?: string; paired?: boolean; reason?: string | null; androidReady?: boolean; lastPullAt?: string | null };
   browserAutomation?: { ok: boolean | null; code: string; latencyMs?: number; error?: string };
+  webApp?: { ok: boolean; version: string | null; script: string | null; matchesApi: boolean; builtAt: string | null; path: string; reason?: string };
   system?: {
     cpu: { cores: number; usagePercent: number; load1: number; load5: number; load15: number; loadPercent: number };
     memory: { totalBytes: number; availableBytes: number; usedBytes: number; usagePercent: number };

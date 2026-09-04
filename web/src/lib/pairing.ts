@@ -25,6 +25,14 @@ export type PairingState =
   | "BOOTSTRAPPING_KEYS"
   | "READY";
 
+export type PairingProgress =
+  | "PREPARING_KEYS"
+  | "CREATING_SESSION"
+  | "AWAITING_ANDROID"
+  | "ANDROID_APPROVED"
+  | "VERIFYING_CERTIFICATE"
+  | "CERTIFICATE_VERIFIED";
+
 export interface PairingHandle {
   session: PairingSession;
   qr: PairingQrPayload;
@@ -51,10 +59,11 @@ function b64(buf: ArrayBuffer): string {
  * Start the pairing dance: local keygen → session create → QR payload.
  * The caller renders `handle.qr` as the QR image and calls `wait()`.
  */
-export async function beginPairing(): Promise<PairingHandle> {
+export async function beginPairing(onProgress?: (stage: PairingProgress) => void): Promise<PairingHandle> {
   // P0-6: durable, NON-extractable device keys (IndexedDB). If persistence
   // fails, pairing must not start — a device without its private key can
   // never be verified later (fail closed).
+  onProgress?.("PREPARING_KEYS");
   const keys = await getOrCreateDeviceKeys();
   const webDeviceId = keys.deviceId;
   const nonce = randomId(12);
@@ -69,6 +78,7 @@ export async function beginPairing(): Promise<PairingHandle> {
   )) as CryptoKeyPair;
   const ephemeralPubB64 = b64(await crypto.subtle.exportKey("raw", ephemeral.publicKey));
 
+  onProgress?.("CREATING_SESSION");
   const created = await createSession({
     webDeviceId,
     webSigningPublicKey: keys.signingPublicKeyB64,
@@ -83,6 +93,7 @@ export async function beginPairing(): Promise<PairingHandle> {
     expiresAt: created.expiresAt,
     ttlSeconds: created.ttlSeconds,
   };
+  onProgress?.("AWAITING_ANDROID");
 
   let cancelled = false;
   const cancel = () => {
@@ -96,6 +107,7 @@ export async function beginPairing(): Promise<PairingHandle> {
         try {
           const status = await getPairingStatus(pairingSession.pairingSessionId, pairingSession.pollSecret);
           if (status.state === "APPROVED" && status.certificate) {
+            onProgress?.("ANDROID_APPROVED");
             // BLOCKER 1 — full verification chain, fail closed:
             // CERTIFICATE_RECEIVED -> binding checks -> rootSignature
             // (Trust Root key pinned from the approval payload)
@@ -106,6 +118,7 @@ export async function beginPairing(): Promise<PairingHandle> {
             } catch {
               return reject(new Error("certificate is not valid JSON"));
             }
+            onProgress?.("VERIFYING_CERTIFICATE");
             const state = await verifyCertificate(cert, {
               deviceId: webDeviceId,
               transcriptHash: status.transcriptHash,
@@ -117,6 +130,7 @@ export async function beginPairing(): Promise<PairingHandle> {
             if (state.step === "REJECTED") {
               return reject(new Error(`certificate rejected: ${state.reason}`));
             }
+            onProgress?.("CERTIFICATE_VERIFIED");
             return resolve({
               certificate: status.certificate,
               deviceId: status.deviceId,
