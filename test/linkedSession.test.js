@@ -20,7 +20,8 @@ function makeKey() {
 }
 
 function sign(priv, data) {
-  return crypto.sign("sha256", data, priv).toString("base64");
+  // Browser WebCrypto returns IEEE-P1363 (raw r||s), not ASN.1 DER.
+  return crypto.sign("sha256", data, { key: priv, dsaEncoding: "ieee-p1363" }).toString("base64");
 }
 
 test("complete: challenge signature issues HttpOnly linked session with capability scope", async () => {

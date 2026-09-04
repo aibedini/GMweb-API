@@ -19,6 +19,8 @@ export interface PairingQrPayload {
   nonce: string;
   origin: string;
   expiresAt: number;
+  /** Present only when the creating browser has dashboard/admin authority. */
+  identityBootstrapToken?: string;
 }
 
 export interface CreateSessionResponse extends PairingSession {
@@ -41,6 +43,7 @@ export async function createSession(transcript: {
   const res = await fetch("/api/v1/pairing/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify(transcript),
   });
   if (!res.ok) {

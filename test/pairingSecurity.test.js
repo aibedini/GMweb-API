@@ -312,6 +312,35 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     assert.equal(res.json().qr.origin, "https://messages.example.com");
   });
 
+  test("only an admin-authorized session receives a QR identity bootstrap token", async () => {
+    const adminApp = Fastify({ logger: false });
+    registerPairingRoutes(adminApp, {
+      agentAuthService: svc,
+      config: {},
+      canBootstrapIdentity: () => true,
+    });
+    await adminApp.ready();
+    try {
+      const res = await adminApp.inject({
+        method: "POST",
+        url: "/api/v1/pairing/session",
+        payload: transcript(),
+      });
+      assert.equal(res.statusCode, 200);
+      const body = res.json();
+      assert.ok(body.qr.identityBootstrapToken);
+      assert.equal(
+        pairing.consumeIdentityBootstrap(
+          body.pairingSessionId,
+          body.qr.identityBootstrapToken,
+        ),
+        true,
+      );
+    } finally {
+      await adminApp.close();
+    }
+  });
+
   // ── P0-8: transcript hash binding ───────────────────────────────────────
 
   test("transcriptHash is canonical and matches an independent recomputation", async () => {

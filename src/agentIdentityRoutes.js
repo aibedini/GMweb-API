@@ -52,7 +52,11 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
           type: "object",
           properties: {
             error: { type: "string" },
-            reason: { type: "string", enum: ["device_key_mismatch", "device_key_not_configured"] },
+            reason: { type: "string", enum: [
+              "device_key_mismatch",
+              "device_key_not_configured",
+              "invalid_pairing_bootstrap",
+            ] },
             expectedKeyPreview: { type: ["string", "null"] },
           },
         },
@@ -62,7 +66,17 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
     // FIX 5b (review): role is NEVER taken from the client. The service
     // assigns PRIMARY_TRUST_AGENT to the first enrolled agent automatically.
     const { deviceId, publicKeys, protocolVersion } = request.body || {};
-    const result = agentAuthService.registerIdentity({ deviceId, publicKeys, protocolVersion });
+    if (request.authenticatedAgentId && request.authenticatedAgentId !== String(deviceId || "")) {
+      const err = new Error("signed identity does not match registration deviceId");
+      err.statusCode = 403;
+      throw err;
+    }
+    const result = agentAuthService.registerIdentity({
+      deviceId,
+      publicKeys,
+      protocolVersion,
+      forcePrimary: request.identityBootstrapAuthorized === true,
+    });
     return { ...result, role: result.role };
   });
 

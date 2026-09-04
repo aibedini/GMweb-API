@@ -120,6 +120,10 @@ function createSession(p, ctx) {
   // QR screenshot cannot consume the approval race-style.
   const pollSecret = newId(24);
   const pollSecretHash = crypto.createHash("sha256").update(pollSecret).digest("hex");
+  const identityBootstrapToken = ctx && ctx.identityBootstrap ? newId(32) : null;
+  const identityBootstrapHash = identityBootstrapToken
+    ? crypto.createHash("sha256").update(identityBootstrapToken).digest("hex")
+    : null;
   const ip = String((ctx && ctx.ip) || "unknown");
   // P1-3 — per-IP + global caps.
   let set = perIp.get(ip);
@@ -167,6 +171,8 @@ function createSession(p, ctx) {
     expiresAt: now() + PAIRING_TTL_MS,
     ip,
     pollSecretHash,
+    identityBootstrapHash,
+    identityBootstrapUses: 0,
     state: "PENDING", // PENDING → APPROVED → CONSUMED
     approved: null,
   };
@@ -179,7 +185,19 @@ function createSession(p, ctx) {
     expiresAt: session.expiresAt,
     ttlSeconds: Math.round(PAIRING_TTL_MS / 1000),
     pollSecret, // returned ONCE to the creating browser (never stored raw)
+    identityBootstrapToken,
   };
+}
+
+/** Authorize at most the initial enrollment plus one recovery refresh. */
+function consumeIdentityBootstrap(pairingSessionId, token) {
+  const session = getSession(pairingSessionId);
+  if (!session || session.state !== "PENDING" || !session.identityBootstrapHash || !token ||
+      session.identityBootstrapUses >= 2) return false;
+  const actual = crypto.createHash("sha256").update(String(token)).digest("hex");
+  if (!safeEqual(actual, session.identityBootstrapHash)) return false;
+  session.identityBootstrapUses += 1;
+  return true;
 }
 
 function getSession(pairingSessionId) {
@@ -390,5 +408,6 @@ module.exports = {
   hashOf,
   canonicalBytes,
   pollSecretMatches,
+  consumeIdentityBootstrap,
   _reset,
 };

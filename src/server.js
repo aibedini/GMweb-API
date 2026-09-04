@@ -87,6 +87,7 @@ const pairingGate = require("./pairingGate");
 const { registerAgentIdentityRoutes } = require("./agentIdentityRoutes");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const { registerPairingRoutes } = require("./pairingRoutes");
+const pairingSessions = require("./pairingSessions");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
 // Pull mode: the phone dials OUT to the server and picks up tasks (no tunnel).
@@ -705,9 +706,35 @@ function requireToken(request, reply, done) {
   // verified "a signature exists" without binding it to this request. The
   // bound deviceId is exposed as request.authenticatedAgentId for handlers.
   if (requestPath(request.url).startsWith("/api/v1/agent/")) {
+    if (requestPath(request.url) === "/api/v1/agent/identity") {
+      const bootstrapToken = String(request.headers["x-pairing-bootstrap"] || "");
+      const bootstrapSession = String(request.headers["x-pairing-session"] || "");
+      if (bootstrapToken) {
+        if (pairingSessions.consumeIdentityBootstrap(bootstrapSession, bootstrapToken)) {
+          request.identityBootstrapAuthorized = true;
+          return done();
+        }
+        reply.code(401).send({ error: "unauthorized", reason: "invalid_pairing_bootstrap" });
+        return;
+      }
+    }
     if (checkDeviceKey(request)) return done();
     if (requestPath(request.url) === "/api/v1/agent/identity") {
-      reply.code(401).send(deviceKeyStore.authFailure());
+      // An already-enrolled Android identity refreshes its own public keys
+      // with the same per-device signature used by all other agent routes.
+      // Unknown identities still need the dashboard-authorized QR bootstrap.
+      const auth = agentAuthService.verifyAgentHeader(
+        request,
+        request.rawBody || Buffer.alloc(0),
+      );
+      if (auth.ok) {
+        request.authenticatedAgentId = auth.deviceId;
+        return done();
+      }
+      const failure = request.headers["x-agent-auth"]
+        ? { error: "unauthorized", reason: auth.reason }
+        : deviceKeyStore.authFailure();
+      reply.code(401).send(failure);
       return;
     }
     const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
@@ -2642,7 +2669,11 @@ registerControlPlaneRoutes(app, {
 registerAgentIdentityRoutes(app, { agentAuthService });
 
 // ADR-007: primary-device QR pairing relay (web ← Android approval).
-registerPairingRoutes(app, { agentAuthService, config });
+registerPairingRoutes(app, {
+  agentAuthService,
+  config,
+  canBootstrapIdentity: (request) => hasDashboardAccess(request),
+});
 
 // web-01 (§44): narrow realtime channel for the PWA — {type:"sync.available"}
 // only. Auth: master token / dashboard session via requireToken (project keys

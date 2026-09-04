@@ -178,7 +178,8 @@ export async function completeLinkedSession(
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(`complete failed: HTTP ${res.status} ${body.error ?? ""}`);
+    const detail = [body.error, body.reason].filter(Boolean).join("/");
+    throw new Error(`complete failed: HTTP ${res.status} ${detail}`.trim());
   }
   return res.json();
 }

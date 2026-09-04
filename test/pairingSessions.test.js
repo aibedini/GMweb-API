@@ -34,6 +34,23 @@ test("create returns a 120s single-use session and echoes the QR transcript", ()
   assert.equal(qr.origin, "https://messages.example.com");
 });
 
+test("dashboard QR bootstrap is session-bound, secret, and expires with the pending session", () => {
+  const created = pairing.createSession(transcript(), { ...ctx(), identityBootstrap: true });
+  assert.ok(created.identityBootstrapToken);
+  const session = pairing.getSession(created.pairingSessionId);
+  assert.equal(Object.hasOwn(session, "identityBootstrapToken"), false);
+  assert.equal(pairing.consumeIdentityBootstrap(created.pairingSessionId, "wrong"), false);
+  assert.equal(pairing.consumeIdentityBootstrap(created.pairingSessionId, created.identityBootstrapToken), true);
+  assert.equal(pairing.consumeIdentityBootstrap(created.pairingSessionId, created.identityBootstrapToken), true);
+  assert.equal(pairing.consumeIdentityBootstrap(created.pairingSessionId, created.identityBootstrapToken), false);
+});
+
+test("anonymous QR sessions never carry identity bootstrap authority", () => {
+  const created = pairing.createSession(transcript(), ctx());
+  assert.equal(created.identityBootstrapToken, null);
+  assert.equal(pairing.consumeIdentityBootstrap(created.pairingSessionId, "anything"), false);
+});
+
 test("approve flips PENDING → APPROVED exactly once", () => {
   const created = pairing.createSession(transcript(), ctx());
   const res = pairing.approveSession(created.pairingSessionId, {

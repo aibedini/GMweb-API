@@ -178,7 +178,7 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `POST /api/v1/commands` | **Durable command** (send/mark-read/…): committed to the store **before** the `202` returns. Body `{type, payload(base64), idempotencyKey, targetAgentId?, expiresAt?}` → `202 {commandId, state, created}`. Idempotent: replaying an `idempotencyKey` returns the ORIGINAL command with `created:false` — safe retries, never double sends. | Bearer (master) |
 | `GET /api/v1/commands/:id` | Lifecycle: `QUEUED → DELIVERED_TO_AGENT → ACCEPTED_BY_AGENT → EXECUTING → COMPLETED/FAILED/EXPIRED` (§41). **Never** claims carrier `SENT/DELIVERED` — those words come only from Android evidence. | Bearer |
 | `GET /api/v1/commands` | Queue depth by state. | Bearer |
-| `POST /api/v1/agent/identity` | Bootstrap/refresh Android's stable device identity and public keys. A `401` returns safe `device_key_mismatch` or `device_key_not_configured` plus a masked expected-key preview, so setup fails before pairing instead of surfacing later as `unknown_device`. | `X-API-Key` device key |
+| `POST /api/v1/agent/identity` | Bootstrap/refresh Android's stable device identity and public keys. Existing identities sign the exact request with `X-Agent-Auth`. A fresh/recovery pairing can instead use the short-lived, session-bound bootstrap capability embedded in an admin-authorized QR. | Agent signature, pairing bootstrap, or legacy device key |
 | `POST /api/v1/agent/commands/claim` | **Android Agent only** (device key). Atomically claims queued commands. | `X-API-Key` device key |
 | `POST /api/v1/agent/commands/:id/status` | Agent reports `ACCEPTED/EXECUTING/COMPLETED/FAILED`; guarded transitions, illegal jumps → `409`. | device key |
 | `POST /api/v1/agent/events/batch` | Agent uploads opaque event batches; response **partial-ACKs** per `eventId` with the assigned `serverSequence`; missing IDs stay pending on the device and retry. Duplicate IDs are skipped **without consuming a sequence**. | device key |
@@ -193,6 +193,26 @@ new consumers should prefer them over the legacy `/send` bridge:
 unchanged and remain fully supported; per ADR-004 they will become thin
 adapters over the command engine (`POST /api/v1/commands`) later, without
 breaking production consumers.
+
+### Android ↔ web pairing bootstrap
+
+The browser must be signed into the GMweb dashboard before opening `/web` for
+a fresh Android install or identity recovery. The resulting 120-second QR
+contains a short-lived `identityBootstrapToken` bound to that pairing session.
+Android uses it only for `POST /api/v1/agent/identity`; GMweb stores only its
+SHA-256 hash. It never authorizes metadata lookup or approval.
+
+After enrollment, the phone refreshes its own identity with an exact-body
+`X-Agent-Auth` signature, so later browser pairings require no shared-key copy.
+The trust-sensitive sequence is fixed:
+
+`scan QR → register/refresh identity → signed metadata → user/biometric confirmation → signed approve → browser verifies Android certificate → browser key proof → linked-session cookie probe`
+
+The bootstrap permits the initial enrollment plus one recovery refresh only.
+GMweb accepts both ECDSA encodings at their actual runtime boundaries: Android
+certificate signatures are ASN.1 DER and browser WebCrypto challenge signatures
+are IEEE-P1363 `r||s`. The UI becomes linked only after the final cookie probe
+returns `authenticated:true`.
 
 ---
 

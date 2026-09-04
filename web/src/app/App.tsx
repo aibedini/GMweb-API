@@ -163,17 +163,24 @@ export default function App() {
           // prove key possession → HttpOnly session → sync bootstrap.
           setBootstrapState("CREATING_LINKED_SESSION");
           try {
-            if (link) {
-              await completeLinkedSession(
-                link.pairingSessionId, link.pollSecret, link.deviceId,
-                link.certificate, link.origin,
-              );
+            if (!link) throw new Error("Pairing approval context is missing");
+            await completeLinkedSession(
+              link.pairingSessionId, link.pollSecret, link.deviceId,
+              link.certificate, link.origin,
+            );
+            // Prove the Set-Cookie response was stored and resolves server-side;
+            // do not render the linked UI from an optimistic local flag.
+            const probe = await fetch("/api/v1/linked-session", { credentials: "include" });
+            const session = await probe.json().catch(() => ({}));
+            if (!probe.ok || session.authenticated !== true) {
+              throw new Error("Linked session cookie was not established");
             }
             setBootstrapState("LINKED_SESSION_CREATED");
             setAuthed(true);
           } catch (e) {
             setBootstrapState(null);
-            setError(e instanceof Error ? e.message : String(e));
+            // PairingScreen owns the visible pre-auth error state.
+            throw e instanceof Error ? e : new Error(String(e));
           }
         }}
       />

@@ -90,4 +90,20 @@ describe("AgentAuthService (PR-08b) — per-device signed auth", () => {
     const old = authedRequest(svc, p1, "d", "{}");
     assert.equal(svc.verifyAgentHeader(old, old.bodyBuf).ok, false);
   });
+
+  test("dashboard pairing recovery atomically replaces the primary trust agent", () => {
+    const svc = new AgentAuthService(new Database(":memory:"));
+    const oldPair = makeKey();
+    const newPair = makeKey();
+    const spki = (pair) => pair.publicKey.export({ format: "der", type: "spki" }).toString("base64");
+    svc.registerIdentity({ deviceId: "old", publicKeys: { signing: spki(oldPair) } });
+    const result = svc.registerIdentity({
+      deviceId: "new",
+      publicKeys: { signing: spki(newPair) },
+      forcePrimary: true,
+    });
+    assert.equal(result.role, "PRIMARY_TRUST_AGENT");
+    assert.equal(svc.getRole("old"), "LEGACY_AGENT");
+    assert.equal(svc.getRole("new"), "PRIMARY_TRUST_AGENT");
+  });
 });

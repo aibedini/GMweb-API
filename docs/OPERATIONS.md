@@ -59,6 +59,21 @@ conversation page to release the expanded sidebar DOM. Systemd CPU weights
 favor `gmweb-api` over Chrome under contention so health and admin controls
 remain responsive without throttling Chrome while spare CPU exists.
 
+## Recover Android ↔ web identity pairing
+
+For a fresh phone install or after Android keys/device ID changed, sign into the
+GMweb dashboard in the browser, then open `/web` in the same origin and scan its
+QR from **Messages → Settings → Linked devices**. The authenticated dashboard
+session causes GMweb to put a short-lived, 120-second identity bootstrap capability
+in that QR. No device key needs to be copied into Android.
+
+An anonymous `/web` QR deliberately cannot replace the primary trust agent. It
+can still pair normally when the phone's identity is already enrolled, because
+Android refreshes that identity with its own `X-Agent-Auth` signature. If a
+fresh/recovery scan reports `device_key_mismatch` or `unknown_device`, return to
+the dashboard, sign in, and generate a new QR; do not weaken the pairing routes
+or reuse the master/project API token.
+
 ## Server Manager
 
 On Ubuntu installs, run:

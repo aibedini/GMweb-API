@@ -36,7 +36,14 @@ function verifyP256(data, sigB64, pubB64) {
     } else {
       keyObject = crypto.createPublicKey({ key: keyBytes, format: "der", type: "spki" });
     }
-    return crypto.verify("sha256", data, keyObject, Buffer.from(String(sigB64 || ""), "base64"));
+    const signature = Buffer.from(String(sigB64 || ""), "base64");
+    // Android/Java emits ASN.1 DER while WebCrypto emits the 64-byte
+    // IEEE-P1363 r||s form. Pairing uses both runtimes, so accept both exact
+    // encodings instead of testing only Node's DER default.
+    const verificationKey = signature.length === 64
+      ? { key: keyObject, dsaEncoding: "ieee-p1363" }
+      : keyObject;
+    return crypto.verify("sha256", data, verificationKey, signature);
   } catch {
     return false;
   }
@@ -83,7 +90,7 @@ function requireAgentSignature(request, reply, _agentAuthService, done) {
   return true;
 }
 
-function registerPairingRoutes(app, { agentAuthService, config }) {
+function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIdentity = () => false }) {
   // BLOCKER 7: production origin is fail-closed. Header-derived origins are
   // only allowed outside production (trustProxy + forwarded headers must not
   // decide the root-trust transcript).
@@ -143,6 +150,7 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
     const created = pairing.createSession(request.body || {}, {
       ip: request.ip,
       origin: configuredOrigin || serverOrigin(request, config),
+      identityBootstrap: canBootstrapIdentity(request),
     });
     const session = pairing.getSession(created.pairingSessionId);
     return {
@@ -150,7 +158,12 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
       expiresAt: created.expiresAt,
       ttlSeconds: created.ttlSeconds,
       pollSecret: created.pollSecret, // shown to web ONCE; QR carries only the id
-      qr: pairing.qrPayload(session),
+      qr: {
+        ...pairing.qrPayload(session),
+        ...(created.identityBootstrapToken
+          ? { identityBootstrapToken: created.identityBootstrapToken }
+          : {}),
+      },
     };
   });
 
@@ -439,4 +452,4 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
   });
 }
 
-module.exports = { registerPairingRoutes, serverOrigin };
+module.exports = { registerPairingRoutes, serverOrigin, verifyP256 };

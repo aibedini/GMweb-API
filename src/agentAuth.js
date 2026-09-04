@@ -75,9 +75,18 @@ class AgentAuthService {
    *  enrolled agent becomes PRIMARY_TRUST_AGENT; later agents stay
    *  LEGACY_AGENT (no self-promotion). Re-registering the existing primary
    *  keeps its role. Ops force-change goes through promotePrimary(). */
-  registerIdentity({ deviceId, publicKeys, protocolVersion = 1 }) {
+  registerIdentity({ deviceId, publicKeys, protocolVersion = 1, forcePrimary = false }) {
     if (!deviceId || !publicKeys?.signing) {
       throw new Error("deviceId and publicKeys.signing are required");
+    }
+    if (forcePrimary) {
+      this.db.transaction(() => {
+        this.db.prepare(
+          "UPDATE agent_identities SET device_role = 'LEGACY_AGENT' WHERE device_role = 'PRIMARY_TRUST_AGENT' AND device_id <> ?"
+        ).run(String(deviceId));
+        this._register(deviceId, publicKeys, protocolVersion, "PRIMARY_TRUST_AGENT");
+      })();
+      return { ok: true, role: "PRIMARY_TRUST_AGENT" };
     }
     const existing = this.getStmt.get(String(deviceId));
     const existingRole = existing ? String(existing.device_role || "LEGACY_AGENT") : null;

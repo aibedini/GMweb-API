@@ -27,6 +27,44 @@ export interface DeviceCertificate {
   rootSignature: string;
 }
 
+/** Convert Android/Java's ASN.1 DER ECDSA signature to WebCrypto's r||s form. */
+export function derEcdsaToP1363(signature: Uint8Array, coordinateSize = 32): Uint8Array {
+  let offset = 0;
+  const readLength = (): number => {
+    const first = signature[offset++];
+    if (first === undefined) throw new Error("truncated DER length");
+    if ((first & 0x80) === 0) return first;
+    const count = first & 0x7f;
+    if (count === 0 || count > 2 || offset + count > signature.length) {
+      throw new Error("invalid DER length");
+    }
+    let length = 0;
+    for (let i = 0; i < count; i += 1) length = (length << 8) | signature[offset++];
+    return length;
+  };
+  const readInteger = (): Uint8Array => {
+    if (signature[offset++] !== 0x02) throw new Error("invalid DER integer");
+    const length = readLength();
+    if (length === 0 || offset + length > signature.length) throw new Error("truncated DER integer");
+    let value = signature.slice(offset, offset + length);
+    offset += length;
+    while (value.length > 1 && value[0] === 0) value = value.slice(1);
+    if (value.length > coordinateSize) throw new Error("ECDSA integer is too large");
+    return value;
+  };
+
+  if (signature[offset++] !== 0x30) throw new Error("invalid DER sequence");
+  const sequenceLength = readLength();
+  if (offset + sequenceLength !== signature.length) throw new Error("invalid DER sequence length");
+  const r = readInteger();
+  const s = readInteger();
+  if (offset !== signature.length) throw new Error("trailing DER data");
+  const raw = new Uint8Array(coordinateSize * 2);
+  raw.set(r, coordinateSize - r.length);
+  raw.set(s, coordinateSize * 2 - s.length);
+  return raw;
+}
+
 /** Mirror of PrimaryTrustRoot.canonicalCertificate — byte-for-byte. */
 export function canonicalCertificate(
   c: Omit<DeviceCertificate, "rootSignature">,
@@ -71,11 +109,12 @@ export async function verifyRootSignature(
       true,
       ["verify"],
     );
-    const sigBytes = Uint8Array.from(atob(rootSignature), (c) => c.charCodeAt(0));
+    const derSignature = Uint8Array.from(atob(rootSignature), (c) => c.charCodeAt(0));
+    const sigBytes = derEcdsaToP1363(derSignature);
     return await crypto.subtle.verify(
       { name: "ECDSA", hash: "SHA-256" },
       pubKey,
-      sigBytes,
+      new Uint8Array(sigBytes).buffer,
       new TextEncoder().encode(canonical),
     );
   } catch {
