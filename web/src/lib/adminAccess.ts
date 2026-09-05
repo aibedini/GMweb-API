@@ -25,7 +25,7 @@ async function responseError(res: Response): Promise<Error> {
   return new Error(detail || `HTTP ${res.status}`);
 }
 
-export async function loginWithAdminToken(token: string): Promise<void> {
+export async function loginWithPwaToken(token: string): Promise<void> {
   const res = await fetch("/api/v1/pwa/token-login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

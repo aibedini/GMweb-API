@@ -4,20 +4,14 @@ const crypto = require("node:crypto");
 
 const RECOVERY_CAPABILITIES = [
   "READ_MESSAGES",
-  "SEND_MESSAGES",
   "READ_PAIRING_DIAGNOSTICS",
 ];
 
-function tokensMatch(actual, expected) {
-  if (!actual || !expected) return false;
-  const actualHash = crypto.createHash("sha256").update(String(actual)).digest();
-  const expectedHash = crypto.createHash("sha256").update(String(expected)).digest();
-  return crypto.timingSafeEqual(actualHash, expectedHash);
-}
-
-function recoveryDeviceId(request) {
-  const fingerprint = [request.ip || "", request.headers["user-agent"] || ""].join("\n");
-  return `pwa-admin-${crypto.createHash("sha256").update(fingerprint).digest("hex").slice(0, 16)}`;
+function recoveryDeviceId() {
+  // One revocable identity per successful token exchange. Avoid browser
+  // fingerprinting and avoid coupling two independent PWA sessions that
+  // happen to share an IP/User-Agent.
+  return `pwa-access-${crypto.randomBytes(12).toString("hex")}`;
 }
 
 function setLinkedCookie(reply, linkedSessions, token) {
@@ -31,12 +25,12 @@ function setLinkedCookie(reply, linkedSessions, token) {
 }
 
 /**
- * Admin recovery path for /web. The master token is exchanged once for the
- * same narrow HttpOnly linked-session cookie used by QR pairing. It never
- * authorizes the Android-only pairing lookup/approve routes.
+ * One-time PWA access path for /web. A dedicated, short-lived token is
+ * consumed once and exchanged for the same narrow HttpOnly linked-session
+ * cookie used by QR pairing. The master API token is intentionally rejected.
  */
 function registerPwaAuthRoutes(app, {
-  apiToken,
+  pwaAccessTokens,
   linkedSessions,
   checkRateLimit,
   loginMax = 10,
@@ -45,11 +39,12 @@ function registerPwaAuthRoutes(app, {
   app.post("/api/v1/pwa/token-login", {
     bodyLimit: 8 * 1024,
     schema: {
-      summary: "Exchange the GMweb master token for a restricted PWA session",
+      summary: "Consume a one-time PWA access token",
       description: [
-        "Secure QR alternative for the server owner. The token is verified once and is not stored by the PWA.",
-        "Success issues an HttpOnly, Secure, SameSite=Strict cookie restricted to message sync/send and pairing diagnostics.",
-        "This endpoint does not authorize Android pairing metadata or approval routes.",
+        "QR-independent access for the server owner using a dedicated token created in the dashboard.",
+        "The token is short-lived, stored as a SHA-256 hash, consumed once, and never stored by the PWA.",
+        "Success issues an HttpOnly, Secure, SameSite=Strict cookie restricted to read-only message sync and pairing diagnostics.",
+        "The GMweb master API token and project API keys are not accepted here.",
       ].join("\n"),
       tags: ["Pairing"],
       security: [],
@@ -85,18 +80,18 @@ function registerPwaAuthRoutes(app, {
       return;
     }
 
-    const submittedToken = request.body.token;
-    if (!tokensMatch(submittedToken, apiToken)) {
+    const deviceId = recoveryDeviceId();
+    const access = pwaAccessTokens.consume(request.body.token, deviceId);
+    if (!access) {
       request._pairingDiagnostic = {
         stage: "PWA_TOKEN_LOGIN",
         status: "FAILED",
-        reason: "invalid_admin_token",
+        reason: "invalid_or_expired_pwa_token",
       };
-      reply.code(401).send({ error: "unauthorized", reason: "invalid_admin_token" });
+      reply.code(401).send({ error: "unauthorized", reason: "invalid_or_expired_pwa_token" });
       return;
     }
 
-    const deviceId = recoveryDeviceId(request);
     const token = linkedSessions.issue(deviceId, RECOVERY_CAPABILITIES);
     setLinkedCookie(reply, linkedSessions, token);
     request._pairingDiagnostic = {
@@ -107,10 +102,53 @@ function registerPwaAuthRoutes(app, {
     };
     return {
       ok: true,
-      access: "ADMIN_TOKEN_RECOVERY",
+      access: "ONE_TIME_PWA_TOKEN",
       expiresInSeconds: Math.floor(linkedSessions.SESSION_TTL_MS / 1000),
     };
   });
 }
 
-module.exports = { RECOVERY_CAPABILITIES, registerPwaAuthRoutes, tokensMatch };
+function registerPwaTokenAdminRoutes(app, { pwaAccessTokens, linkedSessions }) {
+  app.get("/admin/pwa-access-tokens", {
+    schema: { summary: "List one-time PWA access tokens", tags: ["PWA Access"] },
+  }, async () => ({ tokens: pwaAccessTokens.list() }));
+
+  app.post("/admin/pwa-access-tokens", {
+    schema: {
+      summary: "Create a one-time PWA access token",
+      tags: ["PWA Access"],
+      body: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          label: { type: "string", minLength: 1, maxLength: 64 },
+          expiresInMinutes: { type: "integer", minimum: 1, maximum: 1440, default: 15 },
+        },
+      },
+    },
+  }, async (request) => ({
+    ok: true,
+    token: pwaAccessTokens.create({
+      label: request.body?.label || "Browser",
+      ttlMs: (request.body?.expiresInMinutes || 15) * 60_000,
+    }),
+  }));
+
+  app.delete("/admin/pwa-access-tokens/:id", {
+    schema: {
+      summary: "Revoke a PWA access token and its browser session",
+      tags: ["PWA Access"],
+      params: { type: "object", required: ["id"], properties: { id: { type: "string" } } },
+    },
+  }, async (request, reply) => {
+    const revoked = pwaAccessTokens.revoke(request.params.id);
+    if (!revoked) {
+      reply.code(404).send({ error: "not_found" });
+      return;
+    }
+    if (revoked.deviceId) linkedSessions.revokeDevice(revoked.deviceId);
+    return { ok: true };
+  });
+}
+
+module.exports = { RECOVERY_CAPABILITIES, registerPwaAuthRoutes, registerPwaTokenAdminRoutes };

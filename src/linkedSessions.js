@@ -45,7 +45,7 @@ function resolve(token) {
   if (!token) return null;
   const session = sessions.get(hashToken(token));
   if (session) touch(token);
-  return session;
+  return session || null;
 }
 
 /** Revoke everything for a device (Android DEVICE_REVOKED). */

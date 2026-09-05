@@ -12,6 +12,7 @@ import {
   MessageSquare,
   Settings2,
   History,
+  ShieldCheck,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -28,6 +29,7 @@ import { VncPage } from "@/pages/Vnc";
 import { LogsPage } from "@/pages/Logs";
 import { SettingsPage } from "@/pages/Settings";
 import { HistoryPage } from "@/pages/HistoryPage";
+import { PwaAccessPage } from "@/pages/PwaAccess";
 
 const NAV = [
   { id: "overview", label: "Overview", icon: Activity, el: <OverviewPage /> },
@@ -36,6 +38,7 @@ const NAV = [
   { id: "history", label: "History", icon: History, el: <HistoryPage /> },
   { id: "conversations", label: "Conversations", icon: MessagesSquare, el: <ConversationsPage /> },
   { id: "apikeys", label: "API Keys", icon: KeyRound, el: <ApiKeysPage /> },
+  { id: "pwa-access", label: "PWA Access", icon: ShieldCheck, el: <PwaAccessPage /> },
   { id: "controls", label: "Controls", icon: SlidersHorizontal, el: <ControlsPage /> },
   { id: "vnc", label: "VNC", icon: Monitor, el: <VncPage /> },
   { id: "logs", label: "Logs", icon: ScrollText, el: <LogsPage /> },

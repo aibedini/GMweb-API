@@ -83,11 +83,12 @@ const { EventStore } = require("./eventStore");
 const { WebPushService } = require("./webPush");
 const { PasskeyService } = require("./passkeys");
 const { AgentAuthService } = require("./agentAuth");
+const { PwaAccessTokenStore } = require("./pwaAccessTokens");
 const pairingGate = require("./pairingGate");
 const { registerAgentIdentityRoutes } = require("./agentIdentityRoutes");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const { registerPairingRoutes } = require("./pairingRoutes");
-const { registerPwaAuthRoutes } = require("./pwaAuthRoutes");
+const { registerPwaAuthRoutes, registerPwaTokenAdminRoutes } = require("./pwaAuthRoutes");
 const pairingSessions = require("./pairingSessions");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
@@ -122,6 +123,7 @@ const eventStore = new EventStore(controlDb, {
     void webPushService.notifySyncAvailable(count).catch(() => {});
   },
 });
+const pwaAccessTokens = new PwaAccessTokenStore(controlDb);
 const webPushService = new WebPushService(controlDb, {
   vapidKeyPath: path.join(config.rootDir, "data", "webpush-vapid.json"),
 });
@@ -625,9 +627,9 @@ function requireToken(request, reply, done) {
   // session exists — status, both option generators, and the auth verify.
   // The verify handlers themselves gate on challenge single-use + UV flag.
   if (requestPath(request.url).startsWith("/api/v1/auth/")) return done();
-  // Public only in the routing sense: this exact endpoint performs its own
-  // constant-time master-token verification and rate limiting before issuing
-  // a restricted HttpOnly PWA session.
+  // Public only in the routing sense: this exact endpoint consumes its own
+  // dedicated one-time PWA token and rate-limits attempts before issuing a
+  // restricted HttpOnly session. Master/project API tokens are rejected.
   if (requestPath(request.url) === "/api/v1/pwa/token-login") return done();
   // ADR-007 P0-1 (security fix): EXACTLY two pairing surfaces are reachable
   // without a session — the unlinked browser's create/status calls. They are
@@ -2773,12 +2775,13 @@ registerPairingRoutes(app, {
 });
 
 registerPwaAuthRoutes(app, {
-  apiToken: config.apiToken,
+  pwaAccessTokens,
   linkedSessions,
   checkRateLimit,
   loginMax: Math.min(config.dashboardLoginMax, 10),
   loginWindowMs: config.dashboardLoginWindowMs,
 });
+registerPwaTokenAdminRoutes(app, { pwaAccessTokens, linkedSessions });
 
 app.get("/api/v1/pairing/diagnostics", {
   schema: {

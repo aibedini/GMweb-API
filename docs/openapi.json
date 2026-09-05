@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.13.11",
+    "version": "0.13.12",
     "contact": {
       "name": "GMweb API"
     }
@@ -2258,11 +2258,11 @@
     },
     "/api/v1/pwa/token-login": {
       "post": {
-        "summary": "Exchange the GMweb master token for a restricted PWA session",
+        "summary": "Consume a one-time PWA access token",
         "tags": [
           "Pairing"
         ],
-        "description": "Secure QR alternative for the server owner. The token is verified once and is not stored by the PWA.\nSuccess issues an HttpOnly, Secure, SameSite=Strict cookie restricted to message sync/send and pairing diagnostics.\nThis endpoint does not authorize Android pairing metadata or approval routes.",
+        "description": "QR-independent access for the server owner using a dedicated token created in the dashboard.\nThe token is short-lived, stored as a SHA-256 hash, consumed once, and never stored by the PWA.\nSuccess issues an HttpOnly, Secure, SameSite=Strict cookie restricted to read-only message sync and pairing diagnostics.\nThe GMweb master API token and project API keys are not accepted here.",
         "requestBody": {
           "required": true,
           "content": {
@@ -2342,6 +2342,77 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/admin/pwa-access-tokens": {
+      "get": {
+        "summary": "List one-time PWA access tokens",
+        "tags": [
+          "PWA Access"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a one-time PWA access token",
+        "tags": [
+          "PWA Access"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "label": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "expiresInMinutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1440,
+                    "default": 15
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/admin/pwa-access-tokens/{id}": {
+      "delete": {
+        "summary": "Revoke a PWA access token and its browser session",
+        "tags": [
+          "PWA Access"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
           }
         }
       }

@@ -1,52 +1,32 @@
 import { useEffect, useMemo, useState } from "react";
-import {
-  Button,
-  Card,
-  CardContent,
-  Chip,
-  ScrollShadow,
-  Separator,
-  Spinner,
-  Tab,
-  TabList,
-  TabPanel,
-  Tabs,
-} from "@heroui/react";
+import { Button, Card, CardContent, Chip, ScrollShadow, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
 import { syncNow, listRecentEvents, getCursor, resetLocal, subscribeSyncAvailable, type StoredEvent } from "../lib/sync";
-import { buildConversations, eventsForAggregate, renderMessage } from "../lib/inbox";
+import { buildConversations, messagesForAggregate, eventDecodeState } from "../lib/inbox";
 import { fetchTrustSnapshot, health, type TrustSnapshot } from "../lib/api";
-import {
-  listCredentials,
-  removeCredential,
-  listAgentIdentities,
-  listPushSubscriptions,
-  type CredentialRow,
-  type IdentityRow,
-} from "../lib/security";
-import {
-  pushSupported,
-  subscribeToPush,
-  unsubscribeFromPush,
-  removeSubscriptionFromServer,
-} from "../lib/push";
+import { listCredentials, removeCredential, listAgentIdentities, listPushSubscriptions, type CredentialRow, type IdentityRow } from "../lib/security";
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
 import { fetchPairingDiagnostics, type PairingDiagnostic } from "../lib/adminAccess";
 
-// ADR-007 §1: first-run is LINKED-DEVICE pairing, never passkey bootstrap.
-// Until the user pairs (or holds a valid linked-device session), the app
-// shows the QR pairing screen. Passkey stays available later behind
-// Security Center (§7) — never as a first-run gate.
+type TabKey = "inbox" | "connection" | "security" | "debug";
 
-type TabKey = "inbox" | "sync" | "trust" | "security" | "debug";
+function shortId(value: string | null | undefined) {
+  return value ? `${value.slice(0, 8)}…` : "—";
+}
 
-const TYPE_COLOR: Record<string, "default" | "success" | "warning" | "danger" | "accent"> = {
-  MESSAGE_CREATED: "accent",
-  MESSAGE_STATUS_CHANGED: "warning",
-  MESSAGE_DELETED: "danger",
-  THREAD_READ: "success",
-};
+function formatTime(value: number) {
+  const date = new Date(value);
+  const today = new Date();
+  return date.toDateString() === today.toDateString()
+    ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function Avatar({ title }: { title: string }) {
+  const initials = title.replace(/^Conversation\s+/, "").slice(0, 2).toUpperCase();
+  return <div className="avatar" aria-hidden="true">{initials}</div>;
+}
 
 export default function App() {
   const [tab, setTab] = useState<TabKey>("inbox");
@@ -56,152 +36,102 @@ export default function App() {
   const [applied, setApplied] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [trust, setTrust] = useState<TrustSnapshot | null>(null);
-  const [version, setVersion] = useState<string>("");
-  const [pushState, setPushState] = useState<string>("");
-  // POST-PAIR state machine (ticket): UNLINKED → PAIRING_APPROVED →
-  // CERTIFICATE_VERIFIED → CREATING_LINKED_SESSION → BOOTSTRAPPING_SYNC →
-  // READY. `authed` now MEANS "linked-device session cookie valid".
+  const [version, setVersion] = useState("");
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [bootstrapState, setBootstrapState] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
   const [credentials, setCredentials] = useState<CredentialRow[] | null>(null);
   const [identities, setIdentities] = useState<IdentityRow[] | null>(null);
   const [pushCount, setPushCount] = useState<number | null>(null);
-  const [securityErr, setSecurityErr] = useState<string | null>(null);
   const [pairingDiagnostics, setPairingDiagnostics] = useState<PairingDiagnostic[] | null>(null);
   const scriptFile = useMemo(() => loadedScriptFile(), []);
 
   const refresh = async () => {
-    setCursor(await getCursor());
-    setEvents(await listRecentEvents(300));
-    setTrust(await fetchTrustSnapshot());
+    const [nextCursor, nextEvents, nextTrust] = await Promise.all([getCursor(), listRecentEvents(500), fetchTrustSnapshot()]);
+    setCursor(nextCursor);
+    setEvents(nextEvents);
+    setTrust(nextTrust);
+  };
+
+  const refreshSecurity = async () => {
+    const [nextCredentials, nextIdentities, pushes] = await Promise.all([
+      listCredentials().catch(() => null),
+      listAgentIdentities().catch(() => null),
+      listPushSubscriptions().catch(() => null),
+    ]);
+    setCredentials(nextCredentials);
+    setIdentities(nextIdentities);
+    setPushCount(pushes?.count ?? null);
   };
 
   useEffect(() => {
-    void (async () => {
-      try {
-        setVersion((await health()).version);
-      } catch {
-        setVersion("unreachable");
-      }
-      // POST-PAIR: linked state comes from the linked-device session cookie
-      // (GET /api/v1/linked-session). A global passkey existing on the
-      // account does NOT mean THIS browser is trusted.
-      try {
-        const res = await fetch("/api/v1/linked-session", { credentials: "include" });
-        const st = await res.json();
-        setAuthed(st.authenticated === true);
-      } catch {
-        setAuthed(false);
-      }
-    })();
+    void health().then((value) => setVersion(value.version)).catch(() => setVersion("unreachable"));
+    void fetch("/api/v1/linked-session", { credentials: "include" })
+      .then((response) => response.json())
+      .then((session) => setAuthed(session.authenticated === true))
+      .catch(() => setAuthed(false));
   }, []);
 
-  // SSE + sync bootstrap ONLY when linkedSessionReady — never before auth.
   useEffect(() => {
     if (!authed) return;
-    void (async () => {
-      try {
-        setBootstrapState("BOOTSTRAPPING_SYNC");
-        await syncNow();
-        await refresh();
-        setBootstrapState("READY");
-      } catch {
-        setBootstrapState(null);
-      }
-    })();
-    // §44 realtime invalidation — narrow signal; cursor sync catches up.
-    const dispose = subscribeSyncAvailable((applied) => {
-      setApplied(applied);
+    setBootstrapState("BOOTSTRAPPING_SYNC");
+    void syncNow().then(refresh).then(() => setBootstrapState("READY")).catch(() => setBootstrapState(null));
+    void refreshSecurity();
+    void fetchPairingDiagnostics().then(setPairingDiagnostics).catch(() => setPairingDiagnostics(null));
+    return subscribeSyncAvailable((count) => {
+      setApplied(count);
       void refresh();
     });
-    return dispose;
   }, [authed]);
+
+  const conversations = useMemo(() => buildConversations(events), [events]);
+  const filteredConversations = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase();
+    if (!query) return conversations;
+    return conversations.filter((item) => `${item.title}\n${item.preview}`.toLocaleLowerCase().includes(query));
+  }, [conversations, search]);
+
+  useEffect(() => {
+    if (!selected && conversations[0]) setSelected(conversations[0].aggregateId);
+  }, [conversations, selected]);
+
+  const selectedConversation = conversations.find((item) => item.aggregateId === selected) || null;
+  const messages = useMemo(() => selected ? messagesForAggregate(events, selected) : [], [events, selected]);
 
   const pull = async () => {
     setBusy(true);
     setError(null);
     try {
-      const n = await syncNow();
-      setApplied(n);
+      const count = await syncNow();
+      setApplied(count);
       await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);
     }
   };
 
-  const conversations = useMemo(() => buildConversations(events), [events]);
-  const selectedEvents = useMemo(
-    () => (selected ? eventsForAggregate(events, selected) : []),
-    [events, selected],
-  );
-
-  const refreshSecurity = async () => {
-    setSecurityErr(null);
-    try {
-      setCredentials(await listCredentials());
-    } catch { setCredentials(null); }
-    try {
-      setIdentities(await listAgentIdentities());
-    } catch { setIdentities(null); }
-    try {
-      setPushCount((await listPushSubscriptions()).count);
-    } catch { setPushCount(null); }
-  };
-
-  useEffect(() => {
-    if (authed) void refreshSecurity();
-  }, [authed]);
-
-  useEffect(() => {
-    if (!authed) return;
-    void fetchPairingDiagnostics().then(setPairingDiagnostics).catch(() => setPairingDiagnostics(null));
-  }, [authed]);
-
-  // ADR-007 §1 state machine: UNLINKED → SHOW_QR → PAIRING_PENDING →
-  // PAIRING_APPROVED → READY. The old passkey gate (authed === false →
-  // "Create a passkey…") is REMOVED: passkey is optional post-pairing
-  // hardening behind Security Center, never the bootstrap of trust.
   if (authed === false || authed === null) {
     return (
       <PairingScreen
         apiVersion={version || "checking"}
         pwaVersion={PWA_BUILD_VERSION}
         scriptFile={scriptFile}
-        onLinked={async (link?: { pairingSessionId: string; pollSecret: string; deviceId: string; certificate: string; origin: string }) => {
-          // CERTIFICATE_VERIFIED already happened in pairing.wait(). Now:
-          // prove key possession → HttpOnly session → sync bootstrap.
+        onLinked={async (link) => {
+          if (!link) throw new Error("Pairing approval context is missing");
           setBootstrapState("CREATING_LINKED_SESSION");
-          try {
-            if (!link) throw new Error("Pairing approval context is missing");
-            await completeLinkedSession(
-              link.pairingSessionId, link.pollSecret, link.deviceId,
-              link.certificate, link.origin,
-            );
-            // Prove the Set-Cookie response was stored and resolves server-side;
-            // do not render the linked UI from an optimistic local flag.
-            const probe = await fetch("/api/v1/linked-session", { credentials: "include" });
-            const session = await probe.json().catch(() => ({}));
-            if (!probe.ok || session.authenticated !== true) {
-              throw new Error("Linked session cookie was not established");
-            }
-            setBootstrapState("LINKED_SESSION_CREATED");
-            setAuthed(true);
-          } catch (e) {
-            setBootstrapState(null);
-            // PairingScreen owns the visible pre-auth error state.
-            throw e instanceof Error ? e : new Error(String(e));
-          }
+          await completeLinkedSession(link.pairingSessionId, link.pollSecret, link.deviceId, link.certificate, link.origin);
+          const probe = await fetch("/api/v1/linked-session", { credentials: "include" });
+          const session = await probe.json().catch(() => ({}));
+          if (!probe.ok || session.authenticated !== true) throw new Error("Linked session cookie was not established");
+          setAuthed(true);
         }}
         onRecoveryLinked={async () => {
           const probe = await fetch("/api/v1/linked-session", { credentials: "include" });
           const session = await probe.json().catch(() => ({}));
-          if (!probe.ok || session.authenticated !== true) {
-            throw new Error("Restricted PWA session cookie was not established");
-          }
-          setBootstrapState("LINKED_SESSION_CREATED");
+          if (!probe.ok || session.authenticated !== true) throw new Error("Restricted PWA session cookie was not established");
           setAuthed(true);
         }}
       />
@@ -209,403 +139,95 @@ export default function App() {
   }
 
   return (
-    <div className="mx-auto flex h-full max-w-5xl flex-col">
-      <header className="flex items-center justify-between border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
-        <h1 className="text-lg font-semibold">Messages</h1>
-        <div className="flex items-center gap-3">
-          <span className="text-xs" style={{ color: "var(--muted-fg)" }} title={`PWA ${PWA_BUILD_VERSION} · ${scriptFile}`}>
-            API {version} · PWA {PWA_BUILD_VERSION} · {scriptFile}
-          </span>
-          {bootstrapState && bootstrapState !== "READY" && (
-            <Chip size="sm" variant="soft">
-              {bootstrapState === "CREATING_LINKED_SESSION" ? "Linking…" : "Syncing…"}
-            </Chip>
-          )}
-          <Chip size="sm" variant="soft" color={cursor > 0 ? "success" : "default"}>
-            cursor {cursor}
-          </Chip>
-          <Button size="sm" variant="tertiary" onPress={() => void pull()} isDisabled={busy}>
-            {busy ? <Spinner size="sm" /> : "Sync"}
-          </Button>
-          <Button size="sm" variant="ghost" onPress={() => setAuthed(false)}>
-            Lock
-          </Button>
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand-mark">M</div>
+        <div className="brand-copy"><strong>Messages</strong><span>GMweb companion</span></div>
+        <div className="topbar-actions">
+          <span className="version-pill" title={`${scriptFile} · cursor ${cursor}`}>v{version || "…"}</span>
+          <span className={`connection-dot ${version === "unreachable" ? "offline" : ""}`} />
+          <span className="connection-label">{version === "unreachable" ? "Offline" : "Connected"}</span>
+          <Button className="topbar-button" size="sm" variant="ghost" onPress={() => void pull()} isDisabled={busy}>{busy ? <Spinner size="sm" /> : "Sync"}</Button>
+          <Button className="topbar-button" size="sm" variant="ghost" onPress={() => setAuthed(false)}>Lock</Button>
         </div>
       </header>
 
-      <Tabs
-        selectedKey={tab}
-        onSelectionChange={(k) => setTab(k as TabKey)}
-        className="px-4 pt-2"
-      >
-        <TabList>
-          <Tab id="inbox">Inbox</Tab>
-          <Tab id="sync">Sync</Tab>
-          <Tab id="trust">Trust</Tab>
+      <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(key as TabKey)} className="app-tabs">
+        <TabList className="tab-list" aria-label="Messages navigation">
+          <Tab id="inbox">Messages</Tab>
+          <Tab id="connection">Connection</Tab>
           <Tab id="security">Security</Tab>
           <Tab id="debug">Debug</Tab>
         </TabList>
 
-        {/* ── Inbox (§48/§49) ──────────────────────────────────────────── */}
-        <TabPanel id="inbox">
-          <div className="flex min-h-0 gap-3 py-3" style={{ height: "calc(100vh - 170px)" }}>
-            {/* Conversation list */}
-            <ScrollShadow className="w-72 shrink-0 rounded-xl border" style={{ borderColor: "var(--border)" }}>
-              {conversations.length === 0 && (
-                <p className="p-4 text-xs" style={{ color: "var(--muted-fg)" }}>
-                  No conversations yet — events arrive from the Android agent.
-                </p>
-              )}
-              {conversations.map((c) => (
-                <button
-                  key={c.aggregateId}
-                  onClick={() => setSelected(c.aggregateId)}
-                  className="w-full border-b px-3 py-2 text-left hover:opacity-80"
-                  style={{
-                    borderColor: "var(--border)",
-                    background: selected === c.aggregateId ? "var(--card)" : "transparent",
-                  }}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-sm font-medium" title={c.aggregateId}>
-                      {c.aggregateId}
-                    </span>
-                    <Chip size="sm" variant="soft" color={TYPE_COLOR[c.lastType] || "default"}>
-                      {c.eventCount}
-                    </Chip>
-                  </div>
-                  <div className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
-                    #{c.lastSequence} · {c.lastType}
-                  </div>
-                </button>
-              ))}
-            </ScrollShadow>
+        <TabPanel id="inbox" className="inbox-panel">
+          <div className="inbox-layout">
+            <aside className="conversation-pane">
+              <div className="pane-heading"><div><p className="eyebrow">Inbox</p><h1>Conversations</h1></div><Chip size="sm" variant="soft">{conversations.length}</Chip></div>
+              <label className="search-box"><span aria-hidden="true">⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search messages" aria-label="Search messages" /></label>
+              <ScrollShadow className="conversation-list">
+                {filteredConversations.map((item) => (
+                  <button key={item.aggregateId} className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => setSelected(item.aggregateId)}>
+                    <Avatar title={item.title} />
+                    <span className="conversation-copy"><span className="conversation-title">{item.title}</span><span className="conversation-preview">{item.preview}</span></span>
+                    <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time></span>
+                  </button>
+                ))}
+                {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : "Waiting for messages from Android"}</p></div>}
+              </ScrollShadow>
+            </aside>
 
-            {/* Conversation timeline (§49) */}
-            <Card className="min-w-0 flex-1">
-              <CardContent className="flex h-full flex-col">
-                {!selected && (
-                  <div className="flex flex-1 items-center justify-center text-sm" style={{ color: "var(--muted-fg)" }}>
-                    Select a conversation to view its event timeline.
-                  </div>
-                )}
-                {selected && (
-                  <>
-                    <div className="flex items-center justify-between border-b pb-2" style={{ borderColor: "var(--border)" }}>
-                      <span className="truncate text-sm font-semibold" title={selected}>
-                        {selected}
-                      </span>
-                      <Chip size="sm" variant="soft" color="accent">
-                        {selectedEvents.length} events
-                      </Chip>
-                    </div>
-                    <ScrollShadow className="min-h-0 flex-1 py-2">
-                      {selectedEvents.map((ev) => (
-                        <div key={ev.sequence} className="mb-2 flex justify-end">
-                          <div
-                            className="max-w-[80%] rounded-2xl px-3 py-2 text-xs"
-                            style={{ background: "var(--accent)", color: "white" }}
-                          >
-                            <div className="mb-1 font-mono opacity-80">#{ev.sequence} · {ev.type}</div>
-                            {renderMessage(ev)}
-                          </div>
-                        </div>
-                      ))}
-                    </ScrollShadow>
-                  </>
-                )}
-              </CardContent>
-            </Card>
-          </div>
-        </TabPanel>
-
-        {/* ── Sync ─────────────────────────────────────────────────────── */}
-        <TabPanel id="sync">
-          <div className="space-y-3 py-3">
-            <Card>
-              <CardContent className="flex items-center justify-between p-4">
-                <div>
-                  <p className="text-sm font-medium">Cursor sync (§54)</p>
-                  <p className="text-xs" style={{ color: "var(--muted-fg)" }}>
-                    local cursor: <code>{cursor}</code> — opaque ciphertext events
-                  </p>
-                </div>
-                <Button variant="primary" onPress={() => void pull()} isDisabled={busy}>
-                  {busy ? "Syncing…" : "Sync now"}
-                </Button>
-              </CardContent>
-            </Card>
-            {applied !== null && (
-              <p className="text-xs" style={{ color: "var(--ok)" }}>applied {applied} event(s) transactionally</p>
-            )}
-            {error && (
-              <p className="text-xs" style={{ color: "var(--danger)" }}>{error}</p>
-            )}
-            <Separator />
-            <ScrollShadow className="max-h-96 rounded-xl border" style={{ borderColor: "var(--border)" }}>
-              {events.slice(0, 30).map((ev) => (
-                <div key={ev.sequence} className="border-b px-3 py-2 text-xs last:border-b-0" style={{ borderColor: "var(--border)" }}>
-                  <div className="flex justify-between">
-                    <span className="font-mono font-semibold">#{ev.sequence}</span>
-                    <Chip size="sm" variant="soft" color={TYPE_COLOR[ev.type] || "default"}>{ev.type}</Chip>
-                  </div>
-                  <div className="truncate font-mono" style={{ color: "var(--muted-fg)" }}>
-                    {ev.ciphertext.slice(0, 44)}…
-                  </div>
-                </div>
-              ))}
-            </ScrollShadow>
-          </div>
-        </TabPanel>
-
-        {/* ── Trust ───────────────────────────────────────────────────── */}
-        <TabPanel id="trust">
-          <Card className="my-3">
-            <CardContent className="p-4">
-              <p className="text-sm font-medium">Signed Trust Registry (ADR-001)</p>
-              {!trust && (
-                <p className="mt-2 text-xs" style={{ color: "var(--muted-fg)" }}>
-                  No snapshot yet — the Android trust root has not published one.
-                </p>
-              )}
-              {trust && (
-                <dl className="mt-3 space-y-1 text-xs">
-                  <div className="flex justify-between">
-                    <dt style={{ color: "var(--muted-fg)" }}>trustSequence</dt>
-                    <dd className="font-mono">{trust.trustSequence}</dd>
-                  </div>
-                  <div className="flex justify-between gap-4">
-                    <dt style={{ color: "var(--muted-fg)" }}>rootPublicKey</dt>
-                    <dd className="truncate font-mono" title={trust.rootPublicKey}>
-                      {trust.rootPublicKey.slice(0, 24)}…
-                    </dd>
-                  </div>
-                  <div className="flex justify-between">
-                    <dt style={{ color: "var(--muted-fg)" }}>updatedAt</dt>
-                    <dd className="font-mono">{new Date(trust.updatedAt).toLocaleString()}</dd>
-                  </div>
-                </dl>
-              )}
-            </CardContent>
-          </Card>
-        </TabPanel>
-
-        {/* ── Security Center (§84) ───────────────────────────────────── */}
-        <TabPanel id="security">
-          <div className="space-y-3 py-3">
-            {securityErr && (
-              <p className="text-xs" style={{ color: "var(--danger)" }}>{securityErr}</p>
-            )}
-
-            <Card>
-              <CardContent className="p-4">
-                <p className="text-sm font-medium">Passkeys (§21)</p>
-                {!credentials && (
-                  <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
-                    Sign in to view enrolled passkeys.
-                  </p>
-                )}
-                {credentials && credentials.length === 0 && (
-                  <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
-                    No passkeys enrolled yet.
-                  </p>
-                )}
-                {credentials && credentials.length > 0 && (
-                  <ul className="mt-2 space-y-2">
-                    {credentials.map((c) => (
-                      <li key={c.credentialId} className="flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs" style={{ borderColor: "var(--border)" }}>
-                        <div className="min-w-0">
-                          <div className="font-mono">{c.label || c.credentialId.slice(0, 20) + "…"}</div>
-                          <div style={{ color: "var(--muted-fg)" }}>
-                            added {new Date(c.createdAt).toLocaleDateString()}
-                            {c.lastUsedAt ? ` · last used ${new Date(c.lastUsedAt).toLocaleDateString()}` : " · never used"}
-                          </div>
-                        </div>
-                        <Button
-                          size="sm"
-                          variant="danger"
-                          onPress={() =>
-                            void (async () => {
-                              try {
-                                await removeCredential(c.credentialId);
-                                await refreshSecurity();
-                              } catch (e) {
-                                setSecurityErr(e instanceof Error ? e.message : "remove failed");
-                              }
-                            })()
-                          }
-                        >
-                          Remove
-                        </Button>
-                      </li>
+            <main className="message-pane">
+              {selectedConversation ? (
+                <>
+                  <div className="message-header"><Avatar title={selectedConversation.title} /><div><h2>{selectedConversation.title}</h2><p>Synced from Android · {shortId(selectedConversation.aggregateId)}</p></div></div>
+                  <ScrollShadow className="message-scroll">
+                    <div className="message-day"><span>Message history</span></div>
+                    {messages.map(({ event, payload }) => (
+                      <div key={event.sequence} className={`message-line ${payload.direction}`}>
+                        <div className="message-bubble"><p>{payload.body}</p><span>{formatTime(payload.dateMs)}{payload.direction === "out" ? " · Sent" : ""}</span></div>
+                      </div>
                     ))}
-                  </ul>
-                )}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardContent className="p-4">
-                <p className="text-sm font-medium">Android Agent Identities (ADR-001)</p>
-                {!identities && (
-                  <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
-                    Unavailable (auth required) or none enrolled.
-                  </p>
-                )}
-                {identities && identities.length === 0 && (
-                  <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
-                    No agent has enrolled per-device keys yet (agents auto-enroll on next registration).
-                  </p>
-                )}
-                {identities && identities.length > 0 && (
-                  <ul className="mt-2 space-y-1 text-xs">
-                    {identities.map((i) => (
-                      <li key={i.device_id} className="flex items-center justify-between rounded-lg border px-3 py-2" style={{ borderColor: "var(--border)" }}>
-                        <span className="font-mono">{i.device_id}</span>
-                        <span style={{ color: "var(--muted-fg)" }}>
-                          v{i.protocol_version} · {new Date(i.registered_at).toLocaleDateString()}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardContent className="p-4">
-                <p className="text-sm font-medium">Push Subscriptions (§89)</p>
-                <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
-                  {pushCount === null
-                    ? "Unavailable (auth required)."
-                    : `${pushCount} device(s) registered for content-less wake-ups.`}
-                </p>
-              </CardContent>
-            </Card>
+                    {messages.length === 0 && (
+                      <div className="empty-conversation"><div className="empty-icon">↻</div><h3>No readable message body yet</h3><p>This thread only contains older status events. New Android message events appear here as normal chat bubbles.</p></div>
+                    )}
+                  </ScrollShadow>
+                  <div className="composer-disabled"><span>Messages are read-only in this release</span><Chip size="sm" variant="soft" color="success">Synced</Chip></div>
+                </>
+              ) : (
+                <div className="empty-conversation"><div className="empty-icon">✦</div><h3>Your messages, without the debug noise</h3><p>Select a conversation when Android sync data arrives.</p></div>
+              )}
+            </main>
           </div>
         </TabPanel>
 
-        {/* ── Debug ───────────────────────────────────────────────────── */}
-        <TabPanel id="debug">
-          <div className="space-y-3 py-3">
-            <Card>
-              <CardContent className="p-4 text-sm">
-                <div className="flex items-center justify-between gap-3">
-                  <div>
-                    <p className="font-medium">Pairing diagnostics</p>
-                    <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
-                      Sanitized stages and reasons. Device/session IDs are hashed; tokens, signatures and certificates are never logged.
-                    </p>
-                  </div>
-                  <Button size="sm" variant="outline" onPress={() => void fetchPairingDiagnostics().then(setPairingDiagnostics).catch(() => setPairingDiagnostics(null))}>
-                    Refresh
-                  </Button>
-                </div>
-                {pairingDiagnostics === null ? (
-                  <p className="mt-3 text-xs" style={{ color: "var(--muted-fg)" }}>
-                    Detailed pairing logs require the restricted admin-token session or dashboard/master access.
-                  </p>
-                ) : pairingDiagnostics.length === 0 ? (
-                  <p className="mt-3 text-xs" style={{ color: "var(--muted-fg)" }}>No pairing events recorded yet.</p>
-                ) : (
-                  <div className="mt-3 max-h-64 space-y-2 overflow-y-auto">
-                    {pairingDiagnostics.map((row) => {
-                      const pairing = row.details?.pairing;
-                      return (
-                        <div key={row.id} className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--border)" }}>
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <b>{pairing?.stage || row.title}</b>
-                            <span style={{ color: row.statusCode >= 400 ? "var(--danger)" : "var(--ok)" }}>
-                              {pairing?.status || row.statusCode}
-                            </span>
-                          </div>
-                          <p className="mt-1" style={{ color: "var(--muted-fg)" }}>
-                            {new Date(row.ts).toLocaleString()} · {pairing?.reason || row.path}
-                            {pairing?.deviceIdHash ? ` · device ${pairing.deviceIdHash}` : ""}
-                            {pairing?.sessionIdHash ? ` · session ${pairing.sessionIdHash}` : ""}
-                          </p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardContent className="p-4 text-sm">
-                <p className="font-medium">Web Push (§45)</p>
-                <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
-                  Content-less wake-ups only (§30 default). Permission is requested
-                  only by this explicit click.
-                </p>
-                <div className="mt-3 flex gap-2">
-                  <Button
-                    size="sm"
-                    variant="primary"
-                    onPress={() =>
-                      void (async () => {
-                        setPushState("…");
-                        try {
-                          if (!pushSupported()) { setPushState("unsupported browser"); return; }
-                          const res = await fetch("/api/v1/push/public-key");
-                          const { publicKey } = (await res.json()) as { publicKey: string };
-                          const sub = await subscribeToPush(publicKey);
-                          if (!sub) { setPushState("permission denied / unsupported"); return; }
-                          const ok = await fetch("/api/v1/push/subscribe", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify(sub.toJSON()),
-                          }).then((r) => r.ok);
-                          setPushState(ok ? "subscribed ✓" : "subscribe upload failed");
-                        } catch (e) {
-                          setPushState(e instanceof Error ? e.message : "error");
-                        }
-                      })()
-                    }
-                  >
-                    Enable push
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onPress={() =>
-                      void (async () => {
-                        const reg = await navigator.serviceWorker?.getRegistration("/web/");
-                        const sub = await reg?.pushManager.getSubscription();
-                        if (sub) {
-                          await removeSubscriptionFromServer(sub.endpoint);
-                          await unsubscribeFromPush();
-                        }
-                        setPushState("unsubscribed");
-                      })()
-                    }
-                  >
-                    Disable
-                  </Button>
-                </div>
-                {pushState && <p className="mt-2 text-xs" style={{ color: "var(--ok)" }}>{pushState}</p>}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardContent className="p-4 text-sm">
-                <p className="font-medium">Local store</p>
-                <p className="mt-1 text-xs" style={{ color: "var(--muted-fg)" }}>
-                  IndexedDB «gmweb-messages» — events + cursor. Server sequences are
-                  the truth; reset never loses data.
-                </p>
-                <Button
-                  size="sm"
-                  variant="danger"
-                  className="mt-3"
-                  onPress={() => void (async () => { await resetLocal(); await refresh(); setApplied(null); })()}
-                >
-                  Reset local cache
-                </Button>
-              </CardContent>
-            </Card>
+        <TabPanel id="connection" className="content-panel">
+          <div className="page-title"><p className="eyebrow">System</p><h1>Connection</h1><p>Live state of the PWA, Android sync and trust registry.</p></div>
+          <div className="status-grid">
+            <Card><CardContent className="status-card"><span>API</span><strong>{version}</strong><Chip size="sm" color={version === "unreachable" ? "danger" : "success"} variant="soft">{version === "unreachable" ? "offline" : "healthy"}</Chip></CardContent></Card>
+            <Card><CardContent className="status-card"><span>PWA build</span><strong>{PWA_BUILD_VERSION}</strong><small>{scriptFile}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Sync cursor</span><strong>{cursor}</strong><small>{applied === null ? "Ready" : `${applied} new event(s)`}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Trust sequence</span><strong>{trust?.trustSequence ?? "—"}</strong><small>{trust ? "Android trust root present" : "Not published"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Payload protection</span><strong>{events.some((event) => event.cryptoVersion === 0) ? "Legacy v0" : "Encrypted"}</strong><small>{events.some((event) => event.cryptoVersion === 0) ? "Readable envelope; browser E2EE is not active" : "Browser key required"}</small></CardContent></Card>
           </div>
+          {bootstrapState && bootstrapState !== "READY" && <div className="notice">Finishing secure session setup: {bootstrapState}</div>}
+          {error && <div className="notice danger">{error}</div>}
+        </TabPanel>
+
+        <TabPanel id="security" className="content-panel">
+          <div className="page-title"><p className="eyebrow">Protection</p><h1>Security</h1><p>Credentials and identities visible to this linked browser.</p></div>
+          <div className="security-list">
+            <Card><CardContent className="security-row"><div><strong>Passkeys</strong><p>{credentials === null ? "Dashboard authentication required" : `${credentials.length} enrolled credential(s)`}</p></div>{credentials?.map((credential) => <Button key={credential.credentialId} size="sm" variant="ghost" onPress={() => void removeCredential(credential.credentialId).then(refreshSecurity)}>Remove {credential.label || shortId(credential.credentialId)}</Button>)}</CardContent></Card>
+            <Card><CardContent className="security-row"><div><strong>Android identities</strong><p>{identities === null ? "Unavailable" : `${identities.length} registered device(s)`}</p></div><Chip size="sm" variant="soft">{identities?.length ?? 0}</Chip></CardContent></Card>
+            <Card><CardContent className="security-row"><div><strong>Private push</strong><p>Notifications contain no sender or message text.</p></div><Chip size="sm" variant="soft">{pushCount ?? 0} subscription(s)</Chip></CardContent></Card>
+          </div>
+        </TabPanel>
+
+        <TabPanel id="debug" className="content-panel">
+          <div className="page-title"><p className="eyebrow">Diagnostics</p><h1>Debug</h1><p>Raw protocol details live here instead of inside the Inbox.</p></div>
+          <div className="debug-actions"><Button variant="secondary" onPress={() => void pull()} isDisabled={busy}>Sync now</Button><Button variant="ghost" onPress={() => void resetLocal().then(refresh)}>Reset local ciphertext</Button></div>
+          <Card><CardContent className="debug-list">{events.slice(0, 40).map((event) => <div key={event.sequence}><code>#{event.sequence}</code><span>{event.type}</span><Chip size="sm" variant="soft" color={eventDecodeState(event) === "readable" ? "success" : eventDecodeState(event) === "encrypted" ? "accent" : "danger"}>{eventDecodeState(event)}</Chip></div>)}</CardContent></Card>
+          <Card><CardContent className="debug-list">{pairingDiagnostics?.slice(0, 20).map((entry) => <div key={entry.id}><code>{entry.statusCode}</code><span>{entry.details?.pairing?.stage || entry.title}</span><small>{entry.details?.pairing?.reason || entry.path}</small></div>)}{pairingDiagnostics?.length === 0 && <p>No pairing diagnostics.</p>}</CardContent></Card>
         </TabPanel>
       </Tabs>
     </div>

@@ -179,7 +179,7 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `GET /api/v1/commands/:id` | Lifecycle: `QUEUED → DELIVERED_TO_AGENT → ACCEPTED_BY_AGENT → EXECUTING → COMPLETED/FAILED/EXPIRED` (§41). **Never** claims carrier `SENT/DELIVERED` — those words come only from Android evidence. | Bearer |
 | `GET /api/v1/commands` | Queue depth by state. | Bearer |
 | `POST /api/v1/agent/identity` | Bootstrap/refresh Android's stable device identity and public keys. Existing identities sign the exact request with `X-Agent-Auth`. A fresh/recovery pairing can instead use the short-lived, session-bound bootstrap capability embedded in an admin-authorized QR. | Agent signature, pairing bootstrap, or legacy device key |
-| `POST /api/v1/pwa/token-login` | QR-independent recovery: exchange the active GMweb master token once for a 7-day, restricted HttpOnly PWA session. The PWA does not persist the submitted token. | Token in JSON body; HTTPS only, rate-limited |
+| `POST /api/v1/pwa/token-login` | QR-independent access: consume a short-lived, one-time `pwa_...` token created in Dashboard → **PWA Access**, then receive a 7-day restricted HttpOnly session. Master/project API tokens are rejected. | One-time token in JSON body; HTTPS only, rate-limited |
 | `GET /api/v1/pairing/diagnostics` | Recent sanitized pairing state/reason trail. Session/device identifiers are hashed; credentials, signatures, certificates and message content are never logged. | Dashboard/master, or restricted admin-recovery PWA session |
 | `POST /api/v1/agent/commands/claim` | **Android Agent only** (device key). Atomically claims queued commands. | `X-API-Key` device key |
 | `POST /api/v1/agent/commands/:id/status` | Agent reports `ACCEPTED/EXECUTING/COMPLETED/FAILED`; guarded transitions, illegal jumps → `409`. | device key |
@@ -217,12 +217,20 @@ are IEEE-P1363 `r||s`. The UI becomes linked only after the final cookie probe
 returns `authenticated:true`.
 
 If Android identity bootstrap is unavailable or QR pairing is blocked, `/web`
-also offers **Use GMweb admin token**. Obtain the active value with `gmweb token`
-on the server. The browser sends it once over same-origin HTTPS to
-`POST /api/v1/pwa/token-login`; GMweb returns a restricted HttpOnly,
-`Secure`, `SameSite=Strict` cookie with message read/send and sanitized pairing
-diagnostic capabilities. This recovery session cannot call the Android-only
-metadata or approval routes, so it does not weaken the signed trust boundary.
+also offers **Use a one-time PWA token**. In the authenticated dashboard, open
+**PWA Access**, choose a browser name and short expiry, and copy the token shown
+once. The browser sends it over same-origin HTTPS to
+`POST /api/v1/pwa/token-login`; GMweb consumes it and returns a restricted
+HttpOnly, `Secure`, `SameSite=Strict` cookie. Only a SHA-256 hash is stored.
+Reusing, expiring, or revoking the token fails closed; revocation also ends the
+browser session created from it. Master/project tokens are never accepted and
+the session cannot call Android-only metadata or approval routes.
+
+The current Android event envelope with `cryptoVersion=0` is readable JSON
+wrapped in Base64 and is not browser E2EE. The PWA decodes it locally to render
+the Inbox and labels it **Legacy v0** in Connection diagnostics. Do not describe
+this format as end-to-end encrypted; `cryptoVersion>=1` remains fail-closed until
+the reviewed browser key-grant protocol is implemented.
 
 The `/web` bootstrap screen displays three deployment identifiers: the live API
 version from `/health`, the PWA build version embedded by Vite, and the exact

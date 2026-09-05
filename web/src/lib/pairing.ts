@@ -200,7 +200,6 @@ export async function completeLinkedSession(
 
 /** Non-extractable operational signing key handle (deviceKeys storage). */
 async function getSigningKey(): Promise<CryptoKey> {
-  const { getOrCreateDeviceKeys } = await import("./deviceKeys");
   const keys = await getOrCreateDeviceKeys();
   return keys.signingPrivateKey;
 }

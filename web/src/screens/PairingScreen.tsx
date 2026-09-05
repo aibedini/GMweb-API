@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { Button, Card, Chip } from "@heroui/react";
 import { beginPairing, type PairingHandle, type PairingProgress } from "../lib/pairing";
-import { loginWithAdminToken } from "../lib/adminAccess";
+import { loginWithPwaToken } from "../lib/adminAccess";
 
 export interface LinkContext {
   pairingSessionId: string;
@@ -22,7 +22,7 @@ const STAGE_LABELS: Record<UiStage, string> = {
   VERIFYING_CERTIFICATE: "Verifying device certificate",
   CERTIFICATE_VERIFIED: "Certificate verified",
   CREATING_LINKED_SESSION: "Creating secure browser session",
-  TOKEN_LOGIN: "Checking GMweb admin token",
+  TOKEN_LOGIN: "Checking one-time PWA token",
   LINKED: "Linked",
   FAILED: "Stopped with an error",
 };
@@ -48,7 +48,7 @@ export function PairingScreen({
   const [error, setError] = useState<string | null>(null);
   const [stage, setStage] = useState<UiStage>("PREPARING_KEYS");
   const [showAlternative, setShowAlternative] = useState(false);
-  const [adminToken, setAdminToken] = useState("");
+  const [accessToken, setAccessToken] = useState("");
   const [tokenBusy, setTokenBusy] = useState(false);
   const startedRef = useRef(false);
   const compatible = apiVersion === pwaVersion;
@@ -103,7 +103,7 @@ export function PairingScreen({
           handle.cancel();
           setHandle(null);
           setQrDataUrl(null);
-          setError("QR expired. Generate a fresh code or use the admin-token option.");
+          setError("QR expired. Generate a fresh code or use a one-time PWA token.");
           setStage("FAILED");
           startedRef.current = false;
           return 0;
@@ -115,15 +115,15 @@ export function PairingScreen({
   }, [handle]);
 
   const useAdminToken = async () => {
-    const submitted = adminToken.trim();
+    const submitted = accessToken.trim();
     if (!submitted || tokenBusy) return;
-    setAdminToken("");
+    setAccessToken("");
     setTokenBusy(true);
     setError(null);
     setStage("TOKEN_LOGIN");
     handle?.cancel();
     try {
-      await loginWithAdminToken(submitted);
+      await loginWithPwaToken(submitted);
       await onRecoveryLinked();
       setStage("LINKED");
     } catch (cause) {
@@ -205,25 +205,25 @@ export function PairingScreen({
 
           <div className="w-full border-t pt-4" style={{ borderColor: "var(--border)" }}>
             <Button variant="ghost" size="sm" className="w-full" onPress={() => setShowAlternative((value) => !value)}>
-              {showAlternative ? "Hide alternative" : "Can't scan? Use GMweb admin token"}
+              {showAlternative ? "Hide alternative" : "Can't scan? Use a one-time PWA token"}
             </Button>
             {showAlternative && (
               <form className="mt-3 space-y-3" onSubmit={(event) => { event.preventDefault(); void useAdminToken(); }}>
                 <p className="text-xs" style={{ color: "var(--muted-fg)" }}>
-                  Paste the active token shown by <code>gmweb token</code>. It is exchanged once for a restricted HttpOnly session and is never saved in browser storage.
+                  In the GMweb dashboard, open <b>PWA Access</b>, create a short-lived token, and paste it here. The master API token is not accepted.
                 </p>
                 <input
-                  aria-label="GMweb admin token"
+                  aria-label="One-time PWA access token"
                   type="password"
-                  value={adminToken}
-                  onChange={(event) => setAdminToken(event.target.value)}
+                  value={accessToken}
+                  onChange={(event) => setAccessToken(event.target.value)}
                   autoComplete="off"
                   spellCheck={false}
-                  placeholder="GMweb admin token"
+                  placeholder="pwa_…"
                   className="h-11 w-full rounded-lg border bg-transparent px-3 text-sm outline-none focus:ring-2"
                   style={{ borderColor: "var(--border)" }}
                 />
-                <Button type="submit" variant="primary" className="w-full" isDisabled={!adminToken.trim() || tokenBusy}>
+                <Button type="submit" variant="primary" className="w-full" isDisabled={!accessToken.trim() || tokenBusy}>
                   {tokenBusy ? "Checking token…" : "Open Messages securely"}
                 </Button>
               </form>
