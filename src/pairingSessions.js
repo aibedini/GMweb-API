@@ -66,16 +66,25 @@ function approveSession(id, approval) {
 }
 function consumeApproval(id, secret) {
   const s = getSession(id);
-  if (!s || !pollSecretMatches(s, secret) || s.state !== "APPROVED") return null;
+  if (!s) return resumeApproval(id, secret);
+  if (!pollSecretMatches(s, secret) || s.state !== "APPROVED") return null;
   const a = s.approved;
   const challenge = { pairingSessionId: id, challenge: a.sessionChallenge, deviceId: a.deviceId,
     certificate: a.certificate, trustRootPublicKey: a.trustRootPublicKey,
-    apiOrigin: s.apiOrigin, webOrigin: s.webOrigin, issuedAt: a.challengeIssuedAt };
+    apiOrigin: s.apiOrigin, webOrigin: s.webOrigin, issuedAt: a.challengeIssuedAt,
+    transcriptHash: a.transcriptHash, approvedAt: a.approvedAt };
   db().prepare("INSERT INTO pairing_challenges VALUES (?, ?, ?, ?)")
     .run(hash(secret), a.deviceId, Date.now() + 600000, JSON.stringify(challenge));
   db().prepare("DELETE FROM pairing_sessions WHERE id = ?").run(id);
   return { state: "APPROVED", certificate: a.certificate, deviceId: a.deviceId,
     transcriptHash: a.transcriptHash, trustRootPublicKey: a.trustRootPublicKey, approvedAt: a.approvedAt };
+}
+function resumeApproval(id, secret) {
+  const parked = peekChallenge(secret);
+  if (!parked || parked.pairingSessionId !== id) return null;
+  return { state: "APPROVED", certificate: parked.certificate, deviceId: parked.deviceId,
+    transcriptHash: parked.transcriptHash, trustRootPublicKey: parked.trustRootPublicKey,
+    approvedAt: parked.approvedAt };
 }
 function peekChallenge(secret) {
   gc();
@@ -100,5 +109,5 @@ function _reset() { db().exec("DELETE FROM pairing_sessions; DELETE FROM pairing
 module.exports = { PAIRING_TTL_MS, MAX_GLOBAL_SESSIONS, MAX_SESSIONS_PER_IP, CapacityError,
   canonicalTranscript, transcriptHash, createSession: atomic(createSession), getSession,
   approveSession: atomic(approveSession), consumeApproval: atomic(consumeApproval), peekChallenge,
-  burnChallenge, challengeCanonical, pollSecretMatches, qrPayload, hashOf: transcriptHash,
+  burnChallenge, challengeCanonical, pollSecretMatches, qrPayload, resumeApproval, hashOf: transcriptHash,
   canonicalBytes: canonicalTranscript, _reset };

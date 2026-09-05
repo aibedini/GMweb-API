@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button, Card, CardContent, Chip, ScrollShadow, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
-import { syncNow, listRecentEvents, getCursor, resetLocal, subscribeSyncAvailable, type StoredEvent } from "../lib/sync";
+import { syncNow, listRecentEvents, listInboxEvents, listAggregateEvents, getCursor, resetLocal, subscribeSyncAvailable, type StoredEvent } from "../lib/sync";
 import { buildConversations, messagesForAggregate, eventDecodeState } from "../lib/inbox";
 import { fetchTrustSnapshot, health, type TrustSnapshot } from "../lib/api";
 import { listCredentials, removeCredential, listAgentIdentities, listPushSubscriptions, type CredentialRow, type IdentityRow } from "../lib/security";
@@ -31,12 +31,15 @@ function Avatar({ title }: { title: string }) {
 export default function App() {
   const [tab, setTab] = useState<TabKey>("inbox");
   const [events, setEvents] = useState<StoredEvent[]>([]);
+  const [threadEvents, setThreadEvents] = useState<StoredEvent[]>([]);
+  const [inboxEvents, setInboxEvents] = useState<StoredEvent[]>([]);
   const [cursor, setCursor] = useState(0);
   const [busy, setBusy] = useState(false);
   const [applied, setApplied] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [trust, setTrust] = useState<TrustSnapshot | null>(null);
   const [version, setVersion] = useState("");
+  const [online, setOnline] = useState(navigator.onLine);
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [bootstrapState, setBootstrapState] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -48,9 +51,10 @@ export default function App() {
   const scriptFile = useMemo(() => loadedScriptFile(), []);
 
   const refresh = async () => {
-    const [nextCursor, nextEvents, nextTrust] = await Promise.all([getCursor(), listRecentEvents(500), fetchTrustSnapshot()]);
+    const [nextCursor, nextEvents, nextTrust, nextInbox] = await Promise.all([getCursor(), listRecentEvents(500), fetchTrustSnapshot(), listInboxEvents()]);
     setCursor(nextCursor);
     setEvents(nextEvents);
+    setInboxEvents(nextInbox);
     setTrust(nextTrust);
   };
 
@@ -76,7 +80,10 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     setBootstrapState("BOOTSTRAPPING_SYNC");
-    void syncNow().then(refresh).then(() => setBootstrapState("READY")).catch(() => setBootstrapState(null));
+    void syncNow().then(refresh).then(() => setBootstrapState("READY")).catch(cause => {
+      setBootstrapState("SYNC_FAILED");
+      setError(cause instanceof Error ? cause.message : String(cause));
+    });
     void refreshSecurity();
     void fetchPairingDiagnostics().then(setPairingDiagnostics).catch(() => setPairingDiagnostics(null));
     return subscribeSyncAvailable((count) => {
@@ -85,12 +92,13 @@ export default function App() {
     }, () => {
       setAuthed(false);
       setEvents([]);
+      setInboxEvents([]);
       setSelected(null);
       void resetLocal();
     });
   }, [authed]);
 
-  const conversations = useMemo(() => buildConversations(events), [events]);
+  const conversations = useMemo(() => buildConversations(inboxEvents), [inboxEvents]);
   const filteredConversations = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     if (!query) return conversations;
@@ -102,7 +110,25 @@ export default function App() {
   }, [conversations, selected]);
 
   const selectedConversation = conversations.find((item) => item.aggregateId === selected) || null;
-  const messages = useMemo(() => selected ? messagesForAggregate(events, selected) : [], [events, selected]);
+  useEffect(() => {
+    const changed = () => setOnline(navigator.onLine);
+    window.addEventListener("online", changed);
+    window.addEventListener("offline", changed);
+    return () => {
+      window.removeEventListener("online", changed);
+      window.removeEventListener("offline", changed);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setThreadEvents([]);
+    if (selected && authed) void listAggregateEvents(selected).then(rows => {
+      if (!cancelled) setThreadEvents(rows);
+    }).catch(cause => { if (!cancelled) setError(String(cause)); });
+    return () => { cancelled = true; };
+  }, [selected, events, authed]);
+  const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
 
   const pull = async () => {
     setBusy(true);
@@ -150,8 +176,8 @@ export default function App() {
         <div className="brand-copy"><strong>Messages</strong><span>GMweb companion</span></div>
         <div className="topbar-actions">
           <span className="version-pill" title={`${scriptFile} · cursor ${cursor}`}>v{version || "…"}</span>
-          <span className={`connection-dot ${version === "unreachable" ? "offline" : ""}`} />
-          <span className="connection-label">{version === "unreachable" ? "Offline" : "Connected"}</span>
+          <span className={`connection-dot ${!online || version === "unreachable" ? "offline" : ""}`} />
+          <span className="connection-label">{!online || version === "unreachable" ? "Offline" : version ? "Connected" : "Checking"}</span>
           <Button className="topbar-button" size="sm" variant="ghost" onPress={() => void pull()} isDisabled={busy}>{busy ? <Spinner size="sm" /> : "Sync"}</Button>
           <Button className="topbar-button" size="sm" variant="ghost" onPress={() => setAuthed(false)}>Lock</Button>
         </div>
@@ -178,7 +204,7 @@ export default function App() {
                     <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time></span>
                   </button>
                 ))}
-                {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : "Waiting for messages from Android"}</p></div>}
+                {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : inboxEvents.some(event => event.decryption?.state === "locked") ? "Messages are locked. Check Security for key access." : "Waiting for messages from Android"}</p></div>}
               </ScrollShadow>
             </aside>
 
@@ -213,7 +239,8 @@ export default function App() {
             <Card><CardContent className="status-card"><span>PWA build</span><strong>{PWA_BUILD_VERSION}</strong><small>{scriptFile}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Sync cursor</span><strong>{cursor}</strong><small>{applied === null ? "Ready" : `${applied} new event(s)`}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Trust sequence</span><strong>{trust?.trustSequence ?? "—"}</strong><small>{trust ? "Android trust root present" : "Not published"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Payload protection</span><strong>{events.some((event) => event.cryptoVersion === 0) ? "Legacy v0" : "Encrypted"}</strong><small>{events.some((event) => event.cryptoVersion === 0) ? "Readable envelope; browser E2EE is not active" : "Browser key required"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Payload protection</span><strong>{inboxEvents.some(event => event.decryption?.state === "decrypted") ? "E2EE locally decrypted" : events.length ? "See payload diagnostics" : "No payloads received"}</strong><small>Legacy v0 is plaintext. Encrypted messages require an authorized key grant. Missing keys stay locked; failed authentication is reported as corrupt.</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Linked session</span><strong>Authenticated</strong><small>Latest stored sequence: {events[0]?.sequence ?? 0}</small></CardContent></Card>
           </div>
           {bootstrapState && bootstrapState !== "READY" && <div className="notice">Finishing secure session setup: {bootstrapState}</div>}
           {error && <div className="notice danger">{error}</div>}
@@ -222,6 +249,7 @@ export default function App() {
         <TabPanel id="security" className="content-panel">
           <div className="page-title"><p className="eyebrow">Protection</p><h1>Security</h1><p>Credentials and identities visible to this linked browser.</p></div>
           <div className="security-list">
+            <Card><CardContent className="security-row"><div><strong>Message encryption</strong><p>{inboxEvents.filter(event => event.decryption?.state === "decrypted").length} decrypted · {inboxEvents.filter(event => event.decryption?.state === "locked").length} locked · {inboxEvents.filter(event => event.decryption?.state === "invalid").length} invalid</p><p>Key grants come from your primary phone. Older browser identities may need Lock → Reset browser identity and pair again. Legacy plaintext cannot be protected retroactively.</p></div></CardContent></Card>
             <Card><CardContent className="security-row"><div><strong>Passkeys</strong><p>{credentials === null ? "Dashboard authentication required" : `${credentials.length} enrolled credential(s)`}</p></div>{credentials?.map((credential) => <Button key={credential.credentialId} size="sm" variant="ghost" onPress={() => void removeCredential(credential.credentialId).then(refreshSecurity)}>Remove {credential.label || shortId(credential.credentialId)}</Button>)}</CardContent></Card>
             <Card><CardContent className="security-row"><div><strong>Android identities</strong><p>{identities === null ? "Unavailable" : `${identities.length} registered device(s)`}</p></div><Chip size="sm" variant="soft">{identities?.length ?? 0}</Chip></CardContent></Card>
             <Card><CardContent className="security-row"><div><strong>Private push</strong><p>Notifications contain no sender or message text.</p></div><Chip size="sm" variant="soft">{pushCount ?? 0} subscription(s)</Chip></CardContent></Card>
@@ -231,7 +259,7 @@ export default function App() {
         <TabPanel id="debug" className="content-panel">
           <div className="page-title"><p className="eyebrow">Diagnostics</p><h1>Debug</h1><p>Raw protocol details live here instead of inside the Inbox.</p></div>
           <div className="debug-actions"><Button variant="secondary" onPress={() => void pull()} isDisabled={busy}>Sync now</Button><Button variant="ghost" onPress={() => void resetLocal().then(refresh)}>Reset local ciphertext</Button></div>
-          <Card><CardContent className="debug-list">{events.slice(0, 40).map((event) => <div key={event.sequence}><code>#{event.sequence}</code><span>{event.type}</span><Chip size="sm" variant="soft" color={eventDecodeState(event) === "readable" ? "success" : eventDecodeState(event) === "encrypted" ? "accent" : "danger"}>{eventDecodeState(event)}</Chip></div>)}</CardContent></Card>
+          <Card><CardContent className="debug-list">{events.slice(0, 40).map((event) => <div key={event.sequence}><code>#{event.sequence}</code><span>{event.type}</span><Chip size="sm" variant="soft" color={eventDecodeState(event) === "Invalid/corrupt payload" ? "danger" : "warning"}>{eventDecodeState(event)}</Chip></div>)}</CardContent></Card>
           <Card><CardContent className="debug-list">{pairingDiagnostics?.slice(0, 20).map((entry) => <div key={entry.id}><code>{entry.statusCode}</code><span>{entry.details?.pairing?.stage || entry.title}</span><small>{entry.details?.pairing?.reason || entry.path}</small></div>)}{pairingDiagnostics?.length === 0 && <p>No pairing diagnostics.</p>}</CardContent></Card>
         </TabPanel>
       </Tabs>

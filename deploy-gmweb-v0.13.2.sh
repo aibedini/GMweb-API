@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Coordinated GMweb pairing release. Physical E2E evidence is mandatory.
 set -euo pipefail
-HOST=eve_deploy@46.31.76.103
+HOST=root@46.31.76.103
 DIR=/opt/gmweb-api
 ORIGIN=https://gmweb.46.31.76.103.nip.io
 
@@ -27,14 +27,14 @@ git archive "$CANDIDATE" | tar -x -C "$STAGE"
 node "$STAGE/scripts/check-pairing-release.js"   /opt/gmweb-release-evidence/pairing-e2e.json   /opt/gmweb-release-evidence/messages.apk
 (
   cd "$STAGE"
-  npm ci --omit=dev
+  npm ci --include=dev
   npm run check
   npm test
 )
 # Promote exactly the revision that passed; do not fetch another revision.
 git merge --ff-only "$CANDIDATE"
 npm ci --omit=dev
-pm2 restart gmweb-api --update-env
-curl --fail --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1:3000/health
+systemctl restart gmweb-api.service
+curl --fail --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1:3030/health
 REMOTE
 curl --fail "$ORIGIN/health"

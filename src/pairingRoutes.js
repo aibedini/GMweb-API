@@ -199,13 +199,13 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
     };
   });
 
-  // ── Web: poll pairing status (anonymous OK; single-use consume) ────────
+  // ── Web: retryable status poll; linked-session challenge stays one-use ──
   app.get("/api/v1/pairing/status", {
     schema: {
-      summary: "Poll pairing status; consumes the certificate exactly once",
+      summary: "Poll pairing status; recover approval until the one-use challenge is completed",
       description:
         "ADR-007 §5: returns {state:'PENDING'} while waiting; on approval returns the " +
-        "Android-signed DeviceCertificate + transcriptHash ONCE and destroys the session. " +
+        "Android-signed DeviceCertificate + transcriptHash and parks a one-use challenge. Lost responses can be recovered with the same poll secret. " +
         "The web MUST verify the certificate binding locally before trusting it.",
       tags: ["Pairing"],
       querystring: {
@@ -222,6 +222,10 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
     const id = request.query.pairingSessionId;
     const pollSecret = request.query.pollSecret;
     const session = pairing.getSession(id);
+    if (!session) {
+      const resumed = pairing.resumeApproval(id, pollSecret);
+      if (resumed) return resumed;
+    }
     if (!session || !pairing.pollSecretMatches(session, pollSecret)) {
       // Wrong/missing pollSecret: treat as EXPIRED without leaking state.
       markPairing(request, "WEB_STATUS_POLL", "FAILED", "invalid_or_expired_session", { sessionId: id });

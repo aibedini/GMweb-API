@@ -4,7 +4,7 @@ import { PROTOCOL, canonicalTranscript, canonicalChallenge } from "../../../shar
  *
  * The web client generates its keypairs LOCALLY, opens a short-lived pairing
  * session, renders the transcript as a QR code, and polls for the
- * Android-signed DeviceCertificate (single-use consume). It verifies the
+ * Android-signed DeviceCertificate (retryable until challenge consumption). It verifies the
  * certificate binding before treating itself as trusted (§5).
  */
 
@@ -14,7 +14,7 @@ import {
   type PairingSession,
   type PairingQrPayload,
 } from "./pairingApi";
-import { getOrCreateDeviceKeys } from "./deviceKeys";
+import { getOrCreateDeviceKeys, saveCryptoRecord } from "./deviceKeys";
 import { verifyCertificate } from "./certVerify";
 import type { DeviceCertificate } from "./trustRoot";
 
@@ -113,7 +113,14 @@ export async function beginPairing(onProgress?: (stage: PairingProgress) => void
       const poll = async () => {
         if (cancelled) return reject(new Error("pairing cancelled"));
         try {
-          const status = await getPairingStatus(pairingSession.pairingSessionId, pairingSession.pollSecret);
+          const status = await getPairingStatus(pairingSession.pairingSessionId, pairingSession.pollSecret).catch(error => {
+            // A lost response may already have parked the server challenge.
+            // Retry only transport failures, never certificate/crypto failures.
+            if (error instanceof TypeError && !cancelled && Date.now() < pairingSession.expiresAt) return null;
+            throw error;
+          });
+          if (cancelled) return reject(new Error("pairing cancelled"));
+          if (!status) { setTimeout(poll, 2000); return; }
           if (status.state === "APPROVED" && status.certificate) {
             onProgress?.("ANDROID_APPROVED");
             // BLOCKER 1 — full verification chain, fail closed:
@@ -141,6 +148,9 @@ export async function beginPairing(onProgress?: (stage: PairingProgress) => void
             if (state.step === "REJECTED") {
               return reject(new Error(`certificate rejected: ${state.reason}`));
             }
+            if (cancelled) return reject(new Error("pairing cancelled"));
+            await saveCryptoRecord("verified-primary", { deviceId: keys.deviceId, root: status.trustRootPublicKey,
+              certificate: cert, encryptionPublicKey: keys.encryptionPublicKeyB64 });
             onProgress?.("CERTIFICATE_VERIFIED");
             return resolve({
               certificate: status.certificate,
@@ -149,6 +159,7 @@ export async function beginPairing(onProgress?: (stage: PairingProgress) => void
             });
           }
           if (status.state === "EXPIRED") return reject(new Error("QR expired — start again"));
+          if (Date.now() >= pairingSession.expiresAt) return reject(new Error("QR expired — start again"));
           setTimeout(poll, 2000);
         } catch (e) {
           reject(e instanceof Error ? e : new Error(String(e)));
@@ -172,7 +183,7 @@ export async function completeLinkedSession(
   certificate: string,
   origin: string,
 ): Promise<{ ok: boolean; deviceId: string; capabilities: string[] }> {
-  // Learn the single-use challenge from the dedicated peek endpoint the single-use challenge from the dedicated peek endpoint
+  // Learn the single-use challenge from the dedicated peek endpoint
   // (pollSecret-authenticated; peeking never burns — only /complete does).
   const q = new URLSearchParams({ pollSecret });
   const chRes = await fetch(`/api/v1/pairing/challenge?${q}`, { credentials: "include" });

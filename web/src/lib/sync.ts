@@ -8,10 +8,11 @@
  * without touching storage or UI.
  */
 
-import { fetchEventsAfter, type SyncEvent } from "./api";
+import { fetchEventsAfter, type SyncEvent } from "./api.ts";
+import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypto.ts";
 
 const DB_NAME = "gmweb-messages";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_EVENTS = "events";
 const STORE_META = "meta";
 const CURSOR_KEY = "sync_cursor";
@@ -31,6 +32,8 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_META)) {
         db.createObjectStore(STORE_META);
       }
+      const events = req.transaction!.objectStore(STORE_EVENTS);
+      if (!events.indexNames.contains("by_type_sequence")) events.createIndex("by_type_sequence", ["type", "sequence"]);
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -57,57 +60,118 @@ export async function getCursor(): Promise<number> {
   return v ?? 0;
 }
 
-async function putCursor(value: number): Promise<void> {
-  await tx([STORE_META], "readwrite", (t) => t.objectStore(STORE_META).put(value, CURSOR_KEY) as unknown as IDBRequest<undefined>);
-}
-
-/** Applies ONE event; the single choke point where Phase 7 decrypts. */
-function applyEvent(_event: SyncEvent): void {
-  // web-01 stores the opaque event only; the Inbox screen lists aggregates.
-}
-
 /** §43: apply pages transactionally until the server says hasMore=false. */
-export async function syncNow(onProgress?: (applied: number) => void): Promise<number> {
+let runningSync: Promise<number> | null = null;
+export function syncNow(onProgress?: (applied: number) => void): Promise<number> {
+  // Serialize manual pulls and SSE invalidations: an older request must never
+  // overwrite a newer cursor after it completes out of order.
+  if (!runningSync) runningSync = drainSync(onProgress).finally(() => { runningSync = null; });
+  return runningSync;
+}
+
+async function drainSync(onProgress?: (applied: number) => void): Promise<number> {
   let cursor = await getCursor();
   let applied = 0;
-  for (let guard = 0; guard < 20; guard++) {
+  for (;;) {
     const page = await fetchEventsAfter(cursor);
     if (page.events.length === 0) break;
+    if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor ||
+        page.events.some(ev => !Number.isSafeInteger(ev.sequence) || ev.sequence <= cursor || ev.sequence > page.nextCursor)) {
+      throw new Error("Invalid sync page: non-advancing cursor or event sequence");
+    }
+    for (const event of page.events) {
+      if (event.cryptoVersion === 1 && event.type === "KEY_GRANT") await receiveKeyGrant(event);
+    }
     const db = await openDb();
     await new Promise<void>((resolve, reject) => {
       const t = db.transaction([STORE_EVENTS, STORE_META], "readwrite");
       const store = t.objectStore(STORE_EVENTS);
       for (const ev of page.events) {
         store.put(ev); // keyed by server sequence — idempotent replay-safe
-        applyEvent(ev);
       }
       t.objectStore(STORE_META).put(page.nextCursor, CURSOR_KEY);
       t.oncomplete = () => resolve();
       t.onerror = () => reject(t.error);
+      t.onabort = () => reject(t.error ?? new Error("Sync transaction aborted"));
     });
     applied += page.events.length;
     cursor = page.nextCursor;
     onProgress?.(applied);
     if (!page.hasMore) break;
   }
-  await putCursor(cursor);
   return applied;
 }
 
-export interface StoredEvent extends SyncEvent {}
+export interface StoredEvent extends SyncEvent { decryption?: Decryption }
+
+async function decryptForDisplay(events: SyncEvent[]): Promise<StoredEvent[]> {
+  const result: StoredEvent[] = [];
+  for (const event of events) {
+    if (event.cryptoVersion > 0) result.push({ ...event, decryption: event.type === "KEY_GRANT"
+      ? await receiveKeyGrant(event) : await decryptMessage(event) });
+    else result.push(event);
+  }
+  return result;
+}
+
+/** Load one selected thread through its index, including history outside the recent window. */
+export async function listAggregateEvents(aggregateId: string): Promise<StoredEvent[]> {
+  const events = await tx([STORE_EVENTS], "readonly", t => t.objectStore(STORE_EVENTS)
+    .index("by_aggregate").getAll(aggregateId)) as SyncEvent[];
+  return decryptForDisplay(events);
+}
+
+/** Select message-bearing threads without KEY_GRANT/status traffic displacing the Inbox. */
+export async function listInboxEvents(limit = 100): Promise<StoredEvent[]> {
+  const db = await openDb();
+  const candidates: SyncEvent[] = [];
+  for (const type of ["MESSAGE_CREATED", "MESSAGE_UPDATED"]) {
+    await new Promise<void>((resolve, reject) => {
+      const t = db.transaction(STORE_EVENTS, "readonly");
+      const range = IDBKeyRange.bound([type, 0], [type, Number.MAX_SAFE_INTEGER]);
+      const req = t.objectStore(STORE_EVENTS).index("by_type_sequence").openCursor(range, "prev");
+      let count = 0;
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return;
+        candidates.push(cursor.value);
+        if (++count < limit) cursor.continue();
+      };
+      t.oncomplete = () => resolve();
+      t.onabort = () => reject(t.error);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  const ids = new Set(candidates.map(row => row.aggregateId).filter((id): id is string => !!id));
+  const rows: StoredEvent[] = [];
+  for (const id of ids) rows.push(...await listAggregateEvents(id));
+  return rows;
+}
 
 export async function listRecentEvents(limit = 100): Promise<StoredEvent[]> {
+  if (!Number.isSafeInteger(limit) || limit < 0) throw new RangeError("Invalid event limit");
+  if (limit === 0) return [];
   const db = await openDb();
-  return new Promise((resolve, reject) => {
+  const events = await new Promise<StoredEvent[]>((resolve, reject) => {
     const t = db.transaction([STORE_EVENTS], "readonly");
-    const req = t.objectStore(STORE_EVENTS).getAll(null, limit);
-    req.onsuccess = () => resolve((req.result as StoredEvent[]).slice(-limit).reverse());
+    const rows: StoredEvent[] = [];
+    const req = t.objectStore(STORE_EVENTS).openCursor(null, "prev");
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor || rows.length === limit) return;
+      rows.push(cursor.value as StoredEvent);
+      if (rows.length < limit) cursor.continue();
+    };
+    t.oncomplete = () => resolve(rows);
+    t.onabort = () => reject(t.error ?? new Error("Event read aborted"));
     req.onerror = () => reject(req.error);
   });
+  return decryptForDisplay(events);
 }
 
 /** Dev/self-check hook used by the Debug screen. */
 export async function resetLocal(): Promise<void> {
+  await runningSync?.catch(() => {});
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
     const t = db.transaction([STORE_EVENTS, STORE_META], "readwrite");

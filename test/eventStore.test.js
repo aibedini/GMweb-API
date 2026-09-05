@@ -31,8 +31,8 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
         { eventId: "e2", type: "T", payload: Buffer.from("y") },
       ],
     });
-    assert.equal(res.accepted.length, 1);
-    assert.equal(res.accepted[0].serverSequence, 2); // NOT 3 — dedupe first
+    assert.equal(res.accepted.length, 2);
+    assert.deepEqual(res.accepted.map(row => row.serverSequence), [1, 2]); // lost ACK is safely replayed
     assert.equal(res.duplicates, 1);
     assert.equal(store.count("a"), 2);
   });

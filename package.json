@@ -1,6 +1,6 @@
 {
   "name": "gmweb-api",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "private": true,
   "description": "GMweb API: OpenWA-style HTTP bridge for Google Messages for Web.",
   "main": "src/server.js",
@@ -37,5 +37,9 @@
   },
   "engines": {
     "node": ">=22.13.0"
+  },
+  "devDependencies": {
+    "@hpke/core": "^1.9.0",
+    "fake-indexeddb": "^6.2.5"
   }
 }

@@ -67,11 +67,26 @@ export interface DeviceKeys {
   keyVersion: number;
 }
 
-/** Load existing durable keys, or generate + persist a fresh set. */
-export async function getOrCreateDeviceKeys(): Promise<DeviceKeys> {
+let loadingKeys: Promise<DeviceKeys> | null = null;
+/** Coalesce StrictMode/concurrent callers so one browser never shows mismatched keys. */
+export function getOrCreateDeviceKeys(): Promise<DeviceKeys> {
+  if (!loadingKeys) {
+    const load = typeof navigator !== "undefined" && navigator.locks
+      ? navigator.locks.request("gmweb-device-keys", loadOrCreateDeviceKeys)
+      : loadOrCreateDeviceKeys();
+    loadingKeys = Promise.resolve(load).then(keys => keys).finally(() => { loadingKeys = null; });
+  }
+  return loadingKeys;
+}
+
+async function loadOrCreateDeviceKeys(): Promise<DeviceKeys> {
   const db = await openDb();
+  try {
   const existing = await idbGet<DeviceKeys>(db, "primary");
-  if (existing && existing.signingPrivateKey && existing.keyVersion === KEY_VERSION) {
+  if (existing) {
+    if (!existing.signingPrivateKey || !existing.encryptionPrivateKey ||
+        existing.signingPrivateKey.extractable || existing.encryptionPrivateKey.extractable ||
+        existing.keyVersion !== KEY_VERSION) throw new Error("Stored device keys are invalid; reset and pair again");
     return existing;
   }
 
@@ -84,7 +99,7 @@ export async function getOrCreateDeviceKeys(): Promise<DeviceKeys> {
   const encryption = (await crypto.subtle.generateKey(
     { name: "ECDH", namedCurve: "P-256" },
     false, // extractable = false (P0-6)
-    ["deriveKey"],
+    ["deriveKey", "deriveBits"],
   )) as CryptoKeyPair;
 
   const signingPublicKeyB64 = b64(await crypto.subtle.exportKey("raw", signing.publicKey));
@@ -106,6 +121,7 @@ export async function getOrCreateDeviceKeys(): Promise<DeviceKeys> {
   // private key must never be paired — it would be un-verifiable later.
   await idbPut(db, "primary", keys);
   return keys;
+  } finally { db.close(); }
 }
 
 /** True when the browser still holds the key material it was paired with. */
@@ -121,6 +137,7 @@ export async function hasDurableKeys(): Promise<boolean> {
 
 /** Destroy local keys (≡ browser un-trusts itself; server revoke is separate). */
 export async function wipeDeviceKeys(): Promise<void> {
+  await loadingKeys?.catch(() => {});
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
@@ -128,4 +145,14 @@ export async function wipeDeviceKeys(): Promise<void> {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error ?? new Error("IndexedDB delete failed"));
   });
+}
+
+export async function saveCryptoRecord(key: string, value: unknown): Promise<void> {
+  const db = await openDb();
+  try { await idbPut(db, key, value); } finally { db.close(); }
+}
+
+export async function loadCryptoRecord<T>(key: string): Promise<T | null> {
+  const db = await openDb();
+  try { return await idbGet<T>(db, key); } finally { db.close(); }
 }

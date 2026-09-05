@@ -73,6 +73,7 @@ class EventStore {
     this.countStmt = db.prepare(
       `SELECT COUNT(*) AS n FROM sync_events WHERE account_id = ?`
     );
+    this.existingStmt = db.prepare("SELECT * FROM sync_events WHERE account_id = ? AND event_uuid = ?");
   }
 
   /**
@@ -88,6 +89,7 @@ class EventStore {
       this.counterStmt.run(accountId);
       const accepted = [];
       let duplicates = 0;
+      let inserted = 0;
       for (const event of batch) {
         const uuid = String(event.eventId || "");
         if (!uuid) { duplicates++; continue; }
@@ -114,19 +116,28 @@ class EventStore {
         if (info.changes > 0) {
           this.bumpSeqStmt.run(accountId);
           accepted.push({ eventId: uuid, serverSequence: seq });
+          inserted++;
         } else {
           duplicates++; // same event_uuid already stored — no sequence consumed
+          const old = this.existingStmt.get(accountId, uuid);
+          if (old && old.ciphertext.equals(payloadBuf) && old.event_type === String(event.type || "UNKNOWN") &&
+              old.aggregate_id === (event.conversationId ? String(event.conversationId) : null) &&
+              old.source_device_id === (sourceDeviceId ? String(sourceDeviceId) : null) &&
+              old.encoding === String(event.encoding || "envelope.v1") &&
+              old.schema_version === (Number(event.schemaVersion) || 1) && old.crypto_version === (Number(event.cryptoVersion) || 0)) {
+            accepted.push({ eventId: uuid, serverSequence: old.sequence });
+          }
         }
       }
-      return { accepted, duplicates };
+      return { accepted, duplicates, inserted };
     });
     const result = accept(events);
     // §44 invalidation hook — AFTER the transaction committed (durable first,
     // realtime second). Never throws into the HTTP path.
-    if (result.accepted.length > 0 && this.onEventsAccepted) {
-      try { this.onEventsAccepted(result.accepted.length); } catch { /* swallow */ }
+    if (result.inserted > 0 && this.onEventsAccepted) {
+      try { this.onEventsAccepted(result.inserted); } catch { /* swallow */ }
     }
-    return result;
+    return { accepted: result.accepted, duplicates: result.duplicates };
   }
 
   /** Cursor sync (§54): events after a per-account sequence cursor. */

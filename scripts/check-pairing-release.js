@@ -6,7 +6,9 @@ const crypto = require("node:crypto");
 const root = path.resolve(__dirname, "..");
 const REQUIRED_STEPS = ["fresh_apk", "primary_enrollment", "clean_browser", "qr_scan",
   "android_metadata", "biometric_approval", "web_certificate_verification", "challenge_signature",
-  "linked_cookie", "sync", "browser_reload", "server_restart", "still_linked", "phone_revoke", "browser_unauthorized"];
+  "linked_cookie", "sync", "encrypted_history", "full_history_grant", "from_now_on_denied",
+  "browser_reload", "server_restart", "still_linked", "phone_revoke", "browser_unauthorized",
+  "revoked_no_new_epochs", "ciphertext_only_server"];
 const sha256 = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 function fingerprint() {
   const hash = crypto.createHash("sha256");

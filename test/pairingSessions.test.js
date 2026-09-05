@@ -3,7 +3,7 @@
 /**
  * ADR-007 — pairing session lifecycle contract tests.
  *
- * Invariants: TTL 120s, single-use approve+consume, single-use status poll,
+ * Invariants: TTL 120s, single-use approval and challenge, retryable status poll,
  * expired sessions never approve, tampered state transitions rejected.
  */
 
@@ -52,14 +52,19 @@ test("approve flips PENDING → APPROVED exactly once", () => {
   );
 });
 
-test("status consume is single-use (certificate returned exactly once)", () => {
+test("lost status response is recoverable only until its challenge is consumed", () => {
   const created = pairing.createSession(transcript(), ctx());
   pairing.approveSession(created.pairingSessionId, { certificate: "CERT", deviceId: "web-abc-123" });
   const first = pairing.consumeApproval(created.pairingSessionId, created.pollSecret);
   assert.equal(first.certificate, "CERT");
   // Session destroyed after the first consume.
   assert.equal(pairing.getSession(created.pairingSessionId), null);
+  assert.deepEqual(pairing.consumeApproval(created.pairingSessionId, created.pollSecret), first);
+  assert.equal(pairing.resumeApproval(created.pairingSessionId, "wrong-secret"), null);
+  assert.equal(pairing.resumeApproval("wrong-session", created.pollSecret), null);
+  assert.equal(pairing.burnChallenge(created.pollSecret), true);
   assert.equal(pairing.consumeApproval(created.pairingSessionId, created.pollSecret), null);
+  assert.equal(pairing.burnChallenge(created.pollSecret), false);
 });
 
 test("expired sessions cannot be approved or fetched", () => {

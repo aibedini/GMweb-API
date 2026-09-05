@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.14.0",
+    "version": "0.14.1",
     "contact": {
       "name": "GMweb API"
     }
@@ -2076,11 +2076,11 @@
     },
     "/api/v1/pairing/status": {
       "get": {
-        "summary": "Poll pairing status; consumes the certificate exactly once",
+        "summary": "Poll pairing status; recover approval until the one-use challenge is completed",
         "tags": [
           "Pairing"
         ],
-        "description": "ADR-007 §5: returns {state:'PENDING'} while waiting; on approval returns the Android-signed DeviceCertificate + transcriptHash ONCE and destroys the session. The web MUST verify the certificate binding locally before trusting it.",
+        "description": "ADR-007 §5: returns {state:'PENDING'} while waiting; on approval returns the Android-signed DeviceCertificate + transcriptHash and parks a one-use challenge. Lost responses can be recovered with the same poll secret. The web MUST verify the certificate binding locally before trusting it.",
         "parameters": [
           {
             "schema": {

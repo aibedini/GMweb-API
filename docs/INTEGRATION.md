@@ -1,4 +1,4 @@
-## GMweb 0.14.0 / Messages 2.7.0: coordinated pairing upgrade
+## GMweb 0.14.1 / Messages 2.7.1: coordinated pairing and encrypted history
 
 Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use
 `POST /api/v1/primary-enrollment`, with operational-key and trust-root proofs.
@@ -14,6 +14,31 @@ Pairing and linked sessions persist in control-plane SQLite. The server now
 verifies Android certificates before accepting approval. Deploy API, PWA,
 dashboard and APK together; old JSON-signed clients must upgrade and pair again.
 A physical-device [release gate](PAIRING-E2E.md) is required before deployment.
+
+### Companion payload and history limitations
+
+Pairing protocol v1 is an authentication protocol, not message E2EE.
+Existing `cryptoVersion=0` events contain Base64-wrapped plaintext JSON and
+remain readable for compatibility. The PWA labels them `Legacy/plaintext-envelope`.
+An unsupported encrypted version is locked, never reported as successfully
+decrypted. Malformed legacy payloads fail closed and stay visible in Debug.
+
+New eligible Android events use the [CKE/DEK v1 format](MESSAGE-CRYPTO-V1.md).
+Historical provider/Room rows enter the same firewall and transactional encrypted
+outbox. Full-history devices receive re-wrapped historical CKEs; from-now-on
+devices receive only epochs whose message-time partition starts at their approval.
+Old v0 events cannot be protected retroactively by withholding epoch keys.
+Crypto Review and the physical release gate still apply before production rollout.
+
+The PWA reads recent raw events using a descending sequence cursor and reads a
+selected thread through its aggregate index. Its Inbox projects canonical message
+events, applies status/read/delete changes, and leaves unrelated activity in Debug.
+The conversation list selects message-bearing threads with a type/sequence index,
+so KEY_GRANT and status traffic cannot displace them from the recent window.
+Opening a selected thread reads its complete local event history through its index.
+Exact event redelivery now returns the original ACK sequence; it never creates
+another event or another SSE invalidation. Conflicting bytes under an existing
+event ID are not acknowledged as identical.
 
 # GMweb — Integration Guide (for a consuming project)
 

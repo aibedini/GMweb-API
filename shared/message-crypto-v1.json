@@ -1,0 +1,37 @@
+{
+  "payload": {
+    "address": "+123",
+    "dateMs": 100,
+    "messageId": "message-test",
+    "body": "سلام encrypted history",
+    "direction": "in",
+    "status": 0
+  },
+  "rootPublicSpki": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEN+BIkx6nfuFX9wQKvbzLQuiEeMyzmqjY8L01fVLSR8MnFsr2nN1aa/fcfdRgx693CzEfWmTzTh45JPloQIBe7w==",
+  "recipientPrivatePkcs8": "MEECAQAwEwYHKoZIzj0CAQYIKoZIzj0DAQcEJzAlAgEBBCAPbrjVbpaDnPdbKDfC2axfYQu1pP9q5ZjsEvB5LQhwGA==",
+  "grant": {
+    "historyFloor": 0,
+    "v": 1,
+    "kind": "key-grant",
+    "conversationId": "conversation-test",
+    "rootSignature": "MEUCIBxzkIVVMfnPowD0hlN4ogV062sRpEONRkETnTTBErOwAiEA7uPjF1BrImzYIGqMH3g0j0udaZXr7kDVhTrczD8xDyA=",
+    "epochId": "epoch-test",
+    "category": "",
+    "deviceId": "device-test",
+    "wrappedCke": "BKmCWq8SfN0q+i92AlQZ39uILui12AxAmCK/ME6R5cuy8TxsttZ58SEBy203vPeGp3s/HgnU57nZTfYftIZvF+wRfNQY40izQnoMZgM+chWW/7GUxYKPWDQfjYIGwYD2yHxOSAHe+qtnGx5xBCooBjI="
+  },
+  "message": {
+    "wrappedDek": "aLExclYqAtiwD0aM8USoC9Hl0AzdkEdoeQEwghqrEpqWQJ/xTM8EzUvW/QvKjyZ5",
+    "eventId": "event-test",
+    "ciphertext": "Bzr7rYXCgxYUTMzoCfGjehjl4NJzQsSHR1CxVUzAPJsAdqC+sUY0uVftgOU/VhhRIZ4dJnD430v9zkw7QaoPxSBZ1U4Auo2W0avzIwyyW1n2uwDodJwz1SFFPdcIWeWHe4HO2TO9F1lqIwioUUeQuUazq7F6dH8h1huc7W5YSJSfkExXmplyrOxw",
+    "wrapIv": "aNw+/U3f/6eY5GIb",
+    "v": 1,
+    "kind": "message",
+    "conversationId": "conversation-test",
+    "epochId": "epoch-test",
+    "type": "MESSAGE_CREATED",
+    "iv": "bvnyV2eSv8zkJ8/O"
+  },
+  "testOnly": true,
+  "recipientPublicRaw": "BAYU7ewWc4TRvD0coeALsWq57l99SW1DoGhL7yM5YW+CtyrXgjs9cavqfGsKYk2Rmr+XN5XNj/QkCd1RrJuxXq4="
+}

@@ -180,7 +180,7 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.deepEqual(body.accepted.map((a) => a.serverSequence), [1, 2]);
   });
 
-  test("duplicate eventId in a later batch ACKs nothing new and consumes no sequence", async () => {
+  test("lost ACK redelivery returns original sequence without duplicating storage", async () => {
     // The suite shares ONE store; anchor expectations to the CURRENT max
     // sequence instead of absolute numbers.
     const before = await app.inject({ method: "GET", url: "/api/v1/sync?after=0&limit=1000" });
@@ -206,11 +206,12 @@ describe("Phase 2 control plane HTTP API", () => {
       },
     });
     const body = second.json();
-    assert.equal(body.accepted.length, 1);
+    assert.equal(body.accepted.length, 2);
     assert.equal(body.duplicates, 1);
     // LOCK 10: the dup consumed NO sequence — the new event lands exactly one
     // above its predecessor with no gap in between.
-    assert.equal(body.accepted[0].serverSequence, firstSeq + 1);
+    assert.equal(body.accepted[0].serverSequence, firstSeq);
+    assert.equal(body.accepted[1].serverSequence, firstSeq + 1);
     const store = await app.inject({ method: "GET", url: "/api/v1/sync?after=0&limit=1000" });
     const seqs = store.json().events.map((e) => e.sequence);
     for (let i = 1; i < seqs.length; i++) {

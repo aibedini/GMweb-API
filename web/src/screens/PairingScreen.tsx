@@ -3,6 +3,7 @@ import QRCode from "qrcode";
 import { Button, Card, Chip } from "@heroui/react";
 import { beginPairing, type PairingHandle, type PairingProgress } from "../lib/pairing";
 import { loginWithPwaToken } from "../lib/adminAccess";
+import { wipeDeviceKeys } from "../lib/deviceKeys";
 
 export interface LinkContext {
   pairingSessionId: string;
@@ -51,18 +52,24 @@ export function PairingScreen({
   const [accessToken, setAccessToken] = useState("");
   const [tokenBusy, setTokenBusy] = useState(false);
   const startedRef = useRef(false);
+  const attemptRef = useRef(0);
   const compatible = apiVersion === pwaVersion;
 
   const start = async () => {
     if (startedRef.current || !compatible) return;
     setError(null);
     startedRef.current = true;
+    const attempt = ++attemptRef.current;
     try {
       const h = await beginPairing((next) => setStage(next));
+      if (attempt !== attemptRef.current) { h.cancel(); return; }
       setHandle(h);
       setSecondsLeft(Math.max(0, Math.round((h.qr.expiresAt - Date.now()) / 1000)));
       setQrDataUrl(await QRCode.toDataURL(JSON.stringify(h.qr), { width: 240, margin: 1 }));
       void h.wait().then(async (link) => {
+        if (attempt !== attemptRef.current) return;
+        setHandle(null); // Approval verified: QR expiry must not cancel cookie establishment.
+        setQrDataUrl(null);
         setStage("CREATING_LINKED_SESSION");
         await onLinked({
           pairingSessionId: h.session.pairingSessionId,
@@ -73,6 +80,7 @@ export function PairingScreen({
         });
         setStage("LINKED");
       }).catch((cause: unknown) => {
+        if (attempt !== attemptRef.current) return;
         if (!/cancel/i.test(String(cause))) {
           setError(cause instanceof Error ? cause.message : String(cause));
           setStage("FAILED");
@@ -82,6 +90,7 @@ export function PairingScreen({
         setQrDataUrl(null);
       });
     } catch (cause) {
+      if (attempt !== attemptRef.current) return;
       setError(cause instanceof Error ? cause.message : String(cause));
       setStage("FAILED");
       startedRef.current = false;
@@ -159,6 +168,14 @@ export function PairingScreen({
           )}
 
           {compatible && qrDataUrl && <img src={qrDataUrl} alt="Pairing QR code" width={240} height={240} />}
+          {compatible && <Button variant="ghost" onPress={() => {
+            ++attemptRef.current;
+            handle?.cancel();
+            setHandle(null);
+            setQrDataUrl(null);
+            startedRef.current = false;
+            void wipeDeviceKeys().then(start).catch(cause => setError(String(cause)));
+          }}>Reset browser identity and pair again</Button>}
 
           {compatible && !qrDataUrl && !error && (
             <p className="text-sm" style={{ color: "var(--muted-fg)" }}>{STAGE_LABELS[stage]}…</p>

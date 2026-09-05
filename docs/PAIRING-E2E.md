@@ -38,11 +38,16 @@ Google Messages Web unpaired throughout the matrix.
 | challenge_signature | Browser proof succeeds for that session and its local key |
 | linked_cookie | Secure/HttpOnly cookie exists; `/api/v1/linked-session` authenticates |
 | sync | `/api/v1/sync` succeeds against Android event storage while Chrome is unpaired |
+| encrypted_history | Real historical messages arrive as v1 ciphertext and decrypt into readable thread bubbles |
+| full_history_grant | Newly approved Full history browser decrypts earlier epochs using only new KEY_GRANT records |
+| from_now_on_denied | A separate clean From now on browser cannot decrypt pre-approval v1 history, including later backfilled rows |
 | browser_reload | Refresh remains linked and opens Inbox |
 | server_restart | Restart only the API process while preserving control-plane SQLite |
 | still_linked | Same browser cookie authenticates and sync succeeds after restart |
 | phone_revoke | Unlink on the phone; signed revocation reaches the API |
 | browser_unauthorized | Existing browser returns to pairing; old cookie cannot sync, and open SSE closes |
+| revoked_no_new_epochs | Subsequent messages rotate epochs; no grant targets the revoked device |
+| ciphertext_only_server | Database and API contain only encrypted body/address bytes for v1 events |
 
 Also exercise a reinstalled phone replacing a previous primary, replayed/
 expired setup QRs, expired ordinary QRs, and separate API/web origins through
