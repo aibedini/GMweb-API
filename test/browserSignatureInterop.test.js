@@ -27,6 +27,7 @@ test("web verifier accepts the DER signature emitted by Android/Java", async () 
   const { canonicalCertificate, verifyRootSignature } = await import("../web/src/lib/trustRoot.ts");
   const keys = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
   const certificate = {
+    protocol: "GMweb-Pairing-v1", pairingSessionId: "session", apiOrigin: "https://api.example", webOrigin: "https://gmweb.example",
     accountId: "default",
     deviceId: "web-device",
     deviceType: "WEB_PWA",

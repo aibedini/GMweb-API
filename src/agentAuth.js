@@ -70,11 +70,8 @@ class AgentAuthService {
     this.recentStamps = []; // [timestamp, deviceId] ring for duplicate rejection
   }
 
-  /** Registration payload (PR-05 publicKeys block) → durable identity.
-   *  FIX 5 (review): clients cannot self-declare roles. Policy: the FIRST
-   *  enrolled agent becomes PRIMARY_TRUST_AGENT; later agents stay
-   *  LEGACY_AGENT (no self-promotion). Re-registering the existing primary
-   *  keeps its role. Ops force-change goes through promotePrimary(). */
+  /** Only a consumed dashboard setup claim grants the primary role.
+   * Signed refreshes retain their existing role and immutable trust keys. */
   registerIdentity({ deviceId, publicKeys, protocolVersion = 1, forcePrimary = false }) {
     if (!deviceId || !publicKeys?.signing) {
       throw new Error("deviceId and publicKeys.signing are required");
@@ -90,14 +87,10 @@ class AgentAuthService {
     }
     const existing = this.getStmt.get(String(deviceId));
     const existingRole = existing ? String(existing.device_role || "LEGACY_AGENT") : null;
-    let role;
-    if (existingRole === "PRIMARY_TRUST_AGENT") {
-      role = "PRIMARY_TRUST_AGENT";
-    } else {
-      const primaries = this.db
-        .prepare("SELECT COUNT(*) AS n FROM agent_identities WHERE device_role = 'PRIMARY_TRUST_AGENT'")
-        .get();
-      role = primaries.n === 0 ? "PRIMARY_TRUST_AGENT" : "LEGACY_AGENT";
+    const role = existingRole || "LEGACY_AGENT";
+    if (existing && (existing.signing_public_key !== publicKeys.signing ||
+        existing.trust_root_public_key !== (publicKeys.trustRoot || null))) {
+      throw Object.assign(new Error("key changes require primary setup"), { statusCode: 403 });
     }
     this._register(deviceId, publicKeys, protocolVersion, role);
     return { ok: true, role };

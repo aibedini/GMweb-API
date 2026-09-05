@@ -126,7 +126,7 @@ export async function resetLocal(): Promise<void> {
  *
  * Returns a disposer (for React effects / StrictMode double-mount).
  */
-export function subscribeSyncAvailable(onSynced: (applied: number) => void): () => void {
+export function subscribeSyncAvailable(onSynced: (applied: number) => void, onRevoked: () => void): () => void {
   let closed = false;
   let es: EventSource | null = null;
   let connecting: ReturnType<typeof setTimeout> | null = null;
@@ -137,6 +137,12 @@ export function subscribeSyncAvailable(onSynced: (applied: number) => void): () 
     es.onmessage = (msg) => {
       try {
         const evt = JSON.parse(msg.data) as { type?: string; newEvents?: number };
+        if (evt.type === "device.revoked") {
+          closed = true;
+          es?.close();
+          onRevoked();
+          return;
+        }
         if (evt.type === "sync.available") {
           void syncNow()
             .then((applied) => {
@@ -152,6 +158,8 @@ export function subscribeSyncAvailable(onSynced: (applied: number) => void): () 
     };
     // EventSource retries on its own; we only rebuild after a hard close.
     es.onerror = () => {
+      void fetch("/api/v1/linked-session", { credentials: "include" })
+        .then(r => r.json()).then(s => { if (s.authenticated === false) { closed = true; onRevoked(); } }).catch(() => {});
       es?.close();
       es = null;
       if (!closed && connecting === null) {

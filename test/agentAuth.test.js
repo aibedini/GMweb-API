@@ -79,16 +79,15 @@ describe("AgentAuthService (PR-08b) — per-device signed auth", () => {
     assert.equal(svc.verifyAgentHeader({ headers: {}, url: "/x" }, "").reason, "missing_agent_auth_header");
   });
 
-  test("identity upsert overwrites keys on re-registration", () => {
+  test("identity refresh cannot replace registered keys without a setup claim", () => {
     const svc = new AgentAuthService(new Database(":memory:"));
     const p1 = makeKey();
     const p2 = makeKey();
-    svc.registerIdentity({ deviceId: "d", publicKeys: { signing: p1.publicKey.export({ format: "der", type: "spki" }).toString("base64") } });
-    svc.registerIdentity({ deviceId: "d", publicKeys: { signing: p2.publicKey.export({ format: "der", type: "spki" }).toString("base64") } });
-    const req = authedRequest(svc, p2, "d", "{}");
+    const publicKeys = { signing: p1.publicKey.export({ format: "der", type: "spki" }).toString("base64") };
+    assert.equal(svc.registerIdentity({ deviceId: "d", publicKeys }).role, "LEGACY_AGENT");
+    assert.throws(() => svc.registerIdentity({ deviceId: "d", publicKeys: { signing: p2.publicKey.export({ format: "der", type: "spki" }).toString("base64") } }), /key changes require primary setup/);
+    const req = authedRequest(svc, p1, "d", "{}");
     assert.equal(svc.verifyAgentHeader(req, req.bodyBuf).ok, true);
-    const old = authedRequest(svc, p1, "d", "{}");
-    assert.equal(svc.verifyAgentHeader(old, old.bodyBuf).ok, false);
   });
 
   test("dashboard pairing recovery atomically replaces the primary trust agent", () => {

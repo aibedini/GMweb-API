@@ -11,6 +11,10 @@ export interface PairingSession {
 
 export interface PairingQrPayload {
   version: number;
+  protocol: string;
+  apiOrigin: string;
+  webOrigin: string;
+  transcriptHash: string;
   pairingSessionId: string;
   webDeviceId: string;
   webSigningPublicKey: string;
@@ -20,7 +24,6 @@ export interface PairingQrPayload {
   origin: string;
   expiresAt: number;
   /** Present only when the creating browser has dashboard/admin authority. */
-  identityBootstrapToken?: string;
 }
 
 export interface CreateSessionResponse extends PairingSession {

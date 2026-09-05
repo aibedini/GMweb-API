@@ -47,7 +47,7 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
         }
       },
       response: {
-        200: { type: "object", properties: { ok: { type: "boolean" } } },
+        200: { type: "object", properties: { ok: { type: "boolean" }, role: { type: "string" } } },
         401: {
           type: "object",
           properties: {
@@ -55,7 +55,6 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
             reason: { type: "string", enum: [
               "device_key_mismatch",
               "device_key_not_configured",
-              "invalid_pairing_bootstrap",
             ] },
             expectedKeyPreview: { type: ["string", "null"] },
           },
@@ -63,8 +62,7 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
       }
     }
   }, async (request) => {
-    // FIX 5b (review): role is NEVER taken from the client. The service
-    // assigns PRIMARY_TRUST_AGENT to the first enrolled agent automatically.
+    // Ordinary registration cannot grant primary authority.
     const { deviceId, publicKeys, protocolVersion } = request.body || {};
     if (request.authenticatedAgentId && request.authenticatedAgentId !== String(deviceId || "")) {
       const err = new Error("signed identity does not match registration deviceId");
@@ -75,12 +73,12 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
       deviceId,
       publicKeys,
       protocolVersion,
-      forcePrimary: request.identityBootstrapAuthorized === true,
+      forcePrimary: false,
     });
     request._pairingDiagnostic = {
       stage: "ANDROID_IDENTITY_REGISTRATION",
       status: "SUCCESS",
-      reason: request.identityBootstrapAuthorized === true ? "pairing_bootstrap" : "identity_refreshed",
+      reason: "identity_refreshed",
       deviceId,
     };
     return { ...result, role: result.role };

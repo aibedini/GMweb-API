@@ -1,3 +1,4 @@
+const fixture = require("./pairingFixture");
 /**
  * PAIRING-E2E-CLOSURE — full-app composition test: server.js global hooks
  * (requireToken) + AgentAuth + identity route + pairingRoutes mounted
@@ -51,7 +52,7 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
     pair = makeKey();
     const spki = pair.publicKey.export({ format: "der", type: "spki" });
     // FIX 5 policy lives in the service: first enrolled agent → PRIMARY.
-    const reg = svc.registerIdentity({ deviceId: DEVICE, publicKeys: { signing: spki.toString("base64") } });
+    const reg = svc.registerIdentity({ deviceId: DEVICE, forcePrimary: true, publicKeys: { signing: spki.toString("base64"), trustRoot: fixture.rootPublicKey } });
     assert.equal(reg.role, "PRIMARY_TRUST_AGENT", "first agent must auto-promote");
     app.addHook("preHandler", (request, reply, done) => {
       pairingGate(svc, request, reply, done);
@@ -145,10 +146,10 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
     ).json();
     const body = JSON.stringify({
       pairingSessionId: created.pairingSessionId,
-      certificate: "CERT-E2E",
+      certificate: fixture.certificate(created.pairingSessionId),
       deviceId: "web-e2e",
-      transcriptHash: created.qr ? "h" : "h",
-      trustRootPublicKey: "TRUST-ROOT",
+      transcriptHash: created.qr.transcriptHash,
+      trustRootPublicKey: fixture.rootPublicKey,
     });
     const approveUrl = "/api/v1/pairing/approve";
     const res = await app.inject({
@@ -168,7 +169,7 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
     });
     assert.equal(status.statusCode, 200);
     assert.equal(status.json().state, "APPROVED");
-    assert.equal(status.json().certificate, "CERT-E2E");
+    assert.equal(JSON.parse(status.json().certificate).deviceId, "web-e2e");
   });
 
   test("status WITHOUT pollSecret → EXPIRED (cannot consume)", async () => {
@@ -267,8 +268,8 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
         pairingSessionId: created.pairingSessionId,
         certificate: "CERT",
         deviceId: "web-e2e",
-        transcriptHash: "h",
-        trustRootPublicKey: "TRUST",
+        transcriptHash: pairing.hashOf(pairing.getSession(created.pairingSessionId)),
+        trustRootPublicKey: fixture.rootPublicKey,
       },
     });
     // The security property: shared key alone must never approve (200).
@@ -293,10 +294,10 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
     // Android-style approve body — EXACT bytes the client will sign.
     const exactRawBody = JSON.stringify({
       pairingSessionId: created.pairingSessionId,
-      certificate: "CERT-RAWBODY",
+      certificate: fixture.certificate(created.pairingSessionId),
       deviceId: "web-e2e",
-      transcriptHash: "h",
-      trustRootPublicKey: "TRUST",
+      transcriptHash: pairing.hashOf(pairing.getSession(created.pairingSessionId)),
+      trustRootPublicKey: fixture.rootPublicKey,
     });
 
     const approveUrl = "/api/v1/pairing/approve";
@@ -318,10 +319,10 @@ describe("PAIRING-E2E: real app composition (global requireToken + agent auth)",
     //    signature from (1) reused → MUST reject (raw-body binding).
     const differentSerialization = JSON.stringify(
       {
-        trustRootPublicKey: "TRUST",
-        transcriptHash: "h",
+        trustRootPublicKey: fixture.rootPublicKey,
+        transcriptHash: pairing.hashOf(pairing.getSession(created.pairingSessionId)),
         deviceId: "web-e2e",
-        certificate: "CERT-RAWBODY",
+        certificate: fixture.certificate(created.pairingSessionId),
         pairingSessionId: created.pairingSessionId,
       },
       null,

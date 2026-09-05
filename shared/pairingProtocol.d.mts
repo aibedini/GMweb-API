@@ -1,0 +1,5 @@
+export const PROTOCOL: "GMweb-Pairing-v1";
+export function canonicalChallenge(c: { pairingSessionId: string; deviceId: string; challenge: string; apiOrigin: string; webOrigin: string; issuedAt: number }): string;
+export function canonicalTranscript(t: { protocol: string; pairingSessionId: string; webDeviceId: string; webSigningPublicKey: string; webEncryptionPublicKey: string; ephemeralPublicKey: string; nonce: string; apiOrigin: string; webOrigin: string; expiresAt: number }): string;
+export function canonicalCertificate(c: { protocol: string; accountId: string; deviceId: string; deviceType: string; signingPublicKey: string; encryptionPublicKey: string; capabilities: string[]; historyGrant: string; trustSequence: number; issuedAt: number; expiresAt: number; pairingTranscriptHash: string; pairingSessionId: string; apiOrigin: string; webOrigin: string }): string;
+export function canonicalEnrollment(c: { claim: string; deviceId: string; apiOrigin: string; publicKeys: { signing: string; encryption: string; trustRoot: string } }): string;

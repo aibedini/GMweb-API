@@ -1,3 +1,4 @@
+import { PROTOCOL, canonicalTranscript, canonicalChallenge } from "../../../shared/pairingProtocol.mjs";
 /**
  * ADR-007 — Linked-device pairing client.
  *
@@ -87,6 +88,13 @@ export async function beginPairing(onProgress?: (stage: PairingProgress) => void
     nonce,
   });
   const qr = created.qr;
+  if (qr.protocol !== PROTOCOL || qr.webOrigin !== window.location.origin ||
+      qr.webDeviceId !== webDeviceId || qr.webSigningPublicKey !== keys.signingPublicKeyB64 ||
+      qr.webEncryptionPublicKey !== keys.encryptionPublicKeyB64 || qr.nonce !== nonce ||
+      qr.ephemeralPublicKey !== ephemeralPubB64) throw new Error("pairing transcript substitution");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonicalTranscript(qr)));
+  const transcriptHash = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+  if (qr.transcriptHash !== transcriptHash) throw new Error("pairing transcript hash mismatch");
   const pairingSession: PairingSession = {
     pairingSessionId: created.pairingSessionId,
     pollSecret: created.pollSecret,
@@ -121,7 +129,10 @@ export async function beginPairing(onProgress?: (stage: PairingProgress) => void
             onProgress?.("VERIFYING_CERTIFICATE");
             const state = await verifyCertificate(cert, {
               deviceId: webDeviceId,
-              transcriptHash: status.transcriptHash,
+              transcriptHash,
+              pairingSessionId: qr.pairingSessionId,
+              apiOrigin: qr.apiOrigin,
+              webOrigin: qr.webOrigin,
               origin: qr.origin,
               signingPublicKeyB64: keys.signingPublicKeyB64,
               encryptionPublicKeyB64: keys.encryptionPublicKeyB64,
@@ -158,7 +169,7 @@ export async function completeLinkedSession(
   pairingSessionId: string,
   pollSecret: string,
   deviceId: string,
-  _certificate: string,
+  certificate: string,
   origin: string,
 ): Promise<{ ok: boolean; deviceId: string; capabilities: string[] }> {
   // Learn the single-use challenge from the dedicated peek endpoint the single-use challenge from the dedicated peek endpoint
@@ -167,10 +178,12 @@ export async function completeLinkedSession(
   const chRes = await fetch(`/api/v1/pairing/challenge?${q}`, { credentials: "include" });
   if (!chRes.ok) throw new Error(`challenge unavailable: HTTP ${chRes.status}`);
   const ch = await chRes.json();
+  if (ch.certificate !== certificate || ch.deviceId !== deviceId || ch.pairingSessionId !== pairingSessionId || ch.webOrigin !== origin)
+    throw new Error("link challenge binding mismatch");
   const challenge = ch.challenge as string;
   const issuedAt = ch.issuedAt as number;
   const canonical = new TextEncoder().encode(
-    ["GMweb-Link-Session-v1", deviceId, challenge, origin, String(issuedAt)].join("\n"),
+    canonicalChallenge({ pairingSessionId, deviceId, challenge, webOrigin: origin, apiOrigin: JSON.parse(certificate).apiOrigin, issuedAt }),
   );
   const sig = await crypto.subtle.sign(
     { name: "ECDSA", hash: "SHA-256" },

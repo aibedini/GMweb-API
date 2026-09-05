@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.13.12",
+    "version": "0.14.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -1837,6 +1837,9 @@
                   "properties": {
                     "ok": {
                       "type": "boolean"
+                    },
+                    "role": {
+                      "type": "string"
                     }
                   }
                 }
@@ -1857,8 +1860,7 @@
                       "type": "string",
                       "enum": [
                         "device_key_mismatch",
-                        "device_key_not_configured",
-                        "invalid_pairing_bootstrap"
+                        "device_key_not_configured"
                       ]
                     },
                     "expectedKeyPreview": {
@@ -1884,6 +1886,111 @@
         "responses": {
           "200": {
             "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/admin/primary-setup": {
+      "post": {
+        "summary": "Create a one-use primary phone setup claim",
+        "tags": [
+          "Pairing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/primary-enrollment": {
+      "post": {
+        "summary": "Consume a setup claim and enroll the primary phone",
+        "tags": [
+          "Pairing"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "claim",
+                  "deviceId",
+                  "apiOrigin",
+                  "publicKeys",
+                  "signature",
+                  "rootSignature"
+                ],
+                "properties": {
+                  "claim": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "deviceId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "apiOrigin": {
+                    "type": "string",
+                    "maxLength": 256
+                  },
+                  "signature": {
+                    "type": "string",
+                    "maxLength": 512
+                  },
+                  "rootSignature": {
+                    "type": "string",
+                    "maxLength": 512
+                  },
+                  "publicKeys": {
+                    "type": "object",
+                    "required": [
+                      "signing",
+                      "encryption",
+                      "trustRoot"
+                    ],
+                    "properties": {
+                      "signing": {
+                        "type": "string",
+                        "maxLength": 512
+                      },
+                      "encryption": {
+                        "type": "string",
+                        "maxLength": 512
+                      },
+                      "trustRoot": {
+                        "type": "string",
+                        "maxLength": 512
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
           }
         }
       }

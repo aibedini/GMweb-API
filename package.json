@@ -1,6 +1,6 @@
 {
   "name": "gmweb-api",
-  "version": "0.13.12",
+  "version": "0.14.0",
   "private": true,
   "description": "GMweb API: OpenWA-style HTTP bridge for Google Messages for Web.",
   "main": "src/server.js",
@@ -16,7 +16,8 @@
     "generate:openapi": "node scripts/generate-openapi.js",
     "hash-password": "node scripts/hash-password.js",
     "check": "node --check src/server.js && node --check src/googleMessagesClient.js && node --check src/apiKeys.js && node --check src/activityLog.js && node --check src/pwaAccessTokens.js && node --check src/pwaAuthRoutes.js && node --check src/queue.js && node --check src/sendPacing.js && node --check src/sendPriority.js && node --check src/sendSchedule.js && node --check src/sendStore.js && node --check src/config.js && node --check src/openLoginChrome.js && node --check scripts/smoke.js && node --check scripts/doctor.js && node --check scripts/new-token.js && node --check scripts/hash-password.js && node --check scripts/export-openapi.js && node --check scripts/generate-openapi.js && node --check scripts/browser-probe.js && node --check public/dashboard/app.js && node --check ecosystem.config.cjs",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "release:pairing-gate": "node scripts/check-pairing-release.js"
   },
   "dependencies": {
     "@fastify/cookie": "^11.1.2",
@@ -33,5 +34,8 @@
     "playwright": "^1.49.1",
     "web-push": "^3.6.7",
     "zod": "^3.24.1"
+  },
+  "engines": {
+    "node": ">=22.13.0"
   }
 }

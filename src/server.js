@@ -89,7 +89,6 @@ const { registerAgentIdentityRoutes } = require("./agentIdentityRoutes");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const { registerPairingRoutes } = require("./pairingRoutes");
 const { registerPwaAuthRoutes, registerPwaTokenAdminRoutes } = require("./pwaAuthRoutes");
-const pairingSessions = require("./pairingSessions");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
 // Pull mode: the phone dials OUT to the server and picks up tasks (no tunnel).
@@ -137,6 +136,7 @@ const passkeyService = new PasskeyService(controlDb, {
 // PR-08b: per-device agent identities (ADR-001) — the agent bridge upgrades
 // from the shared device key to per-device ECDSA signatures.
 const agentAuthService = new AgentAuthService(controlDb);
+require("./pairingDb").configure(controlDb);
 const DEFAULT_ACCOUNT_ID = "default";
 
 /**
@@ -622,6 +622,7 @@ function checkDeviceKey(request) {
 }
 
 function requireToken(request, reply, done) {
+  if (requestPath(request.url) === "/api/v1/primary-enrollment" && request.method === "POST") return done();
   if (config.publicHealth && requestPath(request.url) === "/health") return done();
   // Phase 4 (§21): passkey login flow endpoints must be reachable BEFORE any
   // session exists — status, both option generators, and the auth verify.
@@ -643,7 +644,7 @@ function requireToken(request, reply, done) {
   // POST-PAIR: linked-session introspection is public — the route itself
   // reports authenticated:false when no valid cookie is present.
   if (requestPath(request.url) === "/api/v1/linked-session") return done();
-  if (requestPath(request.url) === "/api/v1/pairing/challenge") return done();
+  if (requestPath(request.url) === "/api/v1/pairing/challenge" || requestPath(request.url) === "/api/v1/pairing/complete") return done();
   // FIX 2 (review): the Android-only pairing endpoints delegate to the SAME
   // agent pipeline as /api/v1/agent/* — verified here ONCE (method-aware,
   // exact rawBody) and bound to request.authenticatedAgentId. The route
@@ -716,31 +717,7 @@ function requireToken(request, reply, done) {
   // verified "a signature exists" without binding it to this request. The
   // bound deviceId is exposed as request.authenticatedAgentId for handlers.
   if (requestPath(request.url).startsWith("/api/v1/agent/")) {
-    if (requestPath(request.url) === "/api/v1/agent/identity") {
-      const bootstrapToken = String(request.headers["x-pairing-bootstrap"] || "");
-      const bootstrapSession = String(request.headers["x-pairing-session"] || "");
-      if (bootstrapToken) {
-        if (pairingSessions.consumeIdentityBootstrap(bootstrapSession, bootstrapToken)) {
-          request.identityBootstrapAuthorized = true;
-          request._pairingDiagnostic = {
-            stage: "ANDROID_IDENTITY_AUTH",
-            status: "SUCCESS",
-            reason: "pairing_bootstrap_valid",
-            sessionId: bootstrapSession,
-          };
-          return done();
-        }
-        request._pairingDiagnostic = {
-          stage: "ANDROID_IDENTITY_AUTH",
-          status: "FAILED",
-          reason: "invalid_pairing_bootstrap",
-          sessionId: bootstrapSession,
-        };
-        reply.code(401).send({ error: "unauthorized", reason: "invalid_pairing_bootstrap" });
-        return;
-      }
-    }
-    if (checkDeviceKey(request)) {
+    if (checkDeviceKey(request) && !(requestPath(request.url) === "/api/v1/agent/identity" && agentAuthService.getIdentity(request.body?.deviceId))) {
       if (requestPath(request.url) === "/api/v1/agent/identity") {
         request._pairingDiagnostic = {
           stage: "ANDROID_IDENTITY_AUTH",
@@ -753,7 +730,7 @@ function requireToken(request, reply, done) {
     if (requestPath(request.url) === "/api/v1/agent/identity") {
       // An already-enrolled Android identity refreshes its own public keys
       // with the same per-device signature used by all other agent routes.
-      // Unknown identities still need the dashboard-authorized QR bootstrap.
+      // Fresh phones enroll through the independent primary setup endpoint.
       const auth = agentAuthService.verifyAgentHeader(
         request,
         request.rawBody || Buffer.alloc(0),
@@ -967,6 +944,11 @@ const controlSseClients = new Set();
 function emitControlEvent(event) {
   const payload = `data: ${JSON.stringify(event)}\n\n`;
   for (const reply of controlSseClients) {
+    if (reply._linkedToken && !linkedSessions.resolve(reply._linkedToken)) {
+      reply.raw.end();
+      controlSseClients.delete(reply);
+      continue;
+    }
     try { reply.raw.write(payload); } catch { controlSseClients.delete(reply); }
   }
 }
@@ -2768,10 +2750,10 @@ registerControlPlaneRoutes(app, {
 registerAgentIdentityRoutes(app, { agentAuthService });
 
 // ADR-007: primary-device QR pairing relay (web ← Android approval).
+require("./primaryEnrollment").registerPrimaryEnrollment(app, { agentAuthService, config, canAdmin: hasDashboardAccess });
 registerPairingRoutes(app, {
   agentAuthService,
   config,
-  canBootstrapIdentity: (request) => hasDashboardAccess(request),
 });
 
 registerPwaAuthRoutes(app, {
@@ -2825,6 +2807,18 @@ app.get("/api/v1/sse", {
   });
   reply.raw.write(": connected\n\n");
 
+  if (request.linkedDevice) {
+    reply._linkedToken = request.cookies[linkedSessions.COOKIE_NAME];
+    const expiryCheck = setInterval(() => {
+      if (!linkedSessions.resolve(reply._linkedToken)) {
+        reply.raw.write('data: {"type":"device.revoked"}\n\n');
+        reply.raw.end();
+        controlSseClients.delete(reply);
+      }
+    }, 1000);
+    expiryCheck.unref();
+    reply.raw.on("close", () => clearInterval(expiryCheck));
+  }
   controlSseClients.add(reply);
   request.raw.on("close", () => controlSseClients.delete(reply));
   return reply;

@@ -1,3 +1,20 @@
+## GMweb 0.14.0 / Messages 2.7.0: coordinated pairing upgrade
+
+Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use
+`POST /api/v1/primary-enrollment`, with operational-key and trust-root proofs.
+Ordinary browser QRs cannot enroll phones. Registering `/agent/identity`
+creates a legacy role; existing identities require a signed refresh and cannot
+replace their keys through the shared device key.
+
+All pairing participants must use `GMweb-Pairing-v1`, the fixed UTF-8 protocol
+in [PAIRING-PROTOCOL-V1.md](PAIRING-PROTOCOL-V1.md). Both `apiOrigin` and
+`webOrigin` are bound into transcripts, certificates and challenges. Configure
+`PUBLIC_API_ORIGIN` and `PUBLIC_WEB_ORIGIN` explicitly in production.
+Pairing and linked sessions persist in control-plane SQLite. The server now
+verifies Android certificates before accepting approval. Deploy API, PWA,
+dashboard and APK together; old JSON-signed clients must upgrade and pair again.
+A physical-device [release gate](PAIRING-E2E.md) is required before deployment.
+
 # GMweb — Integration Guide (for a consuming project)
 
 This document is the stable hand-off for **another project** that wants to send and

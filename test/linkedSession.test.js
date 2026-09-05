@@ -48,6 +48,7 @@ test("complete: challenge signature issues HttpOnly linked session with capabili
   // 2. Approve it (as the Android agent service would, post-gate).
   pairing.approveSession(ps, {
     certificate: JSON.stringify({
+      expiresAt: Date.now() + 86400000, trustSequence: 1,
       deviceId: "web-c-1",
       signingPublicKey: certPub,
       capabilities: ["READ_MESSAGES", "SEND_MESSAGES"],
@@ -66,7 +67,7 @@ test("complete: challenge signature issues HttpOnly linked session with capabili
 
   // 4. Browser signs the canonical challenge with its private key.
   const canonical = pairing.challengeCanonical(
-    taken.deviceId, taken.challenge, "https://gmweb.example", taken.issuedAt
+    taken.deviceId, taken.challenge, "https://gmweb.example", taken.issuedAt, ps, "https://gmweb.example"
   );
   const signature = sign(browserKeys.privateKey, canonical);
 

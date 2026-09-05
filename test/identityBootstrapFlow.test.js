@@ -1,151 +1,97 @@
 "use strict";
-
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const Fastify = require("fastify");
 const Database = require("better-sqlite3");
+const store = require("../src/pairingDb");
 const { AgentAuthService } = require("../src/agentAuth");
-const { registerAgentIdentityRoutes } = require("../src/agentIdentityRoutes");
+const { registerPrimaryEnrollment } = require("../src/primaryEnrollment");
 const { registerPairingRoutes } = require("../src/pairingRoutes");
+const pairingGate = require("../src/pairingGate");
 const pairing = require("../src/pairingSessions");
-
-function keyPair() {
-  return crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const linked = require("../src/linkedSessions");
+const protocol = require("../shared/pairingProtocol.mjs");
+const fixture = require("./pairingFixture");
+const keyPair = () => crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+const spki = pair => pair.publicKey.export({format:"der",type:"spki"}).toString("base64");
+let timestamp = Date.now();
+function signed(pair, method, url, body = "") {
+  const ts = ++timestamp;
+  const canonical = `${method}\n${url}\n${crypto.createHash("sha256").update(body).digest("hex")}\nX-AGENT-TS:${ts}\n`;
+  return {"content-type":"application/json", "x-agent-auth":`phone:${crypto.sign("sha256",Buffer.from(canonical),pair.privateKey).toString("base64")}`,"x-agent-ts":String(ts)};
 }
-
-function spki(pair) {
-  return pair.publicKey.export({ format: "der", type: "spki" }).toString("base64");
-}
-
-function signed(pair, deviceId, method, path, body = Buffer.alloc(0), ts = Date.now()) {
-  const hash = crypto.createHash("sha256").update(body).digest("hex");
-  const canonical = `${method}\n${path}\n${hash}\nX-AGENT-TS:${ts}\n`;
-  const signature = crypto.sign("sha256", Buffer.from(canonical), pair.privateKey).toString("base64");
-  return {
-    "x-agent-auth": `${deviceId}:${signature}`,
-    "x-agent-ts": String(ts),
-  };
-}
-
-test("dashboard QR bootstrap enrolls Android then signed metadata and approval reach APPROVED", async () => {
-  pairing._reset();
-  const app = Fastify({ logger: false });
-  app.addContentTypeParser("application/json", { parseAs: "buffer" }, (request, body, done) => {
-    request.rawBody = body;
-    try { done(null, JSON.parse(body.toString("utf8") || "{}")); } catch (error) { done(error); }
+test("separate phone setup, verified pairing, durable session and revoke without Chrome", async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-pairing-"));
+  const file = path.join(dir,"control.db");
+  const db = new Database(file);
+  store.configure(db);
+  const service = new AgentAuthService(db);
+  service.registerIdentity({deviceId:"stale-phone",publicKeys:{signing:spki(keyPair()),trustRoot:spki(keyPair())},forcePrimary:true});
+  const app = Fastify({logger:false});
+  await app.register(require("@fastify/cookie"));
+  app.addContentTypeParser("application/json",{parseAs:"buffer"},(request,body,done)=>{
+    request.rawBody=body;
+    try {done(null,JSON.parse(body.toString() || "{}"));} catch(e){done(e);}
   });
-
-  const service = new AgentAuthService(new Database(":memory:"));
-  const stale = keyPair();
-  service.registerIdentity({ deviceId: "stale-phone", publicKeys: { signing: spki(stale) } });
-
-  app.addHook("preHandler", (request, reply, done) => {
-    const path = request.url.split("?")[0];
-    if (path === "/api/v1/agent/identity") {
-      const token = String(request.headers["x-pairing-bootstrap"] || "");
-      const sessionId = String(request.headers["x-pairing-session"] || "");
-      if (pairing.consumeIdentityBootstrap(sessionId, token)) {
-        request.identityBootstrapAuthorized = true;
-        return done();
-      }
-      reply.code(401).send({ error: "unauthorized", reason: "invalid_pairing_bootstrap" });
-      return;
-    }
-    if (path.startsWith("/api/v1/pairing/session/") || path === "/api/v1/pairing/approve") {
-      const auth = service.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
-      if (!auth.ok) {
-        reply.code(401).send({ error: "unauthorized", reason: auth.reason });
-        return;
-      }
-      request.authenticatedAgentId = auth.deviceId;
-    }
-    done();
-  });
-  registerAgentIdentityRoutes(app, { agentAuthService: service });
-  registerPairingRoutes(app, {
-    agentAuthService: service,
-    config: { publicWebOrigin: "https://gmweb.example" },
-    canBootstrapIdentity: () => true,
-  });
-  await app.ready();
-
-  try {
-    const browser = keyPair();
-    const create = await app.inject({
-      method: "POST",
-      url: "/api/v1/pairing/session",
-      payload: {
-        webDeviceId: "web-device",
-        webSigningPublicKey: spki(browser),
-        webEncryptionPublicKey: "web-encryption",
-        ephemeralPublicKey: "web-ephemeral",
-        nonce: "nonce",
-      },
-    });
-    assert.equal(create.statusCode, 200);
-    const session = create.json();
-    assert.ok(session.qr.identityBootstrapToken);
-
-    const phone = keyPair();
-    const identityBody = Buffer.from(JSON.stringify({
-      deviceId: "current-phone",
-      protocolVersion: 1,
-      publicKeys: { signing: spki(phone), encryption: "phone-encryption", trustRoot: spki(phone) },
-    }));
-    const enrollment = await app.inject({
-      method: "POST",
-      url: "/api/v1/agent/identity",
-      payload: identityBody,
-      headers: {
-        "content-type": "application/json",
-        "x-pairing-session": session.pairingSessionId,
-        "x-pairing-bootstrap": session.qr.identityBootstrapToken,
-      },
-    });
-    assert.equal(enrollment.statusCode, 200);
-    assert.equal(service.getRole("stale-phone"), "LEGACY_AGENT");
-    assert.equal(service.getRole("current-phone"), "PRIMARY_TRUST_AGENT");
-
-    const metadataPath = `/api/v1/pairing/session/${session.pairingSessionId}`;
-    const metadata = await app.inject({
-      method: "GET",
-      url: metadataPath,
-      headers: signed(phone, "current-phone", "GET", metadataPath, Buffer.alloc(0)),
-    });
-    assert.equal(metadata.statusCode, 200);
-
-    const certificate = JSON.stringify({
-      deviceId: "web-device",
-      signingPublicKey: spki(browser),
-      capabilities: ["READ_MESSAGES"],
-    });
-    const approveBody = Buffer.from(JSON.stringify({
-      pairingSessionId: session.pairingSessionId,
-      certificate,
-      deviceId: "web-device",
-      transcriptHash: metadata.json().transcriptHash,
-      trustRootPublicKey: spki(phone),
-    }));
-    const approve = await app.inject({
-      method: "POST",
-      url: "/api/v1/pairing/approve",
-      payload: approveBody,
-      headers: {
-        "content-type": "application/json",
-        ...signed(phone, "current-phone", "POST", "/api/v1/pairing/approve", approveBody, Date.now() + 1),
-      },
-    });
-    assert.equal(approve.statusCode, 200);
-
-    const status = await app.inject({
-      method: "GET",
-      url: `/api/v1/pairing/status?pairingSessionId=${session.pairingSessionId}&pollSecret=${session.pollSecret}`,
-    });
-    assert.equal(status.statusCode, 200);
-    assert.equal(status.json().state, "APPROVED");
-  } finally {
-    await app.close();
-    pairing._reset();
+  app.addHook("preHandler",(req,reply,done)=>pairingGate(service,req,reply,done));
+  const config={publicWebOrigin:"https://web.example",publicApiOrigin:"https://api.example"};
+  registerPrimaryEnrollment(app,{agentAuthService:service,config,canAdmin:req=>req.headers["x-test-admin"]==="yes"});
+  registerPairingRoutes(app,{agentAuthService:service,config});
+  t.after(async()=>{await app.close();db.close();store.configure(new Database(":memory:"));for(const suffix of ["","-wal","-shm"])fs.rmSync(file+suffix,{force:true});fs.rmdirSync(dir);});
+  assert.equal((await app.inject({method:"POST",url:"/admin/primary-setup"})).statusCode,403);
+  const setup=(await app.inject({method:"POST",url:"/admin/primary-setup",headers:{"x-test-admin":"yes"}})).json();
+  const phone=keyPair();
+  const body={claim:setup.claim,deviceId:"phone",apiOrigin:setup.apiOrigin,publicKeys:{signing:spki(phone),encryption:spki(keyPair()),trustRoot:fixture.rootPublicKey}};
+  const bytes=Buffer.from(protocol.canonicalEnrollment(body));
+  body.signature=crypto.sign("sha256",bytes,phone.privateKey).toString("base64");
+  body.rootSignature=crypto.sign("sha256",bytes,fixture.root.privateKey).toString("base64");
+  const enroll=()=>app.inject({method:"POST",url:"/api/v1/primary-enrollment",payload:body});
+  const wrongOrigin = await app.inject({method:"POST",url:"/api/v1/primary-enrollment",payload:{...body,apiOrigin:"https://other.example"}});
+  assert.equal(wrongOrigin.statusCode,401);
+  const badProof = await app.inject({method:"POST",url:"/api/v1/primary-enrollment",payload:{...body,rootSignature:"invalid"}});
+  assert.equal(badProof.statusCode,401);
+  assert.equal((await enroll()).statusCode,200,"bad proofs must not burn the claim");
+  assert.equal((await enroll()).statusCode,401,"claim is single-use");
+  assert.equal(service.getRole("phone"),"PRIMARY_TRUST_AGENT");
+  assert.equal(service.getRole("stale-phone"),"LEGACY_AGENT");
+  const browser=keyPair();
+  const created=(await app.inject({method:"POST",url:"/api/v1/pairing/session",payload:{webDeviceId:"web",webSigningPublicKey:spki(browser),webEncryptionPublicKey:spki(keyPair()),ephemeralPublicKey:spki(keyPair()),nonce:"nonce"}})).json();
+  assert.equal(created.qr.identityBootstrapToken,undefined);
+  assert.equal(created.qr.apiOrigin,"https://api.example");
+  assert.equal(created.qr.webOrigin,"https://web.example");
+  const metadataUrl=`/api/v1/pairing/session/${created.pairingSessionId}`;
+  const metadata=await app.inject({method:"GET",url:metadataUrl,headers:signed(phone,"GET",metadataUrl)});
+  assert.equal(metadata.statusCode,200);
+  const cert=fixture.certificate(created.pairingSessionId);
+  const approval={pairingSessionId:created.pairingSessionId,deviceId:"web",certificate:cert,transcriptHash:created.qr.transcriptHash,trustRootPublicKey:fixture.rootPublicKey};
+  const approve=async b=>{const raw=JSON.stringify(b);return app.inject({method:"POST",url:"/api/v1/pairing/approve",payload:raw,headers:signed(phone,"POST","/api/v1/pairing/approve",raw)});};
+  for(const field of ["apiOrigin","webOrigin","pairingSessionId","deviceId","signingPublicKey","pairingTranscriptHash"]){
+    const tampered={...JSON.parse(cert),[field]:"substitution"};
+    assert.equal((await approve({...approval,certificate:JSON.stringify(tampered)})).statusCode,403);
   }
+  assert.equal((await approve({...approval,trustRootPublicKey:spki(keyPair())})).statusCode,403);
+  assert.equal((await approve(approval)).statusCode,200);
+  const status=await app.inject({method:"GET",url:`/api/v1/pairing/status?pairingSessionId=${created.pairingSessionId}&pollSecret=${created.pollSecret}`});
+  assert.equal(status.json().state,"APPROVED");
+  const challenge=pairing.peekChallenge(created.pollSecret);
+  const signature=crypto.sign("sha256",pairing.challengeCanonical("web",challenge.challenge,challenge.webOrigin,challenge.issuedAt,created.pairingSessionId,challenge.apiOrigin),{key:browser.privateKey,dsaEncoding:"ieee-p1363"}).toString("base64");
+  const completion={pairingSessionId:created.pairingSessionId,pollSecret:created.pollSecret,deviceId:"web",challenge:challenge.challenge,signature,certificate:cert};
+  const complete=()=>app.inject({method:"POST",url:"/api/v1/pairing/complete",payload:completion});
+  const results=await Promise.all([complete(),complete()]);
+  assert.deepEqual(results.map(r=>r.statusCode).sort(),[200,401]);
+  const cookie=results.find(r=>r.statusCode===200).cookies.find(c=>c.name===linked.COOKIE_NAME);
+  assert.ok(cookie.httpOnly && cookie.secure);
+  assert.equal(linked.resolve(cookie.value).trustSequence,1);
+  // A separate Node process reopens the exact on-disk database.
+  const child=spawnSync(process.execPath,["-e",`const fs=require('fs');const input=JSON.parse(fs.readFileSync(0,'utf8'));require('./src/pairingDb').configure(new(require('better-sqlite3'))(input.file));process.stdout.write(JSON.stringify(require('./src/linkedSessions').resolve(input.token)));`],{cwd:path.resolve(__dirname,".."),input:JSON.stringify({file,token:cookie.value}),encoding:"utf8"});
+  assert.equal(child.status,0,child.stderr);
+  assert.equal(JSON.parse(child.stdout).deviceId,"web");
+  linked.revokeDevice("web");
+  assert.equal(linked.resolve(cookie.value),null);
+  assert.equal(pairing.peekChallenge(created.pollSecret),null);
 });

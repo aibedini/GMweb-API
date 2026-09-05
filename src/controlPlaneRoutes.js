@@ -15,6 +15,12 @@
  */
 function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
+  const applyStatement = statement => trustRegistry.db.transaction(() => {
+    const result = trustRegistry.applyStatement({ accountId, statement });
+    if (result.applied && statement.operation === "DEVICE_REVOKED") linkedSessions?.revokeDevice(statement.deviceId);
+    return result;
+  }).immediate();
+
 
   // ── Trust Registry relay (ADR-001 LOCK 2/9) ──────────────────────────────
   // P0-4 (contract): the ANDROID-primary path is /api/v1/agent/trust/* —
@@ -45,7 +51,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     // being approved) — the AUTHOR is always the authenticated Trust Root
     // agent (checked above). rootSignature provides cryptographic binding;
     // web clients verify it independently before trusting.
-    const result = trustRegistry.applyStatement({ accountId, statement });
+    const result = applyStatement(statement);
     return { ok: true, ...result };
   };
   const trustStatementSchema = {
@@ -72,7 +78,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       reply.code(400).send({ error: "missing_rootSignature_or_statementId" });
       return;
     }
-    const result = trustRegistry.applyStatement({ accountId, statement });
+    const result = applyStatement(statement);
     return { ok: true, ...result };
   });
 
@@ -102,7 +108,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     // being approved) — the AUTHOR is always the authenticated Trust Root
     // agent (checked above). rootSignature provides cryptographic binding;
     // web clients verify it independently before trusting.
-    const result = trustRegistry.applyStatement({ accountId, statement });
+    const result = applyStatement(statement);
     return { ok: true, ...result };
   });
 

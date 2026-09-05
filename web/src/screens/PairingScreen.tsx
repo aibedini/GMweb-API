@@ -182,16 +182,16 @@ export function PairingScreen({
                   <Chip
                     size="sm"
                     variant="soft"
-                    color={handle.qr.identityBootstrapToken ? "success" : "warning"}
+                    color="warning"
                   >
-                    {handle.qr.identityBootstrapToken ? "Fresh Android identity enabled" : "Existing Android identity only"}
+                    Primary phone enrollment required first
                   </Chip>
                   <p className="text-center text-sm" style={{ color: "var(--muted-fg)" }}>
                     Android Messages → Settings → Linked devices → <b>Link new device</b>
                   </p>
-                  {!handle.qr.identityBootstrapToken && (
+                  {(
                     <p className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--border)", color: "var(--muted-fg)" }}>
-                      This anonymous QR cannot enroll a fresh/reinstalled Android identity. Sign in to the GMweb dashboard before generating it, or use the admin-token option below.
+                      For a new or reinstalled phone, first create a phone setup QR in the dashboard and scan it using Enroll this phone as Primary. Then return here to link this browser.
                     </p>
                   )}
                   <Chip size="sm" variant="soft" color={secondsLeft > 20 ? "default" : "warning"}>QR expires in {mm}:{ss}</Chip>

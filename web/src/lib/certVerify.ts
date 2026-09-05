@@ -19,6 +19,9 @@ export type CertState =
 
 export interface VerifyContext {
   deviceId: string;
+  pairingSessionId: string;
+  apiOrigin: string;
+  webOrigin: string;
   transcriptHash: string;
   origin: string;
   signingPublicKeyB64: string;
@@ -35,13 +38,16 @@ export async function verifyCertificate(
   ctx: VerifyContext,
 ): Promise<CertState> {
   const checks: Array<[boolean, string]> = [
+    [cert.protocol === "GMweb-Pairing-v1", "unsupported certificate protocol"],
+    [cert.pairingSessionId === ctx.pairingSessionId, "pairing session mismatch"],
+    [cert.apiOrigin === ctx.apiOrigin && cert.webOrigin === ctx.webOrigin, "certificate origins mismatch"],
     [cert.deviceId === ctx.deviceId, "deviceId mismatch"],
     [cert.deviceType === "WEB_PWA", "deviceType must be WEB_PWA"],
     [
       cert.pairingTranscriptHash === ctx.transcriptHash,
       "pairingTranscriptHash mismatch (substitution?)",
     ],
-    [cert.origin === ctx.origin, "certificate origin mismatch"],
+    [cert.webOrigin === ctx.origin, "certificate origin mismatch"],
     [
       cert.signingPublicKey === ctx.signingPublicKeyB64,
       "signingPublicKey is not OUR key (key substitution?)",

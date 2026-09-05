@@ -1,3 +1,4 @@
+import QRCode from "qrcode";
 import { useEffect, useState } from "react";
 import { Check, Clock3, Copy, KeyRound, Loader2, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
@@ -23,6 +24,9 @@ const statusVariant = (status: PwaToken["status"]) =>
   status === "READY" ? "success" : status === "REVOKED" ? "destructive" : "secondary";
 
 export function PwaAccessPage() {
+  const [setupQr, setSetupQr] = useState("");
+  const [setupExpiresAt, setSetupExpiresAt] = useState(0);
+  const [setupBusy, setSetupBusy] = useState(false);
   const [tokens, setTokens] = useState<PwaToken[]>([]);
   const [label, setLabel] = useState("My browser");
   const [minutes, setMinutes] = useState("15");
@@ -30,6 +34,24 @@ export function PwaAccessPage() {
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!setupExpiresAt) return;
+    const timer = setTimeout(() => setSetupQr(""), Math.max(0, setupExpiresAt - Date.now()));
+    return () => clearTimeout(timer);
+  }, [setupExpiresAt]);
+
+  async function createPhoneSetup() {
+    setSetupBusy(true);
+    setSetupQr("");
+    try {
+      const claim = await api<{ expiresAt: number }>("/admin/primary-setup", { method: "POST" });
+      setSetupQr(await QRCode.toDataURL(JSON.stringify(claim), { width: 360, margin: 2, errorCorrectionLevel: "M" }));
+      setSetupExpiresAt(claim.expiresAt);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not create phone setup QR.");
+    } finally { setSetupBusy(false); }
+  }
 
   async function load() {
     try {
@@ -80,6 +102,15 @@ export function PwaAccessPage() {
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
       <div className="space-y-4">
+        <Card>
+          <CardHeader><CardTitle>Primary phone setup</CardTitle></CardHeader>
+          <CardContent className="space-y-4 p-5">
+            <p>On a new or reinstalled phone, open Messages, Linked devices, then Enroll this phone as Primary. Scan this setup QR and confirm on the phone.</p>
+            <p className="text-sm text-muted-foreground">Enrollment replaces the previous primary phone and signs out its linked browsers. The setup QR expires in five minutes and can be used once.</p>
+            <Button disabled={setupBusy} onClick={() => void createPhoneSetup()}>Create phone setup QR</Button>
+            {setupQr && <img src={setupQr} width={360} height={360} alt="One-use primary phone setup QR" />}
+          </CardContent>
+        </Card>
         <Card className="overflow-hidden">
           <CardHeader className="border-b border-border bg-primary/5">
             <div>

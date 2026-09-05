@@ -82,6 +82,11 @@ export default function App() {
     return subscribeSyncAvailable((count) => {
       setApplied(count);
       void refresh();
+    }, () => {
+      setAuthed(false);
+      setEvents([]);
+      setSelected(null);
+      void resetLocal();
     });
   }, [authed]);
 

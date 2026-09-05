@@ -1,17 +1,12 @@
-/**
- * ADR-007 BLOCKER 2 — web-side mirror of the Android canonical certificate
- * serialization + Trust Root signature verification.
- *
- * BYTE-FOR-BYTE CONTRACT with PrimaryTrustRoot.kt (canonicalCertificate):
- *   org.json's JSONObject.toString() is compact with insertion-ordered keys,
- *   so both sides build the object with the SAME key order and separators.
- *   capabilities are sorted then re-inserted as an array.
- *
- * Shared test vectors live in test/pairingTranscriptVectors.test.js (server)
- * and are referenced by the Android tests.
- */
+import { canonicalCertificate } from "../../../shared/pairingProtocol.mjs";
+export { canonicalCertificate };
+/** Root verification uses the shared Pairing Protocol v1 encoder. */
 
 export interface DeviceCertificate {
+  protocol: string;
+  pairingSessionId: string;
+  apiOrigin: string;
+  webOrigin: string;
   accountId: string;
   deviceId: string;
   deviceType: string; // "WEB_PWA"
@@ -23,7 +18,6 @@ export interface DeviceCertificate {
   issuedAt: number;
   expiresAt: number;
   pairingTranscriptHash: string;
-  origin: string;
   rootSignature: string;
 }
 
@@ -66,29 +60,6 @@ export function derEcdsaToP1363(signature: Uint8Array, coordinateSize = 32): Uin
 }
 
 /** Mirror of PrimaryTrustRoot.canonicalCertificate — byte-for-byte. */
-export function canonicalCertificate(
-  c: Omit<DeviceCertificate, "rootSignature">,
-): string {
-  const caps = [...c.capabilities].sort();
-  const o = {
-    accountId: c.accountId,
-    deviceId: c.deviceId,
-    deviceType: c.deviceType,
-    signingPublicKey: c.signingPublicKey,
-    encryptionPublicKey: c.encryptionPublicKey,
-    capabilities: caps,
-    historyGrant: c.historyGrant,
-    trustSequence: c.trustSequence,
-    issuedAt: c.issuedAt,
-    expiresAt: c.expiresAt,
-    pairingTranscriptHash: c.pairingTranscriptHash,
-    origin: c.origin,
-  };
-  // org.json (Android) escapes forward slashes by default — the signature
-  // covers the ESCAPED bytes. Mirror that byte-for-byte.
-  return JSON.stringify(o).replace(/\//g, "\\/");
-}
-
 /**
  * Verify the Trust Root signature over the canonical certificate bytes.
  * Returns true ONLY when [trustRootPublicKeyB64] is the pinned Android
@@ -99,8 +70,8 @@ export async function verifyRootSignature(
   trustRootPublicKeyB64: string,
 ): Promise<boolean> {
   const { rootSignature, ...rest } = cert;
-  const canonical = canonicalCertificate(rest);
   try {
+    const canonical = canonicalCertificate(rest);
     const keyDer = Uint8Array.from(atob(trustRootPublicKeyB64), (c) => c.charCodeAt(0));
     const pubKey = await crypto.subtle.importKey(
       "spki",

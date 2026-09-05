@@ -1,3 +1,4 @@
+const fixture = require("./pairingFixture");
 "use strict";
 
 /**
@@ -62,7 +63,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     svc = new AgentAuthService(new Database(":memory:"));
     pair = makeKey();
     const spki = pair.publicKey.export({ format: "der", type: "spki" });
-    svc.registerIdentity({ deviceId: DEVICE, publicKeys: { signing: spki.toString("base64") } });
+    svc.registerIdentity({ deviceId: DEVICE, forcePrimary: true, publicKeys: { signing: spki.toString("base64"), trustRoot: fixture.rootPublicKey } });
     // FIX 2b mirror: the real app authenticates pairing Android paths in the
     // GLOBAL preHandler (single verification, binds authenticatedAgentId);
     // routes only check role. Replicate exactly that here.
@@ -108,12 +109,12 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     assert.equal(res.statusCode, 200);
     return res.json();
   };
-  const TRUST_ROOT_PUB = "TRUST-ROOT-PUBLIC-KEY-B64";
+  const TRUST_ROOT_PUB = fixture.rootPublicKey;
 
   const signApprove = (session, cert, opts = {}) => {
     const body = JSON.stringify({
       pairingSessionId: session.pairingSessionId,
-      certificate: cert,
+      certificate: fixture.certificate(session.pairingSessionId),
       deviceId: "web-test-1",
       transcriptHash: pairing.hashOf(pairing.getSession(session.pairingSessionId)),
       trustRootPublicKey: TRUST_ROOT_PUB,
@@ -312,7 +313,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     assert.equal(res.json().qr.origin, "https://messages.example.com");
   });
 
-  test("only an admin-authorized session receives a QR identity bootstrap token", async () => {
+  test("even dashboard browser QRs cannot enroll a phone", async () => {
     const adminApp = Fastify({ logger: false });
     registerPairingRoutes(adminApp, {
       agentAuthService: svc,
@@ -328,14 +329,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
       });
       assert.equal(res.statusCode, 200);
       const body = res.json();
-      assert.ok(body.qr.identityBootstrapToken);
-      assert.equal(
-        pairing.consumeIdentityBootstrap(
-          body.pairingSessionId,
-          body.qr.identityBootstrapToken,
-        ),
-        true,
-      );
+      assert.equal(body.qr.identityBootstrapToken, undefined);
     } finally {
       await adminApp.close();
     }
@@ -359,7 +353,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     await app.inject(signApprove(created, "CERT-H", {}));
     const consumed = pairing.consumeApproval(created.pairingSessionId, created.pollSecret);
     assert.equal(consumed.transcriptHash, sessionHash);
-    assert.equal(consumed.trustRootPublicKey, "TRUST-ROOT-PUBLIC-KEY-B64");
+    assert.equal(consumed.trustRootPublicKey, fixture.rootPublicKey);
   });
 
   // ── P1-1 / P1-3 ─────────────────────────────────────────────────────────

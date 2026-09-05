@@ -1,0 +1,80 @@
+{
+  "protocol": "GMweb-Pairing-v1",
+  "trustRootPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEiACo2axVP0BLA/ST6TmM+Ky4D0CENUvlj10NZKy2CNaiDjBB5bIq7SuIR2Uei0goBM/4w1yrmqYL+jnn5Rbnug==",
+  "vectors": [
+    {
+      "kind": "certificate",
+      "input": {
+        "protocol": "GMweb-Pairing-v1",
+        "accountId": "default",
+        "deviceId": "web-بله-😀/\"\\\n",
+        "deviceType": "WEB_PWA",
+        "signingPublicKey": "public/+/=",
+        "encryptionPublicKey": "encryption/+/=",
+        "capabilities": [
+          "SEND_MESSAGES",
+          "READ_MESSAGES"
+        ],
+        "historyGrant": "FULL_HISTORY",
+        "trustSequence": 7,
+        "issuedAt": 1788300000000,
+        "expiresAt": 1791000000000,
+        "pairingTranscriptHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pairingSessionId": "session-42",
+        "apiOrigin": "https://api.example.com",
+        "webOrigin": "https://web.example.com"
+      },
+      "canonicalBase64": "R013ZWItUGFpcmluZy12MTpjZXJ0aWZpY2F0ZQo3OmRlZmF1bHQsMTk6d2ViLdio2YTZhy3wn5iALyJcCiw3OldFQl9QV0EsMTA6cHVibGljLysvPSwxNDplbmNyeXB0aW9uLysvPSwxOjIsMTM6UkVBRF9NRVNTQUdFUywxMzpTRU5EX01FU1NBR0VTLDEyOkZVTExfSElTVE9SWSwxOjcsMTM6MTc4ODMwMDAwMDAwMCwxMzoxNzkxMDAwMDAwMDAwLDY0OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEsMTA6c2Vzc2lvbi00MiwyMzpodHRwczovL2FwaS5leGFtcGxlLmNvbSwyMzpodHRwczovL3dlYi5leGFtcGxlLmNvbSw=",
+      "sha256": "f4ded3c9e6dbeb620299ba3b2d748040e6ce500b5543ce36798ad5afb821c1ad",
+      "signature": "MEUCIQD0/gmvNeO/XHKsDpFEREa+btXMf07Ju6Sw53B8nhIN2gIgccJ9/jQ47Vwvjq64rbnx4Ce8cYSjmudztdV89ufEcak="
+    },
+    {
+      "kind": "transcript",
+      "input": {
+        "protocol": "GMweb-Pairing-v1",
+        "pairingSessionId": "session-42",
+        "webDeviceId": "web-بله-😀/\"\\\n",
+        "webSigningPublicKey": "public/+/=",
+        "webEncryptionPublicKey": "encryption/+/=",
+        "ephemeralPublicKey": "ephemeral+/=",
+        "nonce": "nonce\n:,",
+        "apiOrigin": "https://api.example.com",
+        "webOrigin": "https://web.example.com",
+        "expiresAt": 1791000000000
+      },
+      "canonicalBase64": "R013ZWItUGFpcmluZy12MTp0cmFuc2NyaXB0CjEwOnNlc3Npb24tNDIsMTk6d2ViLdio2YTZhy3wn5iALyJcCiwxMDpwdWJsaWMvKy89LDE0OmVuY3J5cHRpb24vKy89LDEyOmVwaGVtZXJhbCsvPSw4Om5vbmNlCjosLDIzOmh0dHBzOi8vYXBpLmV4YW1wbGUuY29tLDIzOmh0dHBzOi8vd2ViLmV4YW1wbGUuY29tLDEzOjE3OTEwMDAwMDAwMDAs",
+      "sha256": "bfa579869b662a832a7bc3a622f0434c02251391f1afdb12b12552cf868b8ec8",
+      "signature": "MEYCIQDz4OZ2AV1erfBOsR+5ICgI5enMfYm+dWKL6J10Twm+uwIhAMSQZDMjKSYKiaObuRhyRL75r9arJJkaueNCsqZrzNbq"
+    },
+    {
+      "kind": "enrollment",
+      "input": {
+        "claim": "fixture-public-claim",
+        "deviceId": "phone-1",
+        "publicKeys": {
+          "signing": "signing+/=",
+          "encryption": "enc+/=",
+          "trustRoot": "root+/="
+        },
+        "apiOrigin": "https://api.example.com"
+      },
+      "canonicalBase64": "R013ZWItUGFpcmluZy12MTplbnJvbGxtZW50CjIwOmZpeHR1cmUtcHVibGljLWNsYWltLDc6cGhvbmUtMSwxMDpzaWduaW5nKy89LDY6ZW5jKy89LDc6cm9vdCsvPSwyMzpodHRwczovL2FwaS5leGFtcGxlLmNvbSw=",
+      "sha256": "680133ef617794dcdf3a5961f7b9cf1c76c56f21c904200df314d860460433be",
+      "signature": "MEYCIQDYGUT5S8Iqso5CIGY7eebFkJj2fMxp++BgQDox4Oa1ywIhAMeoKOkfiZuDlKLJoz51+diJUsR/r3GcRkRkUHiNppf+"
+    },
+    {
+      "kind": "challenge",
+      "input": {
+        "pairingSessionId": "session-42",
+        "deviceId": "web-42",
+        "challenge": "1234567890",
+        "apiOrigin": "https://api.example.com",
+        "webOrigin": "https://web.example.com",
+        "issuedAt": 1788300000000
+      },
+      "canonicalBase64": "R013ZWItUGFpcmluZy12MTpjaGFsbGVuZ2UKMTA6c2Vzc2lvbi00Miw2OndlYi00MiwxMDoxMjM0NTY3ODkwLDIzOmh0dHBzOi8vYXBpLmV4YW1wbGUuY29tLDIzOmh0dHBzOi8vd2ViLmV4YW1wbGUuY29tLDEzOjE3ODgzMDAwMDAwMDAs",
+      "sha256": "d5a05fb923cdfff841a4e070078f58d67f609634a16e2012bace1e97de0954c5",
+      "signature": "MEQCIDLZmpWxQ7SNGYj8h7SfQ2cx9EYKDs/8d3vsdnRfhxevAiAAgFjKcXNdwiKkv8PtImPJxzvVwskQk07Xe2ow/bT7kA=="
+    }
+  ]
+}

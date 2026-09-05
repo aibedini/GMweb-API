@@ -36,6 +36,7 @@ function verifyP256(data, sigB64, pubB64) {
     } else {
       keyObject = crypto.createPublicKey({ key: keyBytes, format: "der", type: "spki" });
     }
+    if (keyObject.asymmetricKeyType !== "ec" || keyObject.asymmetricKeyDetails?.namedCurve !== "prime256v1") return false;
     const signature = Buffer.from(String(sigB64 || ""), "base64");
     // Android/Java emits ASN.1 DER while WebCrypto emits the 64-byte
     // IEEE-P1363 r||s form. Pairing uses both runtimes, so accept both exact
@@ -52,6 +53,9 @@ function verifyP256(data, sigB64, pubB64) {
 const pairing = require("./pairingSessions");
 const linkedSessions = require("./linkedSessions");
 const crypto = require("crypto");
+const { db } = require("./pairingDb");
+const { validateCertificate } = require("./pairingCertificate");
+const { canonicalCertificate } = require("../shared/pairingProtocol.mjs");
 
 /** Web-facing origin recorded in the transcript (server-derived only). */
 function serverOrigin(request, config) {
@@ -64,6 +68,13 @@ function serverOrigin(request, config) {
   // otherwise default to https (deployments are HTTPS-only per the ADR).
   const secure = proto === "https" || !request.headers["x-forwarded-proto"];
   return `${secure ? "https" : proto}://${host}`;
+}
+
+function apiOrigin(request, config) {
+  const configured = process.env.PUBLIC_API_ORIGIN || config?.publicApiOrigin;
+  if (configured) return String(configured);
+  // In development only, use the backend host independently of web origin.
+  return `https://${request.headers.host || "localhost"}`;
 }
 
 /**
@@ -100,7 +111,7 @@ function markPairing(request, stage, status, reason, identifiers = {}) {
   };
 }
 
-function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIdentity = () => false }) {
+function registerPairingRoutes(app, { agentAuthService, config }) {
   // BLOCKER 7: production origin is fail-closed. Header-derived origins are
   // only allowed outside production (trustProxy + forwarded headers must not
   // decide the root-trust transcript).
@@ -111,6 +122,12 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
       throw new Error(
         "PUBLIC_WEB_ORIGIN must be set to an HTTPS URL in production (ADR-007 BLOCKER 7) — refusing to start"
       );
+    }
+    const configuredApi = process.env.PUBLIC_API_ORIGIN || config?.publicApiOrigin;
+    for (const origin of [configuredOrigin, configuredApi]) {
+      if (!origin || new URL(origin).protocol !== "https:" || new URL(origin).origin !== origin) {
+        throw new Error("PUBLIC_API_ORIGIN and PUBLIC_WEB_ORIGIN must be explicit HTTPS origins in production");
+      }
     }
   }
   // ── Web: create pairing session + get QR transcript (anonymous OK) ─────
@@ -160,14 +177,14 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
     const created = pairing.createSession(request.body || {}, {
       ip: request.ip,
       origin: configuredOrigin || serverOrigin(request, config),
-      identityBootstrap: canBootstrapIdentity(request),
+      apiOrigin: apiOrigin(request, config),
     });
     const session = pairing.getSession(created.pairingSessionId);
     markPairing(
       request,
       "WEB_SESSION_CREATED",
       "SUCCESS",
-      created.identityBootstrapToken ? "admin_bootstrap_enabled" : "anonymous_qr",
+      "primary_enrollment_required",
       { sessionId: created.pairingSessionId, deviceId: request.body?.webDeviceId },
     );
     return {
@@ -177,9 +194,7 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
       pollSecret: created.pollSecret, // shown to web ONCE; QR carries only the id
       qr: {
         ...pairing.qrPayload(session),
-        ...(created.identityBootstrapToken
-          ? { identityBootstrapToken: created.identityBootstrapToken }
-          : {}),
+
       },
     };
   });
@@ -250,6 +265,9 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
       gateDone = true;
     });
     if (!ok || !gateDone) return reply;
+    if (agentAuthService.getRole(request.authenticatedAgentId) !== "PRIMARY_TRUST_AGENT") {
+      return reply.code(403).send({ error: "primary_enrollment_required", reason: "primary_enrollment_required" });
+    }
     const session = pairing.getSession(request.params.id);
     if (!session) {
       markPairing(request, "ANDROID_METADATA_FETCH", "FAILED", "session_not_found_or_expired", {
@@ -308,10 +326,22 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
         sessionId: request.body?.pairingSessionId,
         deviceId: request.authenticatedAgentId,
       });
-      reply.code(403).send({ error: "forbidden: device is not the primary trust agent" });
+      reply.code(403).send({ error: "primary_enrollment_required", reason: "primary_enrollment_required" });
       return reply;
     }
     const body = request.body || {};
+    const identity = agentAuthService.getIdentity(request.authenticatedAgentId);
+    const session = pairing.getSession(body.pairingSessionId);
+    let certificate;
+    try { certificate = JSON.parse(body.certificate); } catch { certificate = null; }
+    if (!session) return reply.code(404).send({ error: "session_expired" });
+    if (!identity?.trust_root_public_key || identity.trust_root_public_key !== body.trustRootPublicKey ||
+        body.deviceId !== session.webDeviceId || body.transcriptHash !== session.transcriptHash ||
+        !validateCertificate(certificate, session) ||
+        !verifyP256(Buffer.from(canonicalCertificate(certificate), "utf8"), certificate.rootSignature, identity.trust_root_public_key)) {
+      markPairing(request, "ANDROID_SERVER_APPROVAL", "FAILED", "invalid_certificate");
+      return reply.code(403).send({ error: "invalid_certificate", reason: "certificate_binding_or_signature_invalid" });
+    }
     try {
       const approved = pairing.approveSession(body.pairingSessionId, {
         certificate: body.certificate,
@@ -361,6 +391,9 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
       issuedAt: rec.issuedAt,
       deviceId: rec.deviceId,
       certificate: rec.certificate,
+      pairingSessionId: rec.pairingSessionId,
+      webOrigin: rec.webOrigin,
+      apiOrigin: rec.apiOrigin,
     };
   });
 
@@ -407,7 +440,7 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
   }, async (request, reply) => {
     const body = request.body || {};
     const taken = pairing.peekChallenge(body.pollSecret);
-    if (!taken || taken.challenge !== body.challenge) {
+    if (!taken || taken.challenge !== body.challenge || taken.pairingSessionId !== body.pairingSessionId) {
       markPairing(request, "WEB_LINK_SESSION", "FAILED", "invalid_or_expired_challenge", {
         sessionId: body.pairingSessionId,
         deviceId: body.deviceId,
@@ -427,7 +460,7 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
     // Extract the certificate's signing key + capabilities (defensive parse).
     let cert = null;
     try { cert = JSON.parse(taken.certificate); } catch { cert = null; }
-    const certSigPub = cert && (cert.signingPublicKey || (cert.publicKeys && cert.publicKeys && cert.publicKeys.signing)) || "";
+    const certSigPub = cert?.signingPublicKey || "";
     const caps = cert && Array.isArray(cert.capabilities) ? cert.capabilities : [];
     const capNames = ["READ_MESSAGES","SEND_MESSAGES","MANAGE_DEVICES","READ_OTP","READ_BANK_SECURITY","READ_PASSWORD_RESET","READ_AUTH_CODES","READ_FINANCIAL_NOTIFICATIONS"];
     const capabilities = caps.filter((c) => capNames.includes(String(c)));
@@ -450,9 +483,10 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
 
     // Canonical challenge bytes + ECDSA P-256 verification against the
     // certificate's signing public key (SPKI DER Base64 or raw point).
-    const origin = serverOrigin(request, request.server._gmwebConfig || {});
+    const origin = taken.webOrigin;
+    if (!cert || !Number.isSafeInteger(cert.expiresAt) || cert.expiresAt <= Date.now()) return reply.code(403).send({ error: "certificate_expired" });
     const canonical = pairing.challengeCanonical(
-      taken.deviceId, body.challenge, origin, taken.issuedAt || ""
+      taken.deviceId, body.challenge, origin, taken.issuedAt, taken.pairingSessionId, taken.apiOrigin
     );
     const ok = verifyP256(canonical, body.signature, certSigPub);
     if (!ok) {
@@ -476,7 +510,11 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
 
     // Burn the challenge ONLY after every verification passed (a failed
     // verify must not lock the browser out of a legitimate retry).
-    if (!pairing.burnChallenge(body.pollSecret)) {
+    const token = db().transaction(() => {
+      if (!pairing.burnChallenge(body.pollSecret)) return null;
+      return linkedSessions.issue(taken.deviceId, capabilities, cert.trustSequence, cert.expiresAt);
+    }).immediate();
+    if (!token) {
       markPairing(request, "WEB_LINK_SESSION", "FAILED", "challenge_already_used", {
         sessionId: body.pairingSessionId,
         deviceId: body.deviceId,
@@ -484,7 +522,6 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
       reply.code(409).send({ error: "challenge_already_used" });
       return reply;
     }
-    const token = linkedSessions.issue(taken.deviceId, capabilities);
     reply.setCookie(linkedSessions.COOKIE_NAME, token, {
       httpOnly: true,
       secure: true,
@@ -536,4 +573,4 @@ function registerPairingRoutes(app, { agentAuthService, config, canBootstrapIden
   });
 }
 
-module.exports = { registerPairingRoutes, serverOrigin, verifyP256 };
+module.exports = { registerPairingRoutes, serverOrigin, apiOrigin, verifyP256 };
