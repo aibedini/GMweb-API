@@ -31,8 +31,11 @@ async function main() {
   const health = await request("/health");
   console.log("health:", health);
 
-  await request("/browser/start", { method: "POST" });
-  const status = await request("/session/status");
+  let status = await request("/session/status");
+  if (!String(status.transport || "").startsWith("android")) {
+    await request("/browser/start", { method: "POST" });
+    status = await request("/session/status");
+  }
   console.log("status:", {
     paired: status.paired,
     hint: status.hint,

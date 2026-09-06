@@ -1,4 +1,4 @@
-## GMweb 0.15.0 / Messages 2.8.0: observable Primary and linked-device recovery
+## GMweb 0.15.1 / Messages 2.8.0: observable Primary and linked-device recovery
 
 Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use
 `POST /api/v1/primary-enrollment`, with operational-key and trust-root proofs.

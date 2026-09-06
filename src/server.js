@@ -3020,6 +3020,7 @@ app.post("/browser/start", {
     tags: ["Admin"]
   }
 }, async () => {
+  requireChromeMethod("start");
   await client.start();
   return client.status();
 });
@@ -3031,6 +3032,7 @@ app.post("/browser/stop", {
     tags: ["Admin"]
   }
 }, async () => {
+  requireChromeMethod("stop");
   await client.stop();
   return { stopped: true };
 });
@@ -3042,6 +3044,8 @@ app.post("/browser/restart", {
     tags: ["Admin"]
   }
 }, async () => {
+  requireChromeMethod("stop");
+  requireChromeMethod("start");
   await client.stop();
   await client.start();
   return client.status();
