@@ -200,7 +200,7 @@ export default function App() {
                 {filteredConversations.map((item) => (
                   <button key={item.aggregateId} className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => setSelected(item.aggregateId)}>
                     <Avatar title={item.title} />
-                    <span className="conversation-copy"><span className="conversation-title">{item.title}</span><span className="conversation-preview">{item.preview}</span></span>
+                    <span className="conversation-copy"><span className="conversation-title">{item.title}{item.subtitle ? ` · ${item.subtitle}` : ""}</span><span className="conversation-preview">{item.preview}</span></span>
                     <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time></span>
                   </button>
                 ))}
@@ -211,7 +211,7 @@ export default function App() {
             <main className="message-pane">
               {selectedConversation ? (
                 <>
-                  <div className="message-header"><Avatar title={selectedConversation.title} /><div><h2>{selectedConversation.title}</h2><p>Synced from Android · {shortId(selectedConversation.aggregateId)}</p></div></div>
+                  <div className="message-header"><Avatar title={selectedConversation.title} /><div><h2>{selectedConversation.title}</h2><p>{selectedConversation.subtitle ? `${selectedConversation.subtitle} · ` : ""}Synced from Android · {shortId(selectedConversation.aggregateId)}</p></div></div>
                   <ScrollShadow className="message-scroll">
                     <div className="message-day"><span>Message history</span></div>
                     {messages.map(({ event, payload }) => (

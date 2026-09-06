@@ -35,3 +35,31 @@ test('unsupported crypto is locked, corrupt legacy fails closed, neither claims 
   assert.equal(eventDecodeState(corrupt), 'Invalid/corrupt payload');
   assert.deepEqual(buildConversations([encrypted, corrupt]), []);
 });
+
+test('contactName wins the conversation title and address becomes the subtitle', async () => {
+  const { buildConversations } = await import('../web/src/lib/inbox.ts');
+  const rows = [
+    event(1, 'MESSAGE_CREATED', { messageId: 'm1', body: 'Salam', address: '+989121234567', contactName: 'Ali Rezaei', dateMs: 100, direction: 'in' }),
+    event(2, 'MESSAGE_CREATED', { messageId: 'm2', body: 'Reply', address: '+989121234567', contactName: 'Ali Rezaei', dateMs: 200, direction: 'out' }),
+  ];
+  assert.deepEqual(buildConversations(rows), [{
+    aggregateId: 'thread', title: 'Ali Rezaei', subtitle: '+989121234567',
+    preview: 'Reply', lastAt: 200, read: false,
+  }]);
+  // Unknown number (no contactName) keeps the phone-number fallback title.
+  assert.deepEqual(buildConversations([event(9, 'MESSAGE_CREATED', {
+    messageId: 'm9', body: 'Who?', address: '+989190000000', dateMs: 300, direction: 'in',
+  })]), [{ aggregateId: 'thread', title: '+989190000000', preview: 'Who?', lastAt: 300, read: false }]);
+});
+
+test('incoming and outgoing events both project into one conversation with correct directions', async () => {
+  const { messagesForAggregate } = await import('../web/src/lib/inbox.ts');
+  const rows = [
+    event(1, 'MESSAGE_CREATED', { messageId: 'in1', body: 'Hello from you', address: '+123', dateMs: 100, direction: 'in' }),
+    event(2, 'MESSAGE_CREATED', { messageId: 'out1', body: 'Hello back', address: '+123', dateMs: 200, direction: 'out' }),
+  ];
+  const timeline = messagesForAggregate(rows, 'thread');
+  assert.equal(timeline.length, 2);
+  assert.deepEqual(timeline.map((item) => item.payload.direction), ['in', 'out']);
+  assert.deepEqual(timeline.map((item) => item.payload.body), ['Hello from you', 'Hello back']);
+});

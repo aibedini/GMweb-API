@@ -7,11 +7,15 @@ export interface MessagePayload {
   dateMs: number;
   status: number;
   address?: string;
+  /** Optional display name embedded by Android (Contacts lookup at send/receive time). */
+  contactName?: string;
 }
 
 export interface ConversationSummary {
   aggregateId: string;
   title: string;
+  /** Phone number (subtitle) when the title is a contact name. */
+  subtitle?: string;
   preview: string;
   lastAt: number;
   read: boolean;
@@ -58,6 +62,9 @@ function messagePayload(event: StoredEvent): MessagePayload | null {
     dateMs: Number(value.dateMs) || event.createdAt,
     status: Number(value.status) || 0,
     address: typeof value.address === "string" ? value.address : undefined,
+    contactName: typeof value.contactName === "string" && value.contactName.trim()
+      ? value.contactName.trim()
+      : undefined,
   };
 }
 
@@ -105,9 +112,16 @@ export function buildConversations(events: StoredEvent[]): ConversationSummary[]
     const latest = [...messages.values()].sort((a, b) =>
       b.payload.dateMs - a.payload.dateMs || b.event.sequence - a.event.sequence)[0];
     if (!latest) continue;
-    summaries.push({ aggregateId, title: latest.payload.address || fallbackTitle(aggregateId),
-      preview: latest.payload.body || "Empty message", lastAt: latest.payload.dateMs,
-      read: (reads.get(aggregateId) ?? 0) >= latest.payload.dateMs });
+    const address = latest.payload.address || undefined;
+    const named = latest.payload.contactName || undefined;
+    summaries.push({
+      aggregateId,
+      title: named || address || fallbackTitle(aggregateId),
+      ...(named && address ? { subtitle: address } : {}),
+      preview: latest.payload.body || "Empty message",
+      lastAt: latest.payload.dateMs,
+      read: (reads.get(aggregateId) ?? 0) >= latest.payload.dateMs,
+    });
   }
   return summaries.sort((a, b) => b.lastAt - a.lastAt || a.aggregateId.localeCompare(b.aggregateId));
 }

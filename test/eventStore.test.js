@@ -75,6 +75,33 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     assert.equal(ev.cryptoVersion, 0);
   });
 
+  test("MESSAGE_RECEIVED and MESSAGE_SENT are accepted (opaque relay, no type allowlist)", () => {
+    const store = new EventStore(new Database(":memory:"));
+    const res = store.ingestBatch({
+      accountId: "acc1",
+      sourceDeviceId: "agent-1",
+      events: [
+        { eventId: "in-1", type: "MESSAGE_RECEIVED", conversationId: "thread-1", payload: Buffer.from("incoming"), cryptoVersion: 1 },
+        { eventId: "out-1", type: "MESSAGE_SENT", conversationId: "thread-1", payload: Buffer.from("outgoing"), cryptoVersion: 1 },
+      ],
+    });
+    assert.equal(res.accepted.length, 2);
+    assert.equal(res.duplicates, 0);
+    const page = store.after("acc1", 0);
+    assert.deepEqual(page.events.map((e) => e.type), ["MESSAGE_RECEIVED", "MESSAGE_SENT"]);
+    // Re-ingesting the exact same IDs is a duplicate: no new sequence consumed.
+    const replay = store.ingestBatch({
+      accountId: "acc1",
+      sourceDeviceId: "agent-1",
+      events: [
+        { eventId: "in-1", type: "MESSAGE_RECEIVED", conversationId: "thread-1", payload: Buffer.from("incoming"), cryptoVersion: 1 },
+        { eventId: "out-1", type: "MESSAGE_SENT", conversationId: "thread-1", payload: Buffer.from("outgoing"), cryptoVersion: 1 },
+      ],
+    });
+    assert.equal(replay.duplicates, 2);
+    assert.equal(store.count("acc1"), 2);
+  });
+
   test("empty batch is a no-op", () => {
     const store = new EventStore(new Database(":memory:"));
     const res = store.ingestBatch({ accountId: "a", events: [] });
