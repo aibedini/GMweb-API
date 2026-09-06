@@ -197,7 +197,9 @@ export function subscribeSyncAvailable(onSynced: (applied: number) => void, onRe
 
   const connect = () => {
     if (closed) return;
-    es = new EventSource("/api/v1/sse");
+    // EventSource sends cookies for same-origin automatically; withCredentials
+    // additionally keeps the linked-session cookie on cross-origin/proxied setups.
+    es = new EventSource("/api/v1/sse", { withCredentials: true });
     es.onmessage = (msg) => {
       try {
         const evt = JSON.parse(msg.data) as { type?: string; newEvents?: number };

@@ -64,6 +64,7 @@ export async function sendSubscriptionToServer(sub: PushSubscription): Promise<b
   const res = await fetch("/api/v1/push/subscribe", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify({ endpoint: raw.endpoint, keys: raw.keys }),
   });
   return res.ok;
@@ -73,6 +74,7 @@ export async function removeSubscriptionFromServer(endpoint: string): Promise<bo
   const res = await fetch("/api/v1/push/unsubscribe", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify({ endpoint }),
   });
   return res.ok;

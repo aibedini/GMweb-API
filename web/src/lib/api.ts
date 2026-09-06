@@ -42,15 +42,15 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
-/** §54 cursor sync — one page of events after `cursor`. */
+/** §54 cursor sync — one page of events after `cursor`. Linked-session cookie auth. */
 export async function fetchEventsAfter(cursor: number, limit = 500): Promise<SyncPage> {
-  const res = await fetch(`${API}/sync?after=${cursor}&limit=${limit}`);
+  const res = await fetch(`${API}/sync?after=${cursor}&limit=${limit}`, { credentials: "include" });
   return jsonOrThrow<SyncPage>(res);
 }
 
 /** §58 command status poll — used for optimistic outgoing bubbles. */
 export async function fetchCommand(id: string): Promise<CommandView | null> {
-  const res = await fetch(`${API}/commands/${encodeURIComponent(id)}`);
+  const res = await fetch(`${API}/commands/${encodeURIComponent(id)}`, { credentials: "include" });
   if (res.status === 404) return null;
   return jsonOrThrow<CommandView>(res);
 }
@@ -67,7 +67,7 @@ export interface CommandView {
 
 /** §51/§52 trust snapshot — who is approved, per Android's signature. */
 export async function fetchTrustSnapshot(): Promise<TrustSnapshot | null> {
-  const res = await fetch(`${API}/trust/snapshot`);
+  const res = await fetch(`${API}/trust/snapshot`, { credentials: "include" });
   if (res.status === 404) return null;
   return jsonOrThrow<TrustSnapshot>(res);
 }

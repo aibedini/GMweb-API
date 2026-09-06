@@ -20,7 +20,7 @@ export interface IdentityRow {
 
 /** §84 Security Center — enrolled passkeys (requires authed session). */
 export async function listCredentials(): Promise<CredentialRow[]> {
-  const res = await fetch("/api/v1/auth/credentials");
+  const res = await fetch("/api/v1/auth/credentials", { credentials: "include" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const body = (await res.json()) as { credentials: CredentialRow[] };
   return body.credentials;
@@ -31,6 +31,7 @@ export async function removeCredential(credentialId: string): Promise<void> {
   const res = await fetch("/api/v1/auth/credentials/remove", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify({ credentialId }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -38,7 +39,7 @@ export async function removeCredential(credentialId: string): Promise<void> {
 
 /** ADR-004/PR-08b: enrolled Android agent identities. */
 export async function listAgentIdentities(): Promise<IdentityRow[]> {
-  const res = await fetch("/api/v1/agent/identities");
+  const res = await fetch("/api/v1/agent/identities", { credentials: "include" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const body = (await res.json()) as { identities: IdentityRow[] };
   return body.identities;
@@ -46,7 +47,7 @@ export async function listAgentIdentities(): Promise<IdentityRow[]> {
 
 /** §89: registered push subscriptions (endpoint hashes truncated server-side). */
 export async function listPushSubscriptions(): Promise<{ count: number }> {
-  const res = await fetch("/api/v1/push/subscriptions");
+  const res = await fetch("/api/v1/push/subscriptions", { credentials: "include" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
@@ -54,7 +55,7 @@ export async function listPushSubscriptions(): Promise<{ count: number }> {
 /** Session state probe: a 200 on credentials means the cookie is live. */
 export async function isSessionLive(): Promise<boolean> {
   try {
-    const res = await fetch("/api/v1/auth/credentials");
+    const res = await fetch("/api/v1/auth/credentials", { credentials: "include" });
     return res.ok;
   } catch {
     return false;

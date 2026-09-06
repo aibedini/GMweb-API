@@ -64,6 +64,7 @@ export async function getPairingStatus(
 ): Promise<PairingStatus> {
   const res = await fetch(
     `/api/v1/pairing/status?pairingSessionId=${encodeURIComponent(pairingSessionId)}&pollSecret=${encodeURIComponent(pollSecret)}`,
+    { credentials: "include" },
   );
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));

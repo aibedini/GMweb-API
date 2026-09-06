@@ -11,7 +11,7 @@ export interface AuthStatus {
 }
 
 export async function fetchAuthStatus(): Promise<AuthStatus> {
-  const res = await fetch("/api/v1/auth/status");
+  const res = await fetch("/api/v1/auth/status", { credentials: "include" });
   if (!res.ok) throw new Error(`auth status HTTP ${res.status}`);
   return res.json();
 }
@@ -22,13 +22,14 @@ export function webAuthnSupported(): boolean {
 
 /** Bootstrap enrollment (first run) or adding a passkey from an authed session. */
 export async function passkeyRegister(): Promise<{ ok: boolean }> {
-  const res = await fetch("/api/v1/auth/passkey/register/options");
+  const res = await fetch("/api/v1/auth/passkey/register/options", { credentials: "include" });
   if (!res.ok) throw new Error(`options HTTP ${res.status}`);
   const options = await res.json();
   const attestation = await startRegistration({ optionsJSON: options });
   const verify = await fetch("/api/v1/auth/passkey/register/verify", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include", // the response SETS the dashboard session cookie
     body: JSON.stringify(attestation),
   });
   if (!verify.ok) {
@@ -40,13 +41,14 @@ export async function passkeyRegister(): Promise<{ ok: boolean }> {
 
 /** Daily sign-in: assertion → server sets the session cookie. */
 export async function passkeyLogin(): Promise<{ ok: boolean }> {
-  const res = await fetch("/api/v1/auth/passkey/auth/options");
+  const res = await fetch("/api/v1/auth/passkey/auth/options", { credentials: "include" });
   if (!res.ok) throw new Error(`options HTTP ${res.status}`);
   const options = await res.json();
   const assertion = await startAuthentication({ optionsJSON: options });
   const verify = await fetch("/api/v1/auth/passkey/auth/verify", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include", // the response SETS the dashboard session cookie
     body: JSON.stringify(assertion),
   });
   if (!verify.ok) {
