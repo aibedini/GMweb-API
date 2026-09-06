@@ -40,6 +40,16 @@ test("all browser QRs omit phone enrollment authority", () => {
   assert.equal(pairing.qrPayload(pairing.getSession(created.pairingSessionId)).identityBootstrapToken, undefined);
 });
 
+test("manual pairing code resolves the same session without exposing browser poll secret", () => {
+  const created = pairing.createSession(transcript(), ctx());
+  assert.match(created.pairingCode, /^[A-Z0-9]{10}$/);
+  const resolved = pairing.resolvePairingCode(`${created.pairingCode.slice(0, 5)} ${created.pairingCode.slice(5)}`);
+  assert.equal(resolved.pairingSessionId, created.pairingSessionId);
+  assert.equal(resolved.webDeviceId, transcript().webDeviceId);
+  assert.equal(pairing.qrPayload(resolved).pollSecretHash, undefined);
+  assert.equal(pairing.resolvePairingCode("WRONGCODE0"), null);
+});
+
 test("approve flips PENDING → APPROVED exactly once", () => {
   const created = pairing.createSession(transcript(), ctx());
   const res = pairing.approveSession(created.pairingSessionId, {
@@ -72,6 +82,7 @@ test("expired sessions cannot be approved or fetched", () => {
   // Force expiry.
   const session = pairing.getSession(created.pairingSessionId);
   require("../src/pairingDb").db().prepare("UPDATE pairing_sessions SET expires_at = ? WHERE id = ?").run(Date.now() - 1, session.pairingSessionId);
+  assert.equal(pairing.resolvePairingCode(created.pairingCode), null);
   assert.throws(
     () => pairing.approveSession(created.pairingSessionId, { certificate: "C", deviceId: "d" }),
     /not found or expired/

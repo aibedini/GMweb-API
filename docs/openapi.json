@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.14.1",
+    "version": "0.15.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -1890,6 +1890,27 @@
         }
       }
     },
+    "/api/v1/agent/status": {
+      "get": {
+        "summary": "Return the signed caller's authoritative Android identity status",
+        "tags": [
+          "Agent"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/admin/primary-setup": {
       "post": {
         "summary": "Create a one-use primary phone setup claim",
@@ -1995,6 +2016,75 @@
         }
       }
     },
+    "/admin/connection-diagnostics": {
+      "post": {
+        "summary": "Create a short-lived diagnostic-only token",
+        "tags": [
+          "Diagnostics"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/diagnostics": {
+      "post": {
+        "summary": "Run diagnostic-only Android/control-plane checks",
+        "tags": [
+          "Diagnostics"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "token",
+                  "trustRootFingerprint"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "token": {
+                    "type": "string",
+                    "minLength": 20,
+                    "maxLength": 128
+                  },
+                  "trustRootFingerprint": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/pairing/session": {
       "post": {
         "summary": "Create a short-lived QR pairing session (unlinked web client)",
@@ -2062,11 +2152,47 @@
                     "pollSecret": {
                       "type": "string"
                     },
+                    "pairingCode": {
+                      "type": "string"
+                    },
                     "qr": {
                       "type": "object",
                       "additionalProperties": true
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/pairing-code/{code}": {
+      "get": {
+        "summary": "Resolve a short-lived pairing code to the existing signed transcript",
+        "tags": [
+          "Pairing"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 10,
+              "maxLength": 16
+            },
+            "in": "path",
+            "name": "code",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }

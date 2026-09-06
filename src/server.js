@@ -88,6 +88,7 @@ const pairingGate = require("./pairingGate");
 const { registerAgentIdentityRoutes } = require("./agentIdentityRoutes");
 const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
 const { registerPairingRoutes } = require("./pairingRoutes");
+const { registerConnectionDiagnostics } = require("./connectionDiagnostics");
 const { registerPwaAuthRoutes, registerPwaTokenAdminRoutes } = require("./pwaAuthRoutes");
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
@@ -2751,9 +2752,16 @@ registerAgentIdentityRoutes(app, { agentAuthService });
 
 // ADR-007: primary-device QR pairing relay (web ← Android approval).
 require("./primaryEnrollment").registerPrimaryEnrollment(app, { agentAuthService, config, canAdmin: hasDashboardAccess });
+registerConnectionDiagnostics(app, {
+  agentAuthService,
+  canAdmin: hasDashboardAccess,
+  checkRateLimit,
+  config,
+});
 registerPairingRoutes(app, {
   agentAuthService,
   config,
+  checkRateLimit,
 });
 
 registerPwaAuthRoutes(app, {

@@ -38,6 +38,7 @@ export interface PairingHandle {
   session: PairingSession;
   qr: PairingQrPayload;
   webDeviceId: string;
+  pairingCode: string;
   /** Poll until approved; resolves ONLY after CERTIFICATE_VERIFIED. */
   wait: () => Promise<{ certificate: string; deviceId: string; verified: boolean }>;
   cancel: () => void;
@@ -168,7 +169,7 @@ export async function beginPairing(onProgress?: (stage: PairingProgress) => void
       setTimeout(poll, 1500);
     });
 
-  return { session: pairingSession, qr, webDeviceId, wait, cancel };
+  return { session: pairingSession, qr, webDeviceId, pairingCode: created.pairingCode, wait, cancel };
 }
 
 // ── POST-PAIR SECURE BOOTSTRAP ────────────────────────────────────────────

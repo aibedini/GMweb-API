@@ -1,4 +1,5 @@
 "use strict";
+const crypto = require("node:crypto");
 
 /**
  * PR-08b (ADR-001/004) — agent identity registration + per-device auth gate.
@@ -18,6 +19,26 @@ const { registerControlPlaneRoutes } = require("./controlPlaneRoutes");
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { agentAuthService }
  */
+function publicKeyFingerprint(value) {
+  return crypto.createHash("sha256").update(Buffer.from(String(value || ""), "base64")).digest("hex");
+}
+
+function buildIdentityStatus(identity) {
+  if (!identity) return { enrolled: false, isPrimary: false };
+  const role = String(identity.device_role || "LEGACY_AGENT");
+  return {
+    deviceId: String(identity.device_id),
+    enrolled: true,
+    role,
+    isPrimary: role === "PRIMARY_TRUST_AGENT",
+    trustRootFingerprint: identity.trust_root_public_key ? publicKeyFingerprint(identity.trust_root_public_key) : null,
+    signingKeyFingerprint: publicKeyFingerprint(identity.signing_public_key),
+    serverTime: Date.now(),
+    registeredAt: Number(identity.registered_at) || null,
+    lastSeenAt: null,
+  };
+}
+
 function registerAgentIdentityRoutes(app, { agentAuthService }) {
   app.post("/api/v1/agent/identity", {
     schema: {
@@ -90,6 +111,19 @@ function registerAgentIdentityRoutes(app, { agentAuthService }) {
       tags: ["Agent"]
     }
   }, async () => ({ identities: agentAuthService.listIdentities() }));
+
+  app.get("/api/v1/agent/status", {
+    schema: {
+      summary: "Return the signed caller's authoritative Android identity status",
+      tags: ["Agent"],
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    const deviceId = request.authenticatedAgentId;
+    if (!deviceId) return reply.code(401).send({ error: "agent_signature_required" });
+    reply.header("Cache-Control", "no-store");
+    return buildIdentityStatus(agentAuthService.getIdentity(deviceId));
+  });
 }
 
-module.exports = { registerAgentIdentityRoutes };
+module.exports = { registerAgentIdentityRoutes, buildIdentityStatus, publicKeyFingerprint };

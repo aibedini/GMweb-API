@@ -43,6 +43,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
   let app;
   let pair;
   let svc;
+  let pairingCodeLookups;
 
   before(async () => {
     app = Fastify({ logger: false });
@@ -70,6 +71,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     app.addHook("preHandler", (request, reply, done) => {
       const isPairingAgentPath =
         request.url === "/api/v1/pairing/approve" ||
+        /^\/api\/v1\/agent\/pairing-code\/[^/]+$/.test(request.url.split("?")[0]) ||
         /^\/api\/v1\/pairing\/session\/[^/]+$/.test(request.url.split("?")[0]);
       if (!isPairingAgentPath) return done();
       const header = String(request.headers["x-agent-auth"] || "");
@@ -81,7 +83,15 @@ describe("ADR-007 pairing security boundary (route level)", () => {
       }
       reply.code(401).send({ error: "unauthorized" });
     });
-    registerPairingRoutes(app, { agentAuthService: svc, config: {} });
+    registerPairingRoutes(app, {
+      agentAuthService: svc,
+      config: {},
+      checkRateLimit: (_request, key, max) => {
+        if (key !== "pairing-code-lookup") return { allowed: true, retryAfterSeconds: 1 };
+        pairingCodeLookups += 1;
+        return { allowed: pairingCodeLookups <= max, retryAfterSeconds: 60 };
+      },
+    });
     await app.ready();
   });
 
@@ -93,6 +103,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
   // the store before each test so every test starts from an empty map.
   beforeEach(() => {
     pairing._reset();
+    pairingCodeLookups = 0;
   });
 
   const transcript = () => ({
@@ -158,6 +169,21 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     const created = await createSession();
     const res = await app.inject({ method: "GET", url: `/api/v1/pairing/session/${created.pairingSessionId}` });
     assert.equal(res.statusCode, 401);
+  });
+
+  test("Primary Android resolves the same pairing session by code and lookup is rate limited", async () => {
+    const created = await createSession();
+    const path = `/api/v1/agent/pairing-code/${created.pairingCode}`;
+    for (let index = 0; index < 10; index += 1) {
+      const auth = signRequest(pair, DEVICE, "GET", path, Buffer.alloc(0), Date.now() + index);
+      const res = await app.inject({ method: "GET", url: path, headers: auth.headers });
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.json().pairingSessionId, created.pairingSessionId);
+      assert.equal(res.json().pollSecretHash, undefined);
+    }
+    const auth = signRequest(pair, DEVICE, "GET", path, Buffer.alloc(0), Date.now() + 20);
+    const limited = await app.inject({ method: "GET", url: path, headers: auth.headers });
+    assert.equal(limited.statusCode, 429);
   });
 
   test("anonymous POST /pairing/approve is 401", async () => {
@@ -318,6 +344,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     registerPairingRoutes(adminApp, {
       agentAuthService: svc,
       config: {},
+      checkRateLimit: () => ({ allowed: true, retryAfterSeconds: 1 }),
       canBootstrapIdentity: () => true,
     });
     await adminApp.ready();

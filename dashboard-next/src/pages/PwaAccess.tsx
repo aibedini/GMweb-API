@@ -25,8 +25,14 @@ const statusVariant = (status: PwaToken["status"]) =>
 
 export function PwaAccessPage() {
   const [setupQr, setSetupQr] = useState("");
+  const [setupCode, setSetupCode] = useState("");
+  const [setupCopied, setSetupCopied] = useState(false);
   const [setupExpiresAt, setSetupExpiresAt] = useState(0);
   const [setupBusy, setSetupBusy] = useState(false);
+  const [diagnosticToken, setDiagnosticToken] = useState("");
+  const [diagnosticExpiresAt, setDiagnosticExpiresAt] = useState(0);
+  const [diagnosticCopied, setDiagnosticCopied] = useState(false);
+  const [diagnosticBusy, setDiagnosticBusy] = useState(false);
   const [tokens, setTokens] = useState<PwaToken[]>([]);
   const [label, setLabel] = useState("My browser");
   const [minutes, setMinutes] = useState("15");
@@ -37,20 +43,43 @@ export function PwaAccessPage() {
 
   useEffect(() => {
     if (!setupExpiresAt) return;
-    const timer = setTimeout(() => setSetupQr(""), Math.max(0, setupExpiresAt - Date.now()));
+    const timer = setTimeout(() => { setSetupQr(""); setSetupCode(""); }, Math.max(0, setupExpiresAt - Date.now()));
     return () => clearTimeout(timer);
   }, [setupExpiresAt]);
+
+  useEffect(() => {
+    if (!diagnosticExpiresAt) return;
+    const timer = setTimeout(() => setDiagnosticToken(""), Math.max(0, diagnosticExpiresAt - Date.now()));
+    return () => clearTimeout(timer);
+  }, [diagnosticExpiresAt]);
 
   async function createPhoneSetup() {
     setSetupBusy(true);
     setSetupQr("");
+    setSetupCode("");
     try {
-      const claim = await api<{ expiresAt: number }>("/admin/primary-setup", { method: "POST" });
-      setSetupQr(await QRCode.toDataURL(JSON.stringify(claim), { width: 360, margin: 2, errorCorrectionLevel: "M" }));
+      const claim = await api<{ expiresAt: number; protocol: number; kind: string; claim: string; apiOrigin: string }>("/admin/primary-setup", { method: "POST" });
+      const portable = JSON.stringify(claim);
+      setSetupCode(portable);
+      setSetupCopied(false);
+      setSetupQr(await QRCode.toDataURL(portable, { width: 360, margin: 2, errorCorrectionLevel: "M" }));
       setSetupExpiresAt(claim.expiresAt);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not create phone setup QR.");
     } finally { setSetupBusy(false); }
+  }
+
+  async function createDiagnostic() {
+    setDiagnosticBusy(true);
+    setError("");
+    try {
+      const result = await api<{ token: string; expiresAt: number }>("/admin/connection-diagnostics", { method: "POST" });
+      setDiagnosticToken(result.token);
+      setDiagnosticExpiresAt(result.expiresAt);
+      setDiagnosticCopied(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not create a diagnostic token.");
+    } finally { setDiagnosticBusy(false); }
   }
 
   async function load() {
@@ -109,6 +138,42 @@ export function PwaAccessPage() {
             <p className="text-sm text-muted-foreground">Enrollment replaces the previous primary phone and signs out its linked browsers. The setup QR expires in five minutes and can be used once.</p>
             <Button disabled={setupBusy} onClick={() => void createPhoneSetup()}>Create phone setup QR</Button>
             {setupQr && <img src={setupQr} width={360} height={360} alt="One-use primary phone setup QR" />}
+            {setupCode && (
+              <div className="space-y-2">
+                <Label>Setup code / token</Label>
+                <div className="flex gap-2">
+                  <code className="min-w-0 flex-1 overflow-x-auto rounded-lg border border-border bg-background px-3 py-2 text-xs">{setupCode}</code>
+                  <Button type="button" variant="secondary" onClick={async () => {
+                    await navigator.clipboard.writeText(setupCode);
+                    setSetupCopied(true);
+                    setTimeout(() => setSetupCopied(false), 1500);
+                  }}>{setupCopied ? <Check className="size-4" /> : <Copy className="size-4" />}{setupCopied ? "Copied" : "Copy"}</Button>
+                </div>
+                <p className="text-xs text-muted-foreground">The QR and pasted value are the same one-use claim and expire together.</p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader><CardTitle>Connection diagnostics</CardTitle></CardHeader>
+          <CardContent className="space-y-3 p-5">
+            <p className="text-sm text-muted-foreground">Create a diagnostic-only token for the Android Linked devices screen. It expires in 15 minutes and cannot read messages, send SMS, pair a browser, or enroll a Primary phone.</p>
+            <Button disabled={diagnosticBusy} onClick={() => void createDiagnostic()}>
+              {diagnosticBusy && <Loader2 className="size-4 animate-spin" />}Create connection diagnostic
+            </Button>
+            {diagnosticToken && diagnosticExpiresAt > Date.now() && (
+              <div className="rounded-xl border border-border bg-background p-3">
+                <p className="mb-2 text-xs text-muted-foreground">Shown once · expires {new Date(diagnosticExpiresAt).toLocaleTimeString()}</p>
+                <div className="flex gap-2">
+                  <code className="min-w-0 flex-1 overflow-x-auto rounded-lg border border-border px-3 py-2 text-xs">{diagnosticToken}</code>
+                  <Button type="button" variant="secondary" onClick={async () => {
+                    await navigator.clipboard.writeText(diagnosticToken);
+                    setDiagnosticCopied(true);
+                    setTimeout(() => setDiagnosticCopied(false), 1500);
+                  }}>{diagnosticCopied ? <Check className="size-4" /> : <Copy className="size-4" />}{diagnosticCopied ? "Copied" : "Copy"}</Button>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
         <Card className="overflow-hidden">

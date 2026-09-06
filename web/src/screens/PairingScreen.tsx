@@ -212,6 +212,11 @@ export function PairingScreen({
                     </p>
                   )}
                   <Chip size="sm" variant="soft" color={secondsLeft > 20 ? "default" : "warning"}>QR expires in {mm}:{ss}</Chip>
+                  <div className="w-full rounded-lg border p-3 text-center" style={{ borderColor: "var(--border)" }}>
+                    <p className="text-xs" style={{ color: "var(--muted-fg)" }}>Can't scan? Enter this pairing code on Android</p>
+                    <code className="mt-1 block text-lg font-semibold tracking-[0.2em]">{handle.pairingCode.match(/.{1,5}/g)?.join(" ")}</code>
+                    <Button size="sm" variant="ghost" onPress={() => void navigator.clipboard.writeText(handle.pairingCode)}>Copy</Button>
+                  </div>
                 </>
               )}
               {!handle && !tokenBusy && (

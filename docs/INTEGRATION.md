@@ -1,4 +1,4 @@
-## GMweb 0.14.1 / Messages 2.7.1: coordinated pairing and encrypted history
+## GMweb 0.15.0 / Messages 2.8.0: observable Primary and linked-device recovery
 
 Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use
 `POST /api/v1/primary-enrollment`, with operational-key and trust-root proofs.
@@ -14,6 +14,21 @@ Pairing and linked sessions persist in control-plane SQLite. The server now
 verifies Android certificates before accepting approval. Deploy API, PWA,
 dashboard and APK together; old JSON-signed clients must upgrade and pair again.
 A physical-device [release gate](PAIRING-E2E.md) is required before deployment.
+
+Android can verify its authoritative Primary role with the signed
+`GET /api/v1/agent/status` endpoint. Normal browser pairing also displays a
+short-lived 10-character code; a Primary Android agent resolves it through
+`GET /api/v1/agent/pairing-code/:code` and then follows the same confirmation,
+biometric, certificate, proof-of-possession and linked-session flow as QR.
+The dashboard exposes the existing one-use Primary setup claim as both QR and
+copyable text.
+
+Dashboard operators can create a 15-minute `gmwd_...` token through
+`POST /admin/connection-diagnostics`. Android submits it only to the signed
+`POST /api/v1/agent/diagnostics` endpoint. GMweb stores only its SHA-256 hash;
+the token cannot authorize messaging, browser pairing, Primary enrollment, or
+any other route. Responses contain role/fingerprint comparisons and aggregate
+health counts, never public-key material, message data, credentials, or QR data.
 
 ### Companion payload and history limitations
 

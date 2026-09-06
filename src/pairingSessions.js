@@ -33,20 +33,30 @@ function createSession(p, ctx) {
     if (url.protocol !== "https:" || url.origin !== origin) fail("server origin must be an HTTPS origin", 500);
   }
   const pollSecret = crypto.randomBytes(24).toString("base64url");
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const pairingCode = [...crypto.randomBytes(10)].map(value => alphabet[value & 31]).join("");
   const session = { pairingSessionId: crypto.randomBytes(18).toString("base64url"),
     version: 1, protocol: PROTOCOL, webDeviceId: p.webDeviceId,
     webSigningPublicKey: p.webSigningPublicKey, webEncryptionPublicKey: p.webEncryptionPublicKey,
     ephemeralPublicKey: p.ephemeralPublicKey, nonce: p.nonce,
     origin: webOrigin, apiOrigin, webOrigin, createdAt: Date.now(), expiresAt: Date.now() + PAIRING_TTL_MS,
-    ip, pollSecretHash: hash(pollSecret), state: "PENDING", approved: null };
+    ip, pollSecretHash: hash(pollSecret), pairingCodeHash: hash(pairingCode), state: "PENDING", approved: null };
   session.transcriptHash = transcriptHash(session);
   db().prepare("INSERT INTO pairing_sessions VALUES (?, ?, ?, ?)")
     .run(session.pairingSessionId, ip, session.expiresAt, JSON.stringify(session));
-  return { pairingSessionId: session.pairingSessionId, expiresAt: session.expiresAt, ttlSeconds: 120, pollSecret };
+  return { pairingSessionId: session.pairingSessionId, expiresAt: session.expiresAt, ttlSeconds: 120, pollSecret, pairingCode };
 }
 function getSession(id) {
   gc();
   const row = db().prepare("SELECT payload FROM pairing_sessions WHERE id = ?").get(String(id || ""));
+  return row ? JSON.parse(row.payload) : null;
+}
+function resolvePairingCode(code) {
+  gc();
+  const normalized = String(code || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  if (normalized.length !== 10) return null;
+  const row = db().prepare("SELECT payload FROM pairing_sessions WHERE json_extract(payload, '$.pairingCodeHash') = ? AND expires_at > ?")
+    .get(hash(normalized), Date.now());
   return row ? JSON.parse(row.payload) : null;
 }
 function pollSecretMatches(s, secret) {
@@ -110,4 +120,4 @@ module.exports = { PAIRING_TTL_MS, MAX_GLOBAL_SESSIONS, MAX_SESSIONS_PER_IP, Cap
   canonicalTranscript, transcriptHash, createSession: atomic(createSession), getSession,
   approveSession: atomic(approveSession), consumeApproval: atomic(consumeApproval), peekChallenge,
   burnChallenge, challengeCanonical, pollSecretMatches, qrPayload, resumeApproval, hashOf: transcriptHash,
-  canonicalBytes: canonicalTranscript, _reset };
+  canonicalBytes: canonicalTranscript, resolvePairingCode, _reset };

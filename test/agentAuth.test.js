@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
 const { AgentAuthService } = require("../src/agentAuth");
+const { buildIdentityStatus, publicKeyFingerprint } = require("../src/agentIdentityRoutes");
 
 function makeKey() {
   return crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
@@ -22,6 +23,20 @@ function authedRequest(svc, pair, deviceId, body, { ts = Date.now(), url = "/api
 }
 
 describe("AgentAuthService (PR-08b) — per-device signed auth", () => {
+  test("identity status reports authoritative primary role and public-key fingerprints", () => {
+    const svc = new AgentAuthService(new Database(":memory:"));
+    const pair = makeKey();
+    const signing = pair.publicKey.export({ format: "der", type: "spki" }).toString("base64");
+    const trustRoot = makeKey().publicKey.export({ format: "der", type: "spki" }).toString("base64");
+    svc.registerIdentity({ deviceId: "primary-phone", publicKeys: { signing, trustRoot }, forcePrimary: true });
+    const status = buildIdentityStatus(svc.getIdentity("primary-phone"));
+    assert.equal(status.enrolled, true);
+    assert.equal(status.role, "PRIMARY_TRUST_AGENT");
+    assert.equal(status.isPrimary, true);
+    assert.equal(status.trustRootFingerprint, publicKeyFingerprint(trustRoot));
+    assert.equal(status.signingKeyFingerprint, publicKeyFingerprint(signing));
+    assert.deepEqual(buildIdentityStatus(null), { enrolled: false, isPrimary: false });
+  });
   test("valid signature verifies and binds the deviceId", () => {
     const svc = new AgentAuthService(new Database(":memory:"));
     const pair = makeKey();

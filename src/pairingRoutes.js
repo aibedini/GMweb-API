@@ -111,7 +111,7 @@ function markPairing(request, stage, status, reason, identifiers = {}) {
   };
 }
 
-function registerPairingRoutes(app, { agentAuthService, config }) {
+function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }) {
   // BLOCKER 7: production origin is fail-closed. Header-derived origins are
   // only allowed outside production (trustProxy + forwarded headers must not
   // decide the root-trust transcript).
@@ -159,6 +159,7 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
             expiresAt: { type: "number" },
             ttlSeconds: { type: "number" },
             pollSecret: { type: "string" }, // response schema strips unknown fields without this
+            pairingCode: { type: "string" },
             qr: { type: "object", additionalProperties: true },
           },
         },
@@ -192,11 +193,36 @@ function registerPairingRoutes(app, { agentAuthService, config }) {
       expiresAt: created.expiresAt,
       ttlSeconds: created.ttlSeconds,
       pollSecret: created.pollSecret, // shown to web ONCE; QR carries only the id
+      pairingCode: created.pairingCode,
       qr: {
         ...pairing.qrPayload(session),
 
       },
     };
+  });
+
+  app.get("/api/v1/agent/pairing-code/:code", {
+    schema: {
+      summary: "Resolve a short-lived pairing code to the existing signed transcript",
+      tags: ["Pairing"],
+      params: { type: "object", required: ["code"], properties: { code: { type: "string", minLength: 10, maxLength: 16 } } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    const limit = checkRateLimit(request, "pairing-code-lookup", 10, 60_000);
+    if (!limit.allowed) {
+      reply.header("Retry-After", String(limit.retryAfterSeconds));
+      return reply.code(429).send({ error: "rate_limited" });
+    }
+    if (agentAuthService.getRole(request.authenticatedAgentId) !== "PRIMARY_TRUST_AGENT") {
+      return reply.code(403).send({ error: "primary_agent_required" });
+    }
+    const session = pairing.resolvePairingCode(request.params.code);
+    if (!session) return reply.code(404).send({ error: "invalid_or_expired_pairing_code" });
+    markPairing(request, "QR_OR_CODE_DETECTED", "SUCCESS", "pairing_code_resolved", {
+      sessionId: session.pairingSessionId, deviceId: request.authenticatedAgentId,
+    });
+    return pairing.qrPayload(session);
   });
 
   // ── Web: retryable status poll; linked-session challenge stays one-use ──
