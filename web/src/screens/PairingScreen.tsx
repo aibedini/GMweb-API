@@ -201,12 +201,12 @@ export function PairingScreen({
                     variant="soft"
                     color="warning"
                   >
-                    Primary phone enrollment required first
+                    {handle.primaryVerified ? "Primary phone verified" : "Primary phone enrollment required"}
                   </Chip>
                   <p className="text-center text-sm" style={{ color: "var(--muted-fg)" }}>
                     Android Messages → Settings → Linked devices → <b>Link new device</b>
                   </p>
-                  {(
+                  {!handle.primaryVerified && (
                     <p className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--border)", color: "var(--muted-fg)" }}>
                       For a new or reinstalled phone, first create a phone setup QR in the dashboard and scan it using Enroll this phone as Primary. Then return here to link this browser.
                     </p>

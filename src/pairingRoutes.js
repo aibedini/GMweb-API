@@ -54,7 +54,7 @@ const pairing = require("./pairingSessions");
 const linkedSessions = require("./linkedSessions");
 const crypto = require("crypto");
 const { db } = require("./pairingDb");
-const { validateCertificate } = require("./pairingCertificate");
+const { CAPABILITIES, certificateValidationReason } = require("./pairingCertificate");
 const { canonicalCertificate } = require("../shared/pairingProtocol.mjs");
 
 /** Web-facing origin recorded in the transcript (server-derived only). */
@@ -160,6 +160,7 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }
             ttlSeconds: { type: "number" },
             pollSecret: { type: "string" }, // response schema strips unknown fields without this
             pairingCode: { type: "string" },
+            primaryVerified: { type: "boolean" },
             qr: { type: "object", additionalProperties: true },
           },
         },
@@ -181,11 +182,14 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }
       apiOrigin: apiOrigin(request, config),
     });
     const session = pairing.getSession(created.pairingSessionId);
+    const primaryVerified = agentAuthService.listIdentities().some(
+      identity => identity.device_role === "PRIMARY_TRUST_AGENT" && identity.trust_root_public_key,
+    );
     markPairing(
       request,
       "WEB_SESSION_CREATED",
       "SUCCESS",
-      "primary_enrollment_required",
+      primaryVerified ? "primary_verified" : "primary_enrollment_required",
       { sessionId: created.pairingSessionId, deviceId: request.body?.webDeviceId },
     );
     return {
@@ -194,6 +198,7 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }
       ttlSeconds: created.ttlSeconds,
       pollSecret: created.pollSecret, // shown to web ONCE; QR carries only the id
       pairingCode: created.pairingCode,
+      primaryVerified,
       qr: {
         ...pairing.qrPayload(session),
 
@@ -365,13 +370,20 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }
     let certificate;
     try { certificate = JSON.parse(body.certificate); } catch { certificate = null; }
     if (!session) return reply.code(404).send({ error: "session_expired" });
-    if (!identity?.trust_root_public_key || identity.trust_root_public_key !== body.trustRootPublicKey ||
-        body.deviceId !== session.webDeviceId || body.transcriptHash !== session.transcriptHash ||
-        !validateCertificate(certificate, session) ||
-        !verifyP256(Buffer.from(canonicalCertificate(certificate), "utf8"), certificate.rootSignature, identity.trust_root_public_key)) {
-      markPairing(request, "ANDROID_SERVER_APPROVAL", "FAILED", "invalid_certificate");
-      return reply.code(403).send({ error: "invalid_certificate", reason: "certificate_binding_or_signature_invalid" });
-    }
+    const rejectCertificate = reason => {
+      markPairing(request, "ANDROID_SERVER_APPROVAL", "FAILED", reason, {
+        sessionId: body.pairingSessionId, deviceId: body.deviceId,
+      });
+      return reply.code(403).send({ error: "invalid_certificate", reason });
+    };
+    if (!identity?.trust_root_public_key) return rejectCertificate("missing_enrolled_trust_root");
+    if (identity.trust_root_public_key !== body.trustRootPublicKey) return rejectCertificate("trust_root_mismatch");
+    if (body.deviceId !== session.webDeviceId) return rejectCertificate("web_device_binding_mismatch");
+    if (body.transcriptHash !== session.transcriptHash) return rejectCertificate("transcript_hash_mismatch");
+    const validationReason = certificateValidationReason(certificate, session);
+    if (validationReason) return rejectCertificate(validationReason);
+    if (!verifyP256(Buffer.from(canonicalCertificate(certificate), "utf8"), certificate.rootSignature,
+      identity.trust_root_public_key)) return rejectCertificate("certificate_root_signature_invalid");
     try {
       const approved = pairing.approveSession(body.pairingSessionId, {
         certificate: body.certificate,
@@ -492,8 +504,7 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }
     try { cert = JSON.parse(taken.certificate); } catch { cert = null; }
     const certSigPub = cert?.signingPublicKey || "";
     const caps = cert && Array.isArray(cert.capabilities) ? cert.capabilities : [];
-    const capNames = ["READ_MESSAGES","SEND_MESSAGES","MANAGE_DEVICES","READ_OTP","READ_BANK_SECURITY","READ_PASSWORD_RESET","READ_AUTH_CODES","READ_FINANCIAL_NOTIFICATIONS"];
-    const capabilities = caps.filter((c) => capNames.includes(String(c)));
+    const capabilities = caps.filter((c) => CAPABILITIES.has(String(c)));
     if (!capabilities.includes("READ_MESSAGES")) {
       markPairing(request, "WEB_LINK_SESSION", "FAILED", "certificate_lacks_read_capability", {
         sessionId: body.pairingSessionId,

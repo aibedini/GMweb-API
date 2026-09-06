@@ -7,7 +7,8 @@ function certificate(id, key = root) {
   const s = pairing.getSession(id);
   const c = { protocol: s.protocol, accountId: "default", deviceId: s.webDeviceId, deviceType: "WEB_PWA",
     signingPublicKey: s.webSigningPublicKey, encryptionPublicKey: s.webEncryptionPublicKey,
-    capabilities: ["READ_MESSAGES", "SEND_MESSAGES"], historyGrant: "FULL_HISTORY", trustSequence: 1,
+    capabilities: ["READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "RECEIVE_NOTIFICATIONS"],
+    historyGrant: "FULL_HISTORY", trustSequence: 1,
     issuedAt: Date.now(), expiresAt: Date.now() + 86400000,
     pairingTranscriptHash: s.transcriptHash, pairingSessionId: id, apiOrigin: s.apiOrigin, webOrigin: s.webOrigin };
   c.rootSignature = crypto.sign("sha256", Buffer.from(canonicalCertificate(c)), key.privateKey).toString("base64");

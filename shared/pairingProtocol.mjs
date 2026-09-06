@@ -1,6 +1,11 @@
 // Pairing Protocol v1. UTF-8 netstrings, fixed field order, no JSON serializer.
 // Each value is <decimal UTF-8 byte length>:<value>,. No normalization.
 export const PROTOCOL = "GMweb-Pairing-v1";
+export const PAIRING_CAPABILITIES = Object.freeze([
+  "READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "RECEIVE_NOTIFICATIONS",
+  "MANAGE_DEVICES", "READ_OTP", "READ_BANK_SECURITY", "READ_PASSWORD_RESET",
+  "READ_AUTH_CODES", "READ_FINANCIAL_NOTIFICATIONS",
+]);
 function text(value) {
   if (typeof value !== "string" || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value)) {
     throw new Error("invalid protocol string");

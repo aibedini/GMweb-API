@@ -29,6 +29,7 @@ export interface PairingQrPayload {
 export interface CreateSessionResponse extends PairingSession {
   qr: PairingQrPayload;
   pairingCode: string;
+  primaryVerified: boolean;
 }
 
 export type PairingStatus =
