@@ -32,3 +32,32 @@ jobs:
             git diff --stat -- docs/openapi.json
             exit 1
           fi
+
+  pairing-contract-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout Android Messages (canonical pairing protocol peer)
+        uses: actions/checkout@v4
+        with:
+          repository: aibedini/Messages
+          ref: master
+          path: android-messages
+      - name: Pairing protocol fixture must be byte-identical across repositories
+        run: |
+          cmp shared/pairing-protocol-v1.json android-messages/protocol/pairing-protocol-v1.json
+          echo "GMweb shared/pairing-protocol-v1.json == Messages protocol/pairing-protocol-v1.json"
+      - name: Android grants must equal the schema (fail on capability drift)
+        run: |
+          node -e '
+            const schema = require("./shared/pairing-protocol-v1.json");
+            const fs = require("node:fs");
+            const kt = fs.readFileSync("android-messages/app/src/main/java/com/autonomousone/messages/security/PairingCapabilityContract.kt", "utf8");
+            for (const cap of [...schema.capability_definitions.base, ...schema.capability_definitions.sensitive]) {
+              if (!kt.includes(`"${cap}"`)) {
+                console.error(`capability ${cap} is missing from PairingCapabilityContract.kt`);
+                process.exit(1);
+              }
+            }
+            console.log("Android PairingCapabilityContract covers every schema capability");
+          '

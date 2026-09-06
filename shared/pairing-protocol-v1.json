@@ -1,6 +1,24 @@
 {
   "protocol": "GMweb-Pairing-v1",
   "trustRootPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEiACo2axVP0BLA/ST6TmM+Ky4D0CENUvlj10NZKy2CNaiDjBB5bIq7SuIR2Uei0goBM/4w1yrmqYL+jnn5Rbnug==",
+  "capability_definitions": {
+    "base": [
+      "READ_MESSAGES",
+      "SEND_MESSAGES",
+      "MARK_READ",
+      "RECEIVE_NOTIFICATIONS"
+    ],
+    "sensitive": [
+      "READ_OTP",
+      "READ_BANK_SECURITY",
+      "READ_PASSWORD_RESET",
+      "READ_AUTH_CODES",
+      "READ_FINANCIAL_NOTIFICATIONS"
+    ],
+    "reserved": [
+      "MANAGE_DEVICES"
+    ]
+  },
   "vectors": [
     {
       "kind": "certificate",
@@ -75,6 +93,36 @@
       "canonicalBase64": "R013ZWItUGFpcmluZy12MTpjaGFsbGVuZ2UKMTA6c2Vzc2lvbi00Miw2OndlYi00MiwxMDoxMjM0NTY3ODkwLDIzOmh0dHBzOi8vYXBpLmV4YW1wbGUuY29tLDIzOmh0dHBzOi8vd2ViLmV4YW1wbGUuY29tLDEzOjE3ODgzMDAwMDAwMDAs",
       "sha256": "d5a05fb923cdfff841a4e070078f58d67f609634a16e2012bace1e97de0954c5",
       "signature": "MEQCIDLZmpWxQ7SNGYj8h7SfQ2cx9EYKDs/8d3vsdnRfhxevAiAAgFjKcXNdwiKkv8PtImPJxzvVwskQk07Xe2ow/bT7kA=="
+    },
+    {
+      "kind": "certificate",
+      "label": "android_linked_browser_default",
+      "description": "Real Android LinkedDevicesScreen output: the four base linked-browser capabilities plus one user-selected sensitive grant (READ_OTP). Unsigned by design — root signatures require the enrolled phone's non-exportable keystore key; canonical bytes + SHA-256 are the cross-runtime contract.",
+      "input": {
+        "protocol": "GMweb-Pairing-v1",
+        "accountId": "default",
+        "deviceId": "web-بله-😀/\"\\\n",
+        "deviceType": "WEB_PWA",
+        "signingPublicKey": "public/+/=",
+        "encryptionPublicKey": "encryption/+/=",
+        "capabilities": [
+          "READ_MESSAGES",
+          "SEND_MESSAGES",
+          "MARK_READ",
+          "RECEIVE_NOTIFICATIONS",
+          "READ_OTP"
+        ],
+        "historyGrant": "FULL_HISTORY",
+        "trustSequence": 8,
+        "issuedAt": 1788300000000,
+        "expiresAt": 1791000000000,
+        "pairingTranscriptHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pairingSessionId": "session-42",
+        "apiOrigin": "https://api.example.com",
+        "webOrigin": "https://web.example.com"
+      },
+      "canonicalBase64": "R013ZWItUGFpcmluZy12MTpjZXJ0aWZpY2F0ZQo3OmRlZmF1bHQsMTk6d2ViLdio2YTZhy3wn5iALyJcCiw3OldFQl9QV0EsMTA6cHVibGljLysvPSwxNDplbmNyeXB0aW9uLysvPSwxOjUsOTpNQVJLX1JFQUQsMTM6UkVBRF9NRVNTQUdFUyw4OlJFQURfT1RQLDIxOlJFQ0VJVkVfTk9USUZJQ0FUSU9OUywxMzpTRU5EX01FU1NBR0VTLDEyOkZVTExfSElTVE9SWSwxOjgsMTM6MTc4ODMwMDAwMDAwMCwxMzoxNzkxMDAwMDAwMDAwLDY0OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEsMTA6c2Vzc2lvbi00MiwyMzpodHRwczovL2FwaS5leGFtcGxlLmNvbSwyMzpodHRwczovL3dlYi5leGFtcGxlLmNvbSw=",
+      "sha256": "e934f05d499da78df39e76e8907fc51e5c368fe5eb2034f1c41ed4e1800e8b9c"
     }
   ]
 }

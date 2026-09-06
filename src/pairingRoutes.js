@@ -54,7 +54,7 @@ const pairing = require("./pairingSessions");
 const linkedSessions = require("./linkedSessions");
 const crypto = require("crypto");
 const { db } = require("./pairingDb");
-const { CAPABILITIES, certificateValidationReason } = require("./pairingCertificate");
+const { CAPABILITIES, certificateFailureReport } = require("./pairingCertificate");
 const { canonicalCertificate } = require("../shared/pairingProtocol.mjs");
 
 /** Web-facing origin recorded in the transcript (server-derived only). */
@@ -370,9 +370,10 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }
     let certificate;
     try { certificate = JSON.parse(body.certificate); } catch { certificate = null; }
     if (!session) return reply.code(404).send({ error: "session_expired" });
-    const rejectCertificate = reason => {
+    const rejectCertificate = (reason, meta) => {
       markPairing(request, "ANDROID_SERVER_APPROVAL", "FAILED", reason, {
         sessionId: body.pairingSessionId, deviceId: body.deviceId,
+        ...(meta && Object.keys(meta).length > 0 ? { validation: meta } : {}),
       });
       return reply.code(403).send({ error: "invalid_certificate", reason });
     };
@@ -380,8 +381,12 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }
     if (identity.trust_root_public_key !== body.trustRootPublicKey) return rejectCertificate("trust_root_mismatch");
     if (body.deviceId !== session.webDeviceId) return rejectCertificate("web_device_binding_mismatch");
     if (body.transcriptHash !== session.transcriptHash) return rejectCertificate("transcript_hash_mismatch");
-    const validationReason = certificateValidationReason(certificate, session);
-    if (validationReason) return rejectCertificate(validationReason);
+    // P0-2: certificate predicates are split into explicit fail-closed checks.
+    // certificateFailureReport returns the FIRST failed predicate plus a safe
+    // meta block (predicate name + capability names only — never key material).
+    // Capability mismatch therefore logs exactly which capability failed.
+    const failure = certificateFailureReport(certificate, session);
+    if (failure) return rejectCertificate(failure.reason, failure.meta);
     if (!verifyP256(Buffer.from(canonicalCertificate(certificate), "utf8"), certificate.rootSignature,
       identity.trust_root_public_key)) return rejectCertificate("certificate_root_signature_invalid");
     try {

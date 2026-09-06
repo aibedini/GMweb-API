@@ -5,12 +5,14 @@ const crypto = require("node:crypto");
 const fixture = require("../shared/pairing-protocol-v1.json");
 const protocol = require("../shared/pairingProtocol.mjs");
 for (const v of fixture.vectors) {
-  test(`fixed ${v.kind} bytes, hash and signature`, () => {
+  test(`fixed ${v.kind}${v.label ? ` (${v.label})` : ""} bytes, hash${v.signature ? " and signature" : ""}`, () => {
     const encode = protocol[`canonical${v.kind[0].toUpperCase()}${v.kind.slice(1)}`];
     const bytes = Buffer.from(encode(v.input));
     assert.equal(bytes.toString("base64"), v.canonicalBase64);
     assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), v.sha256);
-    assert.equal(crypto.verify("sha256", bytes, crypto.createPublicKey({key:Buffer.from(fixture.trustRootPublicKey,"base64"),format:"der",type:"spki"}), Buffer.from(v.signature,"base64")), true);
+    if (v.signature) {
+      assert.equal(crypto.verify("sha256", bytes, crypto.createPublicKey({key:Buffer.from(fixture.trustRootPublicKey,"base64"),format:"der",type:"spki"}), Buffer.from(v.signature,"base64")), true);
+    }
   });
 }
 test("TypeScript browser verifier reads the same static certificate fixture", async () => {

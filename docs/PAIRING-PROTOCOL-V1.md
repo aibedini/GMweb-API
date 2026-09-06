@@ -80,6 +80,35 @@ instrumentation tests and Node/TypeScript tests read those files. There are
 no private keys in the fixtures. Android instrumentation tests exercise the
 platform JSON implementation rather than the JVM substitute.
 
+
+## Capability contract (single source of truth)
+
+`capability_definitions` in `shared/pairing-protocol-v1.json` (byte-identical
+copy in `Messages/protocol/pairing-protocol-v1.json`) is the ONE canonical
+capability contract. It has three groups:
+
+| Group | Capabilities | Meaning |
+| --- | --- | --- |
+| base | READ_MESSAGES, SEND_MESSAGES, MARK_READ, RECEIVE_NOTIFICATIONS | every linked browser ALWAYS receives them; server validation rejects a certificate missing any of them |
+| sensitive | READ_OTP, READ_BANK_SECURITY, READ_PASSWORD_RESET, READ_AUTH_CODES, READ_FINANCIAL_NOTIFICATIONS | per-device user-selected grants (LinkedDevicesScreen toggles) |
+| reserved | MANAGE_DEVICES | allowlisted server-side; not granted by today's Android UI |
+
+The server reads its allowlist from that JSON — never from a hardcoded set.
+Android derives its certificate builder from `PairingCapabilityContract.kt`
+which mirrors the same JSON. Drift is fail-closed:
+
+- `GMweb test/pairingCapabilityContract.test.js` fails if the schema, the
+  runtime mirror, or the Messages protocol copy disagree.
+- `GMweb .github/workflows/ci.yml` and `Messages .github/workflows/pairing-contract.yml`
+  compare the two repositories' protocol files byte-for-byte on every CI run.
+- `Messages PairingCapabilityContractTest` fails the Android build if the Kotlin
+  lists drift from the schema.
+
+The shared fixture also carries an `android_linked_browser_default` certificate
+vector whose input is exactly what LinkedDevicesScreen produces today (the four
+base capabilities + READ_OTP). Both runtimes re-derive its canonical bytes and
+SHA-256, so any canonicalization drift between Kotlin and Node fails a test.
+
 ## Origins and transport
 
 Production requires explicit `PUBLIC_API_ORIGIN` and `PUBLIC_WEB_ORIGIN`,
