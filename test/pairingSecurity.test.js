@@ -24,6 +24,15 @@ const pairing = require("../src/pairingSessions");
 const { registerPairingRoutes } = require("../src/pairingRoutes");
 
 const DEVICE = "android-primary";
+// CI flake fix: several tests sign the SAME device within one millisecond and
+// AgentAuth rejects a replayed (device, ts) pair. Hand every signature a
+// strictly monotonic timestamp so cross-test collisions are impossible.
+let monotonicAgentTs = 0;
+function nextAgentTs() {
+  const now = Date.now();
+  monotonicAgentTs = Math.max(now, monotonicAgentTs + 1);
+  return monotonicAgentTs;
+}
 
 function makeKey() {
   return crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
@@ -131,7 +140,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
       trustRootPublicKey: TRUST_ROOT_PUB,
     });
     const buf = Buffer.from(body);
-    const ts = opts.ts ?? Date.now();
+    const ts = opts.ts ?? nextAgentTs();
     const url = "/api/v1/pairing/approve";
     const bodyHash = crypto.createHash("sha256").update(buf).digest("hex");
     const canonical = `POST\n${url}\n${bodyHash}\nX-AGENT-TS:${ts}\n`;
