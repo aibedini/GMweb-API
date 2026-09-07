@@ -10,6 +10,7 @@
 
 import { fetchEventsAfter, type SyncEvent } from "./api.ts";
 import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypto.ts";
+import { decodeEventPayload } from "./inbox.ts";
 
 const DB_NAME = "gmweb-messages";
 const DB_VERSION = 2;
@@ -74,6 +75,20 @@ async function drainSync(onProgress?: (applied: number) => void): Promise<number
   let applied = 0;
   for (;;) {
     const page = await fetchEventsAfter(cursor);
+    // Observability (Phase 2) — browser console trace of each sync page.
+    try {
+      let incoming = 0;
+      let outgoing = 0;
+      for (const ev of page.events) {
+        const payload = decodeEventPayload(ev);
+        if (payload?.direction === "in") incoming += 1;
+        else if (payload?.direction === "out") outgoing += 1;
+      }
+      // eslint-disable-next-line no-console
+      console.info(`sync_fetched cursor=${cursor} events=${page.events.length} incoming=${incoming} outgoing=${outgoing}`);
+    } catch {
+      /* best-effort diagnostics only */
+    }
     if (page.events.length === 0) break;
     if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor ||
         page.events.some(ev => !Number.isSafeInteger(ev.sequence) || ev.sequence <= cursor || ev.sequence > page.nextCursor)) {

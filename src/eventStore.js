@@ -17,13 +17,18 @@
 class EventStore {
   /**
    * @param {import("better-sqlite3").Database} db
-   * @param {object} [opts] { onEventsAccepted?: (count:number) => void }
+   * @param {object} [opts] { onEventsAccepted?: (count:number) => void,
+   *        log?: (line:string) => void, debug?: (line:string) => void }
    *        onEventsAccepted: realtime hook (§44) — fired AFTER commit with the
    *        number of newly accepted events, so the SSE layer can emit
    *        {type:"sync.available"}. The store itself stays transport-blind.
+   *        log/debug: optional observability sinks (default no-op) — see the
+   *        batch_received / event_accepted / event_duplicate trace lines.
    */
   constructor(db, opts = {}) {
     this.onEventsAccepted = opts.onEventsAccepted || null;
+    this.log = opts.log || null;
+    this.debug = opts.debug || null;
     this.db = db;
     db.exec(`
       CREATE TABLE IF NOT EXISTS event_counters (
@@ -83,8 +88,11 @@ class EventStore {
    */
   ingestBatch({ accountId, sourceDeviceId, events }) {
     if (!Array.isArray(events) || events.length === 0) {
+      this.log?.(`batch_received sourceDeviceId=${sourceDeviceId || "unknown"} count=0 types=`);
       return { accepted: [], duplicates: 0 };
     }
+    const typeSet = [...new Set(events.map((e) => String(e.type || "UNKNOWN")))].join(",");
+    this.log?.(`batch_received sourceDeviceId=${sourceDeviceId || "unknown"} count=${events.length} types={${typeSet}}`);
     const accept = this.db.transaction((batch) => {
       this.counterStmt.run(accountId);
       const accepted = [];
@@ -92,6 +100,7 @@ class EventStore {
       let inserted = 0;
       for (const event of batch) {
         const uuid = String(event.eventId || "");
+        const type = String(event.type || "UNKNOWN");
         if (!uuid) { duplicates++; continue; }
         // Opaque-bytes guard: an undecodable/empty payload can never become a
         // durable row (LOCK 13 — no silently-dropped content). The caller's
@@ -117,8 +126,10 @@ class EventStore {
           this.bumpSeqStmt.run(accountId);
           accepted.push({ eventId: uuid, serverSequence: seq });
           inserted++;
+          this.debug?.(`event_accepted eventId=${uuid} sequence=${seq} type=${type} aggregateId=${event.conversationId ? String(event.conversationId) : ""} cryptoVersion=${Number(event.cryptoVersion) || 0}`);
         } else {
           duplicates++; // same event_uuid already stored — no sequence consumed
+          this.debug?.(`event_duplicate eventId=${uuid} type=${type}`);
           const old = this.existingStmt.get(accountId, uuid);
           if (old && old.ciphertext.equals(payloadBuf) && old.event_type === String(event.type || "UNKNOWN") &&
               old.aggregate_id === (event.conversationId ? String(event.conversationId) : null) &&

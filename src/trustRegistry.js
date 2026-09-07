@@ -68,6 +68,12 @@ class TrustRegistry {
     this.maxSeqStmt = db.prepare(
       `SELECT MAX(trust_sequence) AS maxSeq FROM trust_statements WHERE account_id = ?`
     );
+    this.revokedStmt = db.prepare(
+      `SELECT trust_sequence, device_id, payload, created_at
+       FROM trust_statements
+       WHERE account_id = ? AND operation = 'DEVICE_REVOKED'
+       ORDER BY trust_sequence ASC`
+    );
   }
 
   /**
@@ -138,6 +144,26 @@ class TrustRegistry {
       rootSignature: r.root_signature,
       createdAt: r.created_at,
     }));
+  }
+
+  /**
+   * Diagnostic view: every stored DEVICE_REVOKED statement for an account,
+   * newest last. Used by GET /api/v1/trust/revoked-devices. This is relayed
+   * state — clients still verify rootSignature themselves; GMweb only lists.
+   */
+  revokedDevices(accountId) {
+    return this.revokedStmt.all(accountId).map((r) => {
+      let payload = {};
+      try { payload = JSON.parse(r.payload); } catch { /* keep empty */ }
+      return {
+        deviceId: r.device_id,
+        trustSequence: r.trust_sequence,
+        // issuedAt is the Android statement's epoch-ms timestamp; fall back to
+        // the relay receipt time only when the signed payload lacks one.
+        revokedAt: Number(payload.issuedAt) || r.created_at,
+        reason: "DEVICE_REVOKED",
+      };
+    });
   }
 }
 

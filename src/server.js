@@ -116,6 +116,10 @@ controlDb.pragma("journal_mode = WAL");
 const trustRegistry = new TrustRegistry(controlDb);
 const commandEngine = new CommandEngine(controlDb);
 const eventStore = new EventStore(controlDb, {
+  // Observability (Phase 2): trace every inbound event batch end-to-end.
+  // grep in PM2/journalctl: `batch_received`, `event_accepted`, `event_duplicate`.
+  log: (line) => console.log(`[eventStore] ${line}`),
+  debug: (line) => console.log(`[eventStore] ${line}`),
   // §44+§45: durability first, then two best-effort realtime hints —
   // (a) in-process SSE fan-out, (b) content-less Web Push wake-ups.
   onEventsAccepted: (count) => {

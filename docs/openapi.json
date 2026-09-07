@@ -1328,6 +1328,52 @@
         }
       }
     },
+    "/api/v1/trust/revoked-devices": {
+      "get": {
+        "summary": "Revoked linked devices (diagnostic, ADR-001 relayed state)",
+        "tags": [
+          "Trust"
+        ],
+        "description": "Lists every stored DEVICE_REVOKED trust statement for the account. GMweb only relays; clients verify rootSignature themselves.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "revoked": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "deviceId": {
+                            "type": [
+                              "null",
+                              "string"
+                            ]
+                          },
+                          "trustSequence": {
+                            "type": "integer"
+                          },
+                          "revokedAt": {
+                            "type": "integer"
+                          },
+                          "reason": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/agent/linked-devices": {
       "get": {
         "summary": "Linked-device session telemetry (server observations)",

@@ -17,7 +17,11 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
   const applyStatement = statement => trustRegistry.db.transaction(() => {
     const result = trustRegistry.applyStatement({ accountId, statement });
-    if (result.applied && statement.operation === "DEVICE_REVOKED") linkedSessions?.revokeDevice(statement.deviceId);
+    if (result.applied && statement.operation === "DEVICE_REVOKED") {
+      // Observability (Phase 2) — grep in PM2/journalctl: `revocation_applied`.
+      console.log(`[trustRegistry] revocation_applied deviceId=${statement.deviceId} sequence=${result.trustSequence}`);
+      linkedSessions?.revokeDevice(statement.deviceId);
+    }
     return result;
   }).immediate();
 
@@ -141,6 +145,36 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     const after = Math.max(0, Number(request.query?.after) || 0);
     return { statements: trustRegistry.statementsAfter(accountId, after) };
   });
+
+  // Diagnostic: which linked devices have been revoked (DEVICE_REVOKED).
+  // Auth matrix: this is a GET under /api/v1/trust/* — reachable by an
+  // authenticated linked-session cookie (READ_MESSAGES) or a master token.
+  app.get("/api/v1/trust/revoked-devices", {
+    schema: {
+      summary: "Revoked linked devices (diagnostic, ADR-001 relayed state)",
+      description: "Lists every stored DEVICE_REVOKED trust statement for the account. GMweb only relays; clients verify rootSignature themselves.",
+      tags: ["Trust"],
+      response: {
+        200: {
+          type: "object",
+          properties: {
+            revoked: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  deviceId: { type: ["string", "null"] },
+                  trustSequence: { type: "integer" },
+                  revokedAt: { type: "integer" },
+                  reason: { type: "string" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }, async () => ({ revoked: trustRegistry.revokedDevices(accountId) }));
 
   // ── POST-PAIR: linked-device presence telemetry (Android-authenticated) ──
   // SERVER OBSERVATIONS only — Android merges with its local signed trust
