@@ -1,4 +1,4 @@
-## GMweb 0.15.3 / Messages 2.8.1: Android-compatible linked-browser capabilities
+## GMweb 0.15.6 / Messages 2.8.5: trust publishing and device telemetry
 
 Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use
 `POST /api/v1/primary-enrollment`, with operational-key and trust-root proofs.

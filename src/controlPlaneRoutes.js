@@ -13,7 +13,7 @@
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
   const applyStatement = statement => trustRegistry.db.transaction(() => {
     const result = trustRegistry.applyStatement({ accountId, statement });
@@ -30,34 +30,6 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   // P0-4 (contract): the ANDROID-primary path is /api/v1/agent/trust/* —
   // the browser-facing /api/v1/trust/* stays GET-only (see requireToken).
   // The handler is shared; both paths demand the PRIMARY_TRUST_AGENT.
-  const trustStatementHandler = async (request, reply) => {
-    // SECURITY (review): trust writes are ANDROID-PRIMARY-ONLY. The linked
-    // browser (READ_MESSAGES) is auth'd for GET /trust/* — it must never be
-    // able to POST a statement, even though rootSignature is what actually
-    // protects the registry (defense in depth: authorization AND crypto).
-    const agent = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
-    if (!agent || agent.role !== "PRIMARY_TRUST_AGENT") {
-      reply.code(403).send({ error: "trust writes require the authenticated PRIMARY_TRUST_AGENT" });
-      return;
-    }
-    const statement = request.body?.statement || request.body;
-    // P0-3: rootSignature MUST be present — GMweb is a verified relay, not a
-    // signature-free bucket.
-    if (!statement.rootSignature) {
-      reply.code(400).send({ error: "missing_rootSignature" });
-      return;
-    }
-    if (!statement.statementId) {
-      reply.code(400).send({ error: "missing_statementId" });
-      return;
-    }
-    // NOTE: statement.deviceId is the SUBJECT device (e.g. the web browser
-    // being approved) — the AUTHOR is always the authenticated Trust Root
-    // agent (checked above). rootSignature provides cryptographic binding;
-    // web clients verify it independently before trusting.
-    const result = applyStatement(statement);
-    return { ok: true, ...result };
-  };
   const trustStatementSchema = {
     schema: {
       summary: "Android-signed trust statement (PRIMARY_TRUST_AGENT only)",
@@ -75,7 +47,15 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     const statement = request.body?.statement || request.body;
     const agent = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
     if (!agent || agent.role !== "PRIMARY_TRUST_AGENT") {
-      reply.code(403).send({ error: "trust writes require the authenticated PRIMARY_TRUST_AGENT" });
+      console.warn("TRUST_STATEMENT_REJECTED", {
+        reason: agent ? "role_mismatch" : "agent_not_authenticated",
+        deviceId: agent?.deviceId ? `${agent.deviceId.slice(0, 8)}…` : null,
+        role: agent?.role || null,
+      });
+      reply.code(403).send({
+        error: "trust_write_forbidden",
+        reason: agent ? "primary_agent_required" : "agent_not_authenticated",
+      });
       return;
     }
     if (!statement.rootSignature || !statement.statementId) {
@@ -175,6 +155,33 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       }
     }
   }, async () => ({ revoked: trustRegistry.revokedDevices(accountId) }));
+
+  app.post("/api/v1/agent/device-telemetry", {
+    schema: {
+      summary: "Receive Android device health telemetry",
+      tags: ["Agent"],
+      body: { type: "object", required: ["deviceId", "timestamp"], additionalProperties: true,
+        properties: { deviceId: { type: "string", maxLength: 128 }, timestamp: { type: "integer" } } },
+    },
+  }, async (request, reply) => {
+    const agent = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (!agent) return reply.code(401).send({ error: "agent_auth_required" });
+    if (request.body.deviceId !== agent.deviceId) return reply.code(403).send({ error: "device_id_mismatch" });
+    if (!deviceTelemetryStore) return reply.code(503).send({ error: "telemetry_unavailable" });
+    deviceTelemetryStore.upsert(request.body, agent.role);
+    return { ok: true };
+  });
+
+  app.get("/admin/device-telemetry", {
+    schema: { summary: "Latest Android fleet telemetry", tags: ["Admin"] },
+  }, async () => ({ devices: deviceTelemetryStore?.getAll() || [] }));
+
+  app.get("/api/v1/linked-device/telemetry", {
+    schema: { summary: "Latest Primary Android telemetry", tags: ["Trust"] },
+  }, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    return { telemetry: deviceTelemetryStore?.getPrimary() || null };
+  });
 
   // ── POST-PAIR: linked-device presence telemetry (Android-authenticated) ──
   // SERVER OBSERVATIONS only — Android merges with its local signed trust

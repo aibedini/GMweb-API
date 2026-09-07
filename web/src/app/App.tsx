@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Button, Card, CardContent, Chip, ScrollShadow, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
 import { syncNow, listRecentEvents, listInboxEvents, listAggregateEvents, getCursor, resetLocal, subscribeSyncAvailable, type StoredEvent } from "../lib/sync";
 import { buildConversations, messagesForAggregate, eventDecodeState } from "../lib/inbox";
-import { fetchTrustSnapshot, health, type TrustSnapshot } from "../lib/api";
+import { fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type TrustSnapshot } from "../lib/api";
 import { listCredentials, removeCredential, listAgentIdentities, listPushSubscriptions, type CredentialRow, type IdentityRow } from "../lib/security";
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
@@ -48,6 +48,7 @@ export default function App() {
   const [identities, setIdentities] = useState<IdentityRow[] | null>(null);
   const [pushCount, setPushCount] = useState<number | null>(null);
   const [pairingDiagnostics, setPairingDiagnostics] = useState<PairingDiagnostic[] | null>(null);
+  const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
   const scriptFile = useMemo(() => loadedScriptFile(), []);
 
   const refresh = async () => {
@@ -85,8 +86,11 @@ export default function App() {
       setError(cause instanceof Error ? cause.message : String(cause));
     });
     void refreshSecurity();
+    const refreshTelemetry = () => void fetchPrimaryTelemetry().then(setTelemetry).catch(() => setTelemetry(null));
+    refreshTelemetry();
+    const telemetryTimer = window.setInterval(refreshTelemetry, 60_000);
     void fetchPairingDiagnostics().then(setPairingDiagnostics).catch(() => setPairingDiagnostics(null));
-    return subscribeSyncAvailable((count) => {
+    const unsubscribe = subscribeSyncAvailable((count) => {
       setApplied(count);
       void refresh();
     }, () => {
@@ -96,6 +100,7 @@ export default function App() {
       setSelected(null);
       void resetLocal();
     });
+    return () => { window.clearInterval(telemetryTimer); unsubscribe(); };
   }, [authed]);
 
   const conversations = useMemo(() => buildConversations(inboxEvents), [inboxEvents]);
@@ -252,6 +257,10 @@ export default function App() {
             <Card><CardContent className="status-card"><span>Trust sequence</span><strong>{trust?.trustSequence ?? "—"}</strong><small>{trust ? "Android trust root present" : "Not published"}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Payload protection</span><strong>{inboxEvents.some(event => event.decryption?.state === "decrypted") ? "E2EE locally decrypted" : events.length ? "See payload diagnostics" : "No payloads received"}</strong><small>Legacy v0 is plaintext. Encrypted messages require an authorized key grant. Missing keys stay locked; failed authentication is reported as corrupt.</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Linked session</span><strong>Authenticated</strong><small>Latest stored sequence: {events[0]?.sequence ?? 0}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Android battery</span><strong>{telemetry?.battery?.level == null ? "—" : `${telemetry.battery.level}%${telemetry.battery.isCharging ? " · charging" : ""}`}</strong><small>{telemetry?.device ? `${telemetry.device.manufacturer} ${telemetry.device.model}` : "Waiting for telemetry"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Android outbox</span><strong>{telemetry?.sync?.outboxDepth ?? "—"}</strong><small>{telemetry?.sync?.deadLetterCount ? `${telemetry.sync.deadLetterCount} dead letter` : "No dead letters"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Android network</span><strong>{telemetry?.network?.isConnected ? "Connected" : telemetry ? "Offline" : "—"}</strong><small>{telemetry?.network?.networkType || "Waiting for telemetry"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Android app</span><strong>{telemetry?.app?.versionName || "—"}</strong><small>{telemetry?.receivedAt ? `Last report ${formatTime(telemetry.receivedAt)}` : "Never reported"}</small></CardContent></Card>
           </div>
           {bootstrapState && bootstrapState !== "READY" && <div className="notice">Finishing secure session setup: {bootstrapState}</div>}
           {error && <div className="notice danger">{error}</div>}

@@ -76,3 +76,19 @@ export async function health(): Promise<{ ok: boolean; version: string }> {
   const res = await fetch("/health");
   return jsonOrThrow<{ ok: boolean; version: string }>(res);
 }
+
+export interface DeviceTelemetry {
+  timestamp: number;
+  receivedAt: number;
+  battery?: { level?: number; isCharging?: boolean; chargingSource?: string };
+  sync?: { outboxDepth?: number; deadLetterCount?: number; trustOutboxDepth?: number };
+  network?: { isConnected?: boolean; networkType?: string };
+  trust?: { approvedDevicesCount?: number; trustSequence?: number };
+  app?: { versionName?: string; versionCode?: number; uptimeMs?: number };
+  device?: { manufacturer?: string; model?: string; androidVersion?: string };
+}
+
+export async function fetchPrimaryTelemetry(): Promise<DeviceTelemetry | null> {
+  const res = await fetch(`${API}/linked-device/telemetry`, { credentials: "include" });
+  return (await jsonOrThrow<{ telemetry: DeviceTelemetry | null }>(res)).telemetry;
+}

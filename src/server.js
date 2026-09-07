@@ -112,6 +112,8 @@ const deviceKeyStore = new DeviceKeyStore({
 // store. Account v1: a single-account deployment — the dashboard operator IS
 // the account (account_id constant until passkey auth lands in Phase 4).
 const controlDb = new (require("better-sqlite3"))(path.join(config.rootDir, "data", "control-plane.db"));
+const { DeviceTelemetryStore } = require("./deviceTelemetry");
+const deviceTelemetryStore = new DeviceTelemetryStore(controlDb);
 controlDb.pragma("journal_mode = WAL");
 const trustRegistry = new TrustRegistry(controlDb);
 const commandEngine = new CommandEngine(controlDb);
@@ -153,6 +155,14 @@ const DEFAULT_ACCOUNT_ID = "default";
  * deviceId or null.
  */
 function authorizeAgent(request, rawBody) {
+  // The global /api/v1/agent/* gate has already verified this exact request.
+  // Re-verifying here would reject the same timestamp as a replay.
+  if (request.authenticatedAgentId) {
+    return {
+      deviceId: request.authenticatedAgentId,
+      role: agentAuthService.getRole(request.authenticatedAgentId),
+    };
+  }
   const header = String(request.headers["x-agent-auth"] || "");
   if (header) {
     const result = agentAuthService.verifyAgentHeader(request, rawBody);
@@ -691,6 +701,8 @@ function requireToken(request, reply, done) {
           p === "/api/v1/sse" ||
           p === "/api/v1/linked-session" ||
           p.startsWith("/api/v1/trust/"))) ||
+      (caps.includes("READ_MESSAGES") && request.method === "GET" &&
+        p === "/api/v1/linked-device/telemetry") ||
       (caps.includes("SEND_MESSAGES") &&
         (p === "/api/v1/commands" || p.startsWith("/api/v1/commands/"))) ||
       (caps.includes("READ_PAIRING_DIAGNOSTICS") &&
@@ -2749,6 +2761,7 @@ registerControlPlaneRoutes(app, {
   accountId: DEFAULT_ACCOUNT_ID,
   authorizeAgent,
   linkedSessions,
+  deviceTelemetryStore,
 });
 
 // PR-08b: per-device identity registration (device-key bootstrap → ECDSA).
