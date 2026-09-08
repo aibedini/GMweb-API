@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Card, CardContent, Chip, ScrollShadow, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
-import { syncNow, listRecentEvents, listInboxEvents, listAggregateEvents, listContacts, listConversations, getCursor, resetLocal, subscribeSyncAvailable, syncStep, syncUntilCaughtUp, type StoredContact, type StoredEvent } from "../lib/sync";
+import { syncNow, listRecentEvents, listInboxEvents, listAggregateEventsPage, listContacts, listConversations, getCursor, resetLocal, subscribeSyncAvailable, syncStep, syncUntilCaughtUp, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, eventDecodeState, type ConversationProjection } from "../lib/inbox";
 import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type TrustSnapshot } from "../lib/api";
 import { encryptCommand } from "../lib/commandCrypto";
@@ -40,6 +40,9 @@ export default function App() {
   const [tab, setTab] = useState<TabKey>("inbox");
   const [events, setEvents] = useState<StoredEvent[]>([]);
   const [threadEvents, setThreadEvents] = useState<StoredEvent[]>([]);
+  const [threadNext, setThreadNext] = useState<number | undefined>();
+  const [threadHasMore, setThreadHasMore] = useState(false);
+  const [loadingOlderThread, setLoadingOlderThread] = useState(false);
   const [inboxEvents, setInboxEvents] = useState<StoredEvent[]>([]);
   const [cursor, setCursor] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -180,11 +183,25 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     setThreadEvents([]);
-    if (selected && authed) void listAggregateEvents(selected).then(rows => {
-      if (!cancelled) setThreadEvents(rows);
+    if (selected && authed) void listAggregateEventsPage(selected, { limit: 200 }).then(page => {
+      if (!cancelled) {
+        setThreadEvents(page.items);
+        setThreadHasMore(page.hasMore);
+        setThreadNext(page.next);
+      }
     }).catch(cause => { if (!cancelled) setError(String(cause)); });
     return () => { cancelled = true; };
   }, [selected, events, authed]);
+  const loadOlderThread = async () => {
+    if (!selected || threadNext === undefined || loadingOlderThread) return;
+    setLoadingOlderThread(true);
+    try {
+      const page = await listAggregateEventsPage(selected, { limit: 200, beforeSequence: threadNext });
+      setThreadEvents(prev => [...prev, ...page.items]);
+      setThreadHasMore(page.hasMore);
+      setThreadNext(page.next);
+    } finally { setLoadingOlderThread(false); }
+  };
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
   const selectedRecipient = messages.map(item => item.payload.address).find(Boolean) || composeRecipient;
 
@@ -332,6 +349,11 @@ export default function App() {
               {selectedConversation ? (
                 <>
                   <div className="message-header"><Avatar title={selectedConversation.title} /><div><h2>{selectedConversation.title}</h2><p>{selectedConversation.subtitle ? `${selectedConversation.subtitle} · ` : ""}Synced from Android · {shortId(selectedConversation.aggregateId)}</p></div></div>
+                  {threadHasMore && (
+                    <Button size="sm" variant="ghost" className="load-older-thread" onPress={() => void loadOlderThread()} isDisabled={loadingOlderThread}>
+                      {loadingOlderThread ? "Loading…" : "Load older messages"}
+                    </Button>
+                  )}
                   <ScrollShadow className="message-scroll">
                     <div className="message-day"><span>Message history</span></div>
                     {messages.map(({ event, payload }) => (

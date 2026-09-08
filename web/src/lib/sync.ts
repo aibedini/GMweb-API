@@ -13,7 +13,7 @@ import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypt
 import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
 
 const DB_NAME = "gmweb-messages";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const STORE_EVENTS = "events";
 const STORE_META = "meta";
 const STORE_CONTACTS = "contacts";
@@ -48,6 +48,7 @@ function openDb(): Promise<IDBDatabase> {
 
       const events = req.transaction!.objectStore(STORE_EVENTS);
       if (!events.indexNames.contains("by_type_sequence")) events.createIndex("by_type_sequence", ["type", "sequence"]);
+      if (!events.indexNames.contains("by_aggregate_sequence")) events.createIndex("by_aggregate_sequence", ["aggregateId", "sequence"]);
     };
     req.onsuccess = async () => {
       const db = req.result;
@@ -194,6 +195,58 @@ export async function listAggregateEvents(aggregateId: string): Promise<StoredEv
     .index("by_aggregate").getAll(aggregateId)) as SyncEvent[];
   return decryptForDisplay(events);
 }
+
+export interface AggregatePage {
+  /** Newest-first page of one thread (older history via next). */
+  items: StoredEvent[];
+  hasMore: boolean;
+  /** Oldest server sequence in this page — cursor for "load older". */
+  next?: number;
+}
+
+/**
+ * P1: paged thread reads via the [aggregateId, sequence] index instead of a
+ * getAll() of the whole conversation. Newest ~200 first; pass
+ * { beforeSequence } (the previous page's `next`) to walk further back.
+ */
+export async function listAggregateEventsPage(
+  aggregateId: string,
+  options: { limit?: number; beforeSequence?: number } = {},
+): Promise<AggregatePage> {
+  const limit = Math.max(1, Math.min(500, options.limit ?? 200));
+  const db = await openDb();
+  const index = db.transaction(STORE_EVENTS, "readonly")
+    .objectStore(STORE_EVENTS).index("by_aggregate_sequence");
+  const range = options.beforeSequence === undefined
+    ? IDBKeyRange.bound([aggregateId, -Infinity], [aggregateId, Infinity])
+    : IDBKeyRange.upperBound([aggregateId, options.beforeSequence], true);
+  const rows: SyncEvent[] = [];
+  let hasMore = false;
+  await new Promise<void>((resolve, reject) => {
+    const t = db.transaction(STORE_EVENTS, "readonly");
+    const req = index.openCursor(range, "prev");
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      if (rows.length < limit) {
+        rows.push(cursor.value as SyncEvent);
+        cursor.continue();
+      } else {
+        hasMore = true;
+      }
+    };
+    t.oncomplete = () => resolve();
+    t.onabort = () => reject(t.error ?? new Error("Aggregate paging aborted"));
+    req.onerror = () => reject(req.error);
+  });
+  const oldest = rows[rows.length - 1];
+  return {
+    items: await decryptForDisplay(rows),
+    hasMore,
+    next: hasMore && oldest ? oldest.sequence : undefined,
+  };
+}
+
 
 /** Select message-bearing threads without KEY_GRANT/status traffic displacing the Inbox. */
 export async function listInboxEvents(limit = 100): Promise<StoredEvent[]> {
