@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Card, CardContent, Chip, ScrollShadow, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
-import { syncNow, listRecentEvents, listInboxEvents, listAggregateEvents, listContacts, getCursor, resetLocal, subscribeSyncAvailable, type StoredContact, type StoredEvent } from "../lib/sync";
-import { buildConversations, messagesForAggregate, eventDecodeState } from "../lib/inbox";
+import { syncNow, listRecentEvents, listInboxEvents, listAggregateEvents, listContacts, listConversations, getCursor, resetLocal, subscribeSyncAvailable, type StoredContact, type StoredEvent } from "../lib/sync";
+import { messagesForAggregate, eventDecodeState, type ConversationProjection } from "../lib/inbox";
 import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type TrustSnapshot } from "../lib/api";
 import { encryptCommand } from "../lib/commandCrypto";
 import { listCredentials, removeCredential, listAgentIdentities, listPushSubscriptions, type CredentialRow, type IdentityRow } from "../lib/security";
@@ -59,6 +59,12 @@ export default function App() {
   const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
   const [contacts, setContacts] = useState<StoredContact[]>([]);
   const [contactSearch, setContactSearch] = useState("");
+  // PWA projection: paginated conversation read-model (replaces the old
+  // listInboxEvents(100) inbox scan).
+  const [conversationPage, setConversationPage] = useState<ConversationProjection[]>([]);
+  const [conversationNext, setConversationNext] = useState<{ lastAt: number; aggregateId: string } | undefined>();
+  const [conversationHasMore, setConversationHasMore] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [draft, setDraft] = useState("");
   const [composeRecipient, setComposeRecipient] = useState("");
@@ -73,7 +79,24 @@ export default function App() {
     setEvents(nextEvents);
     setInboxEvents(nextInbox);
     setTrust(nextTrust);
+    const page = await listConversations({ limit: 100 });
+    setConversationPage(page.items);
+    setConversationHasMore(page.hasMore);
+    setConversationNext(page.next);
     setContacts(nextContacts);
+  };
+
+  const loadOlderConversations = async () => {
+    if (!conversationNext || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const page = await listConversations({ limit: 100, before: conversationNext });
+      setConversationPage(prev => [...prev, ...page.items]);
+      setConversationHasMore(page.hasMore);
+      setConversationNext(page.next);
+    } finally {
+      setLoadingOlder(false);
+    }
   };
 
   const refreshSecurity = async () => {
@@ -121,7 +144,7 @@ export default function App() {
   }, [authed]);
 
   const contactNames = useMemo(() => new Map(contacts.map(contact => [contact.normalizedPhone, contact.displayName])), [contacts]);
-  const conversations = useMemo(() => buildConversations(inboxEvents, contactNames), [inboxEvents, contactNames]);
+  const conversations = conversationPage;
   const filteredContacts = useMemo(() => {
     const query = contactSearch.trim().toLocaleLowerCase();
     return query ? contacts.filter(contact => `${contact.displayName}\n${contact.normalizedPhone}`.toLocaleLowerCase().includes(query)) : contacts;
@@ -291,6 +314,11 @@ export default function App() {
                 ))}
                 {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : inboxEvents.some(event => event.decryption?.state === "locked") ? "Messages are locked. Check Security for key access." : "Waiting for messages from Android"}</p></div>}
               </ScrollShadow>
+              {conversationHasMore && (
+                <Button size="sm" variant="ghost" className="load-older" onPress={() => void loadOlderConversations()} isDisabled={loadingOlder}>
+                  {loadingOlder ? "Loading…" : "Load older conversations"}
+                </Button>
+              )}
             </aside>
 
             <main className="message-pane">
