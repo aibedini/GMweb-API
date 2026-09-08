@@ -401,7 +401,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         type: "object",
         required: ["events"],
         properties: {
-          sourceDeviceId: { type: "string", nullable: true },
+          sourceDeviceId: { type: "string", nullable: true, description: "Deprecated — IGNORED. The stored source identity is the authenticated agent bound from X-Agent-Auth (never the body)." },
           events: {
             type: "array",
             maxItems: 100,
@@ -443,9 +443,14 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       ...e,
       payload: Buffer.isBuffer(e.payload) ? e.payload : String(e.payload || ""),
     }));
+    // P0: sourceDeviceId is NEVER taken from the request body. The per-device
+    // identity was bound by the global agent gate from the verified
+    // X-Agent-Auth signature (request.authenticatedAgentId). A legacy
+    // shared-key caller has no per-device identity → null (it is not a device).
+    const sourceDeviceId = request.authenticatedAgentId || null;
     return eventStore.ingestBatch({
       accountId,
-      sourceDeviceId: body.sourceDeviceId ?? null,
+      sourceDeviceId,
       events,
     });
   });
