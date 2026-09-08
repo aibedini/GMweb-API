@@ -10,14 +10,17 @@
 
 import { fetchEventsAfter, type SyncEvent } from "./api.ts";
 import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypto.ts";
-import { decodeEventPayload } from "./inbox.ts";
+import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
 
 const DB_NAME = "gmweb-messages";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORE_EVENTS = "events";
 const STORE_META = "meta";
 const STORE_CONTACTS = "contacts";
 const CURSOR_KEY = "sync_cursor";
+/** Derived read-model store (PWA projection). Raw events stay the truth. */
+const STORE_CONVERSATIONS = "conversations";
+const PROJECTION_VERSION_KEY = "conversation_projection_version";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -37,10 +40,27 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_CONTACTS)) {
         db.createObjectStore(STORE_CONTACTS, { keyPath: "normalizedPhone" });
       }
+      // PWA projection store (v4): derived per-conversation read model.
+      if (!db.objectStoreNames.contains(STORE_CONVERSATIONS)) {
+        const conversations = db.createObjectStore(STORE_CONVERSATIONS, { keyPath: "aggregateId" });
+        conversations.createIndex("by_last_at", ["lastAt", "aggregateId"]);
+      }
+
       const events = req.transaction!.objectStore(STORE_EVENTS);
       if (!events.indexNames.contains("by_type_sequence")) events.createIndex("by_type_sequence", ["type", "sequence"]);
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = async () => {
+      const db = req.result;
+      try {
+        await ensureConversationProjectionRebuilt(db);
+      } catch (e) {
+        // Projection is a derived cache — a rebuild failure must never break
+        // sync; rows rebuild lazily the next time their aggregate changes.
+        // eslint-disable-next-line no-console
+        console.warn("conversation_projection_rebuild_failed", e);
+      }
+      resolve(db);
+    };
     req.onerror = () => reject(req.error);
   });
   return dbPromise;
@@ -121,6 +141,12 @@ async function drainSync(onProgress?: (applied: number) => void): Promise<number
       t.onerror = () => reject(t.error);
       t.onabort = () => reject(t.error ?? new Error("Sync transaction aborted"));
     });
+    // PWA projection (P0): after the page commits, refresh ONLY the changed
+    // conversations — never rebuild the whole inbox.
+    const changedAggregates = [...new Set(page.events
+      .map((ev) => ev.aggregateId)
+      .filter((id): id is string => typeof id === "string" && id.length > 0))];
+    await refreshConversationProjections(changedAggregates);
     applied += page.events.length;
     cursor = page.nextCursor;
     onProgress?.(applied);
@@ -223,6 +249,137 @@ async function applyContacts(payload: Record<string, unknown>): Promise<void> {
     t.onabort = () => reject(t.error ?? new Error("Contacts transaction aborted"));
   });
 }
+
+// ── PWA conversation projection (read-model, derived from raw events) ──────
+
+function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function txDone(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error ?? new Error("Transaction aborted"));
+  });
+}
+
+async function eventsForAggregate(aggregateId: string): Promise<StoredEvent[]> {
+  const db = await openDb();
+  const req = db.transaction(STORE_EVENTS, "readonly")
+    .objectStore(STORE_EVENTS).index("by_aggregate").getAll(aggregateId) as IDBRequest<SyncEvent[]>;
+  const rows = await requestToPromise(req);
+  return decryptForDisplay(rows);
+}
+
+/**
+ * Recompute the derived row for exactly the given aggregates. Called after
+ * every sync-page commit (only the changed aggregates) and once during the
+ * one-time schema migration. Idempotent.
+ */
+export async function refreshConversationProjections(aggregateIds: string[]): Promise<void> {
+  const unique = [...new Set(aggregateIds.filter((id): id is string => typeof id === "string" && id.length > 0))];
+  if (unique.length === 0) return;
+  const contactMap = new Map((await listContacts()).map((contact) => [contact.normalizedPhone, contact.displayName]));
+  for (const aggregateId of unique) {
+    const events = await eventsForAggregate(aggregateId);
+    const row = conversationProjectionFromEvents(events, aggregateId, contactMap);
+    const db = await openDb();
+    const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
+    const store = transaction.objectStore(STORE_CONVERSATIONS);
+    if (row) store.put(row);
+    else store.delete(aggregateId);
+    await txDone(transaction);
+  }
+}
+
+export interface ConversationPage {
+  items: ConversationProjection[];
+  hasMore: boolean;
+  /** Cursor for the next page ("load older"). */
+  next?: { lastAt: number; aggregateId: string };
+}
+
+/**
+ * Paginated conversation read from the projection store. Replaces the old
+ * `listInboxEvents(limit=100)` candidate scan, so 1000+ conversations stay
+ * reachable instead of older ones silently disappearing from the Inbox.
+ */
+export async function listConversations(
+  options: { limit?: number; before?: { lastAt: number; aggregateId: string } } = {},
+): Promise<ConversationPage> {
+  const limit = Math.max(1, Math.min(500, options.limit ?? 100));
+  const db = await openDb();
+  const items: ConversationProjection[] = [];
+  let hasMore = false;
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(STORE_CONVERSATIONS, "readonly");
+    const index = transaction.objectStore(STORE_CONVERSATIONS).index("by_last_at");
+    const range = options.before
+      ? IDBKeyRange.upperBound([options.before.lastAt, options.before.aggregateId], true)
+      : null;
+    const req = index.openCursor(range, "prev");
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      if (items.length < limit) {
+        items.push(cursor.value as ConversationProjection);
+        cursor.continue();
+      } else {
+        hasMore = true;
+      }
+    };
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error ?? new Error("Conversation list aborted"));
+    req.onerror = () => reject(req.error);
+  });
+  const last = items[items.length - 1];
+  return {
+    items,
+    hasMore,
+    next: hasMore && last ? { lastAt: last.lastAt, aggregateId: last.aggregateId } : undefined,
+  };
+}
+
+/**
+ * One-time migration rebuild: after the schema moves to v4, recompute the
+ * whole projection from locally stored events. Raw events, the cursor and the
+ * browser identity/crypto keys are never touched. Idempotent (meta marker).
+ */
+async function ensureConversationProjectionRebuilt(db: IDBDatabase): Promise<void> {
+  const versionReq = db.transaction(STORE_META, "readonly")
+    .objectStore(STORE_META).get(PROJECTION_VERSION_KEY) as IDBRequest<number | undefined>;
+  const version = await requestToPromise(versionReq);
+  if (version !== undefined) return;
+
+  const keyReq = db.transaction(STORE_EVENTS, "readonly")
+    .objectStore(STORE_EVENTS).index("by_aggregate").getAllKeys() as IDBRequest<IDBValidKey[]>;
+  const keys = await requestToPromise(keyReq);
+  const ids = [...new Set(keys.filter((k): k is string => typeof k === "string" && k.length > 0))];
+
+  const contactMap = new Map((await listContacts()).map((contact) => [contact.normalizedPhone, contact.displayName]));
+
+  for (let offset = 0; offset < ids.length; offset += 50) {
+    for (const aggregateId of ids.slice(offset, offset + 50)) {
+      const getReq = db.transaction(STORE_EVENTS, "readonly")
+        .objectStore(STORE_EVENTS).index("by_aggregate").getAll(aggregateId) as IDBRequest<SyncEvent[]>;
+      const events = await decryptForDisplay(await requestToPromise(getReq));
+      const row = conversationProjectionFromEvents(events, aggregateId, contactMap);
+      const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
+      const store = transaction.objectStore(STORE_CONVERSATIONS);
+      if (row) store.put(row);
+      else store.delete(aggregateId);
+      await txDone(transaction);
+    }
+  }
+  const metaTx = db.transaction(STORE_META, "readwrite");
+  metaTx.objectStore(STORE_META).put(1, PROJECTION_VERSION_KEY);
+  await txDone(metaTx);
+}
+
 
 export async function listContacts(): Promise<StoredContact[]> {
   const rows = await tx([STORE_CONTACTS], "readonly", t => t.objectStore(STORE_CONTACTS).getAll()) as StoredContact[];

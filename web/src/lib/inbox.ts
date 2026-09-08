@@ -22,6 +22,21 @@ export interface ConversationSummary {
   read: boolean;
   unreadCount: number;
 }
+/**
+ * PWA read-model row (IndexedDB `conversations` store). Raw events remain the
+ * source of truth; this is a derived cache that is (a) rebuilt per changed
+ * aggregate after every sync page commit and (b) rebuilt once from stored
+ * events after the schema migration. It replaces the old
+ * `listInboxEvents(limit=100)` candidate-scan so older conversations can no
+ * longer disappear when there are many threads.
+ */
+export interface ConversationProjection extends ConversationSummary {
+  lastMessageId: string;
+  lastSequence: number;
+  decodeState: "ready" | "locked";
+}
+
+
 
 export interface TimelineItem {
   event: StoredEvent;
@@ -146,4 +161,55 @@ export function eventDecodeState(event: StoredEvent): string {
     return event.decryption?.reason ? `Locked: ${event.decryption.reason}` : "Locked/unsupported crypto version";
   }
   return decodeEventPayload(event) ? "Legacy/plaintext-envelope" : "Invalid/corrupt payload";
+}
+
+/**
+ * Build the read-model row for ONE aggregate from its full local event set.
+ * Null when the aggregate has no decodable/decrypted message content at all
+ * (e.g. a conversation that was fully deleted). Locked ciphertext still yields
+ * a row (decodeState: "locked") so the conversation never silently vanishes
+ * from the Inbox before its key grant arrives.
+ */
+export function conversationProjectionFromEvents(
+  events: StoredEvent[],
+  aggregateId: string,
+  contacts: Map<string, string> = new Map(),
+): ConversationProjection | null {
+  const forAggregate = events.filter((event) => event.aggregateId === aggregateId);
+  const summaries = buildConversations(forAggregate, contacts);
+  if (summaries.length > 0) {
+    const summary = summaries.find((item) => item.aggregateId === aggregateId) ?? summaries[0];
+    const timeline = messagesForAggregate(forAggregate, aggregateId);
+    const last = timeline[timeline.length - 1];
+    const decodeState: "ready" | "locked" = last
+      ? eventDecodeState(last.event).startsWith("Locked") ? "locked" : "ready"
+      : "ready";
+    return {
+      ...summary,
+      lastMessageId: last?.payload.messageId ?? summary.aggregateId,
+      lastSequence: last?.event.sequence ?? 0,
+      decodeState,
+    };
+  }
+  // Nothing decodable yet — but if the aggregate still holds ciphertext that
+  // might decrypt once a KEY_GRANT arrives, keep a locked row visible. A
+  // fully-deleted conversation (delete newer than every message) yields null.
+  const newestDeleted = Math.max(0, ...forAggregate
+    .filter((event) => event.type === "MESSAGE_DELETED")
+    .map((event) => event.sequence));
+  const newestMessage = [...forAggregate]
+    .filter((event) => event.type === "MESSAGE_CREATED" || event.type === "MESSAGE_UPDATED")
+    .sort((a, b) => b.sequence - a.sequence)[0];
+  if (!newestMessage || newestMessage.sequence <= newestDeleted) return null;
+  return {
+    aggregateId,
+    title: "Encrypted message",
+    preview: "Locked — waiting for a key grant from your phone",
+    lastAt: newestMessage.createdAt,
+    read: true,
+    unreadCount: 0,
+    lastMessageId: newestMessage.eventId,
+    lastSequence: newestMessage.sequence,
+    decodeState: "locked",
+  };
 }
