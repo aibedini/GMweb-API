@@ -17,6 +17,7 @@ const path = require("node:path");
 const rootDir = path.resolve(__dirname, "..");
 
 async function main() {
+  await fs.mkdir(path.join(rootDir, "data"), { recursive: true });
   const { app } = require("../src/server");
   await app.ready();                 // registers swagger + all route schemas
 

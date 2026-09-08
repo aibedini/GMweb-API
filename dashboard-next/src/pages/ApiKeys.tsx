@@ -8,11 +8,18 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 
+const PROJECT_KEY_SCOPES = [
+  "sms.send", "sms.status", "sms.cancel", "sms.capacity",
+  "conversations.read", "events.read", "commands.create", "commands.read",
+] as const;
+const DEFAULT_PROJECT_KEY_SCOPES = PROJECT_KEY_SCOPES.filter((scope) => !scope.startsWith("commands."));
+
 export function ApiKeysPage() {
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
   const [ips, setIps] = useState("");
+  const [scopes, setScopes] = useState<string[]>([...DEFAULT_PROJECT_KEY_SCOPES]);
   const [freshToken, setFreshToken] = useState<string | null>(null);
 
   async function load() {
@@ -26,11 +33,14 @@ export function ApiKeysPage() {
   async function create(e: React.FormEvent) {
     e.preventDefault();
     const allowedIps = ips.trim() ? ips.split(",").map((s) => s.trim()).filter(Boolean) : [];
-    const d = await api<{ key: { token: string } }>("/admin/api-keys", { method: "POST", body: { name: name.trim(), allowedIps } });
+    const d = await api<{ key: { token: string } }>("/admin/api-keys", {
+      method: "POST", body: { name: name.trim(), allowedIps, scopes },
+    });
     setFreshToken(d.key.token);
     setCreating(false);
     setName("");
     setIps("");
+    setScopes([...DEFAULT_PROJECT_KEY_SCOPES]);
     load();
   }
   async function rotate(id: string) {
@@ -44,6 +54,13 @@ export function ApiKeysPage() {
   }
   async function toggle(k: ApiKey) {
     await api(`/admin/api-keys/${k.id}`, { method: "PATCH", body: { enabled: !k.enabled } });
+    load();
+  }
+  async function toggleScope(k: ApiKey, scope: string) {
+    const scopes = k.scopes.includes(scope)
+      ? k.scopes.filter((value) => value !== scope)
+      : [...k.scopes, scope];
+    await api(`/admin/api-keys/${k.id}`, { method: "PATCH", body: { scopes } });
     load();
   }
 
@@ -67,6 +84,21 @@ export function ApiKeysPage() {
                 <Label>Allowed IPs (comma, blank = any)</Label>
                 <Input value={ips} onChange={(e) => setIps(e.target.value)} placeholder="1.2.3.4, 5.6.7.8" />
               </div>
+              <fieldset className="grid gap-2 sm:col-span-2 sm:grid-cols-2 lg:grid-cols-4">
+                <legend className="mb-1 text-sm font-medium sm:col-span-2 lg:col-span-4">Capabilities</legend>
+                {PROJECT_KEY_SCOPES.map((scope) => (
+                  <label key={scope} className="flex items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={scopes.includes(scope)}
+                      onChange={() => setScopes((current) => current.includes(scope)
+                        ? current.filter((value) => value !== scope)
+                        : [...current, scope])}
+                    />
+                    {scope}
+                  </label>
+                ))}
+              </fieldset>
               <div className="sm:col-span-2">
                 <Button type="submit" size="sm">Create</Button>
               </div>
@@ -97,6 +129,17 @@ export function ApiKeysPage() {
                   <div className="text-xs text-muted-foreground">
                     {k.tokenPreview}… · {k.requestCount} reqs · {k.allowedIps.length ? k.allowedIps.join(", ") : "any IP"}
                   </div>
+                  <details className="mt-1 text-xs text-muted-foreground">
+                    <summary className="cursor-pointer">{k.scopes.length} capabilities</summary>
+                    <div className="mt-2 grid gap-1 sm:grid-cols-2 lg:grid-cols-4">
+                      {PROJECT_KEY_SCOPES.map((scope) => (
+                        <label key={scope} className="flex items-center gap-2">
+                          <input type="checkbox" checked={k.scopes.includes(scope)} onChange={() => toggleScope(k, scope)} />
+                          {scope}
+                        </label>
+                      ))}
+                    </div>
+                  </details>
                 </div>
                 <div className="flex gap-1">
                   <Button size="sm" variant="ghost" onClick={() => toggle(k)} title="Enable/disable">

@@ -152,6 +152,7 @@ export interface ApiKey {
   id: string;
   name: string;
   allowedIps: string[];
+  scopes: string[];
   sendRateMinute: number;
   sendRateHour: number;
   createdAt: string;

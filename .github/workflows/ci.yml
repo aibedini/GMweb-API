@@ -9,8 +9,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -23,6 +23,16 @@ jobs:
         run: npm run check
       - name: Tests
         run: npm test
+      - name: Build dashboards and web app
+        run: |
+          npm --prefix dashboard-next ci
+          npm --prefix dashboard-next run build
+          npm --prefix web ci
+          npm --prefix web run build
+          if ! git diff --quiet -- public/dashboard-next public/web-app; then
+            echo "Committed frontend assets are out of date"
+            exit 1
+          fi
       - name: Verify OpenAPI contract is in sync
         run: |
           npm run generate:openapi
@@ -36,9 +46,9 @@ jobs:
   pairing-contract-drift:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Checkout Android Messages (canonical pairing protocol peer)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: aibedini/Messages
           ref: master
@@ -61,3 +71,16 @@ jobs:
             }
             console.log("Android PairingCapabilityContract covers every schema capability");
           '
+
+  eve-contract-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout Eve consumer
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: aibedini/eve
+          ref: main
+          path: eve-contract-peer
+      - name: Verify Eve and GMweb send contract
+        run: node scripts/check-eve-contract.js eve-contract-peer

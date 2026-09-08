@@ -82,6 +82,10 @@ A project key can call messaging + conversation endpoints but **cannot** touch a
 routes (`/admin/*`, `/browser/*`, `/session/*`) — those return 401. This is the safe
 credential to give the consuming project.
 
+Project keys are capability-scoped. Existing keys are migrated to the documented
+legacy messaging, conversation, and event scopes. Access to the command engine is
+never granted implicitly; it requires `commands.create` and/or `commands.read`.
+
 Create one from the GMweb dashboard, or with the master token:
 
 ```bash
@@ -91,7 +95,8 @@ curl -X POST https://YOUR_HOST/admin/api-keys \
   -d '{
         "name": "project-two",
         "allowedIps": ["<PROJECT_TWO_SERVER_IP>"],
-        "rateLimit": { "minute": 10, "hour": 100 }
+        "scopes": ["sms.send", "sms.status", "sms.cancel", "sms.capacity"],
+        "rateLimit": { "minute": 30, "hour": 1000 }
       }'
 ```
 
@@ -252,6 +257,14 @@ new consumers should prefer them over the legacy `/send` bridge:
 unchanged and remain fully supported; per ADR-004 they will become thin
 adapters over the command engine (`POST /api/v1/commands`) later, without
 breaking production consumers.
+
+Eve should use a dedicated IP-allowlisted project key with only `sms.send`,
+`sms.status`, `sms.cancel`, and `sms.capacity`. The default project-key ingress
+limits are 30 requests/minute and 1000/hour; these govern queue admission, not
+the slower device delivery pace. Existing keys keep their configured limits, so
+an older Eve key must be updated explicitly if it should use these values.
+Command routes remain master/session-only unless
+a project key is explicitly granted `commands.create` or `commands.read`.
 
 ### Android ↔ web pairing bootstrap
 

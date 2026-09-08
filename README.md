@@ -114,6 +114,9 @@ npm --prefix dashboard-next run build # outputs to public/dashboard-next (served
 
 Send it as `Authorization: Bearer <token>` on every request (except public `/health`).
 Give external consumers a **project key** (create one in the dashboard or via `POST /admin/api-keys`).
+Project keys carry explicit least-privilege scopes. Existing keys receive only the
+documented legacy messaging/conversation/event scopes; command-engine access must
+be granted explicitly.
 
 ---
 

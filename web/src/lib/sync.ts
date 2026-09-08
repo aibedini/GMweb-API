@@ -434,7 +434,12 @@ async function ensureConversationProjectionRebuilt(db: IDBDatabase): Promise<voi
   const keys = await requestToPromise(keyReq);
   const ids = [...new Set(keys.filter((k): k is string => typeof k === "string" && k.length > 0))];
 
-  const contactMap = new Map((await listContacts()).map((contact) => [contact.normalizedPhone, contact.displayName]));
+  // Do not call listContacts() while openDb() is still resolving: listContacts()
+  // enters openDb() again and would wait on this very projection rebuild.
+  const contactsReq = db.transaction(STORE_CONTACTS, "readonly")
+    .objectStore(STORE_CONTACTS).getAll() as IDBRequest<StoredContact[]>;
+  const contactMap = new Map((await requestToPromise(contactsReq))
+    .map((contact) => [contact.normalizedPhone, contact.displayName]));
 
   for (let offset = 0; offset < ids.length; offset += 50) {
     for (const aggregateId of ids.slice(offset, offset + 50)) {
@@ -465,10 +470,11 @@ export async function resetLocal(): Promise<void> {
   await runningSync?.catch(() => {});
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
-    const t = db.transaction([STORE_EVENTS, STORE_META, STORE_CONTACTS], "readwrite");
+    const t = db.transaction([STORE_EVENTS, STORE_META, STORE_CONTACTS, STORE_CONVERSATIONS], "readwrite");
     t.objectStore(STORE_EVENTS).clear();
     t.objectStore(STORE_META).clear();
     t.objectStore(STORE_CONTACTS).clear();
+    t.objectStore(STORE_CONVERSATIONS).clear();
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
   });

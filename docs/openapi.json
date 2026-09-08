@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.16.1",
+    "version": "0.16.2",
     "contact": {
       "name": "GMweb API"
     }
@@ -216,6 +216,22 @@
           },
           "sendRateHour": {
             "type": "integer"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "sms.send",
+                "sms.status",
+                "sms.cancel",
+                "sms.capacity",
+                "conversations.read",
+                "events.read",
+                "commands.create",
+                "commands.read"
+              ]
+            }
           },
           "createdAt": {
             "type": "string"
@@ -3474,7 +3490,7 @@
         "tags": [
           "Messaging"
         ],
-        "description": "Queue an SMS/RCS message for delivery via Google Messages.\n\n**Asynchronous by default.** The message is added to a durable Redis-backed\nqueue and processed in the background by a single worker (one browser, one\nsend at a time). The endpoint returns a stable `requestId` plus the current\nBullMQ `jobId` immediately with HTTP 202.\n\n**Track delivery via:**\n- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps\n  (`jobId` is also accepted for backwards compatibility)\n- `POST /send/cancel/{requestId}` — cancel before the worker starts sending\n- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed` / `send_cancelled`\n\n**Retries:** failed sends retry up to 3 times with exponential backoff.\n\n**Synchronous mode:** pass `\"wait\": true` to block until the send finishes\n(up to 90s) and receive the result directly. Use only for low-volume callers.\n\n**Priority lanes:** use `critical` (purchase/renewal), `expired` (already expired),\n`expiring` (near expiry; default), or `announcement` (bulk/lowest). Lower numeric\nlevels run first and every lane remains FIFO. Legacy `high` maps to `critical`;\nlegacy `normal` maps to `expiring`.\n\n**Quiet hours:** non-critical messages are held from 02:00 through 07:59\n`Asia/Tehran` and released at 08:00. Delayed retries are also held even when\nCRITICAL; only a fresh critical first attempt bypasses quiet hours.\nAnnouncements are capped at the configured pending capacity (default 200).\n\n**Rate limits (project keys):** configurable per-minute and per-hour (default 10/min, 100/hr).\n\n**Phone format:** include country code, e.g. `+989121234567`.\n\n**Auto de-dupe:** an identical `{to,text}` re-sent within ~120s (no Idempotency-Key needed) is suppressed and returns `status:\"duplicate_suppressed\"` with the original `jobId` — guards against accidental double-posting.",
+        "description": "Queue an SMS/RCS message for delivery via Google Messages.\n\n**Asynchronous by default.** The message is added to a durable Redis-backed\nqueue and processed in the background by a single worker (one browser, one\nsend at a time). The endpoint returns a stable `requestId` plus the current\nBullMQ `jobId` immediately with HTTP 202.\n\n**Track delivery via:**\n- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps\n  (`jobId` is also accepted for backwards compatibility)\n- `POST /send/cancel/{requestId}` — cancel before the worker starts sending\n- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed` / `send_cancelled`\n\n**Retries:** failed sends retry up to 3 times with exponential backoff.\n\n**Synchronous mode:** pass `\"wait\": true` to block until the send finishes\n(up to 90s) and receive the result directly. Use only for low-volume callers.\n\n**Priority lanes:** use `critical` (purchase/renewal), `expired` (already expired),\n`expiring` (near expiry; default), or `announcement` (bulk/lowest). Lower numeric\nlevels run first and every lane remains FIFO. Legacy `high` maps to `critical`;\nlegacy `normal` maps to `expiring`.\n\n**Quiet hours:** non-critical messages are held from 02:00 through 07:59\n`Asia/Tehran` and released at 08:00. Delayed retries are also held even when\nCRITICAL; only a fresh critical first attempt bypasses quiet hours.\nAnnouncements are capped at the configured pending capacity (default 200).\n\n**Rate limits (project keys):** configurable per-minute and per-hour (default 30/min, 1000/hr).\n\n**Phone format:** include country code, e.g. `+989121234567`.\n\n**Auto de-dupe:** an identical `{to,text}` re-sent within ~120s (no Idempotency-Key needed) is suppressed and returns `status:\"duplicate_suppressed\"` with the original `jobId` — guards against accidental double-posting.",
         "requestBody": {
           "required": true,
           "content": {
@@ -5475,19 +5491,36 @@
                     "maxItems": 30,
                     "description": "Allowed source IPs. Empty array = accept from any IP. Recommended: set to your server's IP."
                   },
+                  "scopes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "sms.send",
+                        "sms.status",
+                        "sms.cancel",
+                        "sms.capacity",
+                        "conversations.read",
+                        "events.read",
+                        "commands.create",
+                        "commands.read"
+                      ]
+                    },
+                    "description": "Explicit capabilities. Omit for the documented legacy messaging defaults."
+                  },
                   "rateLimit": {
                     "type": "object",
                     "properties": {
                       "minute": {
                         "type": "integer",
                         "minimum": 0,
-                        "default": 10,
+                        "default": 30,
                         "description": "Max /send calls per minute (0 = unlimited)"
                       },
                       "hour": {
                         "type": "integer",
                         "minimum": 0,
-                        "default": 100,
+                        "default": 1000,
                         "description": "Max /send calls per hour (0 = unlimited)"
                       }
                     }
@@ -5564,6 +5597,22 @@
                       "type": "string"
                     },
                     "maxItems": 30
+                  },
+                  "scopes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "sms.send",
+                        "sms.status",
+                        "sms.cancel",
+                        "sms.capacity",
+                        "conversations.read",
+                        "events.read",
+                        "commands.create",
+                        "commands.read"
+                      ]
+                    }
                   },
                   "enabled": {
                     "type": "boolean"

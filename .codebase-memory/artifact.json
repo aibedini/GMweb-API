@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "2907c1fb1aa73ad89599ab3a7a37f785862436f6",
-    "indexed_at": "2026-08-22T06:20:22Z",
-    "project": "C-Users-Mahna-GoogleMEssage",
-    "nodes": 1252,
-    "edges": 3503,
-    "original_size": 6488064,
-    "compressed_size": 1213035,
-    "compression_level": 3
+    "commit": "e2de90bd20d4d2f69c2130c2752253ab422c90d9",
+    "indexed_at": "2026-09-08T15:52:11Z",
+    "project": "gmweb-api",
+    "nodes": 4727,
+    "edges": 19184,
+    "original_size": 13041664,
+    "compressed_size": 3051948,
+    "compression_level": 9
 }

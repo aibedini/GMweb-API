@@ -1,5 +1,9 @@
 const fs = require("node:fs/promises");
 const crypto = require("node:crypto");
+const {
+  DEFAULT_PROJECT_KEY_SCOPES,
+  normalizeProjectKeyScopes,
+} = require("./projectKeyScopes");
 
 const LOG_KEEP = 5000;
 const TOKEN_BYTES = 32; // 256-bit token = computationally infeasible to brute-force SHA-256
@@ -38,6 +42,11 @@ class ApiKeyStore {
           delete key.token;
           dirty = true;
         }
+        const scopes = normalizeProjectKeyScopes(key.scopes);
+        if (!Array.isArray(key.scopes) || JSON.stringify(scopes) !== JSON.stringify(key.scopes)) {
+          key.scopes = scopes;
+          dirty = true;
+        }
       }
       this.keys = parsed;
       if (dirty) this.save();
@@ -62,7 +71,7 @@ class ApiKeyStore {
       .catch(() => {});
   }
 
-  create({ name, allowedIps = [], rateLimit = {} }) {
+  create({ name, allowedIps = [], rateLimit = {}, scopes = DEFAULT_PROJECT_KEY_SCOPES }) {
     const id = crypto.randomBytes(8).toString("hex");
     const plaintext = `gmw_${crypto.randomBytes(TOKEN_BYTES).toString("base64url")}`;
     const tokenHash = hashToken(plaintext);
@@ -71,9 +80,10 @@ class ApiKeyStore {
       tokenPreviewStored: `${plaintext.slice(0, 8)}...`,
       name: String(name || "").slice(0, 64) || "Unnamed",
       allowedIps: Array.isArray(allowedIps) ? allowedIps.map(String).slice(0, 30) : [],
+      scopes: normalizeProjectKeyScopes(scopes),
       // Rate limits for /send: maxPerMinute and maxPerHour (0 = unlimited)
-      sendRateMinute: Math.max(0, Number.isFinite(rateLimit.minute) ? rateLimit.minute : 10),
-      sendRateHour:   Math.max(0, Number.isFinite(rateLimit.hour)   ? rateLimit.hour   : 100),
+      sendRateMinute: Math.max(0, Number.isFinite(rateLimit.minute) ? rateLimit.minute : 30),
+      sendRateHour:   Math.max(0, Number.isFinite(rateLimit.hour)   ? rateLimit.hour   : 1000),
       createdAt: new Date().toISOString(),
       lastUsedAt: null,
       requestCount: 0,
@@ -101,6 +111,7 @@ class ApiKeyStore {
         ? patch.allowedIps.map(String).slice(0, 30) : [];
     }
     if (patch.enabled !== undefined) this.keys[id].enabled = Boolean(patch.enabled);
+    if (patch.scopes !== undefined) this.keys[id].scopes = normalizeProjectKeyScopes(patch.scopes, []);
     if (patch.sendRateMinute !== undefined) this.keys[id].sendRateMinute = Math.max(0, Number(patch.sendRateMinute) || 0);
     if (patch.sendRateHour !== undefined) this.keys[id].sendRateHour = Math.max(0, Number(patch.sendRateHour) || 0);
     this.save();
@@ -131,6 +142,10 @@ class ApiKeyStore {
     if (!key.allowedIps || key.allowedIps.length === 0) return true;
     const norm = (ip || "").replace(/^::ffff:/, "");
     return key.allowedIps.some((a) => a === norm || a === ip);
+  }
+
+  hasScope(key, scope) {
+    return Boolean(scope && normalizeProjectKeyScopes(key?.scopes).includes(scope));
   }
 
   // Check and update send rate limit for a key.
@@ -175,6 +190,7 @@ class ApiKeyStore {
       id,
       name: key.name,
       allowedIps: key.allowedIps,
+      scopes: normalizeProjectKeyScopes(key.scopes),
       sendRateMinute: key.sendRateMinute,
       sendRateHour: key.sendRateHour,
       createdAt: key.createdAt,

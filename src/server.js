@@ -15,6 +15,10 @@ const config = require("./config");
 const { GoogleMessagesClient } = require("./googleMessagesClient");
 const { AndroidGatewayClient } = require("./androidGatewayClient");
 const { ApiKeyStore } = require("./apiKeys");
+const {
+  PROJECT_KEY_SCOPES,
+  requiredProjectKeyScope,
+} = require("./projectKeyScopes");
 const { ActivityLogStore, classify: classifyActivity } = require("./activityLog");
 const { SendQueue } = require("./queue");
 const { SendStore } = require("./sendStore");
@@ -837,6 +841,11 @@ function requireToken(request, reply, done) {
       if (!apiKeyStore.isIpAllowed(key, ip)) {
         recordAuthFailure(ip); // wrong IP for a valid-format token
         reply.code(403).send({ error: "ip_not_allowed", ip });
+        return;
+      }
+      const requiredScope = requiredProjectKeyScope(request.method, request.url);
+      if (!requiredScope || !apiKeyStore.hasScope(key, requiredScope)) {
+        reply.code(403).send({ error: "project_scope_denied", requiredScope });
         return;
       }
       request._projectKey = key;
@@ -1814,6 +1823,7 @@ app.addSchema({
     allowedIps: { type: "array", items: { type: "string" } },
     sendRateMinute: { type: "integer" },
     sendRateHour: { type: "integer" },
+    scopes: { type: "array", items: { type: "string", enum: [...PROJECT_KEY_SCOPES] } },
     createdAt: { type: "string" },
     lastUsedAt: { type: ["string", "null"] },
     requestCount: { type: "integer" },
@@ -3289,7 +3299,7 @@ app.post("/send", {
       "CRITICAL; only a fresh critical first attempt bypasses quiet hours.",
       "Announcements are capped at the configured pending capacity (default 200).",
       "",
-      "**Rate limits (project keys):** configurable per-minute and per-hour (default 10/min, 100/hr).",
+      "**Rate limits (project keys):** configurable per-minute and per-hour (default 30/min, 1000/hr).",
       "",
       "**Phone format:** include country code, e.g. `+989121234567`.",
       "",
@@ -3409,11 +3419,6 @@ app.post("/send", {
   // Global kill switch: when the send power is off, refuse every message — no
   // matter the priority, key, idempotency, or remaining capacity. Nothing is
   // queued, so nothing can be sent until a power-on is issued.
-  reply.code(410).send({
-    error: "legacy_send_retired",
-    migration: "Use POST /api/v1/commands with an encrypted SEND_SMS payload",
-  });
-  return;
   if (!sendPowerOn) {
     reply.code(503).send({ error: "powered_off", message: "Sending is powered off. No messages will be sent until power-on." });
     return;
@@ -4774,11 +4779,15 @@ app.post("/admin/api-keys", {
           type: "array", items: { type: "string" }, maxItems: 30,
           description: "Allowed source IPs. Empty array = accept from any IP. Recommended: set to your server's IP."
         },
+        scopes: {
+          type: "array", items: { type: "string", enum: [...PROJECT_KEY_SCOPES] },
+          description: "Explicit capabilities. Omit for the documented legacy messaging defaults."
+        },
         rateLimit: {
           type: "object",
           properties: {
-            minute: { type: "integer", minimum: 0, default: 10, description: "Max /send calls per minute (0 = unlimited)" },
-            hour: { type: "integer", minimum: 0, default: 100, description: "Max /send calls per hour (0 = unlimited)" }
+            minute: { type: "integer", minimum: 0, default: 30, description: "Max /send calls per minute (0 = unlimited)" },
+            hour: { type: "integer", minimum: 0, default: 1000, description: "Max /send calls per hour (0 = unlimited)" }
           }
         }
       },
@@ -4801,6 +4810,7 @@ app.post("/admin/api-keys", {
   const schema = z.object({
     name: z.string().min(1).max(64),
     allowedIps: z.array(z.string()).max(30).optional(),
+    scopes: z.array(z.enum([...PROJECT_KEY_SCOPES])).max(PROJECT_KEY_SCOPES.length).optional(),
     rateLimit: z.object({
       minute: z.number().int().min(0).optional(),
       hour: z.number().int().min(0).optional()
@@ -4826,6 +4836,7 @@ app.patch("/admin/api-keys/:id", {
       properties: {
         name: { type: "string", minLength: 1, maxLength: 64 },
         allowedIps: { type: "array", items: { type: "string" }, maxItems: 30 },
+        scopes: { type: "array", items: { type: "string", enum: [...PROJECT_KEY_SCOPES] } },
         enabled: { type: "boolean" },
         sendRateMinute: { type: "integer", minimum: 0, maximum: 10000 },
         sendRateHour: { type: "integer", minimum: 0, maximum: 100000 }
@@ -4836,6 +4847,7 @@ app.patch("/admin/api-keys/:id", {
   const schema = z.object({
     name: z.string().min(1).max(64).optional(),
     allowedIps: z.array(z.string()).max(30).optional(),
+    scopes: z.array(z.enum([...PROJECT_KEY_SCOPES])).max(PROJECT_KEY_SCOPES.length).optional(),
     enabled: z.boolean().optional(),
     sendRateMinute: z.number().int().min(0).max(10000).optional(),
     sendRateHour: z.number().int().min(0).max(100000).optional()
@@ -5130,3 +5142,6 @@ if (require.main === module) {
 }
 
 module.exports = { app, deviceKeyStore, agentAuthService };
+if (config.appEnv === "test") {
+  module.exports.__testing = { apiKeyStore, sendQueue, sendStore };
+}

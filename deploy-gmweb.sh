@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# Coordinated GMweb pairing release. Physical E2E evidence is mandatory.
+# Coordinated GMweb pairing deployment. Physical E2E evidence is mandatory.
 set -euo pipefail
-HOST=root@46.31.76.103
-DIR=/opt/gmweb-api
-ORIGIN=https://gmweb.46.31.76.103.nip.io
 
-ssh -t "$HOST" bash -s -- "$DIR" "$ORIGIN" <<'REMOTE'
+: "${GMWEB_DEPLOY_HOST:?Set GMWEB_DEPLOY_HOST (for example, deploy@example.net)}"
+: "${GMWEB_PUBLIC_ORIGIN:?Set GMWEB_PUBLIC_ORIGIN (for example, https://gmweb.example.net)}"
+
+HOST=$GMWEB_DEPLOY_HOST
+DIR=${GMWEB_DEPLOY_DIR:-/opt/gmweb-api}
+ORIGIN=$GMWEB_PUBLIC_ORIGIN
+EVIDENCE_DIR=${GMWEB_RELEASE_EVIDENCE_DIR:-/opt/gmweb-release-evidence}
+
+ssh -t "$HOST" bash -s -- "$DIR" "$ORIGIN" "$EVIDENCE_DIR" <<'REMOTE'
 set -euo pipefail
 DIR=$1
 ORIGIN=$2
+EVIDENCE_DIR=$3
 cd "$DIR"
 grep -q '^PUBLIC_WEB_ORIGIN=https://' .env
 grep -q '^PUBLIC_API_ORIGIN=https://' .env
@@ -24,7 +30,9 @@ cleanup() {
 trap cleanup EXIT
 git archive "$CANDIDATE" | tar -x -C "$STAGE"
 # Validate the incoming files BEFORE any live API/PWA files are replaced.
-node "$STAGE/scripts/check-pairing-release.js"   /opt/gmweb-release-evidence/pairing-e2e.json   /opt/gmweb-release-evidence/messages.apk
+node "$STAGE/scripts/check-pairing-release.js" \
+  "$EVIDENCE_DIR/pairing-e2e.json" \
+  "$EVIDENCE_DIR/messages.apk"
 (
   cd "$STAGE"
   npm ci --include=dev
