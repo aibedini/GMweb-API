@@ -46,7 +46,7 @@ const NAV = [
   { id: "logs", label: "Logs", icon: ScrollText, el: <LogsPage /> },
   { id: "settings", label: "Settings", icon: Settings2, el: <SettingsPage /> },
   ...(SHOW_LEGACY_ARCHIVE
-    ? [{ id: "legacy-archive", label: "Legacy archive", icon: History, el: <ConversationsPage /> }]
+    ? [{ id: "legacy-archive", label: "Outbound history (legacy)", icon: History, el: <ConversationsPage /> }]
     : []),
 ];
 
