@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Card, CardContent, Chip, ScrollShadow, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
-import { syncNow, listRecentEvents, listInboxEvents, listAggregateEvents, listContacts, listConversations, getCursor, resetLocal, subscribeSyncAvailable, type StoredContact, type StoredEvent } from "../lib/sync";
+import { syncNow, listRecentEvents, listInboxEvents, listAggregateEvents, listContacts, listConversations, getCursor, resetLocal, subscribeSyncAvailable, syncStep, syncUntilCaughtUp, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, eventDecodeState, type ConversationProjection } from "../lib/inbox";
 import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type TrustSnapshot } from "../lib/api";
 import { encryptCommand } from "../lib/commandCrypto";
@@ -121,10 +121,17 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     setBootstrapState("BOOTSTRAPPING_SYNC");
-    void syncNow().then(refresh).then(() => setBootstrapState("READY")).catch(cause => {
-      setBootstrapState("SYNC_FAILED");
-      setError(cause instanceof Error ? cause.message : String(cause));
-    });
+    void syncStep(2)
+      .then(refresh)
+      .then(() => {
+        setBootstrapState("READY");
+        // First paint is up: pull the remaining history in the background.
+        void syncUntilCaughtUp().then(() => refresh()).catch(() => {});
+      })
+      .catch(cause => {
+        setBootstrapState("SYNC_FAILED");
+        setError(cause instanceof Error ? cause.message : String(cause));
+      });
     void refreshSecurity();
     const refreshTelemetry = () => void fetchPrimaryTelemetry().then(setTelemetry).catch(() => setTelemetry(null));
     refreshTelemetry();

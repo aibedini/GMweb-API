@@ -87,16 +87,35 @@ export async function getCursor(): Promise<number> {
 
 /** §43: apply pages transactionally until the server says hasMore=false. */
 let runningSync: Promise<number> | null = null;
-export function syncNow(onProgress?: (applied: number) => void): Promise<number> {
+function serializeSync(run: () => Promise<number>): Promise<number> {
   // Serialize manual pulls and SSE invalidations: an older request must never
   // overwrite a newer cursor after it completes out of order.
-  if (!runningSync) runningSync = drainSync(onProgress).finally(() => { runningSync = null; });
+  if (!runningSync) runningSync = run().finally(() => { runningSync = null; });
   return runningSync;
 }
 
-async function drainSync(onProgress?: (applied: number) => void): Promise<number> {
+export function syncNow(onProgress?: (applied: number) => void): Promise<number> {
+  return serializeSync(() => drainSync(undefined, onProgress));
+}
+
+/**
+ * Progressive browser bootstrap: fetch/commit a bounded number of pages (default
+ * 2) so the first Inbox paint never waits for the whole archive, then continue
+ * catching up in the background via syncUntilCaughtUp() / SSE invalidations.
+ */
+export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): Promise<number> {
+  return serializeSync(() => drainSync(maxPages, onProgress));
+}
+
+/** Catch-up synonym of syncNow() kept for call-site readability. */
+export function syncUntilCaughtUp(onProgress?: (applied: number) => void): Promise<number> {
+  return syncNow(onProgress);
+}
+
+async function drainSync(maxPages?: number, onProgress?: (applied: number) => void): Promise<number> {
   let cursor = await getCursor();
   let applied = 0;
+  let pages = 0;
   for (;;) {
     const page = await fetchEventsAfter(cursor);
     // Observability (Phase 2) — browser console trace of each sync page.
@@ -150,7 +169,9 @@ async function drainSync(onProgress?: (applied: number) => void): Promise<number
     applied += page.events.length;
     cursor = page.nextCursor;
     onProgress?.(applied);
+    pages += 1;
     if (!page.hasMore) break;
+    if (maxPages !== undefined && pages >= maxPages) break;
   }
   return applied;
 }
