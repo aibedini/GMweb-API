@@ -127,6 +127,10 @@ class AgentAuthService {
     return this.getStmt.get(String(deviceId)) || null;
   }
 
+  getPrimaryIdentity() {
+    return this.db.prepare("SELECT * FROM agent_identities WHERE device_role = 'PRIMARY_TRUST_AGENT' LIMIT 1").get() || null;
+  }
+
   /** BLOCKER 3: explicit role for the identity (PRIMARY_TRUST_AGENT etc.). */
   getRole(deviceId) {
     const identity = this.getIdentity(deviceId);

@@ -18,7 +18,15 @@ describe("Phase 2 control plane HTTP API", () => {
 
   before(async () => {
     app = Fastify({ logger: false });
+    app.addHook("preHandler", (request, _reply, done) => {
+      if (request.headers["x-test-linked"]) request.linkedDevice = {
+        deviceId: String(request.headers["x-test-linked"]),
+        capabilities: ["READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "CONTACTS_READ"],
+      };
+      done();
+    });
     const db = new Database(":memory:");
+    const rateBuckets = new Map();
     registerControlPlaneRoutes(app, {
       trustRegistry: new TrustRegistry(db),
       commandEngine: new CommandEngine(db),
@@ -27,6 +35,11 @@ describe("Phase 2 control plane HTTP API", () => {
       // Test auth stub: request header X-Test-Agent-Role simulates the
       // server's real authorizeAgent (signature → {deviceId, role}).
       linkedSessions: require("../src/linkedSessions"),
+      checkRateLimit: (_request, key, max) => {
+        const count = (rateBuckets.get(key) || 0) + 1;
+        rateBuckets.set(key, count);
+        return { allowed: count <= max, retryAfterSeconds: 60 };
+      },
       authorizeAgent: (request) => {
         const role = request.headers["x-test-agent-role"];
         const deviceId = request.headers["x-test-agent-device"] || "test-agent";
@@ -56,6 +69,25 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.match(body.commandId, /^cmd_/);
     assert.equal(body.state, "QUEUED");
     assert.equal(body.created, true);
+  });
+
+  test("linked SEND_SMS requires encryption and is limited to ten per minute", async () => {
+    const plain = await app.inject({ method: "POST", url: "/api/v1/commands",
+      headers: { "x-test-linked": "rate-device" },
+      payload: { type: "SEND_SMS", payload: Buffer.from("x").toString("base64"), cryptoVersion: 0 } });
+    assert.equal(plain.statusCode, 400);
+    for (let i = 0; i < 10; i += 1) {
+      const response = await app.inject({ method: "POST", url: "/api/v1/commands",
+        headers: { "x-test-linked": "rate-device" },
+        payload: { type: "SEND_SMS", payload: Buffer.from("opaque").toString("base64"),
+          cryptoVersion: 1, idempotencyKey: `rate-${i}` } });
+      assert.equal(response.statusCode, 202, response.body);
+    }
+    const limited = await app.inject({ method: "POST", url: "/api/v1/commands",
+      headers: { "x-test-linked": "rate-device" },
+      payload: { type: "SEND_SMS", payload: Buffer.from("opaque").toString("base64"),
+        cryptoVersion: 1, idempotencyKey: "rate-11" } });
+    assert.equal(limited.statusCode, 429);
   });
 
   test("idempotency replay returns the original commandId with created=false", async () => {

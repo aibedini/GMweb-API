@@ -18,7 +18,7 @@ test('canonical projection updates, reads, deletes and deduplicates without empt
     event(5, 'MESSAGE_STATUS_CHANGED', { messageId: 'unknown', status: 1 }, 'noise')];
   assert.equal(decodeEventPayload(created).body, 'Hello');
   assert.equal(eventDecodeState(created), 'Legacy/plaintext-envelope');
-  assert.deepEqual(buildConversations(rows), [{ aggregateId: 'thread', title: '+123', preview: 'Edited', lastAt: 100, read: true }]);
+  assert.deepEqual(buildConversations(rows), [{ aggregateId: 'thread', title: '+123', preview: 'Edited', lastAt: 100, read: true, unreadCount: 0 }]);
   const messages = messagesForAggregate(rows, 'thread');
   assert.equal(messages.length, 1);
   assert.equal(messages[0].payload.status, 2);
@@ -44,12 +44,12 @@ test('contactName wins the conversation title and address becomes the subtitle',
   ];
   assert.deepEqual(buildConversations(rows), [{
     aggregateId: 'thread', title: 'Ali Rezaei', subtitle: '+989121234567',
-    preview: 'Reply', lastAt: 200, read: false,
+    preview: 'Reply', lastAt: 200, read: false, unreadCount: 1,
   }]);
   // Unknown number (no contactName) keeps the phone-number fallback title.
   assert.deepEqual(buildConversations([event(9, 'MESSAGE_CREATED', {
     messageId: 'm9', body: 'Who?', address: '+989190000000', dateMs: 300, direction: 'in',
-  })]), [{ aggregateId: 'thread', title: '+989190000000', preview: 'Who?', lastAt: 300, read: false }]);
+  })]), [{ aggregateId: 'thread', title: '+989190000000', preview: 'Who?', lastAt: 300, read: false, unreadCount: 1 }]);
 });
 
 test('incoming and outgoing events both project into one conversation with correct directions', async () => {

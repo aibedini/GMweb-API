@@ -1,15 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Card, CardContent, Chip, ScrollShadow, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
-import { syncNow, listRecentEvents, listInboxEvents, listAggregateEvents, getCursor, resetLocal, subscribeSyncAvailable, type StoredEvent } from "../lib/sync";
+import { syncNow, listRecentEvents, listInboxEvents, listAggregateEvents, listContacts, getCursor, resetLocal, subscribeSyncAvailable, type StoredContact, type StoredEvent } from "../lib/sync";
 import { buildConversations, messagesForAggregate, eventDecodeState } from "../lib/inbox";
-import { fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type TrustSnapshot } from "../lib/api";
+import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type TrustSnapshot } from "../lib/api";
+import { encryptCommand } from "../lib/commandCrypto";
 import { listCredentials, removeCredential, listAgentIdentities, listPushSubscriptions, type CredentialRow, type IdentityRow } from "../lib/security";
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
 import { fetchPairingDiagnostics, type PairingDiagnostic } from "../lib/adminAccess";
 
-type TabKey = "inbox" | "connection" | "security" | "debug";
+type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug";
 
 function shortId(value: string | null | undefined) {
   return value ? `${value.slice(0, 8)}…` : "—";
@@ -21,6 +22,13 @@ function formatTime(value: number) {
   return date.toDateString() === today.toDateString()
     ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function messageStatus(status: number): string {
+  if (status === 64) return "failed";
+  if (status === 32) return "queued";
+  if (status === 0) return "delivered";
+  return "sent";
 }
 
 function Avatar({ title }: { title: string }) {
@@ -49,14 +57,23 @@ export default function App() {
   const [pushCount, setPushCount] = useState<number | null>(null);
   const [pairingDiagnostics, setPairingDiagnostics] = useState<PairingDiagnostic[] | null>(null);
   const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
+  const [contacts, setContacts] = useState<StoredContact[]>([]);
+  const [contactSearch, setContactSearch] = useState("");
+  const [capabilities, setCapabilities] = useState<string[]>([]);
+  const [draft, setDraft] = useState("");
+  const [composeRecipient, setComposeRecipient] = useState("");
+  const [commandStatus, setCommandStatus] = useState<string | null>(null);
+  const [pendingMessage, setPendingMessage] = useState<{ body: string; at: number } | null>(null);
+  const markReadSent = useRef(new Set<string>());
   const scriptFile = useMemo(() => loadedScriptFile(), []);
 
   const refresh = async () => {
-    const [nextCursor, nextEvents, nextTrust, nextInbox] = await Promise.all([getCursor(), listRecentEvents(500), fetchTrustSnapshot(), listInboxEvents()]);
+    const [nextCursor, nextEvents, nextTrust, nextInbox, nextContacts] = await Promise.all([getCursor(), listRecentEvents(500), fetchTrustSnapshot(), listInboxEvents(), listContacts()]);
     setCursor(nextCursor);
     setEvents(nextEvents);
     setInboxEvents(nextInbox);
     setTrust(nextTrust);
+    setContacts(nextContacts);
   };
 
   const refreshSecurity = async () => {
@@ -74,7 +91,7 @@ export default function App() {
     void health().then((value) => setVersion(value.version)).catch(() => setVersion("unreachable"));
     void fetch("/api/v1/linked-session", { credentials: "include" })
       .then((response) => response.json())
-      .then((session) => setAuthed(session.authenticated === true))
+      .then((session) => { setAuthed(session.authenticated === true); setCapabilities(session.capabilities || []); })
       .catch(() => setAuthed(false));
   }, []);
 
@@ -103,7 +120,12 @@ export default function App() {
     return () => { window.clearInterval(telemetryTimer); unsubscribe(); };
   }, [authed]);
 
-  const conversations = useMemo(() => buildConversations(inboxEvents), [inboxEvents]);
+  const contactNames = useMemo(() => new Map(contacts.map(contact => [contact.normalizedPhone, contact.displayName])), [contacts]);
+  const conversations = useMemo(() => buildConversations(inboxEvents, contactNames), [inboxEvents, contactNames]);
+  const filteredContacts = useMemo(() => {
+    const query = contactSearch.trim().toLocaleLowerCase();
+    return query ? contacts.filter(contact => `${contact.displayName}\n${contact.normalizedPhone}`.toLocaleLowerCase().includes(query)) : contacts;
+  }, [contacts, contactSearch]);
   const filteredConversations = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     if (!query) return conversations;
@@ -134,6 +156,52 @@ export default function App() {
     return () => { cancelled = true; };
   }, [selected, events, authed]);
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
+  const selectedRecipient = messages.map(item => item.payload.address).find(Boolean) || composeRecipient;
+
+  useEffect(() => {
+    if (pendingMessage && messages.some(item => item.payload.direction === "out" &&
+        item.payload.body === pendingMessage.body && item.payload.dateMs >= pendingMessage.at - 60_000)) {
+      setPendingMessage(null);
+    }
+  }, [messages, pendingMessage]);
+
+  const submitCommand = async (type: "SEND_SMS" | "MARK_THREAD_READ", payload: Record<string, unknown>) => {
+    const idempotencyKey = crypto.randomUUID();
+    const target = await fetchPrimaryCommandKey();
+    const encrypted = await encryptCommand(target.encryptionPublicKey, type, idempotencyKey, { type, ...payload });
+    return createCommand({ type, payload: encrypted, idempotencyKey });
+  };
+
+  useEffect(() => {
+    if (!selectedConversation || selectedConversation.read || !capabilities.includes("MARK_READ") || markReadSent.current.has(selectedConversation.aggregateId)) return;
+    markReadSent.current.add(selectedConversation.aggregateId);
+    void submitCommand("MARK_THREAD_READ", { conversationId: selectedConversation.aggregateId })
+      .catch(() => markReadSent.current.delete(selectedConversation.aggregateId));
+  }, [selectedConversation, capabilities]);
+
+  const send = async () => {
+    const body = draft.trim();
+    if (!body || !selectedRecipient || !capabilities.includes("SEND_MESSAGES")) return;
+    setCommandStatus("queued");
+    setPendingMessage({ body, at: Date.now() });
+    try {
+      const command = await submitCommand("SEND_SMS", { phone: selectedRecipient, body });
+      setDraft("");
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 1_000));
+        const state = await fetchCommand(command.commandId);
+        setCommandStatus(state?.state || "queued");
+        if (state && ["FAILED", "EXPIRED"].includes(state.state)) {
+          setDraft(body);
+          break;
+        }
+        if (state?.state === "COMPLETED") break;
+      }
+    } catch (cause) {
+      setDraft(body);
+      setCommandStatus(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
 
   const pull = async () => {
     setBusy(true);
@@ -190,7 +258,8 @@ export default function App() {
 
       <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(key as TabKey)} className="app-tabs">
         <TabList className="tab-list" aria-label="Messages navigation">
-          <Tab id="inbox">Messages</Tab>
+          <Tab id="inbox">Messages{conversations.reduce((sum, item) => sum + item.unreadCount, 0) ? ` (${conversations.reduce((sum, item) => sum + item.unreadCount, 0)})` : ""}</Tab>
+          <Tab id="contacts">Contacts</Tab>
           <Tab id="connection">Connection</Tab>
           <Tab id="security">Security</Tab>
           <Tab id="debug">Debug</Tab>
@@ -217,7 +286,7 @@ export default function App() {
                   <button key={item.aggregateId} className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => setSelected(item.aggregateId)}>
                     <Avatar title={item.title} />
                     <span className="conversation-copy"><span className="conversation-title">{item.title}{item.subtitle ? ` · ${item.subtitle}` : ""}</span><span className="conversation-preview">{item.preview}</span></span>
-                    <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time></span>
+                    <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time>{item.unreadCount > 0 && <Chip size="sm">{item.unreadCount}</Chip>}</span>
                   </button>
                 ))}
                 {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : inboxEvents.some(event => event.decryption?.state === "locked") ? "Messages are locked. Check Security for key access." : "Waiting for messages from Android"}</p></div>}
@@ -232,19 +301,40 @@ export default function App() {
                     <div className="message-day"><span>Message history</span></div>
                     {messages.map(({ event, payload }) => (
                       <div key={event.sequence} className={`message-line ${payload.direction}`}>
-                        <div className="message-bubble"><p>{payload.body}</p><span>{formatTime(payload.dateMs)}{payload.direction === "out" ? " · Sent" : ""}</span></div>
+                        <div className="message-bubble"><p>{payload.body}</p><span>{formatTime(payload.dateMs)}{payload.direction === "out" ? ` · ${messageStatus(payload.status)}` : ""}</span></div>
                       </div>
                     ))}
+                    {pendingMessage && (
+                      <div className="message-line out">
+                        <div className="message-bubble"><p>{pendingMessage.body}</p><span>{formatTime(pendingMessage.at)} · {commandStatus || "queued"}</span></div>
+                      </div>
+                    )}
                     {messages.length === 0 && (
                       <div className="empty-conversation"><div className="empty-icon">↻</div><h3>No readable message body yet</h3><p>This thread only contains older status events. New Android message events appear here as normal chat bubbles.</p></div>
                     )}
                   </ScrollShadow>
-                  <div className="composer-disabled"><span>Messages are read-only in this release</span><Chip size="sm" variant="soft" color="success">Synced</Chip></div>
+                  <div className="composer-disabled">
+                    <input value={draft} onChange={event => setDraft(event.target.value)} placeholder={selectedRecipient ? "Text message" : "Choose a contact"} disabled={!selectedRecipient || !capabilities.includes("SEND_MESSAGES")} />
+                    <span>{draft.length} chars · {draft.length <= 160 ? "SMS" : draft.length <= 480 ? `${Math.ceil(draft.length / 153)} parts` : "MMS"}</span>
+                    <Button size="sm" onPress={() => void send()} isDisabled={!draft.trim() || !selectedRecipient || !capabilities.includes("SEND_MESSAGES")}>Send</Button>
+                    {commandStatus && <Chip size="sm" variant="soft">{commandStatus}</Chip>}
+                  </div>
                 </>
               ) : (
-                <div className="empty-conversation"><div className="empty-icon">✦</div><h3>Your messages, without the debug noise</h3><p>Select a conversation when Android sync data arrives.</p></div>
+                <div className="empty-conversation"><div className="empty-icon">✦</div><h3>{composeRecipient ? contactNames.get(composeRecipient) || composeRecipient : "New message"}</h3><p>{composeRecipient || "Choose a conversation or contact."}</p>{composeRecipient && <div className="composer-disabled"><input value={draft} onChange={event => setDraft(event.target.value)} placeholder="Text message" /><span>{draft.length} chars · {draft.length <= 160 ? "SMS" : draft.length <= 480 ? `${Math.ceil(draft.length / 153)} parts` : "MMS"}</span><Button size="sm" onPress={() => void send()} isDisabled={!draft.trim() || !capabilities.includes("SEND_MESSAGES")}>Send</Button>{commandStatus && <Chip size="sm" variant="soft">{commandStatus}</Chip>}</div>}</div>
               )}
             </main>
+          </div>
+        </TabPanel>
+
+        <TabPanel id="contacts" className="content-panel">
+          <div className="page-title"><p className="eyebrow">Phone book</p><h1>Contacts</h1><p>End-to-end encrypted contacts synced from the Primary Android device.</p></div>
+          <label className="search-box"><span aria-hidden="true">⌕</span><input value={contactSearch} onChange={(event) => setContactSearch(event.target.value)} placeholder="Search names or numbers" aria-label="Search contacts" /></label>
+          <div className="security-list">
+            {filteredContacts.map(contact => (
+              <button key={contact.normalizedPhone} type="button" onClick={() => { setComposeRecipient(contact.normalizedPhone); setSelected(null); setTab("inbox"); }}><Card><CardContent className="security-row"><div><strong>{contact.displayName}</strong><p>{contact.normalizedPhone}</p></div>{contact.starred && <Chip size="sm" variant="soft">Starred</Chip>}</CardContent></Card></button>
+            ))}
+            {filteredContacts.length === 0 && <div className="empty-list"><span>✦</span><p>{contacts.length ? "No matching contacts" : "Waiting for encrypted contacts from Android"}</p></div>}
           </div>
         </TabPanel>
 
@@ -279,6 +369,7 @@ export default function App() {
         <TabPanel id="debug" className="content-panel">
           <div className="page-title"><p className="eyebrow">Diagnostics</p><h1>Debug</h1><p>Raw protocol details live here instead of inside the Inbox.</p></div>
           <div className="debug-actions"><Button variant="secondary" onPress={() => void pull()} isDisabled={busy}>Sync now</Button><Button variant="ghost" onPress={() => void resetLocal().then(refresh)}>Reset local ciphertext</Button></div>
+          <Card><CardContent className="security-row"><div><strong>Projection</strong><p>cursor {cursor} · sync {error ? "failed" : "HTTP 200"} · grants {events.filter(event => event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT").length} · contacts {contacts.length} · decrypt failures {events.filter(event => event.decryption?.state === "invalid").length}</p></div></CardContent></Card>
           <Card><CardContent className="debug-list">{events.slice(0, 40).map((event) => <div key={event.sequence}><code>#{event.sequence}</code><span>{event.type}</span><Chip size="sm" variant="soft" color={eventDecodeState(event) === "Invalid/corrupt payload" ? "danger" : "warning"}>{eventDecodeState(event)}</Chip></div>)}</CardContent></Card>
           <Card><CardContent className="debug-list">{pairingDiagnostics?.slice(0, 20).map((entry) => <div key={entry.id}><code>{entry.statusCode}</code><span>{entry.details?.pairing?.stage || entry.title}</span><small>{entry.details?.pairing?.reason || entry.path}</small></div>)}{pairingDiagnostics?.length === 0 && <p>No pairing diagnostics.</p>}</CardContent></Card>
         </TabPanel>

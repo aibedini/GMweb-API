@@ -29,7 +29,7 @@ test("schema declares exactly the documented capability groups", () => {
     "capability_definitions with base/sensitive/reserved is mandatory");
   assert.deepEqual(d.base, ["READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "RECEIVE_NOTIFICATIONS"]);
   assert.deepEqual(d.sensitive,
-    ["READ_OTP", "READ_BANK_SECURITY", "READ_PASSWORD_RESET", "READ_AUTH_CODES", "READ_FINANCIAL_NOTIFICATIONS"]);
+    ["CONTACTS_READ", "READ_OTP", "READ_BANK_SECURITY", "READ_PASSWORD_RESET", "READ_AUTH_CODES", "READ_FINANCIAL_NOTIFICATIONS"]);
   assert.deepEqual(d.reserved, ["MANAGE_DEVICES"]);
   const all = universe();
   assert.equal(new Set(all).size, all.length, "capability groups must not overlap or repeat");
@@ -65,8 +65,8 @@ test("the shared fixture carries the REAL Android linked-browser certificate vec
   assert.ok(android, "android_linked_browser_default vector missing from shared fixture");
   assert.deepEqual(
     [...android.input.capabilities].sort(),
-    [...schema.capability_definitions.base, "READ_OTP"].sort(),
-    "Android vector must equal LinkedDevicesScreen output: base + one sensitive grant",
+    [...schema.capability_definitions.base, "CONTACTS_READ", "READ_OTP"].sort(),
+    "Android vector must equal LinkedDevicesScreen output: base + selected contacts and OTP grants",
   );
   assert.equal(android.canonicalBase64.length > 0, true);
   assert.match(android.sha256, /^[0-9a-f]{64}$/);

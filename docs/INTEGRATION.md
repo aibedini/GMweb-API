@@ -1,4 +1,4 @@
-## GMweb 0.15.6 / Messages 2.8.6: trust publishing and device telemetry
+## GMweb 0.16.0 / Messages 2.9.0: E2EE contacts, composer and unified inbox
 
 Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use
 `POST /api/v1/primary-enrollment`, with operational-key and trust-root proofs.

@@ -20,8 +20,8 @@ import { useSession } from "@/lib/session";
 import { Button } from "@/components/ui/button";
 
 import { OverviewPage } from "@/pages/Overview";
-import { SendPage } from "@/pages/SendPage";
 import { QueuePage } from "@/pages/QueuePage";
+import { E2eeRedirect } from "@/pages/E2eeRedirect";
 import { ConversationsPage } from "@/pages/Conversations";
 import { ApiKeysPage } from "@/pages/ApiKeys";
 import { ControlsPage } from "@/pages/Controls";
@@ -31,19 +31,24 @@ import { SettingsPage } from "@/pages/Settings";
 import { HistoryPage } from "@/pages/HistoryPage";
 import { PwaAccessPage } from "@/pages/PwaAccess";
 
+const SHOW_LEGACY_ARCHIVE = import.meta.env.VITE_SHOW_LEGACY_ARCHIVE === "true";
 const NAV = [
   { id: "overview", label: "Overview", icon: Activity, el: <OverviewPage /> },
-  { id: "send", label: "Send", icon: Send, el: <SendPage /> },
+  { id: "send", label: "Send", icon: Send, el: <E2eeRedirect /> },
   { id: "queue", label: "Queue", icon: ListOrdered, el: <QueuePage /> },
   { id: "history", label: "History", icon: History, el: <HistoryPage /> },
-  { id: "conversations", label: "Conversations", icon: MessagesSquare, el: <ConversationsPage /> },
+  { id: "conversations", label: "Conversations", icon: MessagesSquare, el: <E2eeRedirect /> },
+  { id: "contacts", label: "Contacts", icon: MessagesSquare, el: <E2eeRedirect /> },
   { id: "apikeys", label: "API Keys", icon: KeyRound, el: <ApiKeysPage /> },
   { id: "pwa-access", label: "PWA Access", icon: ShieldCheck, el: <PwaAccessPage /> },
   { id: "controls", label: "Controls", icon: SlidersHorizontal, el: <ControlsPage /> },
   { id: "vnc", label: "VNC", icon: Monitor, el: <VncPage /> },
   { id: "logs", label: "Logs", icon: ScrollText, el: <LogsPage /> },
   { id: "settings", label: "Settings", icon: Settings2, el: <SettingsPage /> },
-] as const;
+  ...(SHOW_LEGACY_ARCHIVE
+    ? [{ id: "legacy-archive", label: "Legacy archive", icon: History, el: <ConversationsPage /> }]
+    : []),
+];
 
 export function Shell() {
   const { logout } = useSession();

@@ -102,6 +102,18 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     assert.equal(store.count("acc1"), 2);
   });
 
+  test("contacts snapshot, change, and grant events are accepted as opaque data", () => {
+    const store = new EventStore(new Database(":memory:"));
+    const result = store.ingestBatch({ accountId: "contacts", sourceDeviceId: "phone", events: [
+      { eventId: "contacts-1", type: "CONTACTS_SNAPSHOT", conversationId: "contacts", payload: Buffer.from("cipher-1"), cryptoVersion: 1 },
+      { eventId: "contacts-2", type: "CONTACTS_CHANGED", conversationId: "contacts", payload: Buffer.from("cipher-2"), cryptoVersion: 1 },
+      { eventId: "contacts-key", type: "CONTACTS_KEY_GRANT", conversationId: "contacts", payload: Buffer.from("grant"), cryptoVersion: 1 },
+    ] });
+    assert.equal(result.accepted.length, 3);
+    assert.deepEqual(store.after("contacts", 0, 10).events.map(event => event.type),
+      ["CONTACTS_SNAPSHOT", "CONTACTS_CHANGED", "CONTACTS_KEY_GRANT"]);
+  });
+
   test("empty batch is a no-op", () => {
     const store = new EventStore(new Database(":memory:"));
     const res = store.ingestBatch({ accountId: "a", events: [] });

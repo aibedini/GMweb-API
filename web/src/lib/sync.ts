@@ -13,9 +13,10 @@ import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypt
 import { decodeEventPayload } from "./inbox.ts";
 
 const DB_NAME = "gmweb-messages";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE_EVENTS = "events";
 const STORE_META = "meta";
+const STORE_CONTACTS = "contacts";
 const CURSOR_KEY = "sync_cursor";
 
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -32,6 +33,9 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_META)) {
         db.createObjectStore(STORE_META);
+      }
+      if (!db.objectStoreNames.contains(STORE_CONTACTS)) {
+        db.createObjectStore(STORE_CONTACTS, { keyPath: "normalizedPhone" });
       }
       const events = req.transaction!.objectStore(STORE_EVENTS);
       if (!events.indexNames.contains("by_type_sequence")) events.createIndex("by_type_sequence", ["type", "sequence"]);
@@ -95,7 +99,15 @@ async function drainSync(onProgress?: (applied: number) => void): Promise<number
       throw new Error("Invalid sync page: non-advancing cursor or event sequence");
     }
     for (const event of page.events) {
-      if (event.cryptoVersion === 1 && event.type === "KEY_GRANT") await receiveKeyGrant(event);
+      if (event.cryptoVersion === 1 && (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")) {
+        await receiveKeyGrant(event);
+      }
+    }
+    for (const event of page.events) {
+      if (event.cryptoVersion === 1 && (event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
+        const decoded = await decryptMessage(event);
+        if (decoded.state === "decrypted") await applyContacts(decoded.payload);
+      }
     }
     const db = await openDb();
     await new Promise<void>((resolve, reject) => {
@@ -122,7 +134,7 @@ export interface StoredEvent extends SyncEvent { decryption?: Decryption }
 async function decryptForDisplay(events: SyncEvent[]): Promise<StoredEvent[]> {
   const result: StoredEvent[] = [];
   for (const event of events) {
-    if (event.cryptoVersion > 0) result.push({ ...event, decryption: event.type === "KEY_GRANT"
+    if (event.cryptoVersion > 0) result.push({ ...event, decryption: (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")
       ? await receiveKeyGrant(event) : await decryptMessage(event) });
     else result.push(event);
   }
@@ -184,14 +196,48 @@ export async function listRecentEvents(limit = 100): Promise<StoredEvent[]> {
   return decryptForDisplay(events);
 }
 
+export interface StoredContact {
+  normalizedPhone: string;
+  displayName: string;
+  starred: boolean;
+  photoThumbBase64?: string | null;
+  lastUpdateMs: number;
+}
+
+async function applyContacts(payload: Record<string, unknown>): Promise<void> {
+  const contacts = Array.isArray(payload.contacts) ? payload.contacts : [];
+  const deleted = Array.isArray(payload.deleted) ? payload.deleted : [];
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const t = db.transaction(STORE_CONTACTS, "readwrite");
+    const store = t.objectStore(STORE_CONTACTS);
+    if (payload.replaceAll === true && Number(payload.chunkIndex) === 0) store.clear();
+    for (const value of contacts) {
+      if (!value || typeof value !== "object") continue;
+      const row = value as Partial<StoredContact>;
+      if (typeof row.normalizedPhone === "string" && typeof row.displayName === "string") store.put(row);
+    }
+    for (const phone of deleted) if (typeof phone === "string") store.delete(phone);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error ?? new Error("Contacts transaction aborted"));
+  });
+}
+
+export async function listContacts(): Promise<StoredContact[]> {
+  const rows = await tx([STORE_CONTACTS], "readonly", t => t.objectStore(STORE_CONTACTS).getAll()) as StoredContact[];
+  return rows.sort((a, b) => a.displayName.localeCompare(b.displayName));
+}
+
 /** Dev/self-check hook used by the Debug screen. */
 export async function resetLocal(): Promise<void> {
   await runningSync?.catch(() => {});
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
-    const t = db.transaction([STORE_EVENTS, STORE_META], "readwrite");
+    const t = db.transaction([STORE_EVENTS, STORE_META, STORE_CONTACTS], "readwrite");
     t.objectStore(STORE_EVENTS).clear();
     t.objectStore(STORE_META).clear();
+    t.objectStore(STORE_CONTACTS).clear();
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
   });

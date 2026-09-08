@@ -30,7 +30,7 @@ type PinnedPrimary = { deviceId: string; root: string; encryptionPublicKey: stri
 export async function receiveKeyGrant(event: SyncEvent): Promise<Decryption> {
   try {
     const o = envelope(event);
-    if (event.type !== "KEY_GRANT" || o.kind !== "key-grant") throw new Error("Not a key grant");
+    if ((event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT") || o.kind !== "key-grant") throw new Error("Not a key grant");
     const keys = await getOrCreateDeviceKeys();
     if (o.deviceId !== keys.deviceId) return { state: "key-grant", reason: "Grant for another device" };
     const pinned = await loadCryptoRecord<PinnedPrimary>("verified-primary");

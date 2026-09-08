@@ -35,7 +35,22 @@ function registerPwaAuthRoutes(app, {
   checkRateLimit,
   loginMax = 10,
   loginWindowMs = 60_000,
+  canAdmin = () => false,
 }) {
+  app.post("/api/v1/auth/bridge-linked-session", {
+    schema: {
+      summary: "Exchange an authenticated dashboard session for a linked E2EE session",
+      tags: ["Pairing"],
+    },
+  }, async (request, reply) => {
+    if (!canAdmin(request)) return reply.code(403).send({ error: "dashboard_auth_required" });
+    const token = linkedSessions.issue(recoveryDeviceId(), [
+      "READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "RECEIVE_NOTIFICATIONS", "CONTACTS_READ",
+    ]);
+    setLinkedCookie(reply, linkedSessions, token);
+    return { ok: true, redirect: "/web" };
+  });
+
   app.post("/api/v1/pwa/token-login", {
     bodyLimit: 8 * 1024,
     schema: {

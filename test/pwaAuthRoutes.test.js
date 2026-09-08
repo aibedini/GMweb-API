@@ -9,7 +9,7 @@ const linkedSessions = require("../src/linkedSessions");
 const { PwaAccessTokenStore } = require("../src/pwaAccessTokens");
 const { registerPwaAuthRoutes, registerPwaTokenAdminRoutes } = require("../src/pwaAuthRoutes");
 
-async function makeApp({ allowed = true } = {}) {
+async function makeApp({ allowed = true, admin = false } = {}) {
   const app = Fastify({ logger: false });
   const db = new Database(":memory:");
   const pwaAccessTokens = new PwaAccessTokenStore(db);
@@ -18,11 +18,28 @@ async function makeApp({ allowed = true } = {}) {
     pwaAccessTokens,
     linkedSessions,
     checkRateLimit: () => ({ allowed, retryAfterSeconds: 30 }),
+    canAdmin: () => admin,
   });
   registerPwaTokenAdminRoutes(app, { pwaAccessTokens, linkedSessions });
   await app.ready();
   return { app, db, pwaAccessTokens };
 }
+
+test("dashboard session bridges to a full linked E2EE session", async (t) => {
+  const { app, db } = await makeApp({ admin: true });
+  t.after(async () => { await app.close(); db.close(); });
+  const response = await app.inject({ method: "POST", url: "/api/v1/auth/bridge-linked-session" });
+  assert.equal(response.statusCode, 200, response.body);
+  const token = String(response.headers["set-cookie"]).match(/^gmweb_linked_session=([^;]+)/)?.[1];
+  const session = linkedSessions.resolve(token);
+  assert.deepEqual(session.capabilities, ["READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "RECEIVE_NOTIFICATIONS", "CONTACTS_READ"]);
+});
+
+test("bridge rejects a request without dashboard authentication", async (t) => {
+  const { app, db } = await makeApp();
+  t.after(async () => { await app.close(); db.close(); });
+  assert.equal((await app.inject({ method: "POST", url: "/api/v1/auth/bridge-linked-session" })).statusCode, 403);
+});
 
 test("dashboard creates a hashed, expiring PWA token and only returns plaintext once", async (t) => {
   const { app, db } = await makeApp();

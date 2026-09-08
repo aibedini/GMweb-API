@@ -1,0 +1,17 @@
+{
+  "statement": {
+    "version": 1,
+    "accountId": "default",
+    "statementId": "stmt-jvm-1",
+    "operation": "DEVICE_APPROVED",
+    "deviceId": "web-jvm-1",
+    "trustSequence": 42,
+    "capabilities": ["READ_MESSAGES", "CONTACTS_READ"],
+    "historyGrant": "FULL_HISTORY",
+    "issuedAt": 1788300000000
+  },
+  "canonicalBase64": "eyJ2ZXJzaW9uIjoxLCJhY2NvdW50SWQiOiJkZWZhdWx0Iiwic3RhdGVtZW50SWQiOiJzdG10LWp2bS0xIiwib3BlcmF0aW9uIjoiREVWSUNFX0FQUFJPVkVEIiwiZGV2aWNlSWQiOiJ3ZWItanZtLTEiLCJ0cnVzdFNlcXVlbmNlIjo0MiwiY2FwYWJpbGl0aWVzIjpbIkNPTlRBQ1RTX1JFQUQiLCJSRUFEX01FU1NBR0VTIl0sImhpc3RvcnlHcmFudCI6IkZVTExfSElTVE9SWSIsImlzc3VlZEF0IjoxNzg4MzAwMDAwMDAwLCJjZXJ0aWZpY2F0ZUhhc2giOiJlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1In0=",
+  "sha256": "4d3b350f1192d7bcc816d62673a365f59b0e9abfbecf65d5606b119a7e358a31",
+  "rootPublicKey": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEha3xW5DH1kAnBwS6z6vrTEOSDWNs0kNV8/CBJLlkLay+J7B3zJprtdfvT9xnr+NnqcUf473lv/1LtdMPeJJbIQ==",
+  "rootSignature": "MEYCIQDSctO2+WX9N1BdPxG6g67bs6mmz4iGukJkOvN1FKgT8AIhAI+BI+SxhoOY/qP55bAjBpidGHWBJyoEWdFgJqnUdAkL"
+}

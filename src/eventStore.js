@@ -89,10 +89,12 @@ class EventStore {
   ingestBatch({ accountId, sourceDeviceId, events }) {
     if (!Array.isArray(events) || events.length === 0) {
       this.log?.(`batch_received sourceDeviceId=${sourceDeviceId || "unknown"} count=0 types=`);
+      this.log?.(`SYNC_REPORT sourceDeviceId=${sourceDeviceId || "unknown"} received=0 accepted=0 duplicates=0 types=`);
       return { accepted: [], duplicates: 0 };
     }
     const typeSet = [...new Set(events.map((e) => String(e.type || "UNKNOWN")))].join(",");
     this.log?.(`batch_received sourceDeviceId=${sourceDeviceId || "unknown"} count=${events.length} types={${typeSet}}`);
+    this.log?.(`SYNC_REPORT sourceDeviceId=${sourceDeviceId || "unknown"} received=${events.length} types={${typeSet}}`);
     const accept = this.db.transaction((batch) => {
       this.counterStmt.run(accountId);
       const accepted = [];
@@ -143,6 +145,7 @@ class EventStore {
       return { accepted, duplicates, inserted };
     });
     const result = accept(events);
+    this.log?.(`SYNC_REPORT accepted=${result.accepted.length} duplicates=${result.duplicates} inserted=${result.inserted}`);
     // §44 invalidation hook — AFTER the transaction committed (durable first,
     // realtime second). Never throws into the HTTP path.
     if (result.inserted > 0 && this.onEventsAccepted) {
@@ -169,6 +172,21 @@ class EventStore {
 
   count(accountId) {
     return this.countStmt.get(accountId)?.n || 0;
+  }
+
+  stats(accountId) {
+    const group = (column) => this.db.prepare(
+      `SELECT ${column} value, COUNT(*) count FROM sync_events WHERE account_id = ? GROUP BY ${column}`
+    ).all(accountId).map(row => ({ value: row.value, count: row.count }));
+    const last = this.db.prepare("SELECT MAX(created_at) value FROM sync_events WHERE account_id = ? AND event_type = 'MESSAGE_CREATED'").get(accountId)?.value || null;
+    return {
+      total: this.count(accountId),
+      byType: group("event_type"),
+      byCryptoVersion: group("crypto_version"),
+      direction: { unknown: this.count(accountId), reason: "direction is encrypted" },
+      contactsEvents: this.db.prepare("SELECT COUNT(*) count FROM sync_events WHERE account_id = ? AND event_type LIKE 'CONTACTS_%'").get(accountId)?.count || 0,
+      lastBackfillTs: last,
+    };
   }
 }
 

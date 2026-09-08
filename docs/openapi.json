@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.15.5",
+    "version": "0.16.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -1374,6 +1374,95 @@
         }
       }
     },
+    "/api/v1/agent/device-telemetry": {
+      "post": {
+        "summary": "Receive Android device health telemetry",
+        "tags": [
+          "Agent"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "deviceId",
+                  "timestamp"
+                ],
+                "additionalProperties": true,
+                "properties": {
+                  "deviceId": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "timestamp": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/admin/device-telemetry": {
+      "get": {
+        "summary": "Latest Android fleet telemetry",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/sync-stats": {
+      "get": {
+        "summary": "Encrypted sync and device queue statistics",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/v1/linked-device/telemetry": {
+      "get": {
+        "summary": "Latest Primary Android telemetry",
+        "tags": [
+          "Trust"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/v1/linked-device/command-key": {
+      "get": {
+        "summary": "Primary Android command encryption public key",
+        "tags": [
+          "Commands"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
     "/api/v1/agent/linked-devices": {
       "get": {
         "summary": "Linked-device session telemetry (server observations)",
@@ -2534,6 +2623,19 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/bridge-linked-session": {
+      "post": {
+        "summary": "Exchange an authenticated dashboard session for a linked E2EE session",
+        "tags": [
+          "Pairing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
           }
         }
       }

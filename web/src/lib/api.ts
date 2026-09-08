@@ -77,6 +77,23 @@ export async function health(): Promise<{ ok: boolean; version: string }> {
   return jsonOrThrow<{ ok: boolean; version: string }>(res);
 }
 
+export async function fetchPrimaryCommandKey(): Promise<{ deviceId: string; encryptionPublicKey: string }> {
+  const res = await fetch(`${API}/linked-device/command-key`, { credentials: "include" });
+  return jsonOrThrow(res);
+}
+
+export async function createCommand(body: {
+  type: "SEND_SMS" | "MARK_THREAD_READ";
+  payload: string;
+  idempotencyKey: string;
+}): Promise<{ commandId: string; state: string; created: boolean }> {
+  const res = await fetch(`${API}/commands`, {
+    method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...body, encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1 }),
+  });
+  return jsonOrThrow(res);
+}
+
 export interface DeviceTelemetry {
   timestamp: number;
   receivedAt: number;

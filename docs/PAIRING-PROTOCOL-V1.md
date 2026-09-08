@@ -89,8 +89,8 @@ capability contract. It has three groups:
 
 | Group | Capabilities | Meaning |
 | --- | --- | --- |
-| base | READ_MESSAGES, SEND_MESSAGES, MARK_READ, RECEIVE_NOTIFICATIONS | every linked browser ALWAYS receives them; server validation rejects a certificate missing any of them |
-| sensitive | READ_OTP, READ_BANK_SECURITY, READ_PASSWORD_RESET, READ_AUTH_CODES, READ_FINANCIAL_NOTIFICATIONS | per-device user-selected grants (LinkedDevicesScreen toggles) |
+| base | READ_MESSAGES, SEND_MESSAGES, MARK_READ, RECEIVE_NOTIFICATIONS | every newly approved browser receives them |
+| sensitive | CONTACTS_READ, READ_OTP, READ_BANK_SECURITY, READ_PASSWORD_RESET, READ_AUTH_CODES, READ_FINANCIAL_NOTIFICATIONS | per-device user-selected grants (LinkedDevicesScreen toggles); existing browsers must be re-approved for contacts |
 | reserved | MANAGE_DEVICES | allowlisted server-side; not granted by today's Android UI |
 
 The server reads its allowlist from that JSON — never from a hardcoded set.

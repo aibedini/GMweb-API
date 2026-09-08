@@ -13,7 +13,7 @@
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentAuthService, checkRateLimit }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
   const applyStatement = statement => trustRegistry.db.transaction(() => {
     const result = trustRegistry.applyStatement({ accountId, statement });
@@ -176,11 +176,34 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     schema: { summary: "Latest Android fleet telemetry", tags: ["Admin"] },
   }, async () => ({ devices: deviceTelemetryStore?.getAll() || [] }));
 
+  app.get("/api/v1/admin/sync-stats", {
+    schema: { summary: "Encrypted sync and device queue statistics", tags: ["Admin"] },
+  }, async () => {
+    const primary = deviceTelemetryStore?.getPrimary() || null;
+    return {
+      ...eventStore.stats(accountId),
+      pendingTrustStatements: primary?.sync?.trustOutboxDepth ?? null,
+      deadLetterCount: primary?.sync?.deadLetterCount ?? null,
+      linkedSessions: linkedSessions?.telemetry() || [],
+    };
+  });
+
   app.get("/api/v1/linked-device/telemetry", {
     schema: { summary: "Latest Primary Android telemetry", tags: ["Trust"] },
   }, async (request, reply) => {
     if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
     return { telemetry: deviceTelemetryStore?.getPrimary() || null };
+  });
+
+  app.get("/api/v1/linked-device/command-key", {
+    schema: { summary: "Primary Android command encryption public key", tags: ["Commands"] },
+  }, async (request, reply) => {
+    if (!request.linkedDevice?.capabilities?.includes("SEND_MESSAGES")) {
+      return reply.code(403).send({ error: "send_messages_capability_required" });
+    }
+    const identity = agentAuthService?.getPrimaryIdentity();
+    if (!identity?.encryption_public_key) return reply.code(404).send({ error: "primary_command_key_unavailable" });
+    return { deviceId: identity.device_id, encryptionPublicKey: identity.encryption_public_key };
   });
 
   // ── POST-PAIR: linked-device presence telemetry (Android-authenticated) ──
@@ -239,6 +262,19 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     }
   }, async (request, reply) => {
     const body = request.body || {};
+    if (request.linkedDevice && body.type === "MARK_THREAD_READ" &&
+        !request.linkedDevice.capabilities?.includes("MARK_READ")) {
+      return reply.code(403).send({ error: "mark_read_capability_required" });
+    }
+    if (request.linkedDevice && body.type === "SEND_SMS" &&
+        !request.linkedDevice.capabilities?.includes("SEND_MESSAGES")) {
+      return reply.code(403).send({ error: "send_messages_capability_required" });
+    }
+    if (request.linkedDevice && body.type === "SEND_SMS") {
+      if (Number(body.cryptoVersion) !== 1) return reply.code(400).send({ error: "encrypted_command_required" });
+      const limit = checkRateLimit(request, `linked-send:${request.linkedDevice.deviceId}`, 10, 60_000);
+      if (!limit.allowed) return reply.code(429).send({ error: "send_rate_limit", retryAfterSeconds: limit.retryAfterSeconds });
+    }
     let payload = null;
     try {
       payload = Buffer.from(String(body.payload || ""), "base64");

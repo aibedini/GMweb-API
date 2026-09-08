@@ -7,6 +7,7 @@ export interface MessagePayload {
   dateMs: number;
   status: number;
   address?: string;
+  read?: boolean;
   /** Optional display name embedded by Android (Contacts lookup at send/receive time). */
   contactName?: string;
 }
@@ -19,6 +20,7 @@ export interface ConversationSummary {
   preview: string;
   lastAt: number;
   read: boolean;
+  unreadCount: number;
 }
 
 export interface TimelineItem {
@@ -62,6 +64,7 @@ function messagePayload(event: StoredEvent): MessagePayload | null {
     dateMs: Number(value.dateMs) || event.createdAt,
     status: Number(value.status) || 0,
     address: typeof value.address === "string" ? value.address : undefined,
+    read: value.read === true,
     contactName: typeof value.contactName === "string" && value.contactName.trim()
       ? value.contactName.trim()
       : undefined,
@@ -105,7 +108,7 @@ function project(events: StoredEvent[]) {
   return { threads, reads };
 }
 
-export function buildConversations(events: StoredEvent[]): ConversationSummary[] {
+export function buildConversations(events: StoredEvent[], contacts: Map<string, string> = new Map()): ConversationSummary[] {
   const { threads, reads } = project(events);
   const summaries: ConversationSummary[] = [];
   for (const [aggregateId, messages] of threads) {
@@ -113,14 +116,17 @@ export function buildConversations(events: StoredEvent[]): ConversationSummary[]
       b.payload.dateMs - a.payload.dateMs || b.event.sequence - a.event.sequence)[0];
     if (!latest) continue;
     const address = latest.payload.address || undefined;
-    const named = latest.payload.contactName || undefined;
+    const named = (address ? contacts.get(address) : undefined) || latest.payload.contactName || undefined;
+    const unreadCount = [...messages.values()].filter(item => item.payload.direction === "in" &&
+      !item.payload.read && item.payload.dateMs > (reads.get(aggregateId) ?? 0)).length;
     summaries.push({
       aggregateId,
       title: named || address || fallbackTitle(aggregateId),
       ...(named && address ? { subtitle: address } : {}),
       preview: latest.payload.body || "Empty message",
       lastAt: latest.payload.dateMs,
-      read: (reads.get(aggregateId) ?? 0) >= latest.payload.dateMs,
+      read: unreadCount === 0,
+      unreadCount,
     });
   }
   return summaries.sort((a, b) => b.lastAt - a.lastAt || a.aggregateId.localeCompare(b.aggregateId));

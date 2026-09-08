@@ -590,7 +590,7 @@ function isDashboardAsset(requestUrl) {
 
 // Routes only accessible by master token or dashboard session (not project keys)
 const ADMIN_ONLY_PREFIXES = ["/admin/", "/browser/", "/session/", "/dashboard/", "/vnc", "/docs"];
-const ADMIN_ONLY_EXACT_PATHS = new Set(["/api/v1/pairing/diagnostics"]);
+const ADMIN_ONLY_EXACT_PATHS = new Set(["/api/v1/pairing/diagnostics", "/api/v1/admin/sync-stats"]);
 
 function isAdminOnlyPath(url) {
   const p = requestPath(url);
@@ -703,7 +703,9 @@ function requireToken(request, reply, done) {
           p.startsWith("/api/v1/trust/"))) ||
       (caps.includes("READ_MESSAGES") && request.method === "GET" &&
         p === "/api/v1/linked-device/telemetry") ||
-      (caps.includes("SEND_MESSAGES") &&
+      (caps.includes("SEND_MESSAGES") && request.method === "GET" &&
+        p === "/api/v1/linked-device/command-key") ||
+      ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ")) &&
         (p === "/api/v1/commands" || p.startsWith("/api/v1/commands/"))) ||
       (caps.includes("READ_PAIRING_DIAGNOSTICS") &&
         request.method === "GET" && p === "/api/v1/pairing/diagnostics") ||
@@ -2762,6 +2764,8 @@ registerControlPlaneRoutes(app, {
   authorizeAgent,
   linkedSessions,
   deviceTelemetryStore,
+  agentAuthService,
+  checkRateLimit,
 });
 
 // PR-08b: per-device identity registration (device-key bootstrap → ECDSA).
@@ -2785,6 +2789,7 @@ registerPwaAuthRoutes(app, {
   pwaAccessTokens,
   linkedSessions,
   checkRateLimit,
+  canAdmin: hasDashboardAccess,
   loginMax: Math.min(config.dashboardLoginMax, 10),
   loginWindowMs: config.dashboardLoginWindowMs,
 });
@@ -3402,6 +3407,11 @@ app.post("/send", {
   // Global kill switch: when the send power is off, refuse every message — no
   // matter the priority, key, idempotency, or remaining capacity. Nothing is
   // queued, so nothing can be sent until a power-on is issued.
+  reply.code(410).send({
+    error: "legacy_send_retired",
+    migration: "Use POST /api/v1/commands with an encrypted SEND_SMS payload",
+  });
+  return;
   if (!sendPowerOn) {
     reply.code(503).send({ error: "powered_off", message: "Sending is powered off. No messages will be sent until power-on." });
     return;
