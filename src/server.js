@@ -2778,6 +2778,8 @@ registerConnectionDiagnostics(app, {
   canAdmin: hasDashboardAccess,
   checkRateLimit,
   config,
+  eventStore,
+  accountId: DEFAULT_ACCOUNT_ID,
 });
 registerPairingRoutes(app, {
   agentAuthService,

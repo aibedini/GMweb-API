@@ -119,4 +119,34 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     const res = store.ingestBatch({ accountId: "a", events: [] });
     assert.deepEqual(res.accepted, []);
   });
+
+  test("diagnostic stats expose only aggregate pipeline counts per account and source device", () => {
+    const store = new EventStore(new Database(":memory:"));
+    store.ingestBatch({ accountId: "account", sourceDeviceId: "phone-a", events: [
+      { eventId: "m1", type: "MESSAGE_CREATED", payload: Buffer.from("secret-a"), cryptoVersion: 1 },
+      { eventId: "k1", type: "KEY_GRANT", payload: Buffer.from("secret-b"), cryptoVersion: 1 },
+    ] });
+    store.ingestBatch({ accountId: "account", sourceDeviceId: "phone-b", events: [
+      { eventId: "u1", type: "MESSAGE_UPDATED", payload: Buffer.from("secret-c"), cryptoVersion: 0 },
+    ] });
+
+    const stats = store.diagnosticStats("account", "phone-a");
+    assert.deepEqual(stats.account, {
+      total: 3,
+      messageCreated: 1,
+      messageUpdated: 1,
+      keyGrant: 1,
+      byCryptoVersion: [{ value: 0, count: 1 }, { value: 1, count: 2 }],
+      maxSequence: 3,
+    });
+    assert.deepEqual(stats.sourceDevice, {
+      total: 2,
+      messageCreated: 1,
+      messageUpdated: 0,
+      keyGrant: 1,
+      byCryptoVersion: [{ value: 1, count: 2 }],
+      maxSequence: 2,
+    });
+    assert.equal(JSON.stringify(stats).includes("secret"), false);
+  });
 });

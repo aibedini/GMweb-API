@@ -34,7 +34,7 @@ function buildServerChecks({ identity, trustRootFingerprint, trustSequence, link
   };
 }
 
-function registerConnectionDiagnostics(app, { agentAuthService, canAdmin, checkRateLimit, config }) {
+function registerConnectionDiagnostics(app, { agentAuthService, canAdmin, checkRateLimit, config, eventStore, accountId }) {
   ensureTable();
   app.post("/admin/connection-diagnostics", {
     schema: { summary: "Create a short-lived diagnostic-only token", tags: ["Diagnostics"],
@@ -84,6 +84,7 @@ function registerConnectionDiagnostics(app, { agentAuthService, canAdmin, checkR
         activeSessions,
         publicApiOrigin: process.env.PUBLIC_API_ORIGIN || config?.publicApiOrigin,
       }),
+      sync: eventStore.diagnosticStats(accountId, request.authenticatedAgentId),
     };
   });
 }

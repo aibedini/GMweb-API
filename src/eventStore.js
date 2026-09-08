@@ -188,6 +188,28 @@ class EventStore {
       lastBackfillTs: last,
     };
   }
+
+  diagnosticStats(accountId, sourceDeviceId) {
+    const counts = (deviceId = null) => {
+      const sourceFilter = deviceId ? " AND source_device_id = ?" : "";
+      const args = deviceId ? [accountId, deviceId] : [accountId];
+      const scalar = (sql) => Number(this.db.prepare(sql).get(...args)?.value || 0);
+      return {
+        total: scalar(`SELECT COUNT(*) value FROM sync_events WHERE account_id = ?${sourceFilter}`),
+        messageCreated: scalar(`SELECT COUNT(*) value FROM sync_events WHERE account_id = ?${sourceFilter} AND event_type = 'MESSAGE_CREATED'`),
+        messageUpdated: scalar(`SELECT COUNT(*) value FROM sync_events WHERE account_id = ?${sourceFilter} AND event_type = 'MESSAGE_UPDATED'`),
+        keyGrant: scalar(`SELECT COUNT(*) value FROM sync_events WHERE account_id = ?${sourceFilter} AND event_type = 'KEY_GRANT'`),
+        byCryptoVersion: this.db.prepare(
+          `SELECT crypto_version value, COUNT(*) count FROM sync_events WHERE account_id = ?${sourceFilter} GROUP BY crypto_version ORDER BY crypto_version`
+        ).all(...args).map(row => ({ value: Number(row.value), count: Number(row.count) })),
+        maxSequence: scalar(`SELECT COALESCE(MAX(sequence), 0) value FROM sync_events WHERE account_id = ?${sourceFilter}`),
+      };
+    };
+    return {
+      account: counts(),
+      sourceDevice: counts(sourceDeviceId),
+    };
+  }
 }
 
 module.exports = { EventStore };
