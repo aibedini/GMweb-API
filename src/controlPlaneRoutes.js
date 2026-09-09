@@ -505,7 +505,8 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (!request.linkedDevice?.capabilities?.includes("READ_MESSAGES")) {
       return reply.code(403).send({ error: "capability_denied" });
     }
-    return eventStore.grantsAfter(accountId, Number(request.query?.after) || 0, Number(request.query?.limit) || 1000);
+    return eventStore.deviceGrantsAfter(accountId, request.linkedDevice.deviceId,
+      Number(request.query?.after) || 0, Number(request.query?.limit) || 1000);
   });
 }
 

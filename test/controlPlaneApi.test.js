@@ -293,7 +293,10 @@ describe("Phase 2 control plane HTTP API", () => {
     await app.inject({
       method: "POST", url: "/api/v1/agent/events/batch",
       payload: { events: [
-        { eventId: `grant-${Date.now()}`, type: "KEY_GRANT", conversationId: "thread", payload: Buffer.from("opaque-grant").toString("base64"), cryptoVersion: 1 },
+        { eventId: `grant-${Date.now()}`, type: "KEY_GRANT", conversationId: "thread",
+          payload: Buffer.from(JSON.stringify({ deviceId: "web-device", wrapped: "opaque" })).toString("base64"), cryptoVersion: 1 },
+        { eventId: `other-grant-${Date.now()}`, type: "KEY_GRANT", conversationId: "thread",
+          payload: Buffer.from(JSON.stringify({ deviceId: "other-device", wrapped: "opaque" })).toString("base64"), cryptoVersion: 1 },
       ] },
     });
     const response = await app.inject({
@@ -305,5 +308,6 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.ok(page.events.length > 0);
     assert.ok(page.events.every(event => event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT"));
     assert.ok(page.events.every(event => typeof event.ciphertext === "string"));
+    assert.ok(page.events.every(event => JSON.parse(Buffer.from(event.ciphertext, "base64")).deviceId === "web-device"));
   });
 });

@@ -140,7 +140,9 @@ export default function App() {
         setBootstrapState("FIRST_PAINT_READY");
         setSyncStatus(getBrowserSyncStatus());
         if (getBrowserSyncStatus().state === "UP_TO_DATE") return;
-        void syncUntilCaughtUp()
+        void syncUntilCaughtUp((count) => {
+          if (count % 10_000 === 0) void refresh();
+        })
           .then(refresh)
           .then(() => {
             setBootstrapState("UP_TO_DATE");

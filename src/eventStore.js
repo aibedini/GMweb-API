@@ -61,6 +61,9 @@ class EventStore {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_events_uuid ON sync_events (account_id, event_uuid);
       CREATE INDEX IF NOT EXISTS idx_events_time ON sync_events (account_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_events_grant_target
+        ON sync_events(account_id, json_extract(CAST(ciphertext AS TEXT), '$.deviceId'), sequence)
+        WHERE event_type IN ('KEY_GRANT', 'CONTACTS_KEY_GRANT') AND json_valid(CAST(ciphertext AS TEXT));
     `);
     this.counterStmt = db.prepare(
       `INSERT INTO event_counters (account_id, next_sequence) VALUES (?, 1)
@@ -85,12 +88,14 @@ class EventStore {
        FROM sync_events WHERE account_id = ? AND sequence > ?
        ORDER BY sequence ASC LIMIT ?`
     );
-    this.grantsAfterStmt = db.prepare(
+    this.deviceGrantsAfterStmt = db.prepare(
       `SELECT sequence, event_uuid AS eventId, event_type AS type, aggregate_id AS aggregateId,
               source_device_id AS sourceDeviceId, ciphertext, encoding, schema_version AS schemaVersion,
               crypto_version AS cryptoVersion, created_at AS createdAt
        FROM sync_events
        WHERE account_id = ? AND sequence > ? AND event_type IN ('KEY_GRANT', 'CONTACTS_KEY_GRANT')
+         AND json_valid(CAST(ciphertext AS TEXT))
+         AND json_extract(CAST(ciphertext AS TEXT), '$.deviceId') = ?
        ORDER BY sequence ASC LIMIT ?`
     );
     this.countStmt = db.prepare(
@@ -179,10 +184,10 @@ class EventStore {
     return eventPage(rows, afterSequence, capped);
   }
 
-  /** Opaque grant bootstrap for a linked browser catching up through a large archive. */
-  grantsAfter(accountId, afterSequence, limit = 1000) {
+  /** Grant envelopes addressed to the authenticated linked device only. */
+  deviceGrantsAfter(accountId, deviceId, afterSequence, limit = 1000) {
     const capped = Math.max(1, Math.min(1000, Number(limit) || 1000));
-    const rows = this.grantsAfterStmt.all(accountId, Number(afterSequence) || 0, capped + 1);
+    const rows = this.deviceGrantsAfterStmt.all(accountId, Number(afterSequence) || 0, deviceId, capped + 1);
     return eventPage(rows, afterSequence, capped);
   }
 

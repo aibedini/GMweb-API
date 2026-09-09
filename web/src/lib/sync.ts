@@ -9,7 +9,7 @@
  */
 
 import { fetchEventsAfter, fetchKeyGrantsAfter, type SyncEvent } from "./api.ts";
-import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypto.ts";
+import { receiveKeyGrant, receiveKeyGrants, decryptMessage, type Decryption } from "./messageCrypto.ts";
 import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
 import { getOrCreateDeviceKeys } from "./deviceKeys.ts";
 
@@ -162,6 +162,7 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
   updateSyncStatus({ state: "INITIALIZING", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
   return serializeSync(async () => {
     try {
+      await bootstrapKeyGrants();
       const result = await drainSync(maxPages, onProgress);
       updateSyncStatus({
         state: result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY",
@@ -186,6 +187,15 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
   let applied = 0;
   let pages = 0;
   let lastPageCount = 0;
+  const pendingAggregates = new Set<string>();
+  let projectionThrough = cursor;
+  const flushProjection = async () => {
+    if (pendingAggregates.size > 0) {
+      await refreshConversationProjections([...pendingAggregates]);
+      pendingAggregates.clear();
+    }
+    await setMetaNumber(PROJECTION_CURSOR_KEY, projectionThrough);
+  };
   for (;;) {
     const page = await fetchEventsAfter(cursor);
     lastPageCount = page.events.length;
@@ -208,11 +218,8 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
         page.events.some(ev => !Number.isSafeInteger(ev.sequence) || ev.sequence <= cursor || ev.sequence > page.nextCursor)) {
       throw new Error("Invalid sync page: non-advancing cursor or event sequence");
     }
-    for (const event of page.events) {
-      if (event.cryptoVersion === 1 && (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")) {
-        await receiveKeyGrant(event);
-      }
-    }
+    await receiveKeyGrants(page.events.filter(event => event.cryptoVersion === 1 &&
+      (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")));
     for (const event of page.events) {
       if (event.cryptoVersion === 1 && (event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
         const decoded = await decryptMessage(event);
@@ -236,12 +243,14 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
     const changedAggregates = [...new Set(page.events
       .map((ev) => ev.aggregateId)
       .filter((id): id is string => typeof id === "string" && id.length > 0))];
-    await refreshConversationProjections(changedAggregates);
-    await setMetaNumber(PROJECTION_CURSOR_KEY, page.nextCursor);
+    for (const id of changedAggregates) pendingAggregates.add(id);
+    projectionThrough = page.nextCursor;
     applied += page.events.length;
     cursor = page.nextCursor;
     onProgress?.(applied);
     pages += 1;
+    const stopping = !page.hasMore || (maxPages !== undefined && pages >= maxPages);
+    if (pages % 10 === 0 || stopping) await flushProjection();
     if (!page.hasMore) return { applied, lastPageCount, caughtUp: true };
     if (maxPages !== undefined && pages >= maxPages) return { applied, lastPageCount, caughtUp: false };
   }
@@ -501,8 +510,10 @@ async function bootstrapKeyGrants(): Promise<void> {
           event.sequence > page.nextCursor || (event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT"))) {
       throw new Error("Invalid key-grant bootstrap page");
     }
-    for (const event of page.events) {
-      const result = await receiveKeyGrant(event);
+    const results = await receiveKeyGrants(page.events);
+    for (let index = 0; index < page.events.length; index += 1) {
+      const event = page.events[index];
+      const result = results[index];
       if (result.state !== "key-grant" || result.reason !== "Authorized epoch key stored") continue;
       if (event.type === "CONTACTS_KEY_GRANT") contactsGrantAccepted = true;
       else if (event.aggregateId) acceptedAggregates.add(event.aggregateId);

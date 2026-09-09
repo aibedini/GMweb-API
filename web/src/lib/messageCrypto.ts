@@ -1,5 +1,5 @@
 import { Aes256Gcm, CipherSuite, DhkemP256HkdfSha256, HkdfSha256 } from "@hpke/core";
-import { getOrCreateDeviceKeys, loadCryptoRecord, saveCryptoRecord } from "./deviceKeys.ts";
+import { getOrCreateDeviceKeys, loadCryptoRecord, saveCryptoRecords } from "./deviceKeys.ts";
 import { derEcdsaToP1363 } from "./trustRoot.ts";
 import type { SyncEvent } from "./api.ts";
 
@@ -26,39 +26,64 @@ export type Decryption = { state: "decrypted"; payload: Record<string, unknown> 
   { state: "locked" | "invalid" | "key-grant"; reason: string };
 type PinnedPrimary = { deviceId: string; root: string; encryptionPublicKey: string };
 
+async function receiveKeyGrantPage(events: SyncEvent[]): Promise<Decryption[]> {
+  if (events.length === 0) return [];
+  const keys = await getOrCreateDeviceKeys();
+  const pinned = await loadCryptoRecord<PinnedPrimary>("verified-primary");
+  let root: CryptoKey | null = null;
+  if (pinned) {
+    try {
+      root = await crypto.subtle.importKey("spki", unb64(pinned.root),
+        { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    } catch { /* reported as an unavailable verified root below */ }
+  }
+  const records: Array<{ key: string; value: unknown }> = [];
+  const results: Decryption[] = [];
+  for (const event of events) {
+    try {
+      const o = envelope(event);
+      if ((event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT") || o.kind !== "key-grant") throw new Error("Not a key grant");
+      if (o.deviceId !== keys.deviceId) { results.push({ state: "key-grant", reason: "Grant for another device" }); continue; }
+      if (!pinned || pinned.deviceId !== keys.deviceId || pinned.encryptionPublicKey !== keys.encryptionPublicKeyB64 || !root) {
+        results.push({ state: "locked", reason: "Pair again to verify the primary trust root" }); continue;
+      }
+      if (!keys.encryptionPrivateKey.usages.includes("deriveBits")) {
+        results.push({ state: "locked", reason: "Legacy browser key: reset keys and pair again to enable E2EE" }); continue;
+      }
+      if (!Number.isSafeInteger(o.historyFloor) || Number(o.historyFloor) < 0) throw new Error("Invalid history boundary");
+      const fields = [string(o, "epochId"), string(o, "conversationId"), string(o, "deviceId"), string(o, "category"), String(o.historyFloor)];
+      const wrapped = string(o, "wrappedCke");
+      const signature = new Uint8Array(derEcdsaToP1363(unb64(string(o, "rootSignature"))));
+      if (!await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, root, signature,
+        binding("GMweb-CKE-signature-v1", ...fields, wrapped))) throw new Error("Invalid key grant signature");
+      const bytes = unb64(wrapped);
+      if (bytes.length !== 113) throw new Error("Invalid HPKE grant length");
+      const recipient = await suite.createRecipientContext({
+        recipientKey: { privateKey: keys.encryptionPrivateKey, publicKey: keys.encryptionPublicKey },
+        enc: bytes.slice(0, 65), info: binding("GMweb-CKE-v1", ...fields),
+      });
+      const raw = new Uint8Array(await recipient.open(bytes.slice(65)));
+      try {
+        if (raw.length !== 32) throw new Error("Invalid CKE length");
+        const cke = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
+        records.push({ key: `cke:${keys.deviceId}:${pinned.root}:${fields[0]}`,
+          value: { key: cke, conversationId: fields[1] } });
+      } finally { raw.fill(0); }
+      results.push({ state: "key-grant", reason: "Authorized epoch key stored" });
+    } catch (e) { results.push({ state: "invalid", reason: e instanceof Error ? e.message : "Invalid key grant" }); }
+  }
+  await saveCryptoRecords(records);
+  return results;
+}
+
+/** Verify and persist one server page with one key load and one IndexedDB commit. */
+export async function receiveKeyGrants(events: SyncEvent[]): Promise<Decryption[]> {
+  return receiveKeyGrantPage(events);
+}
+
 /** Authentication precedes HPKE decapsulation; the server cannot invent a CKE grant. */
 export async function receiveKeyGrant(event: SyncEvent): Promise<Decryption> {
-  try {
-    const o = envelope(event);
-    if ((event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT") || o.kind !== "key-grant") throw new Error("Not a key grant");
-    const keys = await getOrCreateDeviceKeys();
-    if (o.deviceId !== keys.deviceId) return { state: "key-grant", reason: "Grant for another device" };
-    const pinned = await loadCryptoRecord<PinnedPrimary>("verified-primary");
-    if (!pinned || pinned.deviceId !== keys.deviceId || pinned.encryptionPublicKey !== keys.encryptionPublicKeyB64)
-      return { state: "locked", reason: "Pair again to verify the primary trust root" };
-    if (!keys.encryptionPrivateKey.usages.includes("deriveBits"))
-      return { state: "locked", reason: "Legacy browser key: reset keys and pair again to enable E2EE" };
-    if (!Number.isSafeInteger(o.historyFloor) || Number(o.historyFloor) < 0) throw new Error("Invalid history boundary");
-    const fields = [string(o, "epochId"), string(o, "conversationId"), string(o, "deviceId"), string(o, "category"), String(o.historyFloor)];
-    const wrapped = string(o, "wrappedCke");
-    const root = await crypto.subtle.importKey("spki", unb64(pinned.root), { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
-    const signature = new Uint8Array(derEcdsaToP1363(unb64(string(o, "rootSignature"))));
-    if (!await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, root, signature,
-      binding("GMweb-CKE-signature-v1", ...fields, wrapped))) throw new Error("Invalid key grant signature");
-    const bytes = unb64(wrapped);
-    if (bytes.length !== 113) throw new Error("Invalid HPKE grant length");
-    const recipient = await suite.createRecipientContext({
-      recipientKey: { privateKey: keys.encryptionPrivateKey, publicKey: keys.encryptionPublicKey },
-      enc: bytes.slice(0, 65), info: binding("GMweb-CKE-v1", ...fields),
-    });
-    const raw = new Uint8Array(await recipient.open(bytes.slice(65)));
-    try {
-      if (raw.length !== 32) throw new Error("Invalid CKE length");
-      const cke = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["decrypt"]);
-      await saveCryptoRecord(`cke:${keys.deviceId}:${pinned.root}:${fields[0]}`, { key: cke, conversationId: fields[1] });
-    } finally { raw.fill(0); }
-    return { state: "key-grant", reason: "Authorized epoch key stored" };
-  } catch (e) { return { state: "invalid", reason: e instanceof Error ? e.message : "Invalid key grant" }; }
+  return (await receiveKeyGrantPage([event]))[0];
 }
 
 export async function decryptMessage(event: SyncEvent): Promise<Decryption> {

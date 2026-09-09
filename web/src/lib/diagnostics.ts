@@ -2,7 +2,7 @@ import { fetchSyncDiagnostics, health, type ServerSyncDiagnostics, type SyncEven
 import { getBrowserSyncStatus, getCursor, getProjectionCursor, type BrowserSyncStatus } from "./sync.ts";
 import { getStoredDeviceIdentity, loadCryptoRecord } from "./deviceKeys.ts";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "./buildInfo.ts";
-import { decryptMessage, receiveKeyGrant, type Decryption } from "./messageCrypto.ts";
+import { decryptMessage, receiveKeyGrants, type Decryption } from "./messageCrypto.ts";
 
 const EVENT_TYPES = ["MESSAGE_CREATED", "MESSAGE_UPDATED", "KEY_GRANT", "CONTACTS_KEY_GRANT", "CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"];
 
@@ -96,6 +96,8 @@ async function localCounts() {
     const messageAggregates = new Set<string>();
     let total = 0;
     let nullAggregateCount = 0;
+    // Full counts stay exact; crypto checks use a bounded recent sample so a
+    // large history cannot leave the Diagnostics screen on "Collecting…".
     const rawEvents: SyncEvent[] = [];
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction("events", "readonly");
@@ -105,6 +107,7 @@ async function localCounts() {
         if (!cursor) return;
         const event = cursor.value as SyncEvent;
         rawEvents.push(event);
+        if (rawEvents.length > 1000) rawEvents.shift();
         total += 1;
         byType[event.type] = (byType[event.type] || 0) + 1;
         byCryptoVersion[String(event.cryptoVersion)] = (byCryptoVersion[String(event.cryptoVersion)] || 0) + 1;
@@ -123,10 +126,10 @@ async function localCounts() {
       ? await request(db.transaction("contacts", "readonly").objectStore("contacts").count()) : 0;
     rawEvents.sort((a, b) => a.sequence - b.sequence);
     const grantStates = new Map<number, Decryption>();
-    for (const event of rawEvents) {
-      if (event.cryptoVersion > 0 && (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT"))
-        grantStates.set(event.sequence, await receiveKeyGrant(event));
-    }
+    const grants = rawEvents.filter(event => event.cryptoVersion > 0 &&
+      (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT"));
+    const grantResults = await receiveKeyGrants(grants);
+    grants.forEach((event, index) => grantStates.set(event.sequence, grantResults[index]));
     const payloadStates = new Map<number, Decryption>();
     for (const event of rawEvents) {
       if (event.cryptoVersion > 0 && event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT")

@@ -107,12 +107,13 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     const result = store.ingestBatch({ accountId: "contacts", sourceDeviceId: "phone", events: [
       { eventId: "contacts-1", type: "CONTACTS_SNAPSHOT", conversationId: "contacts", payload: Buffer.from("cipher-1"), cryptoVersion: 1 },
       { eventId: "contacts-2", type: "CONTACTS_CHANGED", conversationId: "contacts", payload: Buffer.from("cipher-2"), cryptoVersion: 1 },
-      { eventId: "contacts-key", type: "CONTACTS_KEY_GRANT", conversationId: "contacts", payload: Buffer.from("grant"), cryptoVersion: 1 },
+      { eventId: "contacts-key", type: "CONTACTS_KEY_GRANT", conversationId: "contacts",
+        payload: Buffer.from(JSON.stringify({ deviceId: "web" })), cryptoVersion: 1 },
     ] });
     assert.equal(result.accepted.length, 3);
     assert.deepEqual(store.after("contacts", 0, 10).events.map(event => event.type),
       ["CONTACTS_SNAPSHOT", "CONTACTS_CHANGED", "CONTACTS_KEY_GRANT"]);
-    assert.deepEqual(store.grantsAfter("contacts", 0, 10).events.map(event => event.type),
+    assert.deepEqual(store.deviceGrantsAfter("contacts", "web", 0, 10).events.map(event => event.type),
       ["CONTACTS_KEY_GRANT"]);
   });
 
@@ -120,16 +121,17 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     const store = new EventStore(new Database(":memory:"));
     store.ingestBatch({ accountId: "grants", sourceDeviceId: "phone", events: [
       { eventId: "m1", type: "MESSAGE_CREATED", conversationId: "a", payload: Buffer.from("m") },
-      { eventId: "g1", type: "KEY_GRANT", conversationId: "a", payload: Buffer.from("g1"), cryptoVersion: 1 },
+      { eventId: "g1", type: "KEY_GRANT", conversationId: "a", payload: Buffer.from(JSON.stringify({ deviceId: "web" })), cryptoVersion: 1 },
       { eventId: "m2", type: "MESSAGE_CREATED", conversationId: "b", payload: Buffer.from("m") },
-      { eventId: "g2", type: "CONTACTS_KEY_GRANT", conversationId: "contacts", payload: Buffer.from("g2"), cryptoVersion: 1 },
+      { eventId: "other", type: "KEY_GRANT", conversationId: "a", payload: Buffer.from(JSON.stringify({ deviceId: "other" })), cryptoVersion: 1 },
+      { eventId: "g2", type: "CONTACTS_KEY_GRANT", conversationId: "contacts", payload: Buffer.from(JSON.stringify({ deviceId: "web" })), cryptoVersion: 1 },
     ] });
-    const first = store.grantsAfter("grants", 0, 1);
+    const first = store.deviceGrantsAfter("grants", "web", 0, 1);
     assert.deepEqual(first.events.map(event => [event.sequence, event.type]), [[2, "KEY_GRANT"]]);
     assert.equal(first.nextCursor, 2);
     assert.equal(first.hasMore, true);
-    const second = store.grantsAfter("grants", first.nextCursor, 1);
-    assert.deepEqual(second.events.map(event => [event.sequence, event.type]), [[4, "CONTACTS_KEY_GRANT"]]);
+    const second = store.deviceGrantsAfter("grants", "web", first.nextCursor, 1);
+    assert.deepEqual(second.events.map(event => [event.sequence, event.type]), [[5, "CONTACTS_KEY_GRANT"]]);
     assert.equal(second.hasMore, false);
     assert.equal(store.after("grants", 0, 1).events[0].sequence, 1);
   });

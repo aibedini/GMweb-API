@@ -24,7 +24,13 @@ test('Tink Android HPKE grant decrypts with non-extractable WebCrypto key; AEAD 
   assert.equal((await cryptoModule.decryptMessage(message)).state, 'locked');
   const forgedGrant = event('KEY_GRANT', { ...vector.grant, historyFloor: 100 });
   assert.equal((await cryptoModule.receiveKeyGrant(forgedGrant)).state, 'invalid');
-  assert.equal((await cryptoModule.receiveKeyGrant(event('KEY_GRANT', vector.grant))).state, 'key-grant');
+  const batch = await cryptoModule.receiveKeyGrants([
+    event('KEY_GRANT', { ...vector.grant, deviceId: 'another-device' }),
+    event('KEY_GRANT', vector.grant),
+  ]);
+  assert.deepEqual(batch.map(result => result.state), ['key-grant', 'key-grant']);
+  assert.equal(batch[0].reason, 'Grant for another device');
+  assert.equal(batch[1].reason, 'Authorized epoch key stored');
   const decrypted = await cryptoModule.decryptMessage(message);
   assert.equal(decrypted.state, 'decrypted', JSON.stringify(decrypted));
   assert.deepEqual(decrypted.payload, vector.payload);

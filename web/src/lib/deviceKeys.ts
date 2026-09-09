@@ -163,6 +163,22 @@ export async function saveCryptoRecord(key: string, value: unknown): Promise<voi
   try { await idbPut(db, key, value); } finally { db.close(); }
 }
 
+/** Commit a page of derived crypto records atomically. */
+export async function saveCryptoRecords(records: Array<{ key: string; value: unknown }>): Promise<void> {
+  if (records.length === 0) return;
+  const db = await openDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      const store = tx.objectStore(STORE);
+      for (const record of records) store.put(record.value, record.key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB batch put failed"));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB batch put aborted"));
+    });
+  } finally { db.close(); }
+}
+
 export async function loadCryptoRecord<T>(key: string): Promise<T | null> {
   const db = await openDb();
   try { return await idbGet<T>(db, key); } finally { db.close(); }
