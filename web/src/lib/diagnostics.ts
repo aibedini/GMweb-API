@@ -1,4 +1,4 @@
-import { fetchSyncDiagnostics, health, type ServerSyncDiagnostics, type SyncEvent } from "./api.ts";
+import { fetchKeyGrantsAfter, fetchSyncDiagnostics, health, type ServerSyncDiagnostics, type SyncEvent } from "./api.ts";
 import { getBrowserSyncStatus, getCursor, getProjectionCursor, type BrowserSyncStatus } from "./sync.ts";
 import { getStoredDeviceIdentity, loadCryptoRecord } from "./deviceKeys.ts";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "./buildInfo.ts";
@@ -179,13 +179,14 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
   // Opening through sync.ts first guarantees the current schema and performs
   // any pending projection repair before the read-only diagnostic scan.
   const [cursor, projectionCursor] = await Promise.all([getCursor(), getProjectionCursor()]);
-  const [sessionResponse, api, server, local, identity, pinned, registration] = await Promise.all([
+  const [sessionResponse, api, server, local, identity, pinned, registration, grantProbe] = await Promise.all([
     fetch("/api/v1/linked-session", { credentials: "include" }).then(response => response.json()).catch(() => ({})),
     health().catch(() => ({ ok: false, version: "unreachable" })),
     fetchSyncDiagnostics().catch(() => null),
     localCounts(), getStoredDeviceIdentity(),
     loadCryptoRecord<{ deviceId: string; encryptionPublicKey: string }>("verified-primary").catch(() => null),
     navigator.serviceWorker?.getRegistration().catch(() => undefined),
+    fetchKeyGrantsAfter(0, 20).then(page => receiveKeyGrants(page.events)).catch(() => []),
   ]);
   const runtime = getBrowserSyncStatus();
   const projectionLag = Math.max(0, cursor - projectionCursor);
@@ -214,7 +215,7 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     },
     crypto: {
       browserIdentity: Boolean(identity), verifiedPrimary: Boolean(pinned), primaryMatchesBrowser,
-      messages: local.messageCrypto, keyGrants: local.keyGrantCrypto,
+      messages: local.messageCrypto, keyGrants: countDecryptions(grantProbe),
     },
     projection: {
       cursor: projectionCursor, lag: projectionLag, rawMessageAggregates: local.distinctMessageAggregateCount,

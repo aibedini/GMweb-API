@@ -1,4 +1,4 @@
-## GMweb 0.16.5 / Messages 2.9.2: fast grant bootstrap and progressive history recovery
+## GMweb 0.16.6 / Messages 2.9.2: fast grant bootstrap and bounded crypto diagnostics
 
 Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use
 `POST /api/v1/primary-enrollment`, with operational-key and trust-root proofs.
