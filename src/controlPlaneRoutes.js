@@ -510,6 +510,26 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     return eventStore.deviceGrantsAfter(accountId, request.linkedDevice.deviceId,
       Number(request.query?.after) || 0, Number(request.query?.limit) || 1000);
   });
+
+  app.get("/api/v1/linked-device/keyring", {
+    schema: {
+      summary: "Fetch this browser's bounded account keys and v3 full-history key",
+      tags: ["Sync"],
+      querystring: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", minimum: 1, maximum: 1000, default: 1000 },
+        },
+      },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    if (!request.linkedDevice?.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "capability_denied" });
+    }
+    return eventStore.deviceKeyring(accountId, request.linkedDevice.deviceId,
+      Number(request.query?.limit) || 1000);
+  });
 }
 
 module.exports = { registerControlPlaneRoutes };

@@ -136,6 +136,24 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     assert.equal(store.after("grants", 0, 1).events[0].sequence, 1);
   });
 
+  test("v2/v3 keys are bounded, device-filtered, and independent of message cursor", () => {
+    const store = new EventStore(new Database(":memory:"));
+    store.ingestBatch({ accountId: "keyring", sourceDeviceId: "phone", events: [
+      { eventId: "m1", type: "MESSAGE_CREATED", conversationId: "a", payload: Buffer.from("cipher"), cryptoVersion: 2 },
+      { eventId: "k1", type: "KEYRING_ENTRY", conversationId: "__account_keyring__",
+        payload: Buffer.from(JSON.stringify({ deviceId: "web-a", keyId: "messages" })), encoding: "envelope.v2", cryptoVersion: 2 },
+      { eventId: "k2", type: "KEYRING_ENTRY", conversationId: "__account_keyring__",
+        payload: Buffer.from(JSON.stringify({ deviceId: "web-b", keyId: "messages" })), encoding: "envelope.v2", cryptoVersion: 2 },
+      { eventId: "h1", type: "HISTORY_KEY_GRANT", conversationId: "__history_master__",
+        payload: Buffer.from(JSON.stringify({ deviceId: "web-a", keyId: "history" })), encoding: "envelope.v3", cryptoVersion: 3 },
+    ] });
+    const page = store.deviceKeyring("keyring", "web-a");
+    assert.deepEqual(page.events.map(event => event.eventId), ["k1", "h1"]);
+    assert.equal(page.hasMore, false);
+    assert.equal(page.nextCursor, 4);
+    assert.equal(store.after("keyring", 0, 1).events[0].eventId, "m1");
+  });
+
   test("empty batch is a no-op", () => {
     const store = new EventStore(new Database(":memory:"));
     const res = store.ingestBatch({ accountId: "a", events: [] });

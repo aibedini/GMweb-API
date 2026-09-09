@@ -184,13 +184,13 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     const created = await createSession();
     const path = `/api/v1/agent/pairing-code/${created.pairingCode}`;
     for (let index = 0; index < 10; index += 1) {
-      const auth = signRequest(pair, DEVICE, "GET", path, Buffer.alloc(0), Date.now() + index);
+      const auth = signRequest(pair, DEVICE, "GET", path, Buffer.alloc(0), nextAgentTs());
       const res = await app.inject({ method: "GET", url: path, headers: auth.headers });
       assert.equal(res.statusCode, 200);
       assert.equal(res.json().pairingSessionId, created.pairingSessionId);
       assert.equal(res.json().pollSecretHash, undefined);
     }
-    const auth = signRequest(pair, DEVICE, "GET", path, Buffer.alloc(0), Date.now() + 20);
+    const auth = signRequest(pair, DEVICE, "GET", path, Buffer.alloc(0), nextAgentTs());
     const limited = await app.inject({ method: "GET", url: path, headers: auth.headers });
     assert.equal(limited.statusCode, 429);
   });
@@ -240,7 +240,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
       trustRootPublicKey: "TRUST",
     });
     const buf = Buffer.from(body);
-    const ts = Date.now();
+    const ts = nextAgentTs();
     const wrongHash = crypto.createHash("sha256").update(buf).digest("hex");
     const canonical = `POST\n/api/v1/agent/commands/claim\n${wrongHash}\nX-AGENT-TS:${ts}\n`;
     const sig = crypto.sign("sha256", Buffer.from(canonical), pair.privateKey).toString("base64");
@@ -265,7 +265,7 @@ describe("ADR-007 pairing security boundary (route level)", () => {
     // ADR-007 P0-4: resubmitting the EXACT same signed request must be
     // rejected - the (deviceId, ts) replay cache in AgentAuthService catches it.
     const created = await createSession();
-    const ts = Date.now();
+    const ts = nextAgentTs();
     const req = signApprove(created, "CERT-REPLAY", { ts });
     const first = await app.inject(req);
     assert.equal(first.statusCode, 200);

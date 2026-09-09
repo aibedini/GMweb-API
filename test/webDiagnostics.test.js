@@ -16,6 +16,14 @@ test("diagnostics derive projection, contacts, sync, and build failures determin
     { CONTACTS_SNAPSHOT: 1, CONTACTS_KEY_GRANT: 1 },
     { ...emptyCrypto, invalid: 1 }, 0,
   ), "CONTACTS_DECRYPT_FAILED");
+  assert.equal(diagnostics.detectContactsFailure(
+    { CONTACTS_SNAPSHOT: 1, CONTACTS_KEY_GRANT: 1 },
+    { ...emptyCrypto, locked: 1 }, 0,
+  ), "CONTACTS_KEY_UNAVAILABLE");
+  assert.equal(diagnostics.detectContactsFailure(
+    { CONTACTS_SNAPSHOT: 1, KEYRING_ENTRY: 1 },
+    { ...emptyCrypto, locked: 1 }, 0,
+  ), "CONTACTS_KEY_UNAVAILABLE");
   assert.equal(diagnostics.diagnosticOutcome({
     buildMismatch: false, projectionFailure: null, syncState: "SYNCING_HISTORY",
     contactsFailure: null, syncLag: 10, projectionLag: 0,

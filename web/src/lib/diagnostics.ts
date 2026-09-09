@@ -1,10 +1,10 @@
-import { fetchKeyGrantsAfter, fetchSyncDiagnostics, health, type ServerSyncDiagnostics, type SyncEvent } from "./api.ts";
+import { fetchKeyGrantsAfter, fetchKeyring, fetchSyncDiagnostics, health, type ServerSyncDiagnostics, type SyncEvent } from "./api.ts";
 import { getBrowserSyncStatus, getCursor, getProjectionCursor, type BrowserSyncStatus } from "./sync.ts";
 import { getStoredDeviceIdentity, loadCryptoRecord } from "./deviceKeys.ts";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "./buildInfo.ts";
 import { decryptMessage, receiveKeyGrants, type Decryption } from "./messageCrypto.ts";
 
-const EVENT_TYPES = ["MESSAGE_CREATED", "MESSAGE_UPDATED", "KEY_GRANT", "CONTACTS_KEY_GRANT", "CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"];
+const EVENT_TYPES = ["MESSAGE_CREATED", "MESSAGE_UPDATED", "KEY_GRANT", "CONTACTS_KEY_GRANT", "KEYRING_ENTRY", "HISTORY_KEY_GRANT", "CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"];
 
 export interface WebDiagnosticReport {
   collectedAt: number;
@@ -14,7 +14,7 @@ export interface WebDiagnosticReport {
   indexedDb: { total: number; byType: Record<string, number>; byCryptoVersion: Record<string, number>; nullAggregateCount: number; distinctMessageAggregateCount: number; conversationRows: number; contactRows: number };
   crypto: { browserIdentity: boolean; verifiedPrimary: boolean; primaryMatchesBrowser: boolean; messages: DecryptionCounts; keyGrants: DecryptionCounts };
   projection: { cursor: number; lag: number; rawMessageAggregates: number; rows: number; readyRows: number; lockedRows: number; failure: "PROJECTION_DIVERGENCE" | null };
-  contacts: { grants: number; snapshots: number; changed: number; stored: number; grantCrypto: DecryptionCounts; payloadCrypto: DecryptionCounts; failure: "CONTACTS_NO_GRANT" | "CONTACTS_DECRYPT_FAILED" | "CONTACTS_PROJECTION_EMPTY" | null };
+  contacts: { grants: number; snapshots: number; changed: number; stored: number; grantCrypto: DecryptionCounts; payloadCrypto: DecryptionCounts; failure: "CONTACTS_NO_GRANT" | "CONTACTS_KEY_UNAVAILABLE" | "CONTACTS_DECRYPT_FAILED" | "CONTACTS_PROJECTION_EMPTY" | null };
   selectedThread?: { aggregateHash: string; rawEvents: number; messageCreated: number; messageUpdated: number; keyGrantRelated: number; decrypted: number; locked: number; invalid: number; state: string; firstPageDurationMs: number | null; lastPageError: string | null };
   overall: "PASS" | "SYNCING" | "WARN" | "FAIL";
 }
@@ -42,7 +42,9 @@ export function countDecryptions(values: Array<Decryption | undefined>): Decrypt
   for (const value of values) {
     if (!value) continue;
     if (value.state === "decrypted") result.decrypted += 1;
-    else if (value.state === "key-grant" && value.reason === "Authorized epoch key stored") result.accepted += 1;
+    else if (value.state === "key-grant" &&
+      (value.reason === "Authorized epoch key stored" || value.reason === "Authorized account key stored" ||
+       value.reason === "Authorized history key stored")) result.accepted += 1;
     else {
       if (value.state === "invalid") result.invalid += 1;
       else if (value.state === "locked") result.locked += 1;
@@ -60,8 +62,9 @@ export function detectProjectionFailure(rawAggregates: number, projectionRows: n
 
 export function detectContactsFailure(eventCounts: Record<string, number>, payloadCrypto: DecryptionCounts, stored: number): WebDiagnosticReport["contacts"]["failure"] {
   const payloads = (eventCounts.CONTACTS_SNAPSHOT || 0) + (eventCounts.CONTACTS_CHANGED || 0);
-  if (payloads > 0 && !eventCounts.CONTACTS_KEY_GRANT) return "CONTACTS_NO_GRANT";
-  if (payloadCrypto.locked > 0 || payloadCrypto.invalid > 0) return "CONTACTS_DECRYPT_FAILED";
+  if (payloads > 0 && !eventCounts.CONTACTS_KEY_GRANT && !eventCounts.KEYRING_ENTRY) return "CONTACTS_NO_GRANT";
+  if (payloadCrypto.invalid > 0) return "CONTACTS_DECRYPT_FAILED";
+  if (payloadCrypto.locked > 0) return "CONTACTS_KEY_UNAVAILABLE";
   if (payloads > 0 && stored === 0) return "CONTACTS_PROJECTION_EMPTY";
   return null;
 }
@@ -127,12 +130,12 @@ async function localCounts() {
     rawEvents.sort((a, b) => a.sequence - b.sequence);
     const grantStates = new Map<number, Decryption>();
     const grants = rawEvents.filter(event => event.cryptoVersion > 0 &&
-      (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT"));
+      (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT" || event.type === "KEYRING_ENTRY" || event.type === "HISTORY_KEY_GRANT"));
     const grantResults = await receiveKeyGrants(grants);
     grants.forEach((event, index) => grantStates.set(event.sequence, grantResults[index]));
     const payloadStates = new Map<number, Decryption>();
     for (const event of rawEvents) {
-      if (event.cryptoVersion > 0 && event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT")
+      if (event.cryptoVersion > 0 && event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT" && event.type !== "KEYRING_ENTRY" && event.type !== "HISTORY_KEY_GRANT")
         payloadStates.set(event.sequence, await decryptMessage(event));
     }
     const statesFor = (types: string[], grants = false) => rawEvents
@@ -148,7 +151,7 @@ async function localCounts() {
       readyRows: projections.filter(row => row.decodeState === "ready").length,
       lockedRows: projections.filter(row => row.decodeState === "locked").length,
       messageCrypto: countDecryptions(statesFor(["MESSAGE_CREATED", "MESSAGE_UPDATED"])),
-      keyGrantCrypto: countDecryptions(statesFor(["KEY_GRANT"], true)),
+      keyGrantCrypto: countDecryptions(statesFor(["KEY_GRANT", "KEYRING_ENTRY", "HISTORY_KEY_GRANT"], true)),
       contactGrantCrypto: countDecryptions(statesFor(["CONTACTS_KEY_GRANT"], true)),
       contactPayloadCrypto: countDecryptions(statesFor(["CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"])),
     };
@@ -186,7 +189,10 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     localCounts(), getStoredDeviceIdentity(),
     loadCryptoRecord<{ deviceId: string; encryptionPublicKey: string }>("verified-primary").catch(() => null),
     navigator.serviceWorker?.getRegistration().catch(() => undefined),
-    fetchKeyGrantsAfter(0, 20).then(page => receiveKeyGrants(page.events)).catch(() => []),
+    Promise.all([
+      fetchKeyring().then(page => page.events),
+      fetchKeyGrantsAfter(0, 20).then(page => page.events),
+    ]).then(pages => receiveKeyGrants(pages.flat())).catch(() => []),
   ]);
   const runtime = getBrowserSyncStatus();
   const projectionLag = Math.max(0, cursor - projectionCursor);
@@ -232,7 +238,7 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     aggregateHash: await shortHash(selected.aggregateId), rawEvents: selected.events.length,
     messageCreated: selected.events.filter(event => event.type === "MESSAGE_CREATED").length,
     messageUpdated: selected.events.filter(event => event.type === "MESSAGE_UPDATED").length,
-    keyGrantRelated: selected.events.filter(event => event.type === "KEY_GRANT").length,
+    keyGrantRelated: selected.events.filter(event => event.type === "KEY_GRANT" || event.type === "KEYRING_ENTRY" || event.type === "HISTORY_KEY_GRANT").length,
     decrypted: selected.events.filter(event => event.cryptoVersion === 0 || event.decryption?.state === "decrypted").length,
     locked: selected.events.filter(event => event.decryption?.state === "locked").length,
     invalid: selected.events.filter(event => event.decryption?.state === "invalid").length,
@@ -259,12 +265,13 @@ export function formatWebDiagnostics(report: WebDiagnosticReport): string {
     `Projection lag             ${report.projection.lag}`,
     `Raw MESSAGE_CREATED        ${type("MESSAGE_CREATED")}`,
     `Raw KEY_GRANT              ${type("KEY_GRANT")}`,
+    `Raw HISTORY_KEY_GRANT      ${type("HISTORY_KEY_GRANT")}`,
     `Message decrypted          ${report.crypto.messages.decrypted}`,
     `Message locked             ${report.crypto.messages.locked}`,
     `Message invalid            ${report.crypto.messages.invalid}`,
     ...reasons("Message reason", report.crypto.messages.reasons),
-    `KEY_GRANT accepted         ${report.crypto.keyGrants.accepted}`,
-    ...reasons("KEY_GRANT reason", report.crypto.keyGrants.reasons),
+    `Key grants accepted        ${report.crypto.keyGrants.accepted}`,
+    ...reasons("Key grant reason", report.crypto.keyGrants.reasons),
     `Raw message aggregates     ${report.projection.rawMessageAggregates}`,
     `Conversation rows          ${report.projection.rows}`,
     `Contacts grants            ${report.contacts.grants}`,

@@ -115,6 +115,7 @@ const deviceKeyStore = new DeviceKeyStore({
 // GMweb relays Android-signed trust statements and owns the durable command
 // store. Account v1: a single-account deployment — the dashboard operator IS
 // the account (account_id constant until passkey auth lands in Phase 4).
+require("node:fs").mkdirSync(path.join(config.rootDir, "data"), { recursive: true });
 const controlDb = new (require("better-sqlite3"))(path.join(config.rootDir, "data", "control-plane.db"));
 const { DeviceTelemetryStore } = require("./deviceTelemetry");
 const deviceTelemetryStore = new DeviceTelemetryStore(controlDb);
@@ -705,6 +706,7 @@ function requireToken(request, reply, done) {
           p === "/api/v1/sse" ||
           p === "/api/v1/linked-device/sync-diagnostics" ||
           p === "/api/v1/linked-device/key-grants" ||
+          p === "/api/v1/linked-device/keyring" ||
           p === "/api/v1/linked-session" ||
           p.startsWith("/api/v1/trust/"))) ||
       (caps.includes("READ_MESSAGES") && request.method === "GET" &&

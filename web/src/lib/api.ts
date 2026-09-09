@@ -54,6 +54,12 @@ export async function fetchKeyGrantsAfter(cursor: number, limit = 1000): Promise
   return jsonOrThrow<SyncPage>(res);
 }
 
+/** Browser-bound v2 capability keys and v3 history key, outside the message cursor. */
+export async function fetchKeyring(limit = 1000): Promise<SyncPage> {
+  const res = await fetch(`${API}/linked-device/keyring?limit=${limit}`, { credentials: "include" });
+  return jsonOrThrow<SyncPage>(res);
+}
+
 /** §58 command status poll — used for optimistic outgoing bubbles. */
 export async function fetchCommand(id: string): Promise<CommandView | null> {
   const res = await fetch(`${API}/commands/${encodeURIComponent(id)}`, { credentials: "include" });

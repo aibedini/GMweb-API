@@ -8,7 +8,7 @@
  * without touching storage or UI.
  */
 
-import { fetchEventsAfter, fetchKeyGrantsAfter, type SyncEvent } from "./api.ts";
+import { fetchEventsAfter, fetchKeyGrantsAfter, fetchKeyring, type SyncEvent } from "./api.ts";
 import { receiveKeyGrant, receiveKeyGrants, decryptMessage, type Decryption } from "./messageCrypto.ts";
 import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
 import { getOrCreateDeviceKeys } from "./deviceKeys.ts";
@@ -24,6 +24,7 @@ const STORE_CONVERSATIONS = "conversations";
 const PROJECTION_VERSION_KEY = "conversation_projection_version";
 export const PROJECTION_CURSOR_KEY = "conversation_projection_cursor";
 const KEY_GRANT_CURSOR_PREFIX = "key_grant_bootstrap_v2_cursor:";
+const KEYRING_CURSOR_PREFIX = "account_keyring_v2_cursor:";
 
 export type BrowserSyncState = "INITIALIZING" | "FIRST_PAINT_READY" | "SYNCING_HISTORY" |
   "UP_TO_DATE" | "DEGRADED" | "FAILED";
@@ -218,10 +219,13 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
         page.events.some(ev => !Number.isSafeInteger(ev.sequence) || ev.sequence <= cursor || ev.sequence > page.nextCursor)) {
       throw new Error("Invalid sync page: non-advancing cursor or event sequence");
     }
-    await receiveKeyGrants(page.events.filter(event => event.cryptoVersion === 1 &&
-      (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")));
+    await receiveKeyGrants(page.events.filter(event =>
+      (event.cryptoVersion === 1 && (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")) ||
+      (event.cryptoVersion === 2 && event.type === "KEYRING_ENTRY") ||
+      (event.cryptoVersion === 3 && event.type === "HISTORY_KEY_GRANT")));
     for (const event of page.events) {
-      if (event.cryptoVersion === 1 && (event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
+      if ((event.cryptoVersion === 1 || event.cryptoVersion === 2) &&
+          (event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
         const decoded = await decryptMessage(event);
         if (decoded.state === "decrypted") await applyContacts(decoded.payload);
       }
@@ -261,7 +265,7 @@ export interface StoredEvent extends SyncEvent { decryption?: Decryption }
 async function decryptForDisplay(events: SyncEvent[]): Promise<StoredEvent[]> {
   const result: StoredEvent[] = [];
   for (const event of events) {
-    if (event.cryptoVersion > 0) result.push({ ...event, decryption: (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")
+    if (event.cryptoVersion > 0) result.push({ ...event, decryption: (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT" || event.type === "KEYRING_ENTRY" || event.type === "HISTORY_KEY_GRANT")
       ? await receiveKeyGrant(event) : await decryptMessage(event) });
     else result.push(event);
   }
@@ -498,7 +502,30 @@ async function repairContactsFromLocalEvents(db: IDBDatabase): Promise<void> {
  */
 async function bootstrapKeyGrants(): Promise<void> {
   const db = await openDb();
-  const cursorKey = `${KEY_GRANT_CURSOR_PREFIX}${(await getOrCreateDeviceKeys()).deviceId}`;
+  const deviceId = (await getOrCreateDeviceKeys()).deviceId;
+  const keyring = await fetchKeyring();
+  if (keyring.hasMore || keyring.events.some(event =>
+    !((event.type === "KEYRING_ENTRY" && event.cryptoVersion === 2) ||
+      (event.type === "HISTORY_KEY_GRANT" && event.cryptoVersion === 3)))) {
+    throw new Error("Invalid or oversized account keyring");
+  }
+  const keyringCursorKey = `${KEYRING_CURSOR_PREFIX}${deviceId}`;
+  const previousKeyringCursor = await metaNumber(db, keyringCursorKey);
+  if (keyring.nextCursor > previousKeyringCursor) {
+    const keyringResults = await receiveKeyGrants(keyring.events);
+    const rejectedKey = keyringResults.find(result => result.state !== "key-grant" ||
+      (result.reason !== "Authorized account key stored" &&
+       result.reason !== "Authorized history key stored"));
+    if (rejectedKey) throw new Error(`Account keyring failed: ${"reason" in rejectedKey ? rejectedKey.reason : "unexpected result"}`);
+
+    const aggregateIds = (await requestToPromise(db.transaction(STORE_CONVERSATIONS, "readonly")
+      .objectStore(STORE_CONVERSATIONS).getAllKeys())).filter((key): key is string => typeof key === "string");
+    await refreshConversationProjectionsInDb(db, aggregateIds);
+    await repairContactsFromLocalEvents(db);
+    await setMetaNumber(keyringCursorKey, keyring.nextCursor);
+  }
+
+  const cursorKey = `${KEY_GRANT_CURSOR_PREFIX}${deviceId}`;
   let cursor = await metaNumber(db, cursorKey);
   const acceptedAggregates = new Set<string>();
   let contactsGrantAccepted = false;

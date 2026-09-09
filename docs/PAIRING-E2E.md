@@ -38,9 +38,9 @@ Google Messages Web unpaired throughout the matrix.
 | challenge_signature | Browser proof succeeds for that session and its local key |
 | linked_cookie | Secure/HttpOnly cookie exists; `/api/v1/linked-session` authenticates |
 | sync | `/api/v1/sync` succeeds against Android event storage while Chrome is unpaired |
-| encrypted_history | Real historical messages arrive as v1 ciphertext and decrypt into readable thread bubbles |
-| full_history_grant | Newly approved Full history browser decrypts earlier epochs using only new KEY_GRANT records |
-| from_now_on_denied | A separate clean From now on browser cannot decrypt pre-approval v1 history, including later backfilled rows |
+| encrypted_history | Real historical messages arrive as v3 ciphertext and decrypt into readable thread bubbles |
+| full_history_grant | A newly approved Full history browser decrypts ordinary history with one origin-bound `HISTORY_KEY_GRANT` |
+| from_now_on_denied | A separate clean From now on browser cannot use the history wrap and only receives post-approval live keys |
 | browser_reload | Refresh remains linked and opens Inbox |
 | server_restart | Restart only the API process while preserving control-plane SQLite |
 | still_linked | Same browser cookie authenticates and sync succeeds after restart |

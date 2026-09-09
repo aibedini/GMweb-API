@@ -64,6 +64,9 @@ class EventStore {
       CREATE INDEX IF NOT EXISTS idx_events_grant_target
         ON sync_events(account_id, json_extract(CAST(ciphertext AS TEXT), '$.deviceId'), sequence)
         WHERE event_type IN ('KEY_GRANT', 'CONTACTS_KEY_GRANT') AND json_valid(CAST(ciphertext AS TEXT));
+      CREATE INDEX IF NOT EXISTS idx_events_key_target_v3
+        ON sync_events(account_id, json_extract(CAST(ciphertext AS TEXT), '$.deviceId'), sequence)
+        WHERE event_type IN ('KEYRING_ENTRY', 'HISTORY_KEY_GRANT') AND json_valid(CAST(ciphertext AS TEXT));
     `);
     this.counterStmt = db.prepare(
       `INSERT INTO event_counters (account_id, next_sequence) VALUES (?, 1)
@@ -94,6 +97,16 @@ class EventStore {
               crypto_version AS cryptoVersion, created_at AS createdAt
        FROM sync_events
        WHERE account_id = ? AND sequence > ? AND event_type IN ('KEY_GRANT', 'CONTACTS_KEY_GRANT')
+         AND json_valid(CAST(ciphertext AS TEXT))
+         AND json_extract(CAST(ciphertext AS TEXT), '$.deviceId') = ?
+       ORDER BY sequence ASC LIMIT ?`
+    );
+    this.deviceKeyringStmt = db.prepare(
+      `SELECT sequence, event_uuid AS eventId, event_type AS type, aggregate_id AS aggregateId,
+              source_device_id AS sourceDeviceId, ciphertext, encoding, schema_version AS schemaVersion,
+              crypto_version AS cryptoVersion, created_at AS createdAt
+       FROM sync_events
+       WHERE account_id = ? AND event_type IN ('KEYRING_ENTRY', 'HISTORY_KEY_GRANT')
          AND json_valid(CAST(ciphertext AS TEXT))
          AND json_extract(CAST(ciphertext AS TEXT), '$.deviceId') = ?
        ORDER BY sequence ASC LIMIT ?`
@@ -189,6 +202,13 @@ class EventStore {
     const capped = Math.max(1, Math.min(1000, Number(limit) || 1000));
     const rows = this.deviceGrantsAfterStmt.all(accountId, Number(afterSequence) || 0, deviceId, capped + 1);
     return eventPage(rows, afterSequence, capped);
+  }
+
+  /** Browser-bound v2/v3 keys; independent of the message sync cursor. */
+  deviceKeyring(accountId, deviceId, limit = 1000) {
+    const capped = Math.max(1, Math.min(1000, Number(limit) || 1000));
+    const rows = this.deviceKeyringStmt.all(accountId, deviceId, capped + 1);
+    return eventPage(rows, 0, capped);
   }
 
   count(accountId) {

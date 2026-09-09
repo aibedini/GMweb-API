@@ -310,4 +310,33 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.ok(page.events.every(event => typeof event.ciphertext === "string"));
     assert.ok(page.events.every(event => JSON.parse(Buffer.from(event.ciphertext, "base64")).deviceId === "web-device"));
   });
+
+  test("linked key bootstrap returns only this browser's v2/v3 keys", async () => {
+    const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/keyring" });
+    assert.equal(denied.statusCode, 403);
+    await app.inject({
+      method: "POST", url: "/api/v1/agent/events/batch",
+      payload: { events: [
+        { eventId: `keyring-${Date.now()}`, type: "KEYRING_ENTRY", conversationId: "__account_keyring__",
+          payload: Buffer.from(JSON.stringify({ deviceId: "web-device", keyId: "messages" })).toString("base64"), cryptoVersion: 2 },
+        { eventId: `other-keyring-${Date.now()}`, type: "KEYRING_ENTRY", conversationId: "__account_keyring__",
+          payload: Buffer.from(JSON.stringify({ deviceId: "other-device", keyId: "messages" })).toString("base64"), cryptoVersion: 2 },
+        { eventId: `history-${Date.now()}`, type: "HISTORY_KEY_GRANT", conversationId: "__history_master__",
+          payload: Buffer.from(JSON.stringify({ deviceId: "web-device", keyId: "history" })).toString("base64"),
+          encoding: "envelope.v3", cryptoVersion: 3 },
+      ] },
+    });
+    const response = await app.inject({
+      method: "GET", url: "/api/v1/linked-device/keyring?limit=1000",
+      headers: { "x-test-linked": "web-device" },
+    });
+    assert.equal(response.statusCode, 200);
+    const page = response.json();
+    assert.equal(page.hasMore, false);
+    assert.ok(page.events.length > 0);
+    assert.ok(page.events.every(event =>
+      (event.type === "KEYRING_ENTRY" && event.cryptoVersion === 2) ||
+      (event.type === "HISTORY_KEY_GRANT" && event.cryptoVersion === 3)));
+    assert.ok(page.events.every(event => JSON.parse(Buffer.from(event.ciphertext, "base64")).deviceId === "web-device"));
+  });
 });
