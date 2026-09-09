@@ -107,7 +107,9 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       }
     }
   }, async (request, reply) => {
-    const snap = trustRegistry.getSnapshot(accountId);
+    const primary = agentAuthService?.getPrimaryIdentity?.();
+    const snap = trustRegistry.getSnapshot(accountId) ||
+      trustRegistry.getStatementSnapshot(accountId, primary?.trust_root_public_key);
     if (!snap) { reply.code(404).send({ error: "no_trust_snapshot" }); return; }
     return snap;
   });

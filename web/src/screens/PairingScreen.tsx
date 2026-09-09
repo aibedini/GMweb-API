@@ -4,6 +4,7 @@ import { Button, Card, Chip } from "@heroui/react";
 import { beginPairing, type PairingHandle, type PairingProgress } from "../lib/pairing";
 import { loginWithPwaToken } from "../lib/adminAccess";
 import { wipeDeviceKeys } from "../lib/deviceKeys";
+import { resetLocal } from "../lib/sync";
 
 export interface LinkContext {
   pairingSessionId: string;
@@ -65,7 +66,15 @@ export function PairingScreen({
       if (attempt !== attemptRef.current) { h.cancel(); return; }
       setHandle(h);
       setSecondsLeft(Math.max(0, Math.round((h.qr.expiresAt - Date.now()) / 1000)));
-      setQrDataUrl(await QRCode.toDataURL(JSON.stringify(h.qr), { width: 240, margin: 1 }));
+      // The Android app resolves this one-time code to the authenticated full
+      // transcript. Keeping public keys out of the optical payload makes the
+      // QR low-density and reliable on laptop displays and phone cameras.
+      const compactQr = `GMWEB:PAIR:1:${h.pairingCode}`;
+      setQrDataUrl(await QRCode.toDataURL(compactQr, {
+        width: 336,
+        margin: 4,
+        errorCorrectionLevel: "M",
+      }));
       void h.wait().then(async (link) => {
         if (attempt !== attemptRef.current) return;
         setHandle(null); // Approval verified: QR expiry must not cancel cookie establishment.
@@ -167,14 +176,14 @@ export function PairingScreen({
             </div>
           )}
 
-          {compatible && qrDataUrl && <img src={qrDataUrl} alt="Pairing QR code" width={240} height={240} />}
+          {compatible && qrDataUrl && <img src={qrDataUrl} alt="Pairing QR code" width={336} height={336} />}
           {compatible && <Button variant="ghost" onPress={() => {
             ++attemptRef.current;
             handle?.cancel();
             setHandle(null);
             setQrDataUrl(null);
             startedRef.current = false;
-            void wipeDeviceKeys().then(start).catch(cause => setError(String(cause)));
+            void Promise.all([wipeDeviceKeys(), resetLocal()]).then(start).catch(cause => setError(String(cause)));
           }}>Reset browser identity and pair again</Button>}
 
           {compatible && !qrDataUrl && !error && (

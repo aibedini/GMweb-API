@@ -76,6 +76,21 @@ describe("TrustRegistry relay", () => {
     assert.equal(reg.getSnapshot("acc1").trustSequence, 5);
   });
 
+  test("materializes current state from Android-signed statements", () => {
+    const reg = new TrustRegistry(new Database(":memory:"));
+    assert.equal(reg.getStatementSnapshot("acc1", "ROOTPUB"), null);
+    reg.applyStatement({ accountId: "acc1", statement: stmt(1, "DEVICE_APPROVED") });
+    let snap = reg.getStatementSnapshot("acc1", "ROOTPUB");
+    assert.equal(snap.trustSequence, 1);
+    assert.equal(snap.rootPublicKey, "ROOTPUB");
+    assert.equal(snap.snapshot.source, "ANDROID_SIGNED_STATEMENTS");
+    assert.equal(snap.snapshot.devices.length, 1);
+    reg.applyStatement({ accountId: "acc1", statement: stmt(2, "DEVICE_REVOKED") });
+    snap = reg.getStatementSnapshot("acc1", "ROOTPUB");
+    assert.equal(snap.trustSequence, 2);
+    assert.equal(snap.snapshot.devices.length, 0);
+  });
+
   test("cursor pagination returns only statements after the cursor", () => {
     const reg = new TrustRegistry(new Database(":memory:"));
     for (let i = 1; i <= 5; i++) {

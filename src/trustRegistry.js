@@ -133,6 +133,38 @@ class TrustRegistry {
     };
   }
 
+  /**
+   * Materialize the current registry from the Android-signed statement log.
+   * This keeps old installations useful when they predate snapshot uploads;
+   * each included certificate/transition retains its Android root signature.
+   */
+  getStatementSnapshot(accountId, rootPublicKey) {
+    const rows = this.listStmt.all(accountId, 0);
+    if (!rootPublicKey || rows.length === 0) return null;
+    const devices = new Map();
+    for (const row of rows) {
+      let statement;
+      try { statement = JSON.parse(row.payload); } catch { continue; }
+      if (!statement.deviceId) continue;
+      if (statement.operation === "DEVICE_REVOKED") devices.delete(statement.deviceId);
+      else if (["DEVICE_APPROVED", "DEVICE_CAPABILITIES_CHANGED", "DEVICE_KEY_ROTATED"].includes(statement.operation)) {
+        devices.set(statement.deviceId, statement);
+      }
+    }
+    const trustSequence = Number(rows.at(-1)?.trust_sequence) || 0;
+    return {
+      accountId,
+      trustSequence,
+      rootPublicKey: String(rootPublicKey),
+      snapshot: {
+        version: 1,
+        source: "ANDROID_SIGNED_STATEMENTS",
+        devices: [...devices.values()],
+      },
+      updatedAt: Number(rows.at(-1)?.created_at) || Date.now(),
+    };
+  }
+
   /** Statements after a cursor (clients verify each rootSignature locally). */
   statementsAfter(accountId, afterSequence) {
     return this.listStmt.all(accountId, Number(afterSequence) || 0).map((r) => ({

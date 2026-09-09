@@ -16,7 +16,7 @@
 
 const DB_NAME = "gmweb-pairing";
 const STORE = "device-keys";
-const KEY_VERSION = 1;
+const KEY_VERSION = 2;
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -86,6 +86,8 @@ async function loadOrCreateDeviceKeys(): Promise<DeviceKeys> {
   if (existing) {
     if (!existing.signingPrivateKey || !existing.encryptionPrivateKey ||
         existing.signingPrivateKey.extractable || existing.encryptionPrivateKey.extractable ||
+        !existing.signingPrivateKey.usages.includes("sign") ||
+        !existing.encryptionPrivateKey.usages.includes("deriveBits") ||
         existing.keyVersion !== KEY_VERSION) throw new Error("Stored device keys are invalid; reset and pair again");
     return existing;
   }
@@ -129,7 +131,10 @@ export async function hasDurableKeys(): Promise<boolean> {
   try {
     const db = await openDb();
     const existing = await idbGet<DeviceKeys>(db, "primary");
-    return Boolean(existing?.signingPrivateKey && existing.keyVersion === KEY_VERSION);
+    return Boolean(existing?.signingPrivateKey && existing?.encryptionPrivateKey &&
+      existing.signingPrivateKey.usages.includes("sign") &&
+      existing.encryptionPrivateKey.usages.includes("deriveBits") &&
+      existing.keyVersion === KEY_VERSION);
   } catch {
     return false;
   }
@@ -150,12 +155,16 @@ export async function getStoredDeviceIdentity(): Promise<{ deviceId: string; enc
 export async function wipeDeviceKeys(): Promise<void> {
   await loadingKeys?.catch(() => {});
   const db = await openDb();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).delete("primary");
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error("IndexedDB delete failed"));
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      // A browser identity is one unit: private keys, pinned Android root and
+      // wrapped content keys must never survive independently across reset.
+      tx.objectStore(STORE).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB clear failed"));
+    });
+  } finally { db.close(); }
 }
 
 export async function saveCryptoRecord(key: string, value: unknown): Promise<void> {

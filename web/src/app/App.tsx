@@ -4,7 +4,7 @@ import { syncNow, listRecentEvents, listAggregateEventsPage, listContacts, listC
 import { messagesForAggregate, type ConversationProjection } from "../lib/inbox";
 import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchSyncDiagnostics, fetchTrustSnapshot, health, type DeviceTelemetry, type ServerSyncDiagnostics, type TrustSnapshot } from "../lib/api";
 import { encryptCommand } from "../lib/commandCrypto";
-import { listCredentials, removeCredential, listAgentIdentities, listPushSubscriptions, type CredentialRow, type IdentityRow } from "../lib/security";
+import { listCredentials, removeCredential, listPushSubscriptions, type CredentialRow } from "../lib/security";
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
@@ -64,7 +64,6 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [credentials, setCredentials] = useState<CredentialRow[] | null>(null);
-  const [identities, setIdentities] = useState<IdentityRow[] | null>(null);
   const [pushCount, setPushCount] = useState<number | null>(null);
   const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
   const [contacts, setContacts] = useState<StoredContact[]>([]);
@@ -113,13 +112,11 @@ export default function App() {
   };
 
   const refreshSecurity = async () => {
-    const [nextCredentials, nextIdentities, pushes] = await Promise.all([
+    const [nextCredentials, pushes] = await Promise.all([
       listCredentials().catch(() => null),
-      listAgentIdentities().catch(() => null),
       listPushSubscriptions().catch(() => null),
     ]);
     setCredentials(nextCredentials);
-    setIdentities(nextIdentities);
     setPushCount(pushes?.count ?? null);
   };
 
@@ -390,16 +387,6 @@ export default function App() {
         </TabList>
 
         <TabPanel id="inbox" className="inbox-panel">
-          {authed && syncStatus.state !== "INITIALIZING" && trust === null && (
-            <div className="notice" role="status">
-              <span>
-                <strong>Android trust snapshot is not published yet.</strong>{" "}
-                This linked session is active. Encrypted content unlocks as Android-signed key grants arrive;
-                open Connection or Debug to follow that progress.
-              </span>
-              <Button size="sm" variant="ghost" onPress={() => setTab("connection")}>Connection status</Button>
-            </div>
-          )}
           <div className={`notice ${syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED" ? "danger" : ""}`} role="status">
             <span>{syncBanner}</span>
             {(syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED") &&
@@ -489,7 +476,7 @@ export default function App() {
             <Card><CardContent className="status-card"><span>API</span><strong>{version}</strong><Chip size="sm" color={version === "unreachable" ? "danger" : "success"} variant="soft">{version === "unreachable" ? "offline" : "healthy"}</Chip></CardContent></Card>
             <Card><CardContent className="status-card"><span>PWA build</span><strong>{PWA_BUILD_VERSION}</strong><small>{scriptFile}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Sync cursor</span><strong>{cursor}</strong><small>{applied === null ? "Ready" : `${applied} new event(s)`}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Trust sequence</span><strong>{trust?.trustSequence ?? "—"}</strong><small>{trust ? "Android trust root present" : "Not published"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Trust sequence</span><strong>{trust?.trustSequence ?? "—"}</strong><small>{trust ? "Android-signed registry available" : "Waiting for first Android trust statement"}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Payload protection</span><strong>{events.some(event => event.decryption?.state === "decrypted") ? "E2EE locally decrypted" : events.length ? "See payload diagnostics" : "No payloads received"}</strong><small>Encrypted messages require an authorized key grant. Missing keys stay locked; failed authentication is reported as corrupt.</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Linked session</span><strong>Authenticated</strong><small>Latest stored sequence: {events[0]?.sequence ?? 0}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Android battery</span><strong>{telemetry?.battery?.level == null ? "—" : `${telemetry.battery.level}%${telemetry.battery.isCharging ? " · charging" : ""}`}</strong><small>{telemetry?.device ? `${telemetry.device.manufacturer} ${telemetry.device.model}` : "Waiting for telemetry"}</small></CardContent></Card>
@@ -506,7 +493,7 @@ export default function App() {
           <div className="security-list">
             <Card><CardContent className="security-row"><div><strong>Message encryption</strong><p>{events.filter(event => event.decryption?.state === "decrypted").length} recent decrypted · {events.filter(event => event.decryption?.state === "locked").length} recent locked · {events.filter(event => event.decryption?.state === "invalid").length} recent invalid</p><p>Open Debug for full local aggregate counts. Key grants come from your primary phone.</p></div></CardContent></Card>
             <Card><CardContent className="security-row"><div><strong>Passkeys</strong><p>{credentials === null ? "Dashboard authentication required" : `${credentials.length} enrolled credential(s)`}</p></div>{credentials?.map((credential) => <Button key={credential.credentialId} size="sm" variant="ghost" onPress={() => void removeCredential(credential.credentialId).then(refreshSecurity)}>Remove {credential.label || shortId(credential.credentialId)}</Button>)}</CardContent></Card>
-            <Card><CardContent className="security-row"><div><strong>Android identities</strong><p>{identities === null ? "Unavailable" : `${identities.length} registered device(s)`}</p></div><Chip size="sm" variant="soft">{identities?.length ?? 0}</Chip></CardContent></Card>
+            <Card><CardContent className="security-row"><div><strong>Android trust registry</strong><p>{trust ? `Verified root published at sequence ${trust.trustSequence}` : "Waiting for the primary phone's first signed trust statement"}</p></div><Chip size="sm" variant="soft">{trust ? "Ready" : "Pending"}</Chip></CardContent></Card>
             <Card><CardContent className="security-row"><div><strong>Private push</strong><p>Notifications contain no sender or message text.</p></div><Chip size="sm" variant="soft">{pushCount ?? 0} subscription(s)</Chip></CardContent></Card>
           </div>
         </TabPanel>
