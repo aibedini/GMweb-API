@@ -1,4 +1,4 @@
-## GMweb 0.16.1 / Messages 2.9.1: E2EE contacts, composer and unified inbox
+## GMweb 0.16.3 / Messages 2.9.1: observable and recoverable E2EE inbox
 
 Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use
 `POST /api/v1/primary-enrollment`, with operational-key and trust-root proofs.

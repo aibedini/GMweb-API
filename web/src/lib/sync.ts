@@ -21,6 +21,38 @@ const CURSOR_KEY = "sync_cursor";
 /** Derived read-model store (PWA projection). Raw events stay the truth. */
 const STORE_CONVERSATIONS = "conversations";
 const PROJECTION_VERSION_KEY = "conversation_projection_version";
+export const PROJECTION_CURSOR_KEY = "conversation_projection_cursor";
+
+export type BrowserSyncState = "INITIALIZING" | "FIRST_PAINT_READY" | "SYNCING_HISTORY" |
+  "UP_TO_DATE" | "DEGRADED" | "FAILED";
+export interface BrowserSyncStatus {
+  state: BrowserSyncState;
+  lastSuccessfulSyncAt: number | null;
+  lastPageCount: number;
+  appliedThisRun: number;
+  lastErrorPhase: string | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+}
+let syncStatus: BrowserSyncStatus = {
+  state: "INITIALIZING",
+  lastSuccessfulSyncAt: null,
+  lastPageCount: 0,
+  appliedThisRun: 0,
+  lastErrorPhase: null,
+  lastErrorCode: null,
+  lastErrorMessage: null,
+};
+export function getBrowserSyncStatus(): BrowserSyncStatus { return { ...syncStatus }; }
+function updateSyncStatus(change: Partial<BrowserSyncStatus>) { syncStatus = { ...syncStatus, ...change }; }
+function syncFailure(phase: string, cause: unknown, fatal: boolean) {
+  updateSyncStatus({
+    state: fatal ? "FAILED" : "DEGRADED",
+    lastErrorPhase: phase,
+    lastErrorCode: cause instanceof DOMException ? cause.name : "SYNC_ERROR",
+    lastErrorMessage: cause instanceof Error ? cause.message : String(cause),
+  });
+}
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -54,11 +86,12 @@ function openDb(): Promise<IDBDatabase> {
       const db = req.result;
       try {
         await ensureConversationProjectionRebuilt(db);
+        await repairConversationProjectionGap(db);
       } catch (e) {
-        // Projection is a derived cache — a rebuild failure must never break
-        // sync; rows rebuild lazily the next time their aggregate changes.
-        // eslint-disable-next-line no-console
-        console.warn("conversation_projection_rebuild_failed", e);
+        db.close();
+        dbPromise = null;
+        reject(e);
+        return;
       }
       resolve(db);
     };
@@ -86,6 +119,13 @@ export async function getCursor(): Promise<number> {
   return v ?? 0;
 }
 
+export async function getProjectionCursor(): Promise<number> {
+  const v = await tx([STORE_META], "readonly", (t) =>
+    t.objectStore(STORE_META).get(PROJECTION_CURSOR_KEY) as IDBRequest<number | undefined>,
+  );
+  return v ?? 0;
+}
+
 /** §43: apply pages transactionally until the server says hasMore=false. */
 let runningSync: Promise<number> | null = null;
 function serializeSync(run: () => Promise<number>): Promise<number> {
@@ -96,7 +136,18 @@ function serializeSync(run: () => Promise<number>): Promise<number> {
 }
 
 export function syncNow(onProgress?: (applied: number) => void): Promise<number> {
-  return serializeSync(() => drainSync(undefined, onProgress));
+  updateSyncStatus({ state: "SYNCING_HISTORY", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
+  return serializeSync(async () => {
+    try {
+      await repairConversationProjection();
+      const result = await drainSync(undefined, onProgress);
+      updateSyncStatus({ state: "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
+      return result.applied;
+    } catch (cause) {
+      syncFailure("SYNC", cause, false);
+      throw cause;
+    }
+  });
 }
 
 /**
@@ -105,7 +156,20 @@ export function syncNow(onProgress?: (applied: number) => void): Promise<number>
  * catching up in the background via syncUntilCaughtUp() / SSE invalidations.
  */
 export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): Promise<number> {
-  return serializeSync(() => drainSync(maxPages, onProgress));
+  updateSyncStatus({ state: "INITIALIZING", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
+  return serializeSync(async () => {
+    try {
+      const result = await drainSync(maxPages, onProgress);
+      updateSyncStatus({
+        state: result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY",
+        lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied,
+      });
+      return result.applied;
+    } catch (cause) {
+      syncFailure("INITIAL_SYNC", cause, true);
+      throw cause;
+    }
+  });
 }
 
 /** Catch-up synonym of syncNow() kept for call-site readability. */
@@ -113,12 +177,15 @@ export function syncUntilCaughtUp(onProgress?: (applied: number) => void): Promi
   return syncNow(onProgress);
 }
 
-async function drainSync(maxPages?: number, onProgress?: (applied: number) => void): Promise<number> {
+interface DrainResult { applied: number; lastPageCount: number; caughtUp: boolean }
+async function drainSync(maxPages?: number, onProgress?: (applied: number) => void): Promise<DrainResult> {
   let cursor = await getCursor();
   let applied = 0;
   let pages = 0;
+  let lastPageCount = 0;
   for (;;) {
     const page = await fetchEventsAfter(cursor);
+    lastPageCount = page.events.length;
     // Observability (Phase 2) — browser console trace of each sync page.
     try {
       let incoming = 0;
@@ -133,7 +200,7 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
     } catch {
       /* best-effort diagnostics only */
     }
-    if (page.events.length === 0) break;
+    if (page.events.length === 0) return { applied, lastPageCount, caughtUp: true };
     if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor ||
         page.events.some(ev => !Number.isSafeInteger(ev.sequence) || ev.sequence <= cursor || ev.sequence > page.nextCursor)) {
       throw new Error("Invalid sync page: non-advancing cursor or event sequence");
@@ -167,14 +234,14 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
       .map((ev) => ev.aggregateId)
       .filter((id): id is string => typeof id === "string" && id.length > 0))];
     await refreshConversationProjections(changedAggregates);
+    await setMetaNumber(PROJECTION_CURSOR_KEY, page.nextCursor);
     applied += page.events.length;
     cursor = page.nextCursor;
     onProgress?.(applied);
     pages += 1;
-    if (!page.hasMore) break;
-    if (maxPages !== undefined && pages >= maxPages) break;
+    if (!page.hasMore) return { applied, lastPageCount, caughtUp: true };
+    if (maxPages !== undefined && pages >= maxPages) return { applied, lastPageCount, caughtUp: false };
   }
-  return applied;
 }
 
 export interface StoredEvent extends SyncEvent { decryption?: Decryption }
@@ -215,8 +282,6 @@ export async function listAggregateEventsPage(
 ): Promise<AggregatePage> {
   const limit = Math.max(1, Math.min(500, options.limit ?? 200));
   const db = await openDb();
-  const index = db.transaction(STORE_EVENTS, "readonly")
-    .objectStore(STORE_EVENTS).index("by_aggregate_sequence");
   const range = options.beforeSequence === undefined
     ? IDBKeyRange.bound([aggregateId, -Infinity], [aggregateId, Infinity])
     : IDBKeyRange.upperBound([aggregateId, options.beforeSequence], true);
@@ -224,6 +289,7 @@ export async function listAggregateEventsPage(
   let hasMore = false;
   await new Promise<void>((resolve, reject) => {
     const t = db.transaction(STORE_EVENTS, "readonly");
+    const index = t.objectStore(STORE_EVENTS).index("by_aggregate_sequence");
     const req = index.openCursor(range, "prev");
     req.onsuccess = () => {
       const cursor = req.result;
@@ -236,6 +302,7 @@ export async function listAggregateEventsPage(
       }
     };
     t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error ?? new Error("Aggregate paging aborted"));
     req.onerror = () => reject(req.error);
   });
@@ -341,12 +408,71 @@ function txDone(transaction: IDBTransaction): Promise<void> {
   });
 }
 
-async function eventsForAggregate(aggregateId: string): Promise<StoredEvent[]> {
+function metaNumber(db: IDBDatabase, key: string): Promise<number> {
+  return requestToPromise(db.transaction(STORE_META, "readonly").objectStore(STORE_META).get(key))
+    .then(value => typeof value === "number" && Number.isSafeInteger(value) ? value : 0);
+}
+
+async function setMetaNumber(key: string, value: number): Promise<void> {
   const db = await openDb();
-  const req = db.transaction(STORE_EVENTS, "readonly")
-    .objectStore(STORE_EVENTS).index("by_aggregate").getAll(aggregateId) as IDBRequest<SyncEvent[]>;
-  const rows = await requestToPromise(req);
-  return decryptForDisplay(rows);
+  const transaction = db.transaction(STORE_META, "readwrite");
+  transaction.objectStore(STORE_META).put(value, key);
+  await txDone(transaction);
+}
+
+async function contactsFromDb(db: IDBDatabase): Promise<StoredContact[]> {
+  return await requestToPromise(db.transaction(STORE_CONTACTS, "readonly")
+    .objectStore(STORE_CONTACTS).getAll()) as StoredContact[];
+}
+
+async function aggregateIdsInSequenceRange(db: IDBDatabase, after: number, through: number): Promise<string[]> {
+  if (through <= after) return [];
+  const ids = new Set<string>();
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(STORE_EVENTS, "readonly");
+    const req = transaction.objectStore(STORE_EVENTS).openCursor(IDBKeyRange.bound(after, through, true, false));
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      const id = (cursor.value as SyncEvent).aggregateId;
+      if (typeof id === "string" && id.length > 0) ids.add(id);
+      cursor.continue();
+    };
+    req.onerror = () => reject(req.error);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error ?? new Error("Projection repair scan aborted"));
+  });
+  return [...ids];
+}
+
+async function refreshConversationProjectionsInDb(db: IDBDatabase, aggregateIds: string[]): Promise<void> {
+  const contactMap = new Map((await contactsFromDb(db)).map(contact => [contact.normalizedPhone, contact.displayName]));
+  for (const aggregateId of aggregateIds) {
+    const rows = await requestToPromise(db.transaction(STORE_EVENTS, "readonly")
+      .objectStore(STORE_EVENTS).index("by_aggregate").getAll(aggregateId)) as SyncEvent[];
+    const row = conversationProjectionFromEvents(await decryptForDisplay(rows), aggregateId, contactMap);
+    const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
+    if (row) transaction.objectStore(STORE_CONVERSATIONS).put(row);
+    else transaction.objectStore(STORE_CONVERSATIONS).delete(aggregateId);
+    await txDone(transaction);
+  }
+}
+
+async function repairConversationProjectionGap(db: IDBDatabase): Promise<void> {
+  const [cursor, projectionCursor] = await Promise.all([
+    metaNumber(db, CURSOR_KEY), metaNumber(db, PROJECTION_CURSOR_KEY),
+  ]);
+  if (projectionCursor >= cursor) return;
+  const ids = await aggregateIdsInSequenceRange(db, projectionCursor, cursor);
+  await refreshConversationProjectionsInDb(db, ids);
+  const transaction = db.transaction(STORE_META, "readwrite");
+  transaction.objectStore(STORE_META).put(cursor, PROJECTION_CURSOR_KEY);
+  await txDone(transaction);
+}
+
+export async function repairConversationProjection(): Promise<void> {
+  await repairConversationProjectionGap(await openDb());
 }
 
 /**
@@ -357,17 +483,7 @@ async function eventsForAggregate(aggregateId: string): Promise<StoredEvent[]> {
 export async function refreshConversationProjections(aggregateIds: string[]): Promise<void> {
   const unique = [...new Set(aggregateIds.filter((id): id is string => typeof id === "string" && id.length > 0))];
   if (unique.length === 0) return;
-  const contactMap = new Map((await listContacts()).map((contact) => [contact.normalizedPhone, contact.displayName]));
-  for (const aggregateId of unique) {
-    const events = await eventsForAggregate(aggregateId);
-    const row = conversationProjectionFromEvents(events, aggregateId, contactMap);
-    const db = await openDb();
-    const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
-    const store = transaction.objectStore(STORE_CONVERSATIONS);
-    if (row) store.put(row);
-    else store.delete(aggregateId);
-    await txDone(transaction);
-  }
+  await refreshConversationProjectionsInDb(await openDb(), unique);
 }
 
 export interface ConversationPage {
@@ -434,12 +550,7 @@ async function ensureConversationProjectionRebuilt(db: IDBDatabase): Promise<voi
   const keys = await requestToPromise(keyReq);
   const ids = [...new Set(keys.filter((k): k is string => typeof k === "string" && k.length > 0))];
 
-  // Do not call listContacts() while openDb() is still resolving: listContacts()
-  // enters openDb() again and would wait on this very projection rebuild.
-  const contactsReq = db.transaction(STORE_CONTACTS, "readonly")
-    .objectStore(STORE_CONTACTS).getAll() as IDBRequest<StoredContact[]>;
-  const contactMap = new Map((await requestToPromise(contactsReq))
-    .map((contact) => [contact.normalizedPhone, contact.displayName]));
+  const contactMap = new Map((await contactsFromDb(db)).map((contact) => [contact.normalizedPhone, contact.displayName]));
 
   for (let offset = 0; offset < ids.length; offset += 50) {
     for (const aggregateId of ids.slice(offset, offset + 50)) {
@@ -454,8 +565,10 @@ async function ensureConversationProjectionRebuilt(db: IDBDatabase): Promise<voi
       await txDone(transaction);
     }
   }
+  const rebuiltThrough = await metaNumber(db, CURSOR_KEY);
   const metaTx = db.transaction(STORE_META, "readwrite");
   metaTx.objectStore(STORE_META).put(1, PROJECTION_VERSION_KEY);
+  metaTx.objectStore(STORE_META).put(rebuiltThrough, PROJECTION_CURSOR_KEY);
   await txDone(metaTx);
 }
 
@@ -488,7 +601,11 @@ export async function resetLocal(): Promise<void> {
  *
  * Returns a disposer (for React effects / StrictMode double-mount).
  */
-export function subscribeSyncAvailable(onSynced: (applied: number) => void, onRevoked: () => void): () => void {
+export function subscribeSyncAvailable(
+  onSynced: (applied: number) => void,
+  onRevoked: () => void,
+  onSyncError?: (cause: unknown) => void,
+): () => void {
   let closed = false;
   let es: EventSource | null = null;
   let connecting: ReturnType<typeof setTimeout> | null = null;
@@ -512,8 +629,9 @@ export function subscribeSyncAvailable(onSynced: (applied: number) => void, onRe
             .then((applied) => {
               if (applied > 0) onSynced(applied);
             })
-            .catch(() => {
-              /* cursor sync retries on the next signal or manual pull */
+            .catch((cause) => {
+              syncFailure("SSE_SYNC", cause, false);
+              onSyncError?.(cause);
             });
         }
       } catch {

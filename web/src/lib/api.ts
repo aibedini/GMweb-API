@@ -109,3 +109,17 @@ export async function fetchPrimaryTelemetry(): Promise<DeviceTelemetry | null> {
   const res = await fetch(`${API}/linked-device/telemetry`, { credentials: "include" });
   return (await jsonOrThrow<{ telemetry: DeviceTelemetry | null }>(res)).telemetry;
 }
+
+export interface ServerSyncDiagnostics {
+  total: number;
+  maxSequence: number;
+  countsByType: Array<{ type: string; count: number }>;
+  countsByCryptoVersion: Array<{ cryptoVersion: number; count: number }>;
+  distinctAggregateCount: number;
+  nullAggregateCount: number;
+}
+
+export async function fetchSyncDiagnostics(): Promise<ServerSyncDiagnostics> {
+  const res = await fetch(`${API}/linked-device/sync-diagnostics`, { credentials: "include" });
+  return jsonOrThrow<ServerSyncDiagnostics>(res);
+}

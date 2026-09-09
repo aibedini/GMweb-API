@@ -1,16 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Card, CardContent, Chip, ScrollShadow, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
-import { syncNow, listRecentEvents, listInboxEvents, listAggregateEventsPage, listContacts, listConversations, getCursor, resetLocal, subscribeSyncAvailable, syncStep, syncUntilCaughtUp, type StoredContact, type StoredEvent } from "../lib/sync";
-import { messagesForAggregate, eventDecodeState, type ConversationProjection } from "../lib/inbox";
-import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type TrustSnapshot } from "../lib/api";
+import { syncNow, listRecentEvents, listAggregateEventsPage, listContacts, listConversations, getCursor, getBrowserSyncStatus, resetLocal, subscribeSyncAvailable, syncStep, syncUntilCaughtUp, type BrowserSyncStatus, type StoredContact, type StoredEvent } from "../lib/sync";
+import { messagesForAggregate, type ConversationProjection } from "../lib/inbox";
+import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchSyncDiagnostics, fetchTrustSnapshot, health, type DeviceTelemetry, type ServerSyncDiagnostics, type TrustSnapshot } from "../lib/api";
 import { encryptCommand } from "../lib/commandCrypto";
 import { listCredentials, removeCredential, listAgentIdentities, listPushSubscriptions, type CredentialRow, type IdentityRow } from "../lib/security";
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
-import { fetchPairingDiagnostics, type PairingDiagnostic } from "../lib/adminAccess";
+import { collectWebDiagnostics, formatWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnostics";
 
 type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug";
+type ThreadState = "IDLE" | "LOADING" | "READY" | "LOCKED" | "EMPTY" | "FAILED";
 
 function shortId(value: string | null | undefined) {
   return value ? `${value.slice(0, 8)}…` : "—";
@@ -43,7 +44,6 @@ export default function App() {
   const [threadNext, setThreadNext] = useState<number | undefined>();
   const [threadHasMore, setThreadHasMore] = useState(false);
   const [loadingOlderThread, setLoadingOlderThread] = useState(false);
-  const [inboxEvents, setInboxEvents] = useState<StoredEvent[]>([]);
   const [cursor, setCursor] = useState(0);
   const [busy, setBusy] = useState(false);
   const [applied, setApplied] = useState<number | null>(null);
@@ -53,12 +53,19 @@ export default function App() {
   const [online, setOnline] = useState(navigator.onLine);
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [bootstrapState, setBootstrapState] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<BrowserSyncStatus>(getBrowserSyncStatus());
+  const [serverStats, setServerStats] = useState<ServerSyncDiagnostics | null>(null);
+  const [threadState, setThreadState] = useState<ThreadState>("IDLE");
+  const [threadFirstPageMs, setThreadFirstPageMs] = useState<number | null>(null);
+  const [threadError, setThreadError] = useState<string | null>(null);
+  const [threadReload, setThreadReload] = useState(0);
+  const [webDiagnostics, setWebDiagnostics] = useState<WebDiagnosticReport | null>(null);
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [credentials, setCredentials] = useState<CredentialRow[] | null>(null);
   const [identities, setIdentities] = useState<IdentityRow[] | null>(null);
   const [pushCount, setPushCount] = useState<number | null>(null);
-  const [pairingDiagnostics, setPairingDiagnostics] = useState<PairingDiagnostic[] | null>(null);
   const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
   const [contacts, setContacts] = useState<StoredContact[]>([]);
   const [contactSearch, setContactSearch] = useState("");
@@ -77,11 +84,14 @@ export default function App() {
   const scriptFile = useMemo(() => loadedScriptFile(), []);
 
   const refresh = async () => {
-    const [nextCursor, nextEvents, nextTrust, nextInbox, nextContacts] = await Promise.all([getCursor(), listRecentEvents(500), fetchTrustSnapshot(), listInboxEvents(), listContacts()]);
+    const [nextCursor, nextEvents, nextTrust, nextContacts, nextServerStats] = await Promise.all([
+      getCursor(), listRecentEvents(500), fetchTrustSnapshot(), listContacts(), fetchSyncDiagnostics().catch(() => null),
+    ]);
     setCursor(nextCursor);
     setEvents(nextEvents);
-    setInboxEvents(nextInbox);
     setTrust(nextTrust);
+    setServerStats(nextServerStats);
+    setSyncStatus(getBrowserSyncStatus());
     const page = await listConversations({ limit: 100 });
     setConversationPage(page.items);
     setConversationHasMore(page.hasMore);
@@ -127,28 +137,42 @@ export default function App() {
     void syncStep(2)
       .then(refresh)
       .then(() => {
-        setBootstrapState("READY");
-        // First paint is up: pull the remaining history in the background.
-        void syncUntilCaughtUp().then(() => refresh()).catch(() => {});
+        setBootstrapState("FIRST_PAINT_READY");
+        setSyncStatus(getBrowserSyncStatus());
+        if (getBrowserSyncStatus().state === "UP_TO_DATE") return;
+        void syncUntilCaughtUp()
+          .then(refresh)
+          .then(() => {
+            setBootstrapState("UP_TO_DATE");
+            setSyncStatus(getBrowserSyncStatus());
+          })
+          .catch(cause => {
+            setBootstrapState("DEGRADED");
+            setSyncStatus(getBrowserSyncStatus());
+            setError(cause instanceof Error ? cause.message : String(cause));
+          });
       })
       .catch(cause => {
-        setBootstrapState("SYNC_FAILED");
+        setBootstrapState("FAILED");
+        setSyncStatus(getBrowserSyncStatus());
         setError(cause instanceof Error ? cause.message : String(cause));
       });
     void refreshSecurity();
     const refreshTelemetry = () => void fetchPrimaryTelemetry().then(setTelemetry).catch(() => setTelemetry(null));
     refreshTelemetry();
     const telemetryTimer = window.setInterval(refreshTelemetry, 60_000);
-    void fetchPairingDiagnostics().then(setPairingDiagnostics).catch(() => setPairingDiagnostics(null));
     const unsubscribe = subscribeSyncAvailable((count) => {
       setApplied(count);
+      setSyncStatus(getBrowserSyncStatus());
       void refresh();
     }, () => {
       setAuthed(false);
       setEvents([]);
-      setInboxEvents([]);
       setSelected(null);
       void resetLocal();
+    }, cause => {
+      setSyncStatus(getBrowserSyncStatus());
+      setError(cause instanceof Error ? cause.message : String(cause));
     });
     return () => { window.clearInterval(telemetryTimer); unsubscribe(); };
   }, [authed]);
@@ -183,15 +207,35 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     setThreadEvents([]);
-    if (selected && authed) void listAggregateEventsPage(selected, { limit: 200 }).then(page => {
-      if (!cancelled) {
-        setThreadEvents(page.items);
-        setThreadHasMore(page.hasMore);
-        setThreadNext(page.next);
-      }
-    }).catch(cause => { if (!cancelled) setError(String(cause)); });
+    setThreadError(null);
+    if (!selected || !authed) {
+      setThreadState("IDLE");
+      return () => { cancelled = true; };
+    }
+    setThreadState("LOADING");
+    const startedAt = performance.now();
+    void listAggregateEventsPage(selected, { limit: 200 }).then(page => {
+      if (cancelled) return;
+      setThreadFirstPageMs(Math.round(performance.now() - startedAt));
+      setThreadEvents(page.items);
+      setThreadHasMore(page.hasMore);
+      setThreadNext(page.next);
+      const rawMessages = page.items.filter(event => event.type === "MESSAGE_CREATED" || event.type === "MESSAGE_UPDATED");
+      const readable = messagesForAggregate(page.items, selected);
+      if (readable.length > 0) setThreadState("READY");
+      else if (rawMessages.some(event => event.decryption?.state === "locked")) setThreadState("LOCKED");
+      else if (rawMessages.some(event => event.decryption?.state === "invalid")) {
+        setThreadState("FAILED");
+        setThreadError("Message decryption failed");
+      } else setThreadState("EMPTY");
+    }).catch(cause => {
+      if (cancelled) return;
+      setThreadFirstPageMs(Math.round(performance.now() - startedAt));
+      setThreadState("FAILED");
+      setThreadError(cause instanceof Error ? cause.message : String(cause));
+    });
     return () => { cancelled = true; };
-  }, [selected, events, authed]);
+  }, [selected, events, authed, threadReload]);
   const loadOlderThread = async () => {
     if (!selected || threadNext === undefined || loadingOlderThread) return;
     setLoadingOlderThread(true);
@@ -200,6 +244,8 @@ export default function App() {
       setThreadEvents(prev => [...prev, ...page.items]);
       setThreadHasMore(page.hasMore);
       setThreadNext(page.next);
+    } catch (cause) {
+      setThreadError(cause instanceof Error ? cause.message : String(cause));
     } finally { setLoadingOlderThread(false); }
   };
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
@@ -259,10 +305,39 @@ export default function App() {
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+      setSyncStatus(getBrowserSyncStatus());
     } finally {
       setBusy(false);
     }
   };
+
+  const runDiagnostics = async () => {
+    setDiagnosticsBusy(true);
+    try {
+      setWebDiagnostics(await collectWebDiagnostics(selected ? {
+        aggregateId: selected,
+        events: threadEvents,
+        state: threadState,
+        firstPageDurationMs: threadFirstPageMs,
+        lastPageError: threadError,
+      } : undefined));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setDiagnosticsBusy(false);
+    }
+  };
+
+  const serverTypeCount = (type: string) =>
+    serverStats?.countsByType.find(row => row.type === type)?.count ?? 0;
+  let syncBanner = `Syncing message history… ${syncStatus.appliedThisRun} event(s) applied`;
+  if (serverStats) syncBanner = `Syncing message history… cursor ${cursor} / ${serverStats.maxSequence}`;
+  if (syncStatus.state === "UP_TO_DATE") syncBanner = "Messages are up to date";
+  if (syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED") syncBanner = `Sync paused after sequence ${cursor}`;
+  let emptyInboxMessage = "Browser has not downloaded message history.";
+  if (serverStats && serverTypeCount("MESSAGE_CREATED") === 0) emptyInboxMessage = "No message events have reached GMweb yet.";
+  else if (cursor > 0 && events.some(event => event.decryption?.state === "locked")) emptyInboxMessage = "Messages downloaded but are waiting for keys.";
+  else if (cursor > 0) emptyInboxMessage = "Conversation projection is being repaired.";
 
   if (authed === false || authed === null) {
     return (
@@ -313,7 +388,7 @@ export default function App() {
         </TabList>
 
         <TabPanel id="inbox" className="inbox-panel">
-          {authed && bootstrapState === "READY" && trust === null && (
+          {authed && syncStatus.state !== "INITIALIZING" && trust === null && (
             <div className="notice" role="status">
               <span>
                 <strong>No linked device approved yet.</strong>{" "}
@@ -324,6 +399,11 @@ export default function App() {
               <Button size="sm" variant="ghost" onPress={() => setTab("connection")}>Connection status</Button>
             </div>
           )}
+          <div className={`notice ${syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED" ? "danger" : ""}`} role="status">
+            <span>{syncBanner}</span>
+            {(syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED") &&
+              <Button size="sm" variant="ghost" onPress={() => void pull()}>Retry</Button>}
+          </div>
           <div className="inbox-layout">
             <aside className="conversation-pane">
               <div className="pane-heading"><div><p className="eyebrow">Inbox</p><h1>Conversations</h1></div><Chip size="sm" variant="soft">{conversations.length}</Chip></div>
@@ -336,7 +416,7 @@ export default function App() {
                     <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time>{item.unreadCount > 0 && <Chip size="sm">{item.unreadCount}</Chip>}</span>
                   </button>
                 ))}
-                {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : inboxEvents.some(event => event.decryption?.state === "locked") ? "Messages are locked. Check Security for key access." : "Waiting for messages from Android"}</p></div>}
+                {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : emptyInboxMessage}</p></div>}
               </ScrollShadow>
               {conversationHasMore && (
                 <Button size="sm" variant="ghost" className="load-older" onPress={() => void loadOlderConversations()} isDisabled={loadingOlder}>
@@ -366,9 +446,10 @@ export default function App() {
                         <div className="message-bubble"><p>{pendingMessage.body}</p><span>{formatTime(pendingMessage.at)} · {commandStatus || "queued"}</span></div>
                       </div>
                     )}
-                    {messages.length === 0 && (
-                      <div className="empty-conversation"><div className="empty-icon">↻</div><h3>No readable message body yet</h3><p>This thread only contains older status events. New Android message events appear here as normal chat bubbles.</p></div>
-                    )}
+                    {threadState === "LOADING" && <div className="empty-conversation"><Spinner /><h3>Loading messages…</h3></div>}
+                    {threadState === "LOCKED" && <div className="empty-conversation"><div className="empty-icon">↻</div><h3>Messages are encrypted</h3><p>The browser is waiting for an authorized key.</p></div>}
+                    {threadState === "EMPTY" && <div className="empty-conversation"><div className="empty-icon">✦</div><h3>No messages in this conversation.</h3></div>}
+                    {threadState === "FAILED" && <div className="empty-conversation"><div className="empty-icon">!</div><h3>Unable to load messages</h3><p>{threadError || "Thread page read failed"}</p><Button size="sm" onPress={() => setThreadReload(value => value + 1)}>Retry</Button></div>}
                   </ScrollShadow>
                   <div className="composer-disabled">
                     <input value={draft} onChange={event => setDraft(event.target.value)} placeholder={selectedRecipient ? "Text message" : "Choose a contact"} disabled={!selectedRecipient || !capabilities.includes("SEND_MESSAGES")} />
@@ -391,7 +472,13 @@ export default function App() {
             {filteredContacts.map(contact => (
               <button key={contact.normalizedPhone} type="button" onClick={() => { setComposeRecipient(contact.normalizedPhone); setSelected(null); setTab("inbox"); }}><Card><CardContent className="security-row"><div><strong>{contact.displayName}</strong><p>{contact.normalizedPhone}</p></div>{contact.starred && <Chip size="sm" variant="soft">Starred</Chip>}</CardContent></Card></button>
             ))}
-            {filteredContacts.length === 0 && <div className="empty-list"><span>✦</span><p>{contacts.length ? "No matching contacts" : "Waiting for encrypted contacts from Android"}</p></div>}
+            {filteredContacts.length === 0 && <div className="empty-list"><span>✦</span><p>{contacts.length
+              ? "No matching contacts"
+              : !capabilities.includes("CONTACTS_READ")
+                ? "Contacts access was not approved for this linked browser. Re-link or re-approve this browser."
+                : serverTypeCount("CONTACTS_SNAPSHOT") === 0 && serverTypeCount("CONTACTS_CHANGED") === 0
+                  ? "No encrypted contact events have reached GMweb yet."
+                  : "Contacts downloaded but are waiting for a key or projection."}</p></div>}
           </div>
         </TabPanel>
 
@@ -402,21 +489,21 @@ export default function App() {
             <Card><CardContent className="status-card"><span>PWA build</span><strong>{PWA_BUILD_VERSION}</strong><small>{scriptFile}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Sync cursor</span><strong>{cursor}</strong><small>{applied === null ? "Ready" : `${applied} new event(s)`}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Trust sequence</span><strong>{trust?.trustSequence ?? "—"}</strong><small>{trust ? "Android trust root present" : "Not published"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Payload protection</span><strong>{inboxEvents.some(event => event.decryption?.state === "decrypted") ? "E2EE locally decrypted" : events.length ? "See payload diagnostics" : "No payloads received"}</strong><small>Legacy v0 is plaintext. Encrypted messages require an authorized key grant. Missing keys stay locked; failed authentication is reported as corrupt.</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Payload protection</span><strong>{events.some(event => event.decryption?.state === "decrypted") ? "E2EE locally decrypted" : events.length ? "See payload diagnostics" : "No payloads received"}</strong><small>Encrypted messages require an authorized key grant. Missing keys stay locked; failed authentication is reported as corrupt.</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Linked session</span><strong>Authenticated</strong><small>Latest stored sequence: {events[0]?.sequence ?? 0}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Android battery</span><strong>{telemetry?.battery?.level == null ? "—" : `${telemetry.battery.level}%${telemetry.battery.isCharging ? " · charging" : ""}`}</strong><small>{telemetry?.device ? `${telemetry.device.manufacturer} ${telemetry.device.model}` : "Waiting for telemetry"}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Android outbox</span><strong>{telemetry?.sync?.outboxDepth ?? "—"}</strong><small>{telemetry?.sync?.deadLetterCount ? `${telemetry.sync.deadLetterCount} dead letter` : "No dead letters"}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Android network</span><strong>{telemetry?.network?.isConnected ? "Connected" : telemetry ? "Offline" : "—"}</strong><small>{telemetry?.network?.networkType || "Waiting for telemetry"}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Android app</span><strong>{telemetry?.app?.versionName || "—"}</strong><small>{telemetry?.receivedAt ? `Last report ${formatTime(telemetry.receivedAt)}` : "Never reported"}</small></CardContent></Card>
           </div>
-          {bootstrapState && bootstrapState !== "READY" && <div className="notice">Finishing secure session setup: {bootstrapState}</div>}
+          {bootstrapState && syncStatus.state !== "UP_TO_DATE" && <div className="notice">Secure session: {bootstrapState}</div>}
           {error && <div className="notice danger">{error}</div>}
         </TabPanel>
 
         <TabPanel id="security" className="content-panel">
           <div className="page-title"><p className="eyebrow">Protection</p><h1>Security</h1><p>Credentials and identities visible to this linked browser.</p></div>
           <div className="security-list">
-            <Card><CardContent className="security-row"><div><strong>Message encryption</strong><p>{inboxEvents.filter(event => event.decryption?.state === "decrypted").length} decrypted · {inboxEvents.filter(event => event.decryption?.state === "locked").length} locked · {inboxEvents.filter(event => event.decryption?.state === "invalid").length} invalid</p><p>Key grants come from your primary phone. Older browser identities may need Lock → Reset browser identity and pair again. Legacy plaintext cannot be protected retroactively.</p></div></CardContent></Card>
+            <Card><CardContent className="security-row"><div><strong>Message encryption</strong><p>{events.filter(event => event.decryption?.state === "decrypted").length} recent decrypted · {events.filter(event => event.decryption?.state === "locked").length} recent locked · {events.filter(event => event.decryption?.state === "invalid").length} recent invalid</p><p>Open Debug for full local aggregate counts. Key grants come from your primary phone.</p></div></CardContent></Card>
             <Card><CardContent className="security-row"><div><strong>Passkeys</strong><p>{credentials === null ? "Dashboard authentication required" : `${credentials.length} enrolled credential(s)`}</p></div>{credentials?.map((credential) => <Button key={credential.credentialId} size="sm" variant="ghost" onPress={() => void removeCredential(credential.credentialId).then(refreshSecurity)}>Remove {credential.label || shortId(credential.credentialId)}</Button>)}</CardContent></Card>
             <Card><CardContent className="security-row"><div><strong>Android identities</strong><p>{identities === null ? "Unavailable" : `${identities.length} registered device(s)`}</p></div><Chip size="sm" variant="soft">{identities?.length ?? 0}</Chip></CardContent></Card>
             <Card><CardContent className="security-row"><div><strong>Private push</strong><p>Notifications contain no sender or message text.</p></div><Chip size="sm" variant="soft">{pushCount ?? 0} subscription(s)</Chip></CardContent></Card>
@@ -424,11 +511,23 @@ export default function App() {
         </TabPanel>
 
         <TabPanel id="debug" className="content-panel">
-          <div className="page-title"><p className="eyebrow">Diagnostics</p><h1>Debug</h1><p>Raw protocol details live here instead of inside the Inbox.</p></div>
-          <div className="debug-actions"><Button variant="secondary" onPress={() => void pull()} isDisabled={busy}>Sync now</Button><Button variant="ghost" onPress={() => void resetLocal().then(refresh)}>Reset local ciphertext</Button></div>
-          <Card><CardContent className="security-row"><div><strong>Projection</strong><p>cursor {cursor} · sync {error ? "failed" : "HTTP 200"} · grants {events.filter(event => event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT").length} · contacts {contacts.length} · decrypt failures {events.filter(event => event.decryption?.state === "invalid").length}</p></div></CardContent></Card>
-          <Card><CardContent className="debug-list">{events.slice(0, 40).map((event) => <div key={event.sequence}><code>#{event.sequence}</code><span>{event.type}</span><Chip size="sm" variant="soft" color={eventDecodeState(event) === "Invalid/corrupt payload" ? "danger" : "warning"}>{eventDecodeState(event)}</Chip></div>)}</CardContent></Card>
-          <Card><CardContent className="debug-list">{pairingDiagnostics?.slice(0, 20).map((entry) => <div key={entry.id}><code>{entry.statusCode}</code><span>{entry.details?.pairing?.stage || entry.title}</span><small>{entry.details?.pairing?.reason || entry.path}</small></div>)}{pairingDiagnostics?.length === 0 && <p>No pairing diagnostics.</p>}</CardContent></Card>
+          <div className="page-title"><p className="eyebrow">Diagnostics</p><h1>Web message diagnostics</h1><p>Privacy-safe counts across server, browser storage, crypto and projection.</p></div>
+          <div className="debug-actions">
+            <Button variant="secondary" onPress={() => void runDiagnostics()} isDisabled={diagnosticsBusy}>{diagnosticsBusy ? "Collecting…" : "Run diagnostics"}</Button>
+            <Button variant="ghost" onPress={() => webDiagnostics && void navigator.clipboard.writeText(formatWebDiagnostics(webDiagnostics))} isDisabled={!webDiagnostics}>Copy diagnostic report</Button>
+            <Button variant="ghost" onPress={() => void pull()} isDisabled={busy}>Retry sync</Button>
+          </div>
+          {webDiagnostics && <div className="status-grid">
+            <Card><CardContent className="status-card"><span>Server</span><strong>{webDiagnostics.session.linked && webDiagnostics.server ? "PASS" : "FAIL"}</strong><small>{webDiagnostics.server?.total ?? "Unavailable"} events · max sequence {webDiagnostics.server?.maxSequence ?? "—"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Browser Sync</span><strong>{webDiagnostics.browserSync.state === "UP_TO_DATE" ? "PASS" : webDiagnostics.browserSync.state === "FAILED" ? "FAIL" : webDiagnostics.browserSync.state === "DEGRADED" ? "WARN" : "SYNCING"}</strong><small>cursor {webDiagnostics.browserSync.cursor} · lag {webDiagnostics.browserSync.syncLag ?? "unknown"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>IndexedDB</span><strong>PASS</strong><small>{webDiagnostics.indexedDb.total} raw events · {webDiagnostics.indexedDb.distinctMessageAggregateCount} message aggregates</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Crypto</span><strong>{webDiagnostics.crypto.messages.invalid ? "FAIL" : webDiagnostics.crypto.messages.locked ? "WARN" : "PASS"}</strong><small>{webDiagnostics.crypto.messages.decrypted} decrypted · {webDiagnostics.crypto.messages.locked} locked · {webDiagnostics.crypto.messages.invalid} invalid</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Projection</span><strong>{webDiagnostics.projection.failure ? "FAIL" : webDiagnostics.projection.lag ? "SYNCING" : "PASS"}</strong><small>{webDiagnostics.projection.failure || `${webDiagnostics.projection.rows} rows`} · cursor {webDiagnostics.projection.cursor} · lag {webDiagnostics.projection.lag}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Contacts</span><strong>{webDiagnostics.contacts.failure ? "WARN" : "PASS"}</strong><small>{webDiagnostics.contacts.failure || `${webDiagnostics.contacts.stored} rows`} · {webDiagnostics.contacts.grants} grants · {webDiagnostics.contacts.snapshots} snapshots</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Selected Thread</span><strong>{!webDiagnostics.selectedThread ? "PASS" : webDiagnostics.selectedThread.state === "FAILED" ? "FAIL" : webDiagnostics.selectedThread.state === "LOADING" ? "SYNCING" : webDiagnostics.selectedThread.state === "LOCKED" ? "WARN" : "PASS"}</strong><small>{webDiagnostics.selectedThread ? `${webDiagnostics.selectedThread.state} · ${webDiagnostics.selectedThread.decrypted} decrypted · ${webDiagnostics.selectedThread.locked} locked` : "Select a conversation"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Build / Service Worker</span><strong>{webDiagnostics.session.buildMismatch ? "BUILD_MISMATCH" : "PASS"}</strong><small>{webDiagnostics.session.pwaVersion} · {webDiagnostics.session.loadedScript} · {webDiagnostics.session.serviceWorker}</small></CardContent></Card>
+          </div>}
+          {webDiagnostics && <div className={`notice ${webDiagnostics.overall === "FAIL" ? "danger" : ""}`}>Overall: {webDiagnostics.overall}</div>}
         </TabPanel>
       </Tabs>
     </div>

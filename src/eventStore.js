@@ -210,6 +210,27 @@ class EventStore {
       sourceDevice: counts(sourceDeviceId),
     };
   }
+
+  /** Privacy-safe server truth for a READ_MESSAGES linked browser. */
+  syncDiagnostics(accountId) {
+    const scalar = (sql) => Number(this.db.prepare(sql).get(accountId)?.value || 0);
+    return {
+      total: scalar("SELECT COUNT(*) value FROM sync_events WHERE account_id = ?"),
+      maxSequence: scalar("SELECT COALESCE(MAX(sequence), 0) value FROM sync_events WHERE account_id = ?"),
+      countsByType: this.db.prepare(
+        "SELECT event_type type, COUNT(*) count FROM sync_events WHERE account_id = ? GROUP BY event_type ORDER BY event_type"
+      ).all(accountId).map(row => ({ type: String(row.type), count: Number(row.count) })),
+      countsByCryptoVersion: this.db.prepare(
+        "SELECT crypto_version cryptoVersion, COUNT(*) count FROM sync_events WHERE account_id = ? GROUP BY crypto_version ORDER BY crypto_version"
+      ).all(accountId).map(row => ({ cryptoVersion: Number(row.cryptoVersion), count: Number(row.count) })),
+      distinctAggregateCount: scalar(
+        "SELECT COUNT(DISTINCT aggregate_id) value FROM sync_events WHERE account_id = ? AND aggregate_id IS NOT NULL"
+      ),
+      nullAggregateCount: scalar(
+        "SELECT COUNT(*) value FROM sync_events WHERE account_id = ? AND aggregate_id IS NULL"
+      ),
+    };
+  }
 }
 
 module.exports = { EventStore };

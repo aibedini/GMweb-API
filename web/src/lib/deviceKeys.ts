@@ -135,6 +135,17 @@ export async function hasDurableKeys(): Promise<boolean> {
   }
 }
 
+/** Internal identity metadata; diagnostics expose only the resulting booleans. */
+export async function getStoredDeviceIdentity(): Promise<{ deviceId: string; encryptionPublicKeyB64: string } | null> {
+  try {
+    const db = await openDb();
+    try {
+      const existing = await idbGet<DeviceKeys>(db, "primary");
+      return existing ? { deviceId: existing.deviceId, encryptionPublicKeyB64: existing.encryptionPublicKeyB64 } : null;
+    } finally { db.close(); }
+  } catch { return null; }
+}
+
 /** Destroy local keys (≡ browser un-trusts itself; server revoke is separate). */
 export async function wipeDeviceKeys(): Promise<void> {
   await loadingKeys?.catch(() => {});

@@ -123,7 +123,7 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
   test("diagnostic stats expose only aggregate pipeline counts per account and source device", () => {
     const store = new EventStore(new Database(":memory:"));
     store.ingestBatch({ accountId: "account", sourceDeviceId: "phone-a", events: [
-      { eventId: "m1", type: "MESSAGE_CREATED", payload: Buffer.from("secret-a"), cryptoVersion: 1 },
+      { eventId: "m1", type: "MESSAGE_CREATED", conversationId: "thread-a", payload: Buffer.from("secret-a"), cryptoVersion: 1 },
       { eventId: "k1", type: "KEY_GRANT", payload: Buffer.from("secret-b"), cryptoVersion: 1 },
     ] });
     store.ingestBatch({ accountId: "account", sourceDeviceId: "phone-b", events: [
@@ -148,5 +148,17 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
       maxSequence: 2,
     });
     assert.equal(JSON.stringify(stats).includes("secret"), false);
+    const linked = store.syncDiagnostics("account");
+    assert.equal(linked.total, 3);
+    assert.equal(linked.maxSequence, 3);
+    assert.equal(linked.distinctAggregateCount, 1);
+    assert.equal(linked.nullAggregateCount, 2);
+    assert.deepEqual(linked.countsByType, [
+      { type: "KEY_GRANT", count: 1 },
+      { type: "MESSAGE_CREATED", count: 1 },
+      { type: "MESSAGE_UPDATED", count: 1 },
+    ]);
+    assert.equal(JSON.stringify(linked).includes("secret"), false);
+    assert.equal(JSON.stringify(linked).includes("thread-a"), false);
   });
 });

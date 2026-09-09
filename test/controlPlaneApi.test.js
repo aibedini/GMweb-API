@@ -269,4 +269,21 @@ describe("Phase 2 control plane HTTP API", () => {
       assert.ok(Buffer.from(ev.ciphertext, "base64").length > 0);
     }
   });
+
+  test("linked sync diagnostics require READ_MESSAGES and return counts only", async () => {
+    const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/sync-diagnostics" });
+    assert.equal(denied.statusCode, 403);
+    const response = await app.inject({
+      method: "GET", url: "/api/v1/linked-device/sync-diagnostics",
+      headers: { "x-test-linked": "web-device" },
+    });
+    assert.equal(response.statusCode, 200);
+    const body = response.json();
+    assert.ok(body.total > 0);
+    assert.ok(body.maxSequence > 0);
+    assert.ok(Array.isArray(body.countsByType));
+    assert.equal("ciphertext" in body, false);
+    assert.equal(JSON.stringify(body).includes("eventId"), false);
+    assert.equal(JSON.stringify(body).includes("aggregateId"), false);
+  });
 });

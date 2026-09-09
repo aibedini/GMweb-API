@@ -474,6 +474,19 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     const limit = Number(request.query?.limit) || 500;
     return eventStore.after(accountId, after, limit);
   });
+
+  app.get("/api/v1/linked-device/sync-diagnostics", {
+    schema: {
+      summary: "Privacy-safe E2EE sync pipeline counts for the linked browser",
+      tags: ["Diagnostics"],
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    if (!request.linkedDevice?.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "capability_denied" });
+    }
+    return eventStore.syncDiagnostics(accountId);
+  });
 }
 
 module.exports = { registerControlPlaneRoutes };
