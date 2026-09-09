@@ -112,6 +112,26 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     assert.equal(result.accepted.length, 3);
     assert.deepEqual(store.after("contacts", 0, 10).events.map(event => event.type),
       ["CONTACTS_SNAPSHOT", "CONTACTS_CHANGED", "CONTACTS_KEY_GRANT"]);
+    assert.deepEqual(store.grantsAfter("contacts", 0, 10).events.map(event => event.type),
+      ["CONTACTS_KEY_GRANT"]);
+  });
+
+  test("grant bootstrap pages skip message traffic without advancing the raw sync cursor", () => {
+    const store = new EventStore(new Database(":memory:"));
+    store.ingestBatch({ accountId: "grants", sourceDeviceId: "phone", events: [
+      { eventId: "m1", type: "MESSAGE_CREATED", conversationId: "a", payload: Buffer.from("m") },
+      { eventId: "g1", type: "KEY_GRANT", conversationId: "a", payload: Buffer.from("g1"), cryptoVersion: 1 },
+      { eventId: "m2", type: "MESSAGE_CREATED", conversationId: "b", payload: Buffer.from("m") },
+      { eventId: "g2", type: "CONTACTS_KEY_GRANT", conversationId: "contacts", payload: Buffer.from("g2"), cryptoVersion: 1 },
+    ] });
+    const first = store.grantsAfter("grants", 0, 1);
+    assert.deepEqual(first.events.map(event => [event.sequence, event.type]), [[2, "KEY_GRANT"]]);
+    assert.equal(first.nextCursor, 2);
+    assert.equal(first.hasMore, true);
+    const second = store.grantsAfter("grants", first.nextCursor, 1);
+    assert.deepEqual(second.events.map(event => [event.sequence, event.type]), [[4, "CONTACTS_KEY_GRANT"]]);
+    assert.equal(second.hasMore, false);
+    assert.equal(store.after("grants", 0, 1).events[0].sequence, 1);
   });
 
   test("empty batch is a no-op", () => {

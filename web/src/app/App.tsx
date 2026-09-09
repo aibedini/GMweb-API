@@ -391,10 +391,9 @@ export default function App() {
           {authed && syncStatus.state !== "INITIALIZING" && trust === null && (
             <div className="notice" role="status">
               <span>
-                <strong>No linked device approved yet.</strong>{" "}
-                Encrypted history sync starts only after your Android phone approves this browser.
-                Open <b>Messages → Settings → Linked devices</b>, tap <b>Link new device</b>, and scan
-                the QR code shown there. Until then this page stays empty — this is not a sync error.
+                <strong>Android trust snapshot is not published yet.</strong>{" "}
+                This linked session is active. Encrypted content unlocks as Android-signed key grants arrive;
+                open Connection or Debug to follow that progress.
               </span>
               <Button size="sm" variant="ghost" onPress={() => setTab("connection")}>Connection status</Button>
             </div>

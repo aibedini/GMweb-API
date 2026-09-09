@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.16.3",
+    "version": "0.16.4",
     "contact": {
       "name": "GMweb API"
     }
@@ -1936,6 +1936,50 @@
         "summary": "Privacy-safe E2EE sync pipeline counts for the linked browser",
         "tags": [
           "Diagnostics"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/linked-device/key-grants": {
+      "get": {
+        "summary": "Bootstrap opaque key grants before a linked browser replays message history",
+        "tags": [
+          "Sync"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            },
+            "in": "query",
+            "name": "after",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 1000
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false
+          }
         ],
         "responses": {
           "200": {

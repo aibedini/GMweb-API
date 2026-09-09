@@ -286,4 +286,24 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.equal(JSON.stringify(body).includes("eventId"), false);
     assert.equal(JSON.stringify(body).includes("aggregateId"), false);
   });
+
+  test("linked key bootstrap returns only opaque grants and requires READ_MESSAGES", async () => {
+    const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/key-grants?after=0" });
+    assert.equal(denied.statusCode, 403);
+    await app.inject({
+      method: "POST", url: "/api/v1/agent/events/batch",
+      payload: { events: [
+        { eventId: `grant-${Date.now()}`, type: "KEY_GRANT", conversationId: "thread", payload: Buffer.from("opaque-grant").toString("base64"), cryptoVersion: 1 },
+      ] },
+    });
+    const response = await app.inject({
+      method: "GET", url: "/api/v1/linked-device/key-grants?after=0&limit=1000",
+      headers: { "x-test-linked": "web-device" },
+    });
+    assert.equal(response.statusCode, 200);
+    const page = response.json();
+    assert.ok(page.events.length > 0);
+    assert.ok(page.events.every(event => event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT"));
+    assert.ok(page.events.every(event => typeof event.ciphertext === "string"));
+  });
 });

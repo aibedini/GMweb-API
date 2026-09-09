@@ -487,6 +487,26 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     }
     return eventStore.syncDiagnostics(accountId);
   });
+
+  app.get("/api/v1/linked-device/key-grants", {
+    schema: {
+      summary: "Bootstrap opaque key grants before a linked browser replays message history",
+      tags: ["Sync"],
+      querystring: {
+        type: "object",
+        properties: {
+          after: { type: "integer", minimum: 0, default: 0 },
+          limit: { type: "integer", minimum: 1, maximum: 1000, default: 1000 },
+        },
+      },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    if (!request.linkedDevice?.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "capability_denied" });
+    }
+    return eventStore.grantsAfter(accountId, Number(request.query?.after) || 0, Number(request.query?.limit) || 1000);
+  });
 }
 
 module.exports = { registerControlPlaneRoutes };

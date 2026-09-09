@@ -7,6 +7,7 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
   global.IDBKeyRange = IDBKeyRange;
   const originalFetch = global.fetch;
   let requests = 0;
+  let grantRequests = 0;
   const rows = Array.from({ length: 1200 }, (_, i) => ({
     sequence: i + 1,
     eventId: `e${i}`,
@@ -19,6 +20,10 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
     ciphertext: '',
   }));
   global.fetch = async url => {
+    if (String(url).includes('/linked-device/key-grants')) {
+      grantRequests++;
+      return Response.json({ events: [], nextCursor: 0, hasMore: false });
+    }
     requests++;
     const after = Number(new URL(url, 'https://example.test').searchParams.get('after'));
     const events = rows.filter(row => row.sequence > after).slice(0, 500);
@@ -32,6 +37,7 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
     assert.equal(first, sync.syncNow(), 'concurrent callers share one drain');
     assert.equal(await first, 1200);
     assert.equal(requests, 3);
+    assert.equal(grantRequests, 1);
     const latest = await sync.listRecentEvents(500);
     assert.deepEqual(latest.map(row => row.sequence), Array.from({ length: 500 }, (_, i) => 1200 - i));
     assert.equal(await sync.getCursor(), 1200);
@@ -50,11 +56,13 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
       'more than 500 status/grant events must not displace message-bearing threads');
     assert.deepEqual(await sync.listRecentEvents(0), []);
     await assert.rejects(sync.listRecentEvents(-1), RangeError);
-    global.fetch = async () => Response.json({ events: [{ sequence: 1201 }], nextCursor: 1199, hasMore: false });
+    global.fetch = async url => String(url).includes('/linked-device/key-grants')
+      ? Response.json({ events: [], nextCursor: 0, hasMore: false })
+      : Response.json({ events: [{ sequence: 1201 }], nextCursor: 1199, hasMore: false });
     await assert.rejects(sync.syncNow(), /Invalid sync page/);
     assert.equal(await sync.getCursor(), 1200);
     assert.equal(sync.getBrowserSyncStatus().state, 'DEGRADED');
-    global.fetch = async () => Response.json({ events: [], nextCursor: 1200, hasMore: false });
+    global.fetch = async url => Response.json({ events: [], nextCursor: String(url).includes('/linked-device/key-grants') ? 0 : 1200, hasMore: false });
     assert.equal(await sync.syncNow(), 0);
     assert.equal(sync.getBrowserSyncStatus().state, 'UP_TO_DATE');
 

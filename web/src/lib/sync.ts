@@ -8,9 +8,10 @@
  * without touching storage or UI.
  */
 
-import { fetchEventsAfter, type SyncEvent } from "./api.ts";
+import { fetchEventsAfter, fetchKeyGrantsAfter, type SyncEvent } from "./api.ts";
 import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypto.ts";
 import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
+import { getOrCreateDeviceKeys } from "./deviceKeys.ts";
 
 const DB_NAME = "gmweb-messages";
 const DB_VERSION = 5;
@@ -22,6 +23,7 @@ const CURSOR_KEY = "sync_cursor";
 const STORE_CONVERSATIONS = "conversations";
 const PROJECTION_VERSION_KEY = "conversation_projection_version";
 export const PROJECTION_CURSOR_KEY = "conversation_projection_cursor";
+const KEY_GRANT_CURSOR_PREFIX = "key_grant_bootstrap_cursor:";
 
 export type BrowserSyncState = "INITIALIZING" | "FIRST_PAINT_READY" | "SYNCING_HISTORY" |
   "UP_TO_DATE" | "DEGRADED" | "FAILED";
@@ -139,6 +141,7 @@ export function syncNow(onProgress?: (applied: number) => void): Promise<number>
   updateSyncStatus({ state: "SYNCING_HISTORY", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
   return serializeSync(async () => {
     try {
+      await bootstrapKeyGrants();
       await repairConversationProjection();
       const result = await drainSync(undefined, onProgress);
       updateSyncStatus({ state: "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
@@ -457,6 +460,63 @@ async function refreshConversationProjectionsInDb(db: IDBDatabase, aggregateIds:
     else transaction.objectStore(STORE_CONVERSATIONS).delete(aggregateId);
     await txDone(transaction);
   }
+}
+
+async function eventsByType(db: IDBDatabase, type: string): Promise<SyncEvent[]> {
+  const range = IDBKeyRange.bound([type, 0], [type, Number.MAX_SAFE_INTEGER]);
+  return await requestToPromise(db.transaction(STORE_EVENTS, "readonly")
+    .objectStore(STORE_EVENTS).index("by_type_sequence").getAll(range)) as SyncEvent[];
+}
+
+async function repairContactsFromLocalEvents(db: IDBDatabase): Promise<void> {
+  const rows = [
+    ...await eventsByType(db, "CONTACTS_SNAPSHOT"),
+    ...await eventsByType(db, "CONTACTS_CHANGED"),
+  ].sort((left, right) => left.sequence - right.sequence);
+  for (const event of rows) {
+    const payload = event.cryptoVersion > 0
+      ? await decryptMessage(event).then(result => result.state === "decrypted" ? result.payload : null)
+      : decodeEventPayload(event);
+    if (payload) await applyContacts(payload);
+  }
+}
+
+/**
+ * A newly linked browser can sit behind several historical device backfills.
+ * Pull only the already-authorized opaque grant events first, install grants
+ * addressed to this browser, then retry local projections. The normal sync
+ * cursor remains the sole raw-event cursor and is never advanced here.
+ */
+async function bootstrapKeyGrants(): Promise<void> {
+  const db = await openDb();
+  const cursorKey = `${KEY_GRANT_CURSOR_PREFIX}${(await getOrCreateDeviceKeys()).deviceId}`;
+  let cursor = await metaNumber(db, cursorKey);
+  const acceptedAggregates = new Set<string>();
+  let contactsGrantAccepted = false;
+  for (;;) {
+    const page = await fetchKeyGrantsAfter(cursor);
+    if (page.events.length === 0) break;
+    if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor ||
+        page.events.some(event => !Number.isSafeInteger(event.sequence) || event.sequence <= cursor ||
+          event.sequence > page.nextCursor || (event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT"))) {
+      throw new Error("Invalid key-grant bootstrap page");
+    }
+    for (const event of page.events) {
+      const result = await receiveKeyGrant(event);
+      if (result.state !== "key-grant" || result.reason !== "Authorized epoch key stored") continue;
+      if (event.type === "CONTACTS_KEY_GRANT") contactsGrantAccepted = true;
+      else if (event.aggregateId) acceptedAggregates.add(event.aggregateId);
+    }
+    cursor = page.nextCursor;
+    if (!page.hasMore) break;
+  }
+  if (acceptedAggregates.size > 0) {
+    const projected = new Set((await requestToPromise(db.transaction(STORE_CONVERSATIONS, "readonly")
+      .objectStore(STORE_CONVERSATIONS).getAllKeys())).filter((key): key is string => typeof key === "string"));
+    await refreshConversationProjectionsInDb(db, [...acceptedAggregates].filter(id => projected.has(id)));
+  }
+  if (contactsGrantAccepted) await repairContactsFromLocalEvents(db);
+  await setMetaNumber(cursorKey, cursor);
 }
 
 async function repairConversationProjectionGap(db: IDBDatabase): Promise<void> {

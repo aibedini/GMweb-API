@@ -1,5 +1,15 @@
 "use strict";
 
+function eventPage(rows, afterSequence, limit) {
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+  return {
+    events: page.map((row) => ({ ...row, ciphertext: Buffer.from(row.ciphertext).toString("base64") })),
+    nextCursor: page.length ? page[page.length - 1].sequence : Number(afterSequence) || 0,
+    hasMore,
+  };
+}
+
 /**
  * Phase 2 (PR-09) — Encrypted Event Store + sync sequencing (TechSpec §48/§54/§55,
  * LOCK 10). Android uploads opaque event batches; GMweb assigns the account's
@@ -73,6 +83,14 @@ class EventStore {
               source_device_id AS sourceDeviceId, ciphertext, encoding, schema_version AS schemaVersion,
               crypto_version AS cryptoVersion, created_at AS createdAt
        FROM sync_events WHERE account_id = ? AND sequence > ?
+       ORDER BY sequence ASC LIMIT ?`
+    );
+    this.grantsAfterStmt = db.prepare(
+      `SELECT sequence, event_uuid AS eventId, event_type AS type, aggregate_id AS aggregateId,
+              source_device_id AS sourceDeviceId, ciphertext, encoding, schema_version AS schemaVersion,
+              crypto_version AS cryptoVersion, created_at AS createdAt
+       FROM sync_events
+       WHERE account_id = ? AND sequence > ? AND event_type IN ('KEY_GRANT', 'CONTACTS_KEY_GRANT')
        ORDER BY sequence ASC LIMIT ?`
     );
     this.countStmt = db.prepare(
@@ -158,16 +176,14 @@ class EventStore {
   after(accountId, afterSequence, limit = 500) {
     const capped = Math.max(1, Math.min(1000, Number(limit) || 500));
     const rows = this.afterStmt.all(accountId, Number(afterSequence) || 0, capped + 1);
-    const hasMore = rows.length > capped;
-    const page = hasMore ? rows.slice(0, capped) : rows;
-    return {
-      events: page.map((r) => ({
-        ...r,
-        ciphertext: Buffer.from(r.ciphertext).toString("base64"),
-      })),
-      nextCursor: page.length ? page[page.length - 1].sequence : Number(afterSequence) || 0,
-      hasMore,
-    };
+    return eventPage(rows, afterSequence, capped);
+  }
+
+  /** Opaque grant bootstrap for a linked browser catching up through a large archive. */
+  grantsAfter(accountId, afterSequence, limit = 1000) {
+    const capped = Math.max(1, Math.min(1000, Number(limit) || 1000));
+    const rows = this.grantsAfterStmt.all(accountId, Number(afterSequence) || 0, capped + 1);
+    return eventPage(rows, afterSequence, capped);
   }
 
   count(accountId) {

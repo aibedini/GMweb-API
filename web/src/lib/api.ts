@@ -48,6 +48,12 @@ export async function fetchEventsAfter(cursor: number, limit = 500): Promise<Syn
   return jsonOrThrow<SyncPage>(res);
 }
 
+/** Read only opaque grant envelopes ahead of the main cursor during initial recovery. */
+export async function fetchKeyGrantsAfter(cursor: number, limit = 1000): Promise<SyncPage> {
+  const res = await fetch(`${API}/linked-device/key-grants?after=${cursor}&limit=${limit}`, { credentials: "include" });
+  return jsonOrThrow<SyncPage>(res);
+}
+
 /** §58 command status poll — used for optimistic outgoing bubbles. */
 export async function fetchCommand(id: string): Promise<CommandView | null> {
   const res = await fetch(`${API}/commands/${encodeURIComponent(id)}`, { credentials: "include" });
