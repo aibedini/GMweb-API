@@ -23,7 +23,7 @@ const CURSOR_KEY = "sync_cursor";
 const STORE_CONVERSATIONS = "conversations";
 const PROJECTION_VERSION_KEY = "conversation_projection_version";
 export const PROJECTION_CURSOR_KEY = "conversation_projection_cursor";
-const KEY_GRANT_CURSOR_PREFIX = "key_grant_bootstrap_cursor:";
+const KEY_GRANT_CURSOR_PREFIX = "key_grant_bootstrap_v2_cursor:";
 
 export type BrowserSyncState = "INITIALIZING" | "FIRST_PAINT_READY" | "SYNCING_HISTORY" |
   "UP_TO_DATE" | "DEGRADED" | "FAILED";
@@ -88,7 +88,6 @@ function openDb(): Promise<IDBDatabase> {
       const db = req.result;
       try {
         await ensureConversationProjectionRebuilt(db);
-        await repairConversationProjectionGap(db);
       } catch (e) {
         db.close();
         dbPromise = null;
@@ -163,6 +162,7 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
   return serializeSync(async () => {
     try {
       await bootstrapKeyGrants();
+      await repairConversationProjection();
       const result = await drainSync(maxPages, onProgress);
       updateSyncStatus({
         state: result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY",
@@ -511,6 +511,9 @@ async function bootstrapKeyGrants(): Promise<void> {
       throw new Error("Invalid key-grant bootstrap page");
     }
     const results = await receiveKeyGrants(page.events);
+    const rejected = results.find(result => result.state !== "key-grant" ||
+      result.reason !== "Authorized epoch key stored");
+    if (rejected) throw new Error(`Key-grant bootstrap failed: ${"reason" in rejected ? rejected.reason : "unexpected result"}`);
     for (let index = 0; index < page.events.length; index += 1) {
       const event = page.events[index];
       const result = results[index];
