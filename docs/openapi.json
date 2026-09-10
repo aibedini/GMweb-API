@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.16.9",
+    "version": "0.17.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -1829,6 +1829,22 @@
                           "type": "string",
                           "nullable": true
                         },
+                        "messageId": {
+                          "type": "string",
+                          "nullable": true,
+                          "description": "Opaque stable message identifier"
+                        },
+                        "revision": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "nullable": true
+                        },
+                        "sortKey": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "nullable": true,
+                          "description": "Minimal non-content ordering metadata"
+                        },
                         "payload": {
                           "type": "string",
                           "description": "base64 opaque envelope bytes"
@@ -1914,6 +1930,133 @@
             "in": "query",
             "name": "limit",
             "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/web/bootstrap": {
+      "get": {
+        "summary": "Encrypted linked-browser bootstrap",
+        "tags": [
+          "Sync"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 100
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/web/conversations": {
+      "get": {
+        "summary": "Encrypted conversation-state page",
+        "tags": [
+          "Sync"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "cursor",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 100
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/web/conversations/{conversationId}/messages": {
+      "get": {
+        "summary": "Encrypted message-state page",
+        "tags": [
+          "Sync"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "before",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "in": "path",
+            "name": "conversationId",
+            "required": true
           }
         ],
         "responses": {

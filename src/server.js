@@ -704,6 +704,9 @@ function requireToken(request, reply, done) {
         request.method === "GET" &&
         (p === "/api/v1/sync" ||
           p === "/api/v1/sse" ||
+          p === "/api/v1/web/bootstrap" ||
+          p === "/api/v1/web/conversations" ||
+          p.startsWith("/api/v1/web/conversations/") ||
           p === "/api/v1/linked-device/sync-diagnostics" ||
           p === "/api/v1/linked-device/key-grants" ||
           p === "/api/v1/linked-device/keyring" ||
@@ -2124,6 +2127,9 @@ function webAppSecurityHeaders(reply) {
   );
   reply.header("X-Content-Type-Options", "nosniff");
   reply.header("Referrer-Policy", "no-referrer");
+  reply.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  reply.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  reply.header("Cross-Origin-Opener-Policy", "same-origin");
 }
 
 async function sendWebAppFile(reply, relPath) {

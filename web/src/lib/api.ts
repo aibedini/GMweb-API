@@ -11,6 +11,9 @@ export interface SyncEvent {
   eventId: string;
   type: string;
   aggregateId: string | null;
+  messageId?: string | null;
+  revision?: number;
+  sortKey?: number;
   sourceDeviceId: string | null;
   /** base64 opaque envelope bytes — NOT decoded here (Phase 7). */
   ciphertext: string;
@@ -23,6 +26,33 @@ export interface SyncEvent {
 export interface SyncPage {
   events: SyncEvent[];
   nextCursor: number;
+  hasMore: boolean;
+}
+
+export interface EncryptedConversationState {
+  conversationId: string;
+  tombstone?: boolean;
+  revision: number;
+  sortKey: number;
+  envelope: string;
+  encoding: string;
+  schemaVersion: number;
+  cryptoVersion: number;
+  lastServerSequence: number;
+}
+
+export interface EncryptedMessageState extends EncryptedConversationState {
+  messageId: string;
+  type: string;
+  tombstone: boolean;
+}
+
+export interface WebBootstrapPage {
+  protocolVersion: number;
+  snapshotVersion: number;
+  highWatermark: number;
+  conversations: EncryptedConversationState[];
+  nextCursor: string | null;
   hasMore: boolean;
 }
 
@@ -46,6 +76,27 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
 export async function fetchEventsAfter(cursor: number, limit = 500): Promise<SyncPage> {
   const res = await fetch(`${API}/sync?after=${cursor}&limit=${limit}`, { credentials: "include" });
   return jsonOrThrow<SyncPage>(res);
+}
+
+export async function fetchWebBootstrap(limit = 100): Promise<WebBootstrapPage> {
+  const res = await fetch(`${API}/web/bootstrap?limit=${limit}`, { credentials: "include", cache: "no-store" });
+  return jsonOrThrow<WebBootstrapPage>(res);
+}
+
+export async function fetchWebConversationPage(cursor?: string, limit = 100) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (cursor) query.set("cursor", cursor);
+  const res = await fetch(`${API}/web/conversations?${query}`,
+    { credentials: "include", cache: "no-store" });
+  return jsonOrThrow<{ conversations: EncryptedConversationState[]; nextCursor: string | null; hasMore: boolean }>(res);
+}
+
+export async function fetchWebMessagePage(conversationId: string, before?: string, limit = 50) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (before) query.set("before", before);
+  const res = await fetch(`${API}/web/conversations/${encodeURIComponent(conversationId)}/messages?${query}`,
+    { credentials: "include", cache: "no-store" });
+  return jsonOrThrow<{ messages: EncryptedMessageState[]; nextCursor: string | null; hasMore: boolean }>(res);
 }
 
 /** Read only opaque grant envelopes ahead of the main cursor during initial recovery. */

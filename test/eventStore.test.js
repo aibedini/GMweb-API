@@ -160,6 +160,53 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     assert.deepEqual(res.accepted, []);
   });
 
+  test("encrypted current state rejects stale history and pages by keyset", () => {
+    const store = new EventStore(new Database(":memory:"));
+    const event = (eventId, messageId, revision, sortKey, payload) => ({
+      eventId, messageId, revision, sortKey, type: "MESSAGE_CREATED",
+      conversationId: "opaque-conversation", payload: Buffer.from(payload), cryptoVersion: 3,
+    });
+    store.ingestBatch({ accountId: "a", events: [
+      event("new", "message-1", 20, 200, "new-cipher"),
+      event("stale", "message-1", 1, 100, "stale-cipher"),
+      event("second", "message-2", 1, 150, "second-cipher"),
+    ] });
+    const page = store.messages("a", "opaque-conversation", null, 1);
+    assert.equal(page.messages.length, 1);
+    assert.equal(page.hasMore, true);
+    assert.equal(Buffer.from(page.messages[0].envelope, "base64").toString(), "new-cipher");
+    assert.equal(page.messages[0].revision, 20);
+    const older = store.messages("a", "opaque-conversation", page.nextCursor, 1);
+    assert.equal(older.messages[0].messageId, "message-2");
+  });
+
+  test("bootstrap captures a high watermark and encrypted conversation page", () => {
+    const store = new EventStore(new Database(":memory:"));
+    store.ingestBatch({ accountId: "a", events: [{
+      eventId: "conversation-1", type: "CONVERSATION_UPSERTED",
+      conversationId: "opaque-1", revision: 7, sortKey: 99,
+      payload: Buffer.from("encrypted-summary"), cryptoVersion: 3,
+    }] });
+    const bootstrap = store.bootstrap("a");
+    assert.equal(bootstrap.protocolVersion, 3);
+    assert.equal(bootstrap.highWatermark, 1);
+    assert.equal(bootstrap.conversations[0].conversationId, "opaque-1");
+    assert.equal(Buffer.from(bootstrap.conversations[0].envelope, "base64").toString(), "encrypted-summary");
+  });
+
+  test("newer conversation tombstone cannot be resurrected by stale snapshot", () => {
+    const store = new EventStore(new Database(":memory:"));
+    store.ingestBatch({ accountId: "a", events: [
+      { eventId: "delete", type: "CONVERSATION_DELETED", conversationId: "c",
+        revision: 10, sortKey: 10, payload: Buffer.from("delete"), cryptoVersion: 3 },
+      { eventId: "old", type: "CONVERSATION_UPSERTED", conversationId: "c",
+        revision: 1, sortKey: 1, payload: Buffer.from("old"), cryptoVersion: 3 },
+    ] });
+    const row = store.conversations("a", null, 1).conversations[0];
+    assert.equal(row.tombstone, true);
+    assert.equal(row.revision, 10);
+  });
+
   test("diagnostic stats expose only aggregate pipeline counts per account and source device", () => {
     const store = new EventStore(new Database(":memory:"));
     store.ingestBatch({ accountId: "account", sourceDeviceId: "phone-a", events: [

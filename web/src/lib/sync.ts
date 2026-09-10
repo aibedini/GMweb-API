@@ -8,23 +8,27 @@
  * without touching storage or UI.
  */
 
-import { fetchEventsAfter, fetchKeyGrantsAfter, fetchKeyring, type SyncEvent } from "./api.ts";
+import { fetchEventsAfter, fetchKeyGrantsAfter, fetchKeyring, fetchWebBootstrap, fetchWebConversationPage, fetchWebMessagePage,
+  type EncryptedConversationState, type EncryptedMessageState, type SyncEvent } from "./api.ts";
 import { receiveKeyGrant, receiveKeyGrants, decryptMessage, type Decryption } from "./messageCrypto.ts";
 import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
 import { getOrCreateDeviceKeys } from "./deviceKeys.ts";
 
 const DB_NAME = "gmweb-messages";
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 const STORE_EVENTS = "events";
 const STORE_META = "meta";
 const STORE_CONTACTS = "contacts";
 const CURSOR_KEY = "sync_cursor";
 /** Derived read-model store (PWA projection). Raw events stay the truth. */
 const STORE_CONVERSATIONS = "conversations";
+const STORE_ENCRYPTED_CONVERSATIONS = "encrypted_conversation_state";
+const STORE_ENCRYPTED_MESSAGES = "encrypted_message_state";
 const PROJECTION_VERSION_KEY = "conversation_projection_version";
 export const PROJECTION_CURSOR_KEY = "conversation_projection_cursor";
 const KEY_GRANT_CURSOR_PREFIX = "key_grant_bootstrap_v2_cursor:";
 const KEYRING_CURSOR_PREFIX = "account_keyring_v2_cursor:";
+const volatileContacts = new Map<string, StoredContact>();
 
 export type BrowserSyncState = "INITIALIZING" | "FIRST_PAINT_READY" | "SYNCING_HISTORY" |
   "UP_TO_DATE" | "DEGRADED" | "FAILED";
@@ -74,11 +78,23 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_CONTACTS)) {
         db.createObjectStore(STORE_CONTACTS, { keyPath: "normalizedPhone" });
+      } else if (req.oldVersion < 6) {
+        // v5 persisted decrypted contact/address data. v6 keeps contacts only
+        // in memory and reconstructs them from encrypted raw events.
+        req.transaction!.objectStore(STORE_CONTACTS).clear();
       }
       // PWA projection store (v4): derived per-conversation read model.
       if (!db.objectStoreNames.contains(STORE_CONVERSATIONS)) {
         const conversations = db.createObjectStore(STORE_CONVERSATIONS, { keyPath: "aggregateId" });
         conversations.createIndex("by_last_at", ["lastAt", "aggregateId"]);
+      }
+      if (!db.objectStoreNames.contains(STORE_ENCRYPTED_CONVERSATIONS)) {
+        const snapshots = db.createObjectStore(STORE_ENCRYPTED_CONVERSATIONS, { keyPath: "conversationId" });
+        snapshots.createIndex("by_sort", ["sortKey", "conversationId"]);
+      }
+      if (!db.objectStoreNames.contains(STORE_ENCRYPTED_MESSAGES)) {
+        const messages = db.createObjectStore(STORE_ENCRYPTED_MESSAGES, { keyPath: "messageId" });
+        messages.createIndex("by_conversation_sort", ["conversationId", "sortKey", "messageId"]);
       }
 
       const events = req.transaction!.objectStore(STORE_EVENTS);
@@ -142,6 +158,7 @@ export function syncNow(onProgress?: (applied: number) => void): Promise<number>
   return serializeSync(async () => {
     try {
       await bootstrapKeyGrants();
+      await bootstrapEncryptedState();
       await repairConversationProjection();
       const result = await drainSync(undefined, onProgress);
       updateSyncStatus({ state: "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
@@ -163,6 +180,7 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
   return serializeSync(async () => {
     try {
       await bootstrapKeyGrants();
+      await bootstrapEncryptedState();
       await repairConversationProjection();
       const result = await drainSync(maxPages, onProgress);
       updateSyncStatus({
@@ -232,10 +250,38 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
     }
     const db = await openDb();
     await new Promise<void>((resolve, reject) => {
-      const t = db.transaction([STORE_EVENTS, STORE_META], "readwrite");
+      const t = db.transaction([STORE_EVENTS, STORE_META, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES], "readwrite");
       const store = t.objectStore(STORE_EVENTS);
       for (const ev of page.events) {
         store.put(ev); // keyed by server sequence — idempotent replay-safe
+        if (["CONVERSATION_UPSERTED", "CONVERSATION_UPSERT", "CONVERSATION_DELETED"].includes(ev.type) && ev.aggregateId) {
+          const states = t.objectStore(STORE_ENCRYPTED_CONVERSATIONS);
+          const next = { conversationId: ev.aggregateId, tombstone: ev.type === "CONVERSATION_DELETED",
+            revision: ev.revision ?? 1,
+            sortKey: ev.sortKey ?? ev.createdAt, envelope: ev.ciphertext, encoding: ev.encoding,
+            schemaVersion: ev.schemaVersion, cryptoVersion: ev.cryptoVersion,
+            lastServerSequence: ev.sequence };
+          const get = states.get(ev.aggregateId);
+          get.onsuccess = () => {
+            const old = get.result as EncryptedConversationState | undefined;
+            if (!old || next.revision > old.revision ||
+                (next.revision === old.revision && next.lastServerSequence > old.lastServerSequence)) states.put(next);
+          };
+        }
+        if (ev.messageId && ev.aggregateId && ["MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED", "MESSAGE_DELETED"].includes(ev.type)) {
+          const states = t.objectStore(STORE_ENCRYPTED_MESSAGES);
+          const next = { messageId: ev.messageId, conversationId: ev.aggregateId, type: ev.type,
+            tombstone: ev.type === "MESSAGE_DELETED", revision: ev.revision ?? 1,
+            sortKey: ev.sortKey ?? ev.createdAt, envelope: ev.ciphertext, encoding: ev.encoding,
+            schemaVersion: ev.schemaVersion, cryptoVersion: ev.cryptoVersion,
+            lastServerSequence: ev.sequence };
+          const get = states.get(ev.messageId);
+          get.onsuccess = () => {
+            const old = get.result as EncryptedMessageState | undefined;
+            if (!old || next.revision > old.revision ||
+                (next.revision === old.revision && next.lastServerSequence > old.lastServerSequence)) states.put(next);
+          };
+        }
       }
       t.objectStore(STORE_META).put(page.nextCursor, CURSOR_KEY);
       t.oncomplete = () => resolve();
@@ -284,7 +330,7 @@ export interface AggregatePage {
   items: StoredEvent[];
   hasMore: boolean;
   /** Oldest server sequence in this page — cursor for "load older". */
-  next?: number;
+  next?: number | string;
 }
 
 /**
@@ -294,10 +340,39 @@ export interface AggregatePage {
  */
 export async function listAggregateEventsPage(
   aggregateId: string,
-  options: { limit?: number; beforeSequence?: number } = {},
+  options: { limit?: number; beforeSequence?: number; beforeState?: string } = {},
 ): Promise<AggregatePage> {
   const limit = Math.max(1, Math.min(500, options.limit ?? 200));
   const db = await openDb();
+  if (typeof navigator !== "undefined" && navigator.onLine) {
+    const remote = await fetchWebMessagePage(aggregateId, options.beforeState, Math.min(100, limit));
+    const write = db.transaction(STORE_ENCRYPTED_MESSAGES, "readwrite");
+    const states = write.objectStore(STORE_ENCRYPTED_MESSAGES);
+    for (const row of remote.messages) states.put(row);
+    await txDone(write);
+    return {
+      items: await decryptForDisplay(remote.messages.map(messageStateEvent)),
+      hasMore: remote.hasMore,
+      next: remote.nextCursor ?? undefined,
+    };
+  }
+  const cached: EncryptedMessageState[] = [];
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(STORE_ENCRYPTED_MESSAGES, "readonly");
+    const index = transaction.objectStore(STORE_ENCRYPTED_MESSAGES).index("by_conversation_sort");
+    const request = index.openCursor(
+      IDBKeyRange.bound([aggregateId, -Infinity, ""], [aggregateId, Infinity, "\uffff"]), "prev");
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor || cached.length >= Math.min(100, limit)) return;
+      cached.push(cursor.value);
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error);
+  });
+  if (cached.length > 0) return { items: await decryptForDisplay(cached.map(messageStateEvent)), hasMore: false };
   const range = options.beforeSequence === undefined
     ? IDBKeyRange.bound([aggregateId, -Infinity], [aggregateId, Infinity])
     : IDBKeyRange.upperBound([aggregateId, options.beforeSequence], true);
@@ -390,21 +465,15 @@ export interface StoredContact {
 async function applyContacts(payload: Record<string, unknown>): Promise<void> {
   const contacts = Array.isArray(payload.contacts) ? payload.contacts : [];
   const deleted = Array.isArray(payload.deleted) ? payload.deleted : [];
-  const db = await openDb();
-  await new Promise<void>((resolve, reject) => {
-    const t = db.transaction(STORE_CONTACTS, "readwrite");
-    const store = t.objectStore(STORE_CONTACTS);
-    if (payload.replaceAll === true && Number(payload.chunkIndex) === 0) store.clear();
-    for (const value of contacts) {
-      if (!value || typeof value !== "object") continue;
-      const row = value as Partial<StoredContact>;
-      if (typeof row.normalizedPhone === "string" && typeof row.displayName === "string") store.put(row);
+  if (payload.replaceAll === true && Number(payload.chunkIndex) === 0) volatileContacts.clear();
+  for (const value of contacts) {
+    if (!value || typeof value !== "object") continue;
+    const row = value as Partial<StoredContact>;
+    if (typeof row.normalizedPhone === "string" && typeof row.displayName === "string") {
+      volatileContacts.set(row.normalizedPhone, row as StoredContact);
     }
-    for (const phone of deleted) if (typeof phone === "string") store.delete(phone);
-    t.oncomplete = () => resolve();
-    t.onerror = () => reject(t.error);
-    t.onabort = () => reject(t.error ?? new Error("Contacts transaction aborted"));
-  });
+  }
+  for (const phone of deleted) if (typeof phone === "string") volatileContacts.delete(phone);
 }
 
 // ── PWA conversation projection (read-model, derived from raw events) ──────
@@ -437,8 +506,8 @@ async function setMetaNumber(key: string, value: number): Promise<void> {
 }
 
 async function contactsFromDb(db: IDBDatabase): Promise<StoredContact[]> {
-  return await requestToPromise(db.transaction(STORE_CONTACTS, "readonly")
-    .objectStore(STORE_CONTACTS).getAll()) as StoredContact[];
+  void db;
+  return [...volatileContacts.values()];
 }
 
 async function aggregateIdsInSequenceRange(db: IDBDatabase, after: number, through: number): Promise<string[]> {
@@ -463,6 +532,9 @@ async function aggregateIdsInSequenceRange(db: IDBDatabase, after: number, throu
 }
 
 async function refreshConversationProjectionsInDb(db: IDBDatabase, aggregateIds: string[]): Promise<void> {
+  const encryptedCount = await requestToPromise(db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readonly")
+    .objectStore(STORE_ENCRYPTED_CONVERSATIONS).count());
+  if (encryptedCount > 0) return;
   const contactMap = new Map((await contactsFromDb(db)).map(contact => [contact.normalizedPhone, contact.displayName]));
   for (const aggregateId of aggregateIds) {
     const rows = await requestToPromise(db.transaction(STORE_EVENTS, "readonly")
@@ -473,6 +545,57 @@ async function refreshConversationProjectionsInDb(db: IDBDatabase, aggregateIds:
     else transaction.objectStore(STORE_CONVERSATIONS).delete(aggregateId);
     await txDone(transaction);
   }
+}
+
+function conversationStateEvent(row: EncryptedConversationState): SyncEvent {
+  return {
+    sequence: row.lastServerSequence,
+    eventId: `snapshot:${row.conversationId}:${row.revision}`,
+    type: "CONVERSATION_UPSERTED",
+    aggregateId: row.conversationId,
+    sourceDeviceId: null,
+    ciphertext: row.envelope,
+    encoding: row.encoding,
+    schemaVersion: row.schemaVersion,
+    cryptoVersion: row.cryptoVersion,
+    createdAt: row.sortKey,
+    revision: row.revision,
+    sortKey: row.sortKey,
+  };
+}
+
+function messageStateEvent(row: EncryptedMessageState): SyncEvent {
+  return {
+    ...conversationStateEvent(row),
+    eventId: `state:${row.messageId}:${row.revision}`,
+    type: row.type,
+    messageId: row.messageId,
+  };
+}
+
+async function bootstrapEncryptedState(): Promise<void> {
+  const existing = await tx([STORE_ENCRYPTED_CONVERSATIONS], "readonly", t =>
+    t.objectStore(STORE_ENCRYPTED_CONVERSATIONS).count());
+  if (existing > 0) return;
+  const page = await fetchWebBootstrap(101);
+  // Compatible API/test harnesses may not expose the new snapshot endpoint
+  // yet; keep the existing delta path until a coordinated server is live.
+  if (page.protocolVersion === undefined) return;
+  if (page.protocolVersion !== 3 || !Number.isSafeInteger(page.highWatermark)) {
+    throw new Error("Unsupported encrypted bootstrap response");
+  }
+  if (page.conversations.length === 0) return;
+  const db = await openDb();
+  const transaction = db.transaction(
+    [STORE_ENCRYPTED_CONVERSATIONS, STORE_CONVERSATIONS, STORE_META], "readwrite");
+  const snapshots = transaction.objectStore(STORE_ENCRYPTED_CONVERSATIONS);
+  for (const row of page.conversations) snapshots.put(row);
+  // v5 stored decrypted snippets here. Bootstrap switches the PWA to the
+  // encrypted state store and removes those legacy plaintext projections.
+  transaction.objectStore(STORE_CONVERSATIONS).clear();
+  transaction.objectStore(STORE_META).put(page.highWatermark, CURSOR_KEY);
+  transaction.objectStore(STORE_META).put(page.highWatermark, PROJECTION_CURSOR_KEY);
+  await txDone(transaction);
 }
 
 async function eventsByType(db: IDBDatabase, type: string): Promise<SyncEvent[]> {
@@ -604,6 +727,69 @@ export async function listConversations(
 ): Promise<ConversationPage> {
   const limit = Math.max(1, Math.min(500, options.limit ?? 100));
   const db = await openDb();
+  const encryptedCount = await requestToPromise(
+    db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readonly")
+      .objectStore(STORE_ENCRYPTED_CONVERSATIONS).count());
+  if (encryptedCount > 0) {
+    if (options.before && navigator.onLine) {
+      const raw = btoa(JSON.stringify([options.before.lastAt, options.before.aggregateId]))
+        .replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+      const remote = await fetchWebConversationPage(raw, Math.min(200, limit + 1));
+      const write = db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readwrite");
+      for (const row of remote.conversations) write.objectStore(STORE_ENCRYPTED_CONVERSATIONS).put(row);
+      await txDone(write);
+    }
+    const encrypted: EncryptedConversationState[] = [];
+    let hasMore = false;
+    await new Promise<void>((resolve, reject) => {
+      const transaction = db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readonly");
+      const index = transaction.objectStore(STORE_ENCRYPTED_CONVERSATIONS).index("by_sort");
+      const range = options.before
+        ? IDBKeyRange.upperBound([options.before.lastAt, options.before.aggregateId], true)
+        : null;
+      const request = index.openCursor(range, "prev");
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        if (encrypted.length < limit) { encrypted.push(cursor.value); cursor.continue(); }
+        else hasMore = true;
+      };
+      request.onerror = () => reject(request.error);
+      transaction.oncomplete = () => resolve();
+      transaction.onabort = () => reject(transaction.error);
+    });
+    const items: ConversationProjection[] = [];
+    for (const row of encrypted) {
+      if (row.tombstone) continue;
+      const event = conversationStateEvent(row);
+      const decrypted = await decryptMessage(event);
+      if (decrypted.state !== "decrypted") {
+        items.push({ aggregateId: row.conversationId, title: "Encrypted message",
+          preview: "Locked — waiting for the history key", lastAt: row.sortKey,
+          read: true, unreadCount: 0, lastMessageId: row.conversationId,
+          lastSequence: row.lastServerSequence, decodeState: "locked" });
+        continue;
+      }
+      const value = decrypted.payload;
+      const address = typeof value.address === "string" ? value.address : "";
+      const displayName = typeof value.displayName === "string" ? value.displayName : address;
+      items.push({
+        aggregateId: row.conversationId,
+        title: displayName || "Unknown conversation",
+        ...(displayName && address && displayName !== address ? { subtitle: address } : {}),
+        preview: typeof value.lastMessagePreview === "string" ? value.lastMessagePreview : "",
+        lastAt: Number(value.lastMessageAt) || row.sortKey,
+        read: Number(value.unreadCount) === 0,
+        unreadCount: Math.max(0, Number(value.unreadCount) || 0),
+        lastMessageId: row.conversationId,
+        lastSequence: row.lastServerSequence,
+        decodeState: "ready",
+      });
+    }
+    const last = items.at(-1);
+    return { items, hasMore, next: hasMore && last
+      ? { lastAt: last.lastAt, aggregateId: last.aggregateId } : undefined };
+  }
   const items: ConversationProjection[] = [];
   let hasMore = false;
   await new Promise<void>((resolve, reject) => {
@@ -675,20 +861,24 @@ async function ensureConversationProjectionRebuilt(db: IDBDatabase): Promise<voi
 
 
 export async function listContacts(): Promise<StoredContact[]> {
-  const rows = await tx([STORE_CONTACTS], "readonly", t => t.objectStore(STORE_CONTACTS).getAll()) as StoredContact[];
+  const rows = [...volatileContacts.values()];
   return rows.sort((a, b) => a.displayName.localeCompare(b.displayName));
 }
 
 /** Dev/self-check hook used by the Debug screen. */
 export async function resetLocal(): Promise<void> {
   await runningSync?.catch(() => {});
+  volatileContacts.clear();
   const db = await openDb();
   await new Promise<void>((resolve, reject) => {
-    const t = db.transaction([STORE_EVENTS, STORE_META, STORE_CONTACTS, STORE_CONVERSATIONS], "readwrite");
+    const t = db.transaction([STORE_EVENTS, STORE_META, STORE_CONTACTS, STORE_CONVERSATIONS,
+      STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES], "readwrite");
     t.objectStore(STORE_EVENTS).clear();
     t.objectStore(STORE_META).clear();
     t.objectStore(STORE_CONTACTS).clear();
     t.objectStore(STORE_CONVERSATIONS).clear();
+    t.objectStore(STORE_ENCRYPTED_CONVERSATIONS).clear();
+    t.objectStore(STORE_ENCRYPTED_MESSAGES).clear();
     t.oncomplete = () => resolve();
     t.onerror = () => reject(t.error);
   });

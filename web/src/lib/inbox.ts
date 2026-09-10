@@ -10,6 +10,9 @@ export interface MessagePayload {
   read?: boolean;
   /** Optional display name embedded by Android (Contacts lookup at send/receive time). */
   contactName?: string;
+  /** Exact correlation for replacing the Web optimistic bubble. */
+  originCommandId?: string;
+  clientMessageId?: string;
 }
 
 export interface ConversationSummary {
@@ -69,7 +72,7 @@ export function decodeEventPayload(event: StoredEvent): Record<string, unknown> 
 }
 
 function messagePayload(event: StoredEvent): MessagePayload | null {
-  if (event.type !== "MESSAGE_CREATED" && event.type !== "MESSAGE_UPDATED") return null;
+  if (!["MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED"].includes(event.type)) return null;
   const value = decodeEventPayload(event);
   if (!value || typeof value.body !== "string") return null;
   return {
@@ -83,6 +86,8 @@ function messagePayload(event: StoredEvent): MessagePayload | null {
     contactName: typeof value.contactName === "string" && value.contactName.trim()
       ? value.contactName.trim()
       : undefined,
+    originCommandId: typeof value.originCommandId === "string" ? value.originCommandId : undefined,
+    clientMessageId: typeof value.clientMessageId === "string" ? value.clientMessageId : undefined,
   };
 }
 

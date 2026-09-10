@@ -56,10 +56,12 @@ test('incoming and outgoing events both project into one conversation with corre
   const { messagesForAggregate } = await import('../web/src/lib/inbox.ts');
   const rows = [
     event(1, 'MESSAGE_CREATED', { messageId: 'in1', body: 'Hello from you', address: '+123', dateMs: 100, direction: 'in' }),
-    event(2, 'MESSAGE_CREATED', { messageId: 'out1', body: 'Hello back', address: '+123', dateMs: 200, direction: 'out' }),
+    event(2, 'MESSAGE_CREATED', { messageId: 'out1', clientMessageId: 'client-1', originCommandId: 'command-1', body: 'Hello back', address: '+123', dateMs: 200, direction: 'out' }),
   ];
   const timeline = messagesForAggregate(rows, 'thread');
   assert.equal(timeline.length, 2);
   assert.deepEqual(timeline.map((item) => item.payload.direction), ['in', 'out']);
   assert.deepEqual(timeline.map((item) => item.payload.body), ['Hello from you', 'Hello back']);
+  assert.equal(timeline[1].payload.clientMessageId, 'client-1');
+  assert.equal(timeline[1].payload.originCommandId, 'command-1');
 });

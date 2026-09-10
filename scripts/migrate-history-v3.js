@@ -18,9 +18,16 @@ const db = new Database(dbPath, apply ? {} : { readonly: true });
 const accounts = db.prepare(
   "SELECT account_id accountId, COUNT(*) eventCount, COALESCE(MAX(sequence), 0) maxSequence FROM sync_events GROUP BY account_id"
 ).all();
+const tableCount = (table) => db.prepare(
+  "SELECT COUNT(*) count FROM sqlite_master WHERE type='table' AND name=?").get(table).count
+  ? db.prepare(`SELECT COUNT(*) count FROM ${table}`).get().count : 0;
+const currentState = {
+  messages: tableCount("encrypted_message_state"),
+  conversations: tableCount("encrypted_conversation_state"),
+};
 
 if (!apply) {
-  console.log(JSON.stringify({ mode: "dry-run", database: dbPath, accounts }, null, 2));
+  console.log(JSON.stringify({ mode: "dry-run", database: dbPath, accounts, currentState }, null, 2));
   console.log("No data changed. Stop GMweb, then rerun with --apply to back up and reset only encrypted sync events.");
   db.close();
   return;
@@ -33,7 +40,9 @@ const backupPath = path.join(root, "data", `control-plane.pre-history-v3.${stamp
   try {
     await db.backup(backupPath);
     db.transaction(() => {
-      db.prepare("DELETE FROM sync_events").run();
+    db.prepare("DELETE FROM sync_events").run();
+    if (tableCount("encrypted_message_state")) db.prepare("DELETE FROM encrypted_message_state").run();
+    if (tableCount("encrypted_conversation_state")) db.prepare("DELETE FROM encrypted_conversation_state").run();
       db.prepare("UPDATE event_counters SET next_sequence = 1").run();
     })();
     console.log(JSON.stringify({

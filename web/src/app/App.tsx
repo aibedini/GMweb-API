@@ -12,6 +12,8 @@ import { collectWebDiagnostics, formatWebDiagnostics, type WebDiagnosticReport }
 
 type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug";
 type ThreadState = "IDLE" | "LOADING" | "READY" | "LOCKED" | "EMPTY" | "FAILED";
+const MAX_RENDERED_CONVERSATIONS = 400;
+const MAX_RENDERED_MESSAGE_EVENTS = 500;
 
 function shortId(value: string | null | undefined) {
   return value ? `${value.slice(0, 8)}…` : "—";
@@ -41,7 +43,7 @@ export default function App() {
   const [tab, setTab] = useState<TabKey>("inbox");
   const [events, setEvents] = useState<StoredEvent[]>([]);
   const [threadEvents, setThreadEvents] = useState<StoredEvent[]>([]);
-  const [threadNext, setThreadNext] = useState<number | undefined>();
+  const [threadNext, setThreadNext] = useState<number | string | undefined>();
   const [threadHasMore, setThreadHasMore] = useState(false);
   const [loadingOlderThread, setLoadingOlderThread] = useState(false);
   const [cursor, setCursor] = useState(0);
@@ -78,7 +80,7 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [composeRecipient, setComposeRecipient] = useState("");
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
-  const [pendingMessage, setPendingMessage] = useState<{ body: string; at: number } | null>(null);
+  const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; at: number } | null>(null);
   const markReadSent = useRef(new Set<string>());
   const scriptFile = useMemo(() => loadedScriptFile(), []);
 
@@ -103,7 +105,7 @@ export default function App() {
     setLoadingOlder(true);
     try {
       const page = await listConversations({ limit: 100, before: conversationNext });
-      setConversationPage(prev => [...prev, ...page.items]);
+      setConversationPage(prev => [...prev, ...page.items].slice(-MAX_RENDERED_CONVERSATIONS));
       setConversationHasMore(page.hasMore);
       setConversationNext(page.next);
     } finally {
@@ -239,8 +241,13 @@ export default function App() {
     if (!selected || threadNext === undefined || loadingOlderThread) return;
     setLoadingOlderThread(true);
     try {
-      const page = await listAggregateEventsPage(selected, { limit: 200, beforeSequence: threadNext });
-      setThreadEvents(prev => [...prev, ...page.items]);
+      const page = await listAggregateEventsPage(selected, {
+        limit: 100,
+        ...(typeof threadNext === "string" ? { beforeState: threadNext } : { beforeSequence: threadNext }),
+      });
+      // Native bounded windowing: deep history remains in encrypted IndexedDB
+      // and only the currently browsed window reaches React's DOM.
+      setThreadEvents(prev => [...prev, ...page.items].slice(-MAX_RENDERED_MESSAGE_EVENTS));
       setThreadHasMore(page.hasMore);
       setThreadNext(page.next);
     } catch (cause) {
@@ -251,8 +258,8 @@ export default function App() {
   const selectedRecipient = messages.map(item => item.payload.address).find(Boolean) || composeRecipient;
 
   useEffect(() => {
-    if (pendingMessage && messages.some(item => item.payload.direction === "out" &&
-        item.payload.body === pendingMessage.body && item.payload.dateMs >= pendingMessage.at - 60_000)) {
+    if (pendingMessage && messages.some(item =>
+      item.payload.clientMessageId === pendingMessage.clientMessageId)) {
       setPendingMessage(null);
     }
   }, [messages, pendingMessage]);
@@ -274,10 +281,11 @@ export default function App() {
   const send = async () => {
     const body = draft.trim();
     if (!body || !selectedRecipient || !capabilities.includes("SEND_MESSAGES")) return;
+    const clientMessageId = crypto.randomUUID();
     setCommandStatus("queued");
-    setPendingMessage({ body, at: Date.now() });
+    setPendingMessage({ clientMessageId, body, at: Date.now() });
     try {
-      const command = await submitCommand("SEND_SMS", { phone: selectedRecipient, body });
+      const command = await submitCommand("SEND_SMS", { phone: selectedRecipient, body, clientMessageId });
       setDraft("");
       for (let attempt = 0; attempt < 20; attempt += 1) {
         await new Promise(resolve => setTimeout(resolve, 1_000));
@@ -285,12 +293,14 @@ export default function App() {
         setCommandStatus(state?.state || "queued");
         if (state && ["FAILED", "EXPIRED"].includes(state.state)) {
           setDraft(body);
+          setPendingMessage(null);
           break;
         }
         if (state?.state === "COMPLETED") break;
       }
     } catch (cause) {
       setDraft(body);
+      setPendingMessage(null);
       setCommandStatus(cause instanceof Error ? cause.message : String(cause));
     }
   };

@@ -414,6 +414,9 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
                 eventId: { type: "string" },
                 type: { type: "string" },
                 conversationId: { type: "string", nullable: true },
+                messageId: { type: "string", nullable: true, description: "Opaque stable message identifier" },
+                revision: { type: "integer", minimum: 1, nullable: true },
+                sortKey: { type: "integer", minimum: 0, nullable: true, description: "Minimal non-content ordering metadata" },
                 payload: { type: "string", description: "base64 opaque envelope bytes" },
                 encoding: { type: "string", default: "envelope.v1" },
                 schemaVersion: { type: "integer", default: 1 },
@@ -471,10 +474,57 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       },
       response: { 200: { type: "object", additionalProperties: true } }
     }
-  }, async (request) => {
+  }, async (request, reply) => {
     const after = Math.max(0, Number(request.query?.after) || 0);
     const limit = Number(request.query?.limit) || 500;
+    reply.header("Cache-Control", "no-store");
     return eventStore.after(accountId, after, limit);
+  });
+
+  const webSnapshotHeaders = (reply) => reply.header("Cache-Control", "no-store");
+
+  app.get("/api/v1/web/bootstrap", {
+    schema: {
+      summary: "Encrypted linked-browser bootstrap",
+      tags: ["Sync"],
+      querystring: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 200, default: 100 } } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    webSnapshotHeaders(reply);
+    return eventStore.bootstrap(accountId, Number(request.query?.limit) || 100);
+  });
+
+  app.get("/api/v1/web/conversations", {
+    schema: {
+      summary: "Encrypted conversation-state page",
+      tags: ["Sync"],
+      querystring: { type: "object", properties: {
+        cursor: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 100 },
+      } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    webSnapshotHeaders(reply);
+    return eventStore.conversations(accountId, request.query?.cursor, Number(request.query?.limit) || 100);
+  });
+
+  app.get("/api/v1/web/conversations/:conversationId/messages", {
+    schema: {
+      summary: "Encrypted message-state page",
+      tags: ["Sync"],
+      params: { type: "object", required: ["conversationId"], properties: { conversationId: { type: "string", minLength: 1 } } },
+      querystring: { type: "object", properties: {
+        before: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
+      } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    webSnapshotHeaders(reply);
+    return eventStore.messages(accountId, request.params.conversationId,
+      request.query?.before, Number(request.query?.limit) || 50);
   });
 
   app.get("/api/v1/linked-device/sync-diagnostics", {
