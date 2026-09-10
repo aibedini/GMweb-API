@@ -67,8 +67,9 @@ function openDb(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (event) => {
       const db = req.result;
+      const versionEvent = event as IDBVersionChangeEvent;
       if (!db.objectStoreNames.contains(STORE_EVENTS)) {
         const store = db.createObjectStore(STORE_EVENTS, { keyPath: "sequence" });
         store.createIndex("by_aggregate", "aggregateId");
@@ -78,7 +79,7 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_CONTACTS)) {
         db.createObjectStore(STORE_CONTACTS, { keyPath: "normalizedPhone" });
-      } else if (req.oldVersion < 6) {
+      } else if (versionEvent.oldVersion < 6) {
         // v5 persisted decrypted contact/address data. v6 keeps contacts only
         // in memory and reconstructs them from encrypted raw events.
         req.transaction!.objectStore(STORE_CONTACTS).clear();
