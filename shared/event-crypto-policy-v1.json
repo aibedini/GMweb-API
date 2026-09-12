@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "contentBearing": {
+    "MESSAGE_CREATED": [1, 2, 3],
+    "MESSAGE_UPDATED": [1, 2, 3],
+    "MESSAGE_STATUS_CHANGED": [1, 2, 3],
+    "MESSAGE_DELETED": [1, 2, 3],
+    "CONVERSATION_UPSERT": [3],
+    "CONVERSATION_UPSERTED": [3],
+    "CONVERSATION_DELETED": [3],
+    "THREAD_READ": [1, 2, 3],
+    "CONTACTS_SNAPSHOT": [1, 2],
+    "CONTACTS_CHANGED": [1, 2]
+  },
+  "controlKey": {
+    "KEY_GRANT": [1],
+    "CONTACTS_KEY_GRANT": [1],
+    "KEYRING_ENTRY": [2],
+    "HISTORY_KEY_GRANT": [3]
+  },
+  "nonContentControl": {
+    "DEVICE_STATUS_CHANGED": [0, 1],
+    "SIM_STATE_CHANGED": [0, 1]
+  }
+}

@@ -1,4 +1,4 @@
-## GMweb 0.17.0 / Messages 3.1.0: encrypted current-state replication
+## GMweb 0.18.0 / Messages 3.3.0: fail-closed encrypted replication
 
 The `/web` inbox bootstraps revision-aware encrypted conversation/message state instead of replaying the complete event log. Android publishes newest-first bounded history with realtime priority. Full history continues to use one browser-bound v3 History Master Key.
 
@@ -252,7 +252,7 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `GET /api/v1/web/bootstrap?limit=` | Atomic encrypted conversation bootstrap plus `highWatermark`; linked `READ_MESSAGES` cookie only. | Linked session |
 | `GET /api/v1/web/conversations?cursor=&limit=` | Encrypted conversation snapshots using keyset pagination. | Linked session |
 | `GET /api/v1/web/conversations/:id/messages?before=&limit=` | Latest-first encrypted message current state using keyset pagination. | Linked session |
-| `GET /api/v1/sse` | Realtime **invalidation signal only** (`{type:"sync.available"}` — zero content, §44). On signal: re-pull `/api/v1/sync` with your cursor. EventSource cannot send headers → `?token=<apiToken>` is accepted (constant-time compared). Durability is never dependent on this stream. | Bearer or `?token=` |
+| `GET /api/v1/sse` | Realtime **invalidation signal only** (`{type:"sync.available"}` — zero content, §44). On signal, re-pull `/api/v1/sync`. The PWA uses its HttpOnly linked-session cookie. Query-token compatibility is disabled by default and requires the temporary `ALLOW_LEGACY_SSE_QUERY_TOKEN=true` flag. | Linked-session cookie |
 | `GET /api/v1/push/public-key` | VAPID public key for Web Push subscription. | Bearer |
 | `POST /api/v1/push/subscribe` / `unsubscribe` | Register/remove a push subscription (§89). **Content-less wake-ups only** (§30): notifications never carry message content. | Bearer |
 | `GET /api/v1/push/subscriptions` | List subscriptions (endpoint hashes truncated for privacy). | Bearer |

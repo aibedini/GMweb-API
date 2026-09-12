@@ -12,12 +12,17 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
     sequence: i + 1,
     eventId: `e${i}`,
     aggregateId: 'thread',
-    type: i < 10 ? 'MESSAGE_CREATED' : 'THREAD_READ',
+    type: i < 10 ? 'MESSAGE_CREATED' : 'DEVICE_STATUS_CHANGED',
     createdAt: i + 1,
-    cryptoVersion: 0,
-    encoding: 'envelope.v1',
+    cryptoVersion: i < 10 ? 3 : 1,
+    encoding: i < 10 ? 'envelope.v3' : 'envelope.v1',
     schemaVersion: 1,
-    ciphertext: '',
+    ciphertext: Buffer.from(i < 10 ? JSON.stringify({
+      v: 3, kind: 'message', eventId: `e${i}`, type: 'MESSAGE_CREATED', conversationId: 'thread',
+      iv: Buffer.alloc(12, 7).toString('base64'), ciphertext: Buffer.alloc(16, 7).toString('base64'),
+      historyWrapIv: Buffer.alloc(12, 7).toString('base64'), historyWrappedDek: Buffer.alloc(16, 7).toString('base64'),
+      liveWrapIv: Buffer.alloc(12, 7).toString('base64'), liveWrappedDek: Buffer.alloc(16, 7).toString('base64'),
+    }) : 'status').toString('base64'),
   }));
   global.fetch = async url => {
     if (/\/linked-device\/(?:key-grants|keyring)/.test(String(url))) {
@@ -26,6 +31,7 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
     }
     if (/\/web\/bootstrap/.test(String(url))) {
       return Response.json({ protocolVersion: 3, snapshotVersion: 1, highWatermark: 0,
+        replicaGeneration: 'test-generation', minimumAvailableSequence: 0,
         conversations: [], nextCursor: null, hasMore: false });
     }
     requests++;
@@ -87,6 +93,30 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
     const repaired = await sync.listConversations();
     assert.equal(repaired.items.length, 1);
     assert.equal(repaired.items[0].aggregateId, 'thread');
+
+    const seed = db.transaction('encrypted_message_state', 'readwrite');
+    for (let i = 1; i <= 1050; i++) seed.objectStore('encrypted_message_state').put({
+      messageId: `large-${String(i).padStart(4, '0')}`,
+      conversationId: 'large-thread', type: 'MESSAGE_CREATED', tombstone: false,
+      revision: 1, sortKey: i, envelope: Buffer.from('opaque').toString('base64'),
+      encoding: 'envelope.v3', schemaVersion: 1, cryptoVersion: 3, lastServerSequence: i,
+    });
+    await new Promise((resolve, reject) => {
+      seed.oncomplete = resolve;
+      seed.onerror = () => reject(seed.error);
+    });
+    const pagedIds = [];
+    let beforeState;
+    do {
+      const page = await sync.listAggregateEventsPage('large-thread', { limit: 50, beforeState });
+      pagedIds.push(...page.items.map(item => item.messageId));
+      beforeState = page.next;
+      if (!page.hasMore) break;
+    } while (true);
+    assert.equal(pagedIds.length, 1050);
+    assert.equal(new Set(pagedIds).size, 1050);
+    assert.deepEqual(pagedIds.slice(0, 3), ['large-1050', 'large-1049', 'large-1048']);
+    assert.deepEqual(pagedIds.slice(-3), ['large-0003', 'large-0002', 'large-0001']);
     db.close();
   } finally { global.fetch = originalFetch; }
 });

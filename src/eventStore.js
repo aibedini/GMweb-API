@@ -1,5 +1,8 @@
 "use strict";
 
+const crypto = require("node:crypto");
+const { validateStoredBatch } = require("./eventCryptoPolicy");
+
 function eventPage(rows, afterSequence, limit) {
   const hasMore = rows.length > limit;
   const page = hasMore ? rows.slice(0, limit) : rows;
@@ -64,6 +67,25 @@ class EventStore {
         account_id TEXT PRIMARY KEY,
         next_sequence INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS replica_metadata (
+        account_id TEXT PRIMARY KEY,
+        replica_generation TEXT NOT NULL,
+        snapshot_version INTEGER NOT NULL,
+        minimum_available_sequence INTEGER NOT NULL,
+        migration_version INTEGER NOT NULL,
+        migration_completed_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS linked_client_sync_state (
+        account_id TEXT NOT NULL,
+        linked_device_id TEXT NOT NULL,
+        last_acked_sequence INTEGER NOT NULL,
+        replica_generation TEXT NOT NULL,
+        snapshot_version INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (account_id, linked_device_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_linked_sync_ack
+        ON linked_client_sync_state(account_id, last_acked_sequence);
       CREATE TABLE IF NOT EXISTS sync_events (
         account_id      TEXT NOT NULL,
         sequence        INTEGER NOT NULL,
@@ -220,6 +242,7 @@ class EventStore {
       this.log?.(`SYNC_REPORT sourceDeviceId=${sourceDeviceId || "unknown"} received=0 accepted=0 duplicates=0 types=`);
       return { accepted: [], duplicates: 0 };
     }
+    validateStoredBatch(events);
     const typeSet = [...new Set(events.map((e) => String(e.type || "UNKNOWN")))].join(",");
     this.log?.(`batch_received sourceDeviceId=${sourceDeviceId || "unknown"} count=${events.length} types={${typeSet}}`);
     this.log?.(`SYNC_REPORT sourceDeviceId=${sourceDeviceId || "unknown"} received=${events.length} types={${typeSet}}`);
@@ -313,7 +336,106 @@ class EventStore {
   after(accountId, afterSequence, limit = 500) {
     const capped = Math.max(1, Math.min(1000, Number(limit) || 500));
     const rows = this.afterStmt.all(accountId, Number(afterSequence) || 0, capped + 1);
-    return eventPage(rows, afterSequence, capped);
+    return { ...eventPage(rows, afterSequence, capped), ...this.replicaMetadata(accountId) };
+  }
+
+  replicaMetadata(accountId) {
+    const select = this.db.prepare(`
+      SELECT replica_generation AS replicaGeneration,
+             snapshot_version AS snapshotVersion,
+             minimum_available_sequence AS minimumAvailableSequence,
+             migration_version AS migrationVersion,
+             migration_completed_at AS migrationCompletedAt
+      FROM replica_metadata WHERE account_id = ?
+    `);
+    let row = select.get(accountId);
+    if (!row) {
+      const now = Date.now();
+      this.db.prepare(`
+        INSERT OR IGNORE INTO replica_metadata
+          (account_id, replica_generation, snapshot_version, minimum_available_sequence,
+           migration_version, migration_completed_at)
+        VALUES (?, ?, 1, 1, 1, ?)
+      `).run(accountId, crypto.randomUUID(), now);
+      row = select.get(accountId);
+    }
+    return row;
+  }
+
+  acknowledgeClient(accountId, linkedDeviceId, cursor, replicaGeneration, snapshotVersion) {
+    const metadata = this.replicaMetadata(accountId);
+    if (replicaGeneration !== metadata.replicaGeneration || snapshotVersion !== metadata.snapshotVersion) {
+      const error = new Error("replica metadata mismatch");
+      error.code = "snapshot_required";
+      throw error;
+    }
+    const highWatermark = this.highWatermark(accountId);
+    if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > highWatermark) {
+      const error = new Error("invalid cursor");
+      error.code = "invalid_cursor";
+      throw error;
+    }
+    this.db.prepare(`
+      INSERT INTO linked_client_sync_state
+        (account_id, linked_device_id, last_acked_sequence, replica_generation, snapshot_version, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, linked_device_id) DO UPDATE SET
+        last_acked_sequence = MAX(last_acked_sequence, excluded.last_acked_sequence),
+        replica_generation = excluded.replica_generation,
+        snapshot_version = excluded.snapshot_version,
+        updated_at = excluded.updated_at
+    `).run(accountId, linkedDeviceId, cursor, replicaGeneration, snapshotVersion, Date.now());
+    return { ok: true, cursor };
+  }
+
+  compact(accountId, { retainEvents = 100000, retainMs = 7 * 24 * 60 * 60 * 1000, limit = 5000 } = {}) {
+    const startedAt = Date.now();
+    const highWatermark = this.highWatermark(accountId);
+    const ackState = this.db.prepare(`
+      SELECT MIN(CASE WHEN updated_at >= ? THEN last_acked_sequence END) AS activeSequence,
+             COUNT(*) AS clientCount
+      FROM linked_client_sync_state WHERE account_id = ?
+    `).get(Date.now() - retainMs, accountId);
+    if (!ackState.clientCount) return { rowsRemoved: 0, durationMs: Date.now() - startedAt };
+    const ack = Number.isSafeInteger(ackState.activeSequence) ? ackState.activeSequence : highWatermark;
+    const maxSequence = Math.min(ack, Math.max(0, highWatermark - retainEvents));
+    const candidates = this.db.prepare(`
+      SELECT sequence FROM sync_events
+      WHERE account_id = ? AND sequence <= ? AND created_at < ?
+        AND event_type IN (
+          'MESSAGE_CREATED', 'MESSAGE_UPDATED', 'MESSAGE_STATUS_CHANGED', 'MESSAGE_DELETED',
+          'CONVERSATION_UPSERT', 'CONVERSATION_UPSERTED', 'CONVERSATION_DELETED', 'THREAD_READ'
+        )
+      ORDER BY sequence ASC LIMIT ?
+    `).all(accountId, maxSequence, Date.now() - retainMs, Math.max(1, Math.min(5000, limit)));
+    if (candidates.length === 0) return { rowsRemoved: 0, durationMs: Date.now() - startedAt };
+    const lastDeleted = candidates.at(-1).sequence;
+    const result = this.db.transaction(() => {
+      const removed = this.db.prepare(`
+        DELETE FROM sync_events WHERE account_id = ? AND sequence IN (
+          SELECT sequence FROM sync_events
+          WHERE account_id = ? AND sequence <= ? AND created_at < ?
+            AND event_type IN (
+              'MESSAGE_CREATED', 'MESSAGE_UPDATED', 'MESSAGE_STATUS_CHANGED', 'MESSAGE_DELETED',
+              'CONVERSATION_UPSERT', 'CONVERSATION_UPSERTED', 'CONVERSATION_DELETED', 'THREAD_READ'
+            )
+          ORDER BY sequence ASC LIMIT ?
+        )
+      `).run(accountId, accountId, maxSequence, Date.now() - retainMs, candidates.length).changes;
+      this.db.prepare(`
+        UPDATE replica_metadata
+        SET minimum_available_sequence = MAX(minimum_available_sequence, ?)
+        WHERE account_id = ?
+      `).run(lastDeleted + 1, accountId);
+      return removed;
+    })();
+    const report = {
+      rowsRemoved: result,
+      durationMs: Date.now() - startedAt,
+      minimumAvailableSequence: this.replicaMetadata(accountId).minimumAvailableSequence,
+    };
+    this.log?.(`compaction rowsRemoved=${report.rowsRemoved} durationMs=${report.durationMs} minimumAvailableSequence=${report.minimumAvailableSequence}`);
+    return report;
   }
 
   /** Grant envelopes addressed to the authenticated linked device only. */
@@ -381,11 +503,29 @@ class EventStore {
     };
   }
 
+  contactBootstrapEvents(accountId) {
+    const rows = this.db.prepare(`
+      SELECT sequence, event_uuid AS eventId, event_type AS type, aggregate_id AS aggregateId,
+             source_device_id AS sourceDeviceId, ciphertext, encoding,
+             schema_version AS schemaVersion, crypto_version AS cryptoVersion, created_at AS createdAt
+      FROM sync_events
+      WHERE account_id = ?
+        AND event_type IN ('CONTACTS_SNAPSHOT', 'CONTACTS_CHANGED')
+        AND sequence >= COALESCE((
+          SELECT MAX(sequence) FROM sync_events
+          WHERE account_id = ? AND event_type = 'CONTACTS_SNAPSHOT'
+        ), 0)
+      ORDER BY sequence ASC
+    `).all(accountId, accountId);
+    return eventPage(rows, 0, rows.length).events;
+  }
+
   bootstrap(accountId, limit = 100) {
     return this.db.transaction(() => ({
       protocolVersion: 3,
-      snapshotVersion: 1,
+      ...this.replicaMetadata(accountId),
       highWatermark: this.highWatermark(accountId),
+      contactEvents: this.contactBootstrapEvents(accountId),
       ...this.conversations(accountId, null, limit),
     }))();
   }

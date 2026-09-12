@@ -27,6 +27,9 @@ export interface SyncPage {
   events: SyncEvent[];
   nextCursor: number;
   hasMore: boolean;
+  replicaGeneration?: string;
+  snapshotVersion?: number;
+  minimumAvailableSequence?: number;
 }
 
 export interface EncryptedConversationState {
@@ -49,8 +52,12 @@ export interface EncryptedMessageState extends EncryptedConversationState {
 
 export interface WebBootstrapPage {
   protocolVersion: number;
+  replicaGeneration: string;
   snapshotVersion: number;
+  minimumAvailableSequence: number;
+  migrationVersion?: number;
   highWatermark: number;
+  contactEvents: SyncEvent[];
   conversations: EncryptedConversationState[];
   nextCursor: string | null;
   hasMore: boolean;
@@ -72,10 +79,33 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
 }
 
+export class SnapshotRequiredError extends Error {
+  readonly details: Record<string, unknown>;
+  constructor(details: Record<string, unknown>) {
+    super("Encrypted replica snapshot required");
+    this.name = "SnapshotRequiredError";
+    this.details = details;
+  }
+}
+
 /** §54 cursor sync — one page of events after `cursor`. Linked-session cookie auth. */
 export async function fetchEventsAfter(cursor: number, limit = 500): Promise<SyncPage> {
   const res = await fetch(`${API}/sync?after=${cursor}&limit=${limit}`, { credentials: "include" });
+  if (res.status === 409) {
+    const body = await res.json().catch(() => ({})) as Record<string, unknown>;
+    if (body.error === "snapshot_required") throw new SnapshotRequiredError(body);
+  }
   return jsonOrThrow<SyncPage>(res);
+}
+
+export async function acknowledgeWebSync(cursor: number, replicaGeneration: string, snapshotVersion: number): Promise<void> {
+  const res = await fetch(`${API}/web/sync/ack`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cursor, replicaGeneration, snapshotVersion }),
+  });
+  await jsonOrThrow(res);
 }
 
 export async function fetchWebBootstrap(limit = 100): Promise<WebBootstrapPage> {

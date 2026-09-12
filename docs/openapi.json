@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.17.0",
+    "version": "0.18.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -1814,23 +1814,51 @@
                     "maxItems": 100,
                     "items": {
                       "type": "object",
+                      "additionalProperties": false,
                       "required": [
                         "eventId",
-                        "payload"
+                        "type",
+                        "payload",
+                        "encoding",
+                        "schemaVersion",
+                        "cryptoVersion"
                       ],
                       "properties": {
                         "eventId": {
-                          "type": "string"
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
                         },
                         "type": {
-                          "type": "string"
+                          "type": "string",
+                          "enum": [
+                            "MESSAGE_CREATED",
+                            "MESSAGE_UPDATED",
+                            "MESSAGE_STATUS_CHANGED",
+                            "MESSAGE_DELETED",
+                            "CONVERSATION_UPSERT",
+                            "CONVERSATION_UPSERTED",
+                            "CONVERSATION_DELETED",
+                            "THREAD_READ",
+                            "CONTACTS_SNAPSHOT",
+                            "CONTACTS_CHANGED",
+                            "KEY_GRANT",
+                            "CONTACTS_KEY_GRANT",
+                            "KEYRING_ENTRY",
+                            "HISTORY_KEY_GRANT",
+                            "DEVICE_STATUS_CHANGED",
+                            "SIM_STATE_CHANGED"
+                          ],
+                          "maxLength": 64
                         },
                         "conversationId": {
                           "type": "string",
+                          "maxLength": 256,
                           "nullable": true
                         },
                         "messageId": {
                           "type": "string",
+                          "maxLength": 128,
                           "nullable": true,
                           "description": "Opaque stable message identifier"
                         },
@@ -1847,19 +1875,28 @@
                         },
                         "payload": {
                           "type": "string",
-                          "description": "base64 opaque envelope bytes"
+                          "minLength": 4,
+                          "maxLength": 174764,
+                          "description": "canonical base64 opaque envelope bytes"
                         },
                         "encoding": {
                           "type": "string",
-                          "default": "envelope.v1"
+                          "enum": [
+                            "envelope.v1",
+                            "envelope.v2",
+                            "envelope.v3"
+                          ]
                         },
                         "schemaVersion": {
                           "type": "integer",
-                          "default": 1
+                          "enum": [
+                            1
+                          ]
                         },
                         "cryptoVersion": {
                           "type": "integer",
-                          "default": 0
+                          "minimum": 0,
+                          "maximum": 3
                         }
                       }
                     }
@@ -1966,6 +2003,58 @@
             "required": false
           }
         ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/web/sync/ack": {
+      "post": {
+        "summary": "Acknowledge a delta cursor after durable browser commit",
+        "tags": [
+          "Sync"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "cursor",
+                  "replicaGeneration",
+                  "snapshotVersion"
+                ],
+                "properties": {
+                  "cursor": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "replicaGeneration": {
+                    "type": "string",
+                    "minLength": 16,
+                    "maxLength": 128
+                  },
+                  "snapshotVersion": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Default Response",

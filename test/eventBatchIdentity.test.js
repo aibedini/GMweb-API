@@ -29,6 +29,20 @@ function makeApp(authenticatedDeviceId) {
   return { app, db, eventStore };
 }
 
+function encryptedEvent(eventId, type) {
+  const conversationId = "thread";
+  const b64 = length => Buffer.alloc(length, 7).toString("base64");
+  return {
+    eventId, type, conversationId, encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3,
+    payload: Buffer.from(JSON.stringify({
+      v: 3, kind: "message", eventId, type, conversationId,
+      iv: b64(12), ciphertext: b64(16),
+      historyWrapIv: b64(12), historyWrappedDek: b64(16),
+      liveWrapIv: b64(12), liveWrappedDek: b64(16),
+    })).toString("base64"),
+  };
+}
+
 test("authenticated agent identity wins over a spoofed body sourceDeviceId", async t => {
   const { app, db } = makeApp("real-android-device");
   t.after(async () => { await app.close(); db.close(); });
@@ -37,7 +51,7 @@ test("authenticated agent identity wins over a spoofed body sourceDeviceId", asy
     method: "POST", url: "/api/v1/agent/events/batch",
     payload: {
       sourceDeviceId: "spoofed-device", // must be IGNORED
-      events: [{ eventId: `evt-spoof-${Date.now()}`, type: "MESSAGE_CREATED", payload: Buffer.from("x").toString("base64") }],
+      events: [encryptedEvent(`evt-spoof-${Date.now()}`, "MESSAGE_CREATED")],
     },
   });
   assert.equal(up.statusCode, 200);
@@ -58,7 +72,7 @@ test("a shared-key caller with no bound identity stores null, not the body value
     method: "POST", url: "/api/v1/agent/events/batch",
     payload: {
       sourceDeviceId: "wannabe-device",
-      events: [{ eventId: `evt-anon-${Date.now()}`, type: "THREAD_READ", payload: Buffer.from("y").toString("base64") }],
+      events: [encryptedEvent(`evt-anon-${Date.now()}`, "THREAD_READ")],
     },
   });
   assert.equal(up.statusCode, 200);

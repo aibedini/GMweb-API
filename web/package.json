@@ -13,6 +13,7 @@
     "@heroui/styles": "^3.2.4",
     "@hpke/core": "^1.9.0",
     "@simplewebauthn/browser": "^13.3.0",
+    "@tanstack/react-virtual": "^3.13.12",
     "framer-motion": "^13.1.1",
     "qrcode": "^1.5.4",
     "react": "^19.1.0",

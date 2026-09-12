@@ -1,35 +1,59 @@
 # ADR: Encrypted Messages-for-Web replication
 
-Status: implemented for automated verification; physical release gate pending.
+Status: automated implementation verified; physical release gate pending.
 
 ## Decision
 
-The phone remains the source of truth. Android encrypts canonical message and conversation snapshots before its durable outbox. GMweb stores the opaque delta in `sync_events` and, in the same SQLite transaction, revision-aware current state in `encrypted_message_state` or `encrypted_conversation_state`. The Web app bootstraps current encrypted state, then continues `/api/v1/sync` at the returned high watermark.
+The phone remains the source of truth. GMweb is an encrypted durable replica, control plane, command queue, and bounded delta broker. An authorized Web client is a local decrypting replica. GMweb never receives SMS plaintext or decryption keys.
 
-Full-history authorization continues to use one browser-bound History Master Key (crypto v3). This design does not add per-conversation grants or a new cipher.
+`FULL_HISTORY` uses one browser/origin-bound v3 History Master Key for ordinary messages. Sensitive categories remain separated by existing v2 capability-domain keys and explicit phone approval.
 
-## Wire metadata
+## Pipeline
 
-The outer event contains only opaque `eventId`, `conversationId`, `messageId`, `revision`, `sortKey`, event type and crypto framing. `sortKey` leaks message/conversation ordering time. It is deliberately not encrypted because indexed pagination needs it; body, address, contact name, direction, status and preview remain inside AEAD ciphertext.
+```text
+Telephony Provider
+  -> Room source-of-truth mirror
+  -> canonical message object
+  -> Android encryption
+  -> encrypted durable outbox (REALTIME before BACKFILL)
+  -> GMweb encrypted current state + bounded delta log
+  -> encrypted browser IndexedDB
+  -> authorized local decryption
+```
 
-## Ordering and races
+The outer event exposes only opaque IDs, event type, revision, ciphertext length, server sequence, and ordering time needed for indexed pagination. Body, address, contact, direction, status details, and preview remain inside AEAD ciphertext.
 
-Android labels outbox rows `REALTIME` or `BACKFILL`; claim order always prefers realtime. Historical production is newest-first and stops at 2,000 pending backfill rows. History uses revision 1; live mutations use a later monotonic device timestamp. GMweb updates current state only when the incoming revision is newer (or the same revision has a later committed server sequence). Tombstones therefore cannot be replaced by stale history.
+## History reliability
+
+Historical production is newest-first and pauses when the bounded backfill queue reaches its cap. The producer watermark records what Android durably enqueued. The ACK watermark advances only across contiguous ACKed history ordinals. Completion requires provider exhaustion, a contiguous ACK through the final ordinal, and zero required dead letters. Recovery resumes/replays from durable checkpoint state with deterministic event IDs.
+
+Realtime outbox work has priority over backfill. A committed Room outbox write wakes the uploader; a two-second timeout remains only as a reliability fallback. Revision-aware current-state UPSERTs prevent stale backfill from replacing newer realtime mutations or tombstones.
+
+## Server replica lifecycle
+
+GMweb publishes:
+
+- `replicaGeneration`: persistent opaque replica identity
+- `snapshotVersion`: encrypted snapshot contract version
+- `minimumAvailableSequence`: oldest usable delta boundary
+
+Linked browsers ACK a cursor only after its IndexedDB transaction commits. Compaction is ACK-gated, bounded, and limited to message/conversation/read events reconstructable from encrypted current-state tables. Key events are never compacted. Contact events are retained, and encrypted bootstrap carries the latest contact snapshot plus subsequent changes.
+
+If a cursor is older than the retained floor, `/api/v1/sync` returns `snapshot_required`; Web transactionally installs encrypted bootstrap state and resumes from its high watermark.
 
 ## Read path
 
-- `GET /api/v1/web/bootstrap`: atomic high watermark plus first encrypted conversation page.
-- `GET /api/v1/web/conversations`: keyset conversation pagination.
-- `GET /api/v1/web/conversations/:conversationId/messages`: keyset message pagination.
-- `GET /api/v1/sync`: durable post-bootstrap delta.
-- `GET /api/v1/sse`: cookie-authenticated contentless wake-up only.
+- `GET /api/v1/web/bootstrap`: encrypted current state, replica metadata, contact reconstruction events, and atomic high watermark
+- `GET /api/v1/web/conversations`: keyset conversation pages
+- `GET /api/v1/web/conversations/:conversationId/messages`: keyset message pages
+- `GET /api/v1/sync`: durable deltas
+- `POST /api/v1/web/sync/ack`: post-IndexedDB durable ACK
+- `GET /api/v1/sse`: cookie-authenticated, contentless wake signal only
 
-The legacy `/conversations` automation endpoints remain compatibility surfaces and are not used by the Android-backed `/web` inbox.
+## Browser storage migration
 
-## Storage and migration
+IndexedDB v7 unconditionally removes legacy decrypted projections and v0 content events, resets data-plane cursors, and persists migration/replica metadata even for an empty bootstrap. Browser identity and non-extractable private keys are preserved. A replica-generation change replaces incompatible encrypted message/contact state, not device identity.
 
-SQLite remains the only server database. The two current-state tables contain no plaintext body/address columns. PWA schema v6 stores encrypted conversation/message state in IndexedDB and clears the legacy decrypted conversation projection after a non-empty encrypted bootstrap. A deployment with no v3 snapshots keeps the old local projection until Android publishes snapshots, avoiding an empty inbox during rollout.
+## Release boundary
 
-## Remaining release boundary
-
-Synthetic and unit verification cannot establish Android ANR/OOM, radio throughput, battery use, real carrier behavior, browser revocation on a real device, or end-to-end plaintext absence in production logs. Those remain release blockers.
+Synthetic tests do not establish physical-device throughput, ANR/OOM, battery impact, real carrier behavior, deployed proxy/log plaintext absence, or real-device revocation. Those gates remain explicitly NOT RUN until executed in their required environments.

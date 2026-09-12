@@ -1,5 +1,18 @@
 "use strict";
 
+const {
+  policy: eventCryptoPolicy,
+  validateWireBatch,
+  MAX_HTTP_BODY_BYTES,
+} = require("./eventCryptoPolicy");
+
+const EVENT_TYPES = Object.keys({
+  ...eventCryptoPolicy.contentBearing,
+  ...eventCryptoPolicy.controlKey,
+  ...eventCryptoPolicy.nonContentControl,
+});
+const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ"]);
+
 /**
  * Phase 2 Control Plane routes (TechSpec §51–58, ADR-001/004) as a REGISTERED
  * MODULE — the modular-monolith boundary: server.js wires dependencies, this
@@ -272,8 +285,12 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         !request.linkedDevice.capabilities?.includes("SEND_MESSAGES")) {
       return reply.code(403).send({ error: "send_messages_capability_required" });
     }
+    if (request.linkedDevice && ENCRYPTED_LINKED_COMMAND_TYPES.has(String(body.type))) {
+      if (Number(body.cryptoVersion) !== 1 || body.encoding !== "envelope.v1" || Number(body.schemaVersion) !== 1) {
+        return reply.code(400).send({ error: "encrypted_command_required" });
+      }
+    }
     if (request.linkedDevice && body.type === "SEND_SMS") {
-      if (Number(body.cryptoVersion) !== 1) return reply.code(400).send({ error: "encrypted_command_required" });
       const limit = checkRateLimit(request, `linked-send:${request.linkedDevice.deviceId}`, 10, 60_000);
       if (!limit.allowed) return reply.code(429).send({ error: "send_rate_limit", retryAfterSeconds: limit.retryAfterSeconds });
     }
@@ -391,6 +408,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   // ── Event batch upload + cursor sync (PR-09, §54/§55, LOCK 10) ──────────
 
   app.post("/api/v1/agent/events/batch", {
+    bodyLimit: MAX_HTTP_BODY_BYTES,
     schema: {
       summary: "Android Agent uploads a durable event batch (§55, partial ACK)",
       description: [
@@ -409,18 +427,19 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
             maxItems: 100,
             items: {
               type: "object",
-              required: ["eventId", "payload"],
+              additionalProperties: false,
+              required: ["eventId", "type", "payload", "encoding", "schemaVersion", "cryptoVersion"],
               properties: {
-                eventId: { type: "string" },
-                type: { type: "string" },
-                conversationId: { type: "string", nullable: true },
-                messageId: { type: "string", nullable: true, description: "Opaque stable message identifier" },
+                eventId: { type: "string", minLength: 1, maxLength: 128 },
+                type: { type: "string", enum: EVENT_TYPES, maxLength: 64 },
+                conversationId: { type: "string", maxLength: 256, nullable: true },
+                messageId: { type: "string", maxLength: 128, nullable: true, description: "Opaque stable message identifier" },
                 revision: { type: "integer", minimum: 1, nullable: true },
                 sortKey: { type: "integer", minimum: 0, nullable: true, description: "Minimal non-content ordering metadata" },
-                payload: { type: "string", description: "base64 opaque envelope bytes" },
-                encoding: { type: "string", default: "envelope.v1" },
-                schemaVersion: { type: "integer", default: 1 },
-                cryptoVersion: { type: "integer", default: 0 }
+                payload: { type: "string", minLength: 4, maxLength: 174764, description: "canonical base64 opaque envelope bytes" },
+                encoding: { type: "string", enum: ["envelope.v1", "envelope.v2", "envelope.v3"] },
+                schemaVersion: { type: "integer", enum: [1] },
+                cryptoVersion: { type: "integer", minimum: 0, maximum: 3 }
               }
             }
           }
@@ -442,12 +461,14 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         }
       }
     }
-  }, async (request) => {
+  }, async (request, reply) => {
     const body = request.body || {};
-    const events = (Array.isArray(body.events) ? body.events : []).map((e) => ({
-      ...e,
-      payload: Buffer.isBuffer(e.payload) ? e.payload : String(e.payload || ""),
-    }));
+    let events;
+    try {
+      events = validateWireBatch(body.events);
+    } catch (error) {
+      return reply.code(400).send({ error: error.code || "invalid_event_batch" });
+    }
     // P0: sourceDeviceId is NEVER taken from the request body. The per-device
     // identity was bound by the global agent gate from the verified
     // X-Agent-Auth signature (request.authenticatedAgentId). A legacy
@@ -478,6 +499,14 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     const after = Math.max(0, Number(request.query?.after) || 0);
     const limit = Number(request.query?.limit) || 500;
     reply.header("Cache-Control", "no-store");
+    const metadata = eventStore.replicaMetadata(accountId);
+    if (after < metadata.minimumAvailableSequence - 1) {
+      return reply.code(409).send({
+        error: "snapshot_required",
+        ...metadata,
+        highWatermark: eventStore.highWatermark(accountId),
+      });
+    }
     return eventStore.after(accountId, after, limit);
   });
 
@@ -493,6 +522,47 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   }, async (request, reply) => {
     webSnapshotHeaders(reply);
     return eventStore.bootstrap(accountId, Number(request.query?.limit) || 100);
+  });
+
+  app.post("/api/v1/web/sync/ack", {
+    schema: {
+      summary: "Acknowledge a delta cursor after durable browser commit",
+      tags: ["Sync"],
+      body: {
+        type: "object",
+        additionalProperties: false,
+        required: ["cursor", "replicaGeneration", "snapshotVersion"],
+        properties: {
+          cursor: { type: "integer", minimum: 0 },
+          replicaGeneration: { type: "string", minLength: 16, maxLength: 128 },
+          snapshotVersion: { type: "integer", minimum: 1 },
+        },
+      },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    }
+    try {
+      const result = eventStore.acknowledgeClient(
+        accountId,
+        request.linkedDevice.deviceId,
+        request.body.cursor,
+        request.body.replicaGeneration,
+        request.body.snapshotVersion,
+      );
+      setImmediate(() => {
+        try { eventStore.compact(accountId); } catch (error) {
+          console.error(`[eventStore] compaction_failed code=${error.code || "internal"}`);
+        }
+      });
+      return result;
+    } catch (error) {
+      return reply.code(error.code === "snapshot_required" ? 409 : 400)
+        .send({ error: error.code || "sync_ack_failed" });
+    }
   });
 
   app.get("/api/v1/web/conversations", {

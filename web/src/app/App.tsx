@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Card, CardContent, Chip, ScrollShadow, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
+import { Button, Card, CardContent, Chip, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
 import { syncNow, listRecentEvents, listAggregateEventsPage, listContacts, listConversations, getCursor, getBrowserSyncStatus, resetLocal, subscribeSyncAvailable, syncStep, syncUntilCaughtUp, type BrowserSyncStatus, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, type ConversationProjection } from "../lib/inbox";
 import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchSyncDiagnostics, fetchTrustSnapshot, health, type DeviceTelemetry, type ServerSyncDiagnostics, type TrustSnapshot } from "../lib/api";
@@ -9,11 +9,10 @@ import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
 import { collectWebDiagnostics, formatWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnostics";
+import { useVirtualizer } from "@tanstack/react-virtual";
 
 type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug";
 type ThreadState = "IDLE" | "LOADING" | "READY" | "LOCKED" | "EMPTY" | "FAILED";
-const MAX_RENDERED_CONVERSATIONS = 400;
-const MAX_RENDERED_MESSAGE_EVENTS = 500;
 
 function shortId(value: string | null | undefined) {
   return value ? `${value.slice(0, 8)}…` : "—";
@@ -82,6 +81,8 @@ export default function App() {
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
   const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; at: number } | null>(null);
   const markReadSent = useRef(new Set<string>());
+  const conversationScrollRef = useRef<HTMLDivElement>(null);
+  const messageScrollRef = useRef<HTMLDivElement>(null);
   const scriptFile = useMemo(() => loadedScriptFile(), []);
 
   const refresh = async () => {
@@ -100,12 +101,27 @@ export default function App() {
     setContacts(nextContacts);
   };
 
+  const refreshCached = async () => {
+    const [nextCursor, nextEvents, nextContacts, page] = await Promise.all([
+      getCursor(), listRecentEvents(500), listContacts(), listConversations({ limit: 100 }),
+    ]);
+    setCursor(nextCursor);
+    setEvents(nextEvents);
+    setContacts(nextContacts);
+    setConversationPage(page.items);
+    setConversationHasMore(page.hasMore);
+    setConversationNext(page.next);
+  };
+
   const loadOlderConversations = async () => {
     if (!conversationNext || loadingOlder) return;
     setLoadingOlder(true);
     try {
       const page = await listConversations({ limit: 100, before: conversationNext });
-      setConversationPage(prev => [...prev, ...page.items].slice(-MAX_RENDERED_CONVERSATIONS));
+      setConversationPage(prev => {
+        const merged = new Map([...prev, ...page.items].map(item => [item.aggregateId, item]));
+        return [...merged.values()].sort((a, b) => b.lastAt - a.lastAt || a.aggregateId.localeCompare(b.aggregateId));
+      });
       setConversationHasMore(page.hasMore);
       setConversationNext(page.next);
     } finally {
@@ -133,10 +149,16 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     setBootstrapState("BOOTSTRAPPING_SYNC");
-    void syncStep(2)
-      .then(refresh)
+    const authConfirmedAt = performance.now();
+    void refreshCached()
       .then(() => {
         setBootstrapState("FIRST_PAINT_READY");
+        performance.mark("gmweb-auth-to-cached-paint");
+        console.info(`web_warm_start authToCachedPaintMs=${Math.round(performance.now() - authConfirmedAt)}`);
+        return syncStep(2);
+      })
+      .then(refresh)
+      .then(() => {
         setSyncStatus(getBrowserSyncStatus());
         if (getBrowserSyncStatus().state === "UP_TO_DATE") return;
         void syncUntilCaughtUp((count) => {
@@ -245,9 +267,15 @@ export default function App() {
         limit: 100,
         ...(typeof threadNext === "string" ? { beforeState: threadNext } : { beforeSequence: threadNext }),
       });
-      // Native bounded windowing: deep history remains in encrypted IndexedDB
-      // and only the currently browsed window reaches React's DOM.
-      setThreadEvents(prev => [...prev, ...page.items].slice(-MAX_RENDERED_MESSAGE_EVENTS));
+      const scroll = messageScrollRef.current;
+      const previousHeight = scroll?.scrollHeight ?? 0;
+      setThreadEvents(prev => {
+        const merged = new Map([...page.items, ...prev].map(event => [event.messageId || event.eventId, event]));
+        return [...merged.values()];
+      });
+      requestAnimationFrame(() => {
+        if (scroll) scroll.scrollTop += scroll.scrollHeight - previousHeight;
+      });
       setThreadHasMore(page.hasMore);
       setThreadNext(page.next);
     } catch (cause) {
@@ -255,6 +283,20 @@ export default function App() {
     } finally { setLoadingOlderThread(false); }
   };
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
+  const conversationVirtualizer = useVirtualizer({
+    count: filteredConversations.length,
+    getScrollElement: () => conversationScrollRef.current,
+    estimateSize: () => 76,
+    overscan: 8,
+    getItemKey: index => filteredConversations[index]?.aggregateId ?? index,
+  });
+  const messageVirtualizer = useVirtualizer({
+    count: messages.length,
+    getScrollElement: () => messageScrollRef.current,
+    estimateSize: () => 72,
+    overscan: 12,
+    getItemKey: index => messages[index]?.payload.messageId ?? messages[index]?.event.eventId ?? index,
+  });
   const selectedRecipient = messages.map(item => item.payload.address).find(Boolean) || composeRecipient;
 
   useEffect(() => {
@@ -406,16 +448,21 @@ export default function App() {
             <aside className="conversation-pane">
               <div className="pane-heading"><div><p className="eyebrow">Inbox</p><h1>Conversations</h1></div><Chip size="sm" variant="soft">{conversations.length}</Chip></div>
               <label className="search-box"><span aria-hidden="true">⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search messages" aria-label="Search messages" /></label>
-              <ScrollShadow className="conversation-list">
-                {filteredConversations.map((item) => (
-                  <button key={item.aggregateId} className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => setSelected(item.aggregateId)}>
-                    <Avatar title={item.title} />
-                    <span className="conversation-copy"><span className="conversation-title">{item.title}{item.subtitle ? ` · ${item.subtitle}` : ""}</span><span className="conversation-preview">{item.preview}</span></span>
-                    <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time>{item.unreadCount > 0 && <Chip size="sm">{item.unreadCount}</Chip>}</span>
-                  </button>
-                ))}
+              <div ref={conversationScrollRef} className="conversation-list">
+                <div style={{ height: conversationVirtualizer.getTotalSize(), position: "relative" }}>
+                  {conversationVirtualizer.getVirtualItems().map(virtualRow => {
+                    const item = filteredConversations[virtualRow.index];
+                    return <button key={item.aggregateId} ref={conversationVirtualizer.measureElement} data-index={virtualRow.index}
+                      style={{ position: "absolute", width: "100%", transform: "translateY(" + virtualRow.start + "px)" }}
+                      className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => setSelected(item.aggregateId)}>
+                        <Avatar title={item.title} />
+                        <span className="conversation-copy"><span className="conversation-title">{item.title}{item.subtitle ? ` · ${item.subtitle}` : ""}</span><span className="conversation-preview">{item.preview}</span></span>
+                        <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time>{item.unreadCount > 0 && <Chip size="sm">{item.unreadCount}</Chip>}</span>
+                      </button>;
+                  })}
+                </div>
                 {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : emptyInboxMessage}</p></div>}
-              </ScrollShadow>
+              </div>
               {conversationHasMore && (
                 <Button size="sm" variant="ghost" className="load-older" onPress={() => void loadOlderConversations()} isDisabled={loadingOlder}>
                   {loadingOlder ? "Loading…" : "Load older conversations"}
@@ -432,13 +479,18 @@ export default function App() {
                       {loadingOlderThread ? "Loading…" : "Load older messages"}
                     </Button>
                   )}
-                  <ScrollShadow className="message-scroll">
+                  <div ref={messageScrollRef} className="message-scroll">
                     <div className="message-day"><span>Message history</span></div>
-                    {messages.map(({ event, payload }) => (
-                      <div key={event.sequence} className={`message-line ${payload.direction}`}>
-                        <div className="message-bubble"><p>{payload.body}</p><span>{formatTime(payload.dateMs)}{payload.direction === "out" ? ` · ${messageStatus(payload.status)}` : ""}</span></div>
-                      </div>
-                    ))}
+                    <div style={{ height: messageVirtualizer.getTotalSize(), position: "relative" }}>
+                      {messageVirtualizer.getVirtualItems().map(virtualRow => {
+                        const { payload } = messages[virtualRow.index];
+                        return <div key={payload.messageId} ref={messageVirtualizer.measureElement} data-index={virtualRow.index}
+                          style={{ position: "absolute", width: "100%", transform: "translateY(" + virtualRow.start + "px)" }}
+                          className={`message-line ${payload.direction}`}>
+                            <div className="message-bubble"><p>{payload.body}</p><span>{formatTime(payload.dateMs)}{payload.direction === "out" ? ` · ${messageStatus(payload.status)}` : ""}</span></div>
+                          </div>;
+                      })}
+                    </div>
                     {pendingMessage && (
                       <div className="message-line out">
                         <div className="message-bubble"><p>{pendingMessage.body}</p><span>{formatTime(pendingMessage.at)} · {commandStatus || "queued"}</span></div>
@@ -448,7 +500,7 @@ export default function App() {
                     {threadState === "LOCKED" && <div className="empty-conversation"><div className="empty-icon">↻</div><h3>Messages are encrypted</h3><p>The browser is waiting for an authorized key.</p></div>}
                     {threadState === "EMPTY" && <div className="empty-conversation"><div className="empty-icon">✦</div><h3>No messages in this conversation.</h3></div>}
                     {threadState === "FAILED" && <div className="empty-conversation"><div className="empty-icon">!</div><h3>Unable to load messages</h3><p>{threadError || "Thread page read failed"}</p><Button size="sm" onPress={() => setThreadReload(value => value + 1)}>Retry</Button></div>}
-                  </ScrollShadow>
+                  </div>
                   <div className="composer-disabled">
                     <input value={draft} onChange={event => setDraft(event.target.value)} placeholder={selectedRecipient ? "Text message" : "Choose a contact"} disabled={!selectedRecipient || !capabilities.includes("SEND_MESSAGES")} />
                     <span>{draft.length} chars · {draft.length <= 160 ? "SMS" : draft.length <= 480 ? `${Math.ceil(draft.length / 153)} parts` : "MMS"}</span>

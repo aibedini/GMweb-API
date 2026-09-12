@@ -9,14 +9,14 @@ const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 const { EventStore } = require("../src/eventStore");
 
-function envelope(payload) {
-  const inner = Buffer.from(JSON.stringify(payload));
-  const envelopeText = JSON.stringify({
-    cryptoVersion: 0,
-    encoding: "application/json",
-    ciphertextB64: inner.toString("base64"),
-  });
-  return Buffer.from(envelopeText);
+function envelope(eventId, type, conversationId) {
+  const b64 = length => Buffer.alloc(length, 7).toString("base64");
+  return Buffer.from(JSON.stringify({
+    v: 3, kind: "message", eventId, type, conversationId,
+    iv: b64(12), ciphertext: b64(16),
+    historyWrapIv: b64(12), historyWrappedDek: b64(16),
+    liveWrapIv: b64(12), liveWrappedDek: b64(16),
+  }));
 }
 
 describe("incoming_sms_e2e_trace", () => {
@@ -31,15 +31,15 @@ describe("incoming_sms_e2e_trace", () => {
       eventId: "in-1",
       type: "MESSAGE_CREATED",
       conversationId: "conversation-1",
-      payload: envelope({ messageId: "m1", direction: "in", body: "Hello from Phone A", dateMs: 1000, status: 1, address: "+123" }),
-      cryptoVersion: 0,
+      payload: envelope("in-1", "MESSAGE_CREATED", "conversation-1"),
+      cryptoVersion: 3,
     };
     const outgoing = {
       eventId: "out-1",
       type: "MESSAGE_CREATED",
       conversationId: "conversation-1",
-      payload: envelope({ messageId: "m2", direction: "out", body: "Hello back", dateMs: 2000, status: 2, address: "+123" }),
-      cryptoVersion: 0,
+      payload: envelope("out-1", "MESSAGE_CREATED", "conversation-1"),
+      cryptoVersion: 3,
     };
 
     const first = store.ingestBatch({ accountId: "acc1", sourceDeviceId: "agent-1", events: [incoming, outgoing] });
@@ -63,7 +63,14 @@ describe("incoming_sms_e2e_trace", () => {
     assert.equal(duplicates.length, 1);
 
     // Browser projection decodes the stored (opaque) events: in + out present.
+    const plaintext = {
+      "in-1": { messageId: "m1", direction: "in", body: "Hello from Phone A", dateMs: 1000, status: 1, address: "+123" },
+      "out-1": { messageId: "m2", direction: "out", body: "Hello back", dateMs: 2000, status: 2, address: "+123" },
+    };
     const page = store.after("acc1", 0);
+    page.events = page.events.map(event => ({
+      ...event, decryption: { state: "decrypted", payload: plaintext[event.eventId] },
+    }));
     assert.equal(page.events.length, 2);
     const { messagesForAggregate, buildConversations } = await import("../web/src/lib/inbox.ts");
     const timeline = messagesForAggregate(page.events, "conversation-1");

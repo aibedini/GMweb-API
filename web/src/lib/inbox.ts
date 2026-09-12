@@ -1,4 +1,5 @@
 import type { StoredEvent } from "./sync";
+import { acceptsContentCrypto, isContentBearingEvent } from "./eventCryptoPolicy.ts";
 
 export interface MessagePayload {
   messageId: string;
@@ -46,11 +47,6 @@ export interface TimelineItem {
   payload: MessagePayload;
 }
 
-function decodeBase64(value: string): Uint8Array {
-  const binary = atob(value);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-}
-
 /**
  * Decode the legacy cryptoVersion=0 Android envelope. Version zero is NOT
  * encryption: it is UTF-8 JSON wrapped in Base64. Keeping this decoder named
@@ -58,17 +54,10 @@ function decodeBase64(value: string): Uint8Array {
  * cryptoVersion>=1 a fail-closed extension point.
  */
 export function decodeEventPayload(event: StoredEvent): Record<string, unknown> | null {
-  if (event.cryptoVersion > 0) return event.decryption?.state === "decrypted" ? event.decryption.payload : null;
-  try {
-    if (event.encoding !== "envelope.v1" || event.cryptoVersion !== 0 || event.schemaVersion !== 1) return null;
-    const envelopeText = new TextDecoder().decode(decodeBase64(event.ciphertext));
-    const envelope = JSON.parse(envelopeText) as { ciphertextB64?: string; encoding?: string; cryptoVersion?: number };
-    if (envelope.cryptoVersion !== 0 || envelope.encoding !== "application/json" || !envelope.ciphertextB64) return null;
-    const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(decodeBase64(envelope.ciphertextB64)));
-    return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
-  } catch {
-    return null;
-  }
+  if (isContentBearingEvent(event.type) && !acceptsContentCrypto(event.type, event.cryptoVersion)) return null;
+  return event.cryptoVersion > 0 && event.decryption?.state === "decrypted"
+    ? event.decryption.payload
+    : null;
 }
 
 function messagePayload(event: StoredEvent): MessagePayload | null {
@@ -165,7 +154,7 @@ export function eventDecodeState(event: StoredEvent): string {
     if (event.decryption?.state === "invalid") return "Invalid/corrupt payload";
     return event.decryption?.reason ? `Locked: ${event.decryption.reason}` : "Locked/unsupported crypto version";
   }
-  return decodeEventPayload(event) ? "Legacy/plaintext-envelope" : "Invalid/corrupt payload";
+  return "Rejected plaintext/unsupported content event";
 }
 
 /**

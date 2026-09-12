@@ -51,6 +51,7 @@ module.exports = {
   port: intFromEnv(process.env.PORT, 3030),
   host: process.env.HOST || "0.0.0.0",
   apiToken: process.env.API_TOKEN || "",
+  allowLegacySseQueryToken: boolFromEnv(process.env.ALLOW_LEGACY_SSE_QUERY_TOKEN, false),
   headless: boolFromEnv(process.env.HEADLESS, false),
   userDataDir: path.resolve(rootDir, process.env.USER_DATA_DIR || "./data/browser-profile"),
   chromeExecutablePath: findChromeExecutable(),

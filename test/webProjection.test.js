@@ -17,8 +17,9 @@ function event(sequence, type, payload, aggregateId) {
   return {
     sequence, eventId: `evt-${sequence}`, type, aggregateId,
     sourceDeviceId: "phone", createdAt: sequence * 1000,
-    encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 0,
-    ciphertext: envelope(payload),
+    encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3,
+    ciphertext: Buffer.from("ciphertext").toString("base64"),
+    decryption: { state: "decrypted", payload },
   };
 }
 
@@ -26,7 +27,7 @@ test("locked ciphertext stays visible as a locked projection until a grant arriv
   const inbox = await import("../web/src/lib/inbox.ts");
   const encrypted = {
     ...event(1, "MESSAGE_CREATED", { body: "ignore" }, "locked-thread"),
-    cryptoVersion: 1, ciphertext: Buffer.from("no-plaintext").toString("base64"),
+    cryptoVersion: 1, ciphertext: Buffer.from("no-plaintext").toString("base64"), decryption: undefined,
   };
   const row = inbox.conversationProjectionFromEvents([encrypted], "locked-thread");
   assert.ok(row);

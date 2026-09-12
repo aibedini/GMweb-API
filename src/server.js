@@ -712,6 +712,8 @@ function requireToken(request, reply, done) {
           p === "/api/v1/linked-device/keyring" ||
           p === "/api/v1/linked-session" ||
           p.startsWith("/api/v1/trust/"))) ||
+      (caps.includes("READ_MESSAGES") && request.method === "POST" &&
+        p === "/api/v1/web/sync/ack") ||
       (caps.includes("READ_MESSAGES") && request.method === "GET" &&
         p === "/api/v1/linked-device/telemetry") ||
       (caps.includes("SEND_MESSAGES") && request.method === "GET" &&
@@ -823,7 +825,8 @@ function requireToken(request, reply, done) {
   // headers, so the control-plane SSE accepts ?token=<apiToken> as a
   // constant-time equivalent of the Bearer header. TEMPORARY until the PWA
   // gets its own passkey session (Phase 4) — then this bridge is deleted.
-  if (requestPath(request.url) === "/api/v1/sse" && config.apiToken) {
+  if (requestPath(request.url) === "/api/v1/sse" && config.apiToken && config.allowLegacySseQueryToken) {
+    app.log.warn("legacy SSE query-token authentication used; disable ALLOW_LEGACY_SSE_QUERY_TOKEN");
     const q = String(request.query?.token || "");
     if (
       q.length === config.apiToken.length &&

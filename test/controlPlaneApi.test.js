@@ -9,6 +9,25 @@ const { CommandEngine } = require("../src/commandEngine");
 const { EventStore } = require("../src/eventStore");
 const { registerControlPlaneRoutes } = require("../src/controlPlaneRoutes");
 
+function encryptedPayload(event) {
+  const b64 = length => Buffer.alloc(length, 7).toString("base64");
+  const envelope = {
+    v: event.cryptoVersion,
+    kind: "message",
+    eventId: event.eventId,
+    type: event.type,
+    conversationId: event.conversationId || "",
+    iv: b64(12),
+    ciphertext: b64(16),
+  };
+  if (event.cryptoVersion === 3) Object.assign(envelope, {
+    historyWrapIv: b64(12), historyWrappedDek: b64(16),
+    liveWrapIv: b64(12), liveWrappedDek: b64(16),
+  });
+  else Object.assign(envelope, { wrapIv: b64(12), wrappedDek: b64(16) });
+  return Buffer.from(JSON.stringify(envelope)).toString("base64");
+}
+
 // Standalone fastify instance with injected deps — no Redis, no browser, no
 // server.js import. This IS the modular-monolith boundary paying off: the
 // control plane is testable in isolation (ADR-004 "independent CI").
@@ -80,13 +99,13 @@ describe("Phase 2 control plane HTTP API", () => {
       const response = await app.inject({ method: "POST", url: "/api/v1/commands",
         headers: { "x-test-linked": "rate-device" },
         payload: { type: "SEND_SMS", payload: Buffer.from("opaque").toString("base64"),
-          cryptoVersion: 1, idempotencyKey: `rate-${i}` } });
+          encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1, idempotencyKey: `rate-${i}` } });
       assert.equal(response.statusCode, 202, response.body);
     }
     const limited = await app.inject({ method: "POST", url: "/api/v1/commands",
       headers: { "x-test-linked": "rate-device" },
       payload: { type: "SEND_SMS", payload: Buffer.from("opaque").toString("base64"),
-        cryptoVersion: 1, idempotencyKey: "rate-11" } });
+        encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1, idempotencyKey: "rate-11" } });
     assert.equal(limited.statusCode, 429);
   });
 
@@ -200,8 +219,8 @@ describe("Phase 2 control plane HTTP API", () => {
       payload: {
         sourceDeviceId: "android-1",
         events: [
-          { eventId: `evt-${Date.now()}-1`, type: "MESSAGE_CREATED", conversationId: "conv-x", payload: Buffer.from("p1").toString("base64") },
-          { eventId: `evt-${Date.now()}-2`, type: "THREAD_READ", payload: Buffer.from("p2").toString("base64") },
+        (() => { const event = { eventId: `evt-${Date.now()}-1`, type: "MESSAGE_CREATED", conversationId: "conv-x", encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3 }; return { ...event, payload: encryptedPayload(event) }; })(),
+        (() => { const event = { eventId: `evt-${Date.now()}-2`, type: "THREAD_READ", encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3 }; return { ...event, payload: encryptedPayload(event) }; })(),
         ],
       },
     });
@@ -210,6 +229,69 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.equal(body.accepted.length, 2);
     // LOCK 10: per-account monotonic — first upload to this test account starts at 1
     assert.deepEqual(body.accepted.map((a) => a.serverSequence), [1, 2]);
+  });
+
+  test("web sync ACK requires linked authorization and matching replica metadata", async () => {
+    const headers = { "x-test-linked": "web-device" };
+    const bootstrap = await app.inject({ method: "GET", url: "/api/v1/web/bootstrap", headers });
+    assert.equal(bootstrap.statusCode, 200);
+    const snapshot = bootstrap.json();
+    const payload = {
+      cursor: snapshot.highWatermark,
+      replicaGeneration: snapshot.replicaGeneration,
+      snapshotVersion: snapshot.snapshotVersion,
+    };
+    const denied = await app.inject({ method: "POST", url: "/api/v1/web/sync/ack", payload });
+    assert.equal(denied.statusCode, 401);
+    const mismatch = await app.inject({
+      method: "POST", url: "/api/v1/web/sync/ack", headers,
+      payload: { ...payload, replicaGeneration: "wrong-generation-id" },
+    });
+    assert.equal(mismatch.statusCode, 409);
+    assert.equal(mismatch.json().error, "snapshot_required");
+    const accepted = await app.inject({ method: "POST", url: "/api/v1/web/sync/ack", headers, payload });
+    assert.equal(accepted.statusCode, 200);
+    assert.equal(accepted.json().cursor, snapshot.highWatermark);
+  });
+
+  test("event ingest rejects plaintext, malformed, unknown, and oversized input", async () => {
+    const valid = (overrides = {}) => {
+      const event = {
+      eventId: `secure-${Date.now()}-${Math.random()}`,
+      type: "MESSAGE_CREATED",
+      encoding: "envelope.v3",
+      schemaVersion: 1,
+      cryptoVersion: 3,
+      ...overrides,
+      };
+      return { ...event, payload: overrides.payload ?? encryptedPayload(event) };
+    };
+    const post = events => app.inject({ method: "POST", url: "/api/v1/agent/events/batch", payload: { events } });
+
+    const plaintext = await post([valid({ cryptoVersion: 0, encoding: "envelope.v1" })]);
+    assert.equal(plaintext.statusCode, 400);
+    assert.equal(plaintext.json().error, "encrypted_payload_required");
+    assert.equal((await post([valid({ payload: "!!!!" })])).statusCode, 400);
+    assert.equal((await post([valid({ eventId: "x".repeat(129) })])).statusCode, 400);
+    assert.equal((await post([valid({ type: "UNKNOWN_DATA" })])).statusCode, 400);
+    assert.equal((await post(Array.from({ length: 101 }, (_, index) => valid({ eventId: `many-${index}` })))).statusCode, 400);
+    assert.equal((await post([valid({ payload: Buffer.alloc(64 * 1024 + 1).toString("base64") })])).statusCode, 400);
+    const aggregate = Array.from({ length: 5 }, (_, index) => valid({
+      eventId: `aggregate-${index}`,
+      type: "KEYRING_ENTRY",
+      payload: Buffer.alloc(110 * 1024, index).toString("base64"),
+      encoding: "envelope.v2",
+      cryptoVersion: 2,
+    }));
+    assert.equal((await post(aggregate)).statusCode, 400);
+
+    const oversized = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/events/batch",
+      headers: { "content-type": "application/json" },
+      payload: JSON.stringify({ padding: "x".repeat(810 * 1024), events: [] }),
+    });
+    assert.equal(oversized.statusCode, 413);
   });
 
   test("lost ACK redelivery returns original sequence without duplicating storage", async () => {
@@ -223,7 +305,7 @@ describe("Phase 2 control plane HTTP API", () => {
     const p2 = Buffer.from("payload-two").toString("base64");
     const first = await app.inject({
       method: "POST", url: "/api/v1/agent/events/batch",
-      payload: { events: [{ eventId, type: "T", payload: p1 }] },
+      payload: { events: [{ eventId, type: "DEVICE_STATUS_CHANGED", payload: p1, encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1 }] },
     });
     const firstSeq = first.json().accepted[0].serverSequence;
     assert.equal(firstSeq, maxSeqBefore + 1);
@@ -232,8 +314,8 @@ describe("Phase 2 control plane HTTP API", () => {
       method: "POST", url: "/api/v1/agent/events/batch",
       payload: {
         events: [
-          { eventId, type: "T", payload: p1 }, // redelivery
-          { eventId: `${eventId}-new`, type: "T", payload: p2 },
+          { eventId, type: "DEVICE_STATUS_CHANGED", payload: p1, encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1 }, // redelivery
+          { eventId: `${eventId}-new`, type: "DEVICE_STATUS_CHANGED", payload: p2, encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1 },
         ],
       },
     });
@@ -294,9 +376,9 @@ describe("Phase 2 control plane HTTP API", () => {
       method: "POST", url: "/api/v1/agent/events/batch",
       payload: { events: [
         { eventId: `grant-${Date.now()}`, type: "KEY_GRANT", conversationId: "thread",
-          payload: Buffer.from(JSON.stringify({ deviceId: "web-device", wrapped: "opaque" })).toString("base64"), cryptoVersion: 1 },
+          payload: Buffer.from(JSON.stringify({ deviceId: "web-device", wrapped: "opaque" })).toString("base64"), encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1 },
         { eventId: `other-grant-${Date.now()}`, type: "KEY_GRANT", conversationId: "thread",
-          payload: Buffer.from(JSON.stringify({ deviceId: "other-device", wrapped: "opaque" })).toString("base64"), cryptoVersion: 1 },
+          payload: Buffer.from(JSON.stringify({ deviceId: "other-device", wrapped: "opaque" })).toString("base64"), encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1 },
       ] },
     });
     const response = await app.inject({
@@ -318,12 +400,12 @@ describe("Phase 2 control plane HTTP API", () => {
       method: "POST", url: "/api/v1/agent/events/batch",
       payload: { events: [
         { eventId: `keyring-${Date.now()}`, type: "KEYRING_ENTRY", conversationId: "__account_keyring__",
-          payload: Buffer.from(JSON.stringify({ deviceId: "web-device", keyId: "messages" })).toString("base64"), cryptoVersion: 2 },
+          payload: Buffer.from(JSON.stringify({ deviceId: "web-device", keyId: "messages" })).toString("base64"), encoding: "envelope.v2", schemaVersion: 1, cryptoVersion: 2 },
         { eventId: `other-keyring-${Date.now()}`, type: "KEYRING_ENTRY", conversationId: "__account_keyring__",
-          payload: Buffer.from(JSON.stringify({ deviceId: "other-device", keyId: "messages" })).toString("base64"), cryptoVersion: 2 },
+          payload: Buffer.from(JSON.stringify({ deviceId: "other-device", keyId: "messages" })).toString("base64"), encoding: "envelope.v2", schemaVersion: 1, cryptoVersion: 2 },
         { eventId: `history-${Date.now()}`, type: "HISTORY_KEY_GRANT", conversationId: "__history_master__",
           payload: Buffer.from(JSON.stringify({ deviceId: "web-device", keyId: "history" })).toString("base64"),
-          encoding: "envelope.v3", cryptoVersion: 3 },
+          encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3 },
       ] },
     });
     const response = await app.inject({

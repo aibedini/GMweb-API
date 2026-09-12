@@ -8,14 +8,15 @@
  * without touching storage or UI.
  */
 
-import { fetchEventsAfter, fetchKeyGrantsAfter, fetchKeyring, fetchWebBootstrap, fetchWebConversationPage, fetchWebMessagePage,
-  type EncryptedConversationState, type EncryptedMessageState, type SyncEvent } from "./api.ts";
+import { acknowledgeWebSync, fetchEventsAfter, fetchKeyGrantsAfter, fetchKeyring, fetchWebBootstrap, fetchWebConversationPage, fetchWebMessagePage, SnapshotRequiredError,
+  type EncryptedConversationState, type EncryptedMessageState, type SyncEvent, type SyncPage } from "./api.ts";
 import { receiveKeyGrant, receiveKeyGrants, decryptMessage, type Decryption } from "./messageCrypto.ts";
 import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
 import { getOrCreateDeviceKeys } from "./deviceKeys.ts";
+import { assertSupportedContentEvent, isContentBearingEvent } from "./eventCryptoPolicy.ts";
 
 const DB_NAME = "gmweb-messages";
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 const STORE_EVENTS = "events";
 const STORE_META = "meta";
 const STORE_CONTACTS = "contacts";
@@ -26,6 +27,13 @@ const STORE_ENCRYPTED_CONVERSATIONS = "encrypted_conversation_state";
 const STORE_ENCRYPTED_MESSAGES = "encrypted_message_state";
 const PROJECTION_VERSION_KEY = "conversation_projection_version";
 export const PROJECTION_CURSOR_KEY = "conversation_projection_cursor";
+const REPLICA_GENERATION_KEY = "replica_generation";
+const SNAPSHOT_VERSION_KEY = "snapshot_version";
+const REPLICA_MIGRATION_VERSION_KEY = "replica_migration_version";
+const RECONSTRUCTABLE_STATE_EVENTS = new Set([
+  "MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED", "MESSAGE_DELETED",
+  "CONVERSATION_UPSERT", "CONVERSATION_UPSERTED", "CONVERSATION_DELETED", "THREAD_READ",
+]);
 const KEY_GRANT_CURSOR_PREFIX = "key_grant_bootstrap_v2_cursor:";
 const KEYRING_CURSOR_PREFIX = "account_keyring_v2_cursor:";
 const volatileContacts = new Map<string, StoredContact>();
@@ -101,6 +109,25 @@ function openDb(): Promise<IDBDatabase> {
       const events = req.transaction!.objectStore(STORE_EVENTS);
       if (!events.indexNames.contains("by_type_sequence")) events.createIndex("by_type_sequence", ["type", "sequence"]);
       if (!events.indexNames.contains("by_aggregate_sequence")) events.createIndex("by_aggregate_sequence", ["aggregateId", "sequence"]);
+      if (versionEvent.oldVersion < 7) {
+        // v7 is a security boundary: decrypted projections are never carried
+        // across the upgrade and cached data-plane deltas are replayed only
+        // from the encrypted server replica. Browser identity stores are not touched.
+        req.transaction!.objectStore(STORE_CONVERSATIONS).clear();
+        req.transaction!.objectStore(STORE_CONTACTS).clear();
+        const cursor = events.openCursor();
+        cursor.onsuccess = () => {
+          const row = cursor.result;
+          if (!row) return;
+          const event = row.value as SyncEvent;
+          if (isContentBearingEvent(event.type) && event.cryptoVersion === 0) row.delete();
+          row.continue();
+        };
+        const meta = req.transaction!.objectStore(STORE_META);
+        meta.put(0, CURSOR_KEY);
+        meta.put(0, PROJECTION_CURSOR_KEY);
+        meta.put(7, REPLICA_MIGRATION_VERSION_KEY);
+      }
     };
     req.onsuccess = async () => {
       const db = req.result;
@@ -204,6 +231,9 @@ export function syncUntilCaughtUp(onProgress?: (applied: number) => void): Promi
 interface DrainResult { applied: number; lastPageCount: number; caughtUp: boolean }
 async function drainSync(maxPages?: number, onProgress?: (applied: number) => void): Promise<DrainResult> {
   let cursor = await getCursor();
+  const db = await openDb();
+  let replicaGeneration = await metaValue<string>(db, REPLICA_GENERATION_KEY);
+  let snapshotVersion = await metaValue<number>(db, SNAPSHOT_VERSION_KEY);
   let applied = 0;
   let pages = 0;
   let lastPageCount = 0;
@@ -217,7 +247,26 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
     await setMetaNumber(PROJECTION_CURSOR_KEY, projectionThrough);
   };
   for (;;) {
-    const page = await fetchEventsAfter(cursor);
+    let page: SyncPage;
+    try {
+      page = await fetchEventsAfter(cursor);
+    } catch (cause) {
+      if (!(cause instanceof SnapshotRequiredError)) throw cause;
+      await bootstrapEncryptedState(true);
+      cursor = await getCursor();
+      projectionThrough = cursor;
+      continue;
+    }
+    if (page.replicaGeneration && (page.replicaGeneration !== replicaGeneration ||
+        page.snapshotVersion !== snapshotVersion)) {
+      await bootstrapEncryptedState(true);
+      cursor = await getCursor();
+      projectionThrough = cursor;
+      replicaGeneration = await metaValue<string>(db, REPLICA_GENERATION_KEY);
+      snapshotVersion = await metaValue<number>(db, SNAPSHOT_VERSION_KEY);
+      continue;
+    }
+    for (const event of page.events) assertSupportedContentEvent(event);
     lastPageCount = page.events.length;
     // Observability (Phase 2) — browser console trace of each sync page.
     try {
@@ -249,7 +298,6 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
         if (decoded.state === "decrypted") await applyContacts(decoded.payload);
       }
     }
-    const db = await openDb();
     await new Promise<void>((resolve, reject) => {
       const t = db.transaction([STORE_EVENTS, STORE_META, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES], "readwrite");
       const store = t.objectStore(STORE_EVENTS);
@@ -289,6 +337,10 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
       t.onerror = () => reject(t.error);
       t.onabort = () => reject(t.error ?? new Error("Sync transaction aborted"));
     });
+    if (page.replicaGeneration && Number.isSafeInteger(page.snapshotVersion)) {
+      await acknowledgeWebSync(page.nextCursor, page.replicaGeneration, page.snapshotVersion!);
+    }
+    await compactLocalContentEvents(db, page.nextCursor - 10_000);
     // PWA projection (P0): after the page commits, refresh ONLY the changed
     // conversations — never rebuild the whole inbox.
     const changedAggregates = [...new Set(page.events
@@ -312,9 +364,17 @@ export interface StoredEvent extends SyncEvent { decryption?: Decryption }
 async function decryptForDisplay(events: SyncEvent[]): Promise<StoredEvent[]> {
   const result: StoredEvent[] = [];
   for (const event of events) {
+    if (isContentBearingEvent(event.type)) {
+      try {
+        assertSupportedContentEvent(event);
+      } catch {
+        result.push({ ...event, decryption: { state: "invalid", reason: "Unsupported encrypted content event" } });
+        continue;
+      }
+    }
     if (event.cryptoVersion > 0) result.push({ ...event, decryption: (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT" || event.type === "KEYRING_ENTRY" || event.type === "HISTORY_KEY_GRANT")
       ? await receiveKeyGrant(event) : await decryptMessage(event) });
-    else result.push(event);
+    else result.push({ ...event, decryption: { state: "invalid", reason: "Unsupported plaintext event" } });
   }
   return result;
 }
@@ -334,6 +394,51 @@ export interface AggregatePage {
   next?: number | string;
 }
 
+function decodeStateCursor(value?: string): [number, string] | null {
+  if (!value) return null;
+  try {
+    const base64 = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+    const parsed = JSON.parse(atob(base64));
+    return Array.isArray(parsed) && Number.isSafeInteger(parsed[0]) && typeof parsed[1] === "string"
+      ? [parsed[0], parsed[1]] : null;
+  } catch { return null; }
+}
+
+function encodeStateCursor(sortKey: number, messageId: string): string {
+  return btoa(JSON.stringify([sortKey, messageId])).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+async function cachedMessagePage(db: IDBDatabase, aggregateId: string, before: string | undefined, limit: number): Promise<AggregatePage> {
+  const decoded = decodeStateCursor(before);
+  const upper: [string, number, string] = decoded
+    ? [aggregateId, decoded[0], decoded[1]]
+    : [aggregateId, Number.MAX_SAFE_INTEGER, "\uffff"];
+  const range = IDBKeyRange.bound([aggregateId, Number.MIN_SAFE_INTEGER, ""], upper, false, Boolean(decoded));
+  const rows: EncryptedMessageState[] = [];
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction(STORE_ENCRYPTED_MESSAGES, "readonly");
+    const request = transaction.objectStore(STORE_ENCRYPTED_MESSAGES)
+      .index("by_conversation_sort").openCursor(range, "prev");
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor || rows.length >= limit + 1) return;
+      rows.push(cursor.value);
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error);
+  });
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit);
+  const last = page.at(-1);
+  return {
+    items: await decryptForDisplay(page.map(messageStateEvent)),
+    hasMore,
+    next: hasMore && last ? encodeStateCursor(last.sortKey, last.messageId) : undefined,
+  };
+}
+
 /**
  * P1: paged thread reads via the [aggregateId, sequence] index instead of a
  * getAll() of the whole conversation. Newest ~200 first; pass
@@ -345,6 +450,11 @@ export async function listAggregateEventsPage(
 ): Promise<AggregatePage> {
   const limit = Math.max(1, Math.min(500, options.limit ?? 200));
   const db = await openDb();
+  const localPage = await cachedMessagePage(db, aggregateId, options.beforeState, limit);
+  if (localPage.items.length >= limit ||
+      (typeof navigator !== "undefined" && !navigator.onLine && localPage.items.length > 0)) {
+    return localPage;
+  }
   if (typeof navigator !== "undefined" && navigator.onLine) {
     const remote = await fetchWebMessagePage(aggregateId, options.beforeState, Math.min(100, limit));
     const write = db.transaction(STORE_ENCRYPTED_MESSAGES, "readwrite");
@@ -499,6 +609,24 @@ function metaNumber(db: IDBDatabase, key: string): Promise<number> {
     .then(value => typeof value === "number" && Number.isSafeInteger(value) ? value : 0);
 }
 
+async function compactLocalContentEvents(db: IDBDatabase, throughSequence: number): Promise<void> {
+  if (throughSequence <= 0) return;
+  const transaction = db.transaction(STORE_EVENTS, "readwrite");
+  const request = transaction.objectStore(STORE_EVENTS).openCursor(IDBKeyRange.upperBound(throughSequence));
+  request.onsuccess = () => {
+    const cursor = request.result;
+    if (!cursor) return;
+    if (RECONSTRUCTABLE_STATE_EVENTS.has((cursor.value as SyncEvent).type)) cursor.delete();
+    cursor.continue();
+  };
+  await txDone(transaction);
+}
+
+function metaValue<T>(db: IDBDatabase, key: string): Promise<T | undefined> {
+  return requestToPromise(db.transaction(STORE_META, "readonly").objectStore(STORE_META).get(key))
+    .then(value => value as T | undefined);
+}
+
 async function setMetaNumber(key: string, value: number): Promise<void> {
   const db = await openDb();
   const transaction = db.transaction(STORE_META, "readwrite");
@@ -574,29 +702,45 @@ function messageStateEvent(row: EncryptedMessageState): SyncEvent {
   };
 }
 
-async function bootstrapEncryptedState(): Promise<void> {
-  const existing = await tx([STORE_ENCRYPTED_CONVERSATIONS], "readonly", t =>
-    t.objectStore(STORE_ENCRYPTED_CONVERSATIONS).count());
-  if (existing > 0) return;
+async function bootstrapEncryptedState(force = false): Promise<void> {
+  const db = await openDb();
+  const storedGeneration = await metaValue<string>(db, REPLICA_GENERATION_KEY);
+  const storedSnapshotVersion = await metaValue<number>(db, SNAPSHOT_VERSION_KEY);
+  if (!force && storedGeneration && Number.isSafeInteger(storedSnapshotVersion)) return;
   const page = await fetchWebBootstrap(101);
-  // Compatible API/test harnesses may not expose the new snapshot endpoint
-  // yet; keep the existing delta path until a coordinated server is live.
-  if (page.protocolVersion === undefined) return;
-  if (page.protocolVersion !== 3 || !Number.isSafeInteger(page.highWatermark)) {
+  if (page.protocolVersion !== 3 || !page.replicaGeneration ||
+      !Number.isSafeInteger(page.snapshotVersion) ||
+      !Number.isSafeInteger(page.minimumAvailableSequence) ||
+      !Number.isSafeInteger(page.highWatermark)) {
     throw new Error("Unsupported encrypted bootstrap response");
   }
-  if (page.conversations.length === 0) return;
-  const db = await openDb();
+  const generationChanged = Boolean(storedGeneration && storedGeneration !== page.replicaGeneration);
   const transaction = db.transaction(
-    [STORE_ENCRYPTED_CONVERSATIONS, STORE_CONVERSATIONS, STORE_META], "readwrite");
+    [STORE_EVENTS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, STORE_CONVERSATIONS, STORE_META], "readwrite");
   const snapshots = transaction.objectStore(STORE_ENCRYPTED_CONVERSATIONS);
-  for (const row of page.conversations) snapshots.put(row);
-  // v5 stored decrypted snippets here. Bootstrap switches the PWA to the
-  // encrypted state store and removes those legacy plaintext projections.
+  snapshots.clear();
+  transaction.objectStore(STORE_ENCRYPTED_MESSAGES).clear();
   transaction.objectStore(STORE_CONVERSATIONS).clear();
-  transaction.objectStore(STORE_META).put(page.highWatermark, CURSOR_KEY);
-  transaction.objectStore(STORE_META).put(page.highWatermark, PROJECTION_CURSOR_KEY);
+  if (generationChanged) {
+    const oldEvents = transaction.objectStore(STORE_EVENTS).openCursor();
+    oldEvents.onsuccess = () => {
+      const cursor = oldEvents.result;
+      if (!cursor) return;
+      if (RECONSTRUCTABLE_STATE_EVENTS.has((cursor.value as SyncEvent).type) ||
+          ["CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"].includes((cursor.value as SyncEvent).type)) cursor.delete();
+      cursor.continue();
+    };
+  }
+  for (const event of page.contactEvents ?? []) transaction.objectStore(STORE_EVENTS).put(event);
+  for (const row of page.conversations) snapshots.put(row);
+  const meta = transaction.objectStore(STORE_META);
+  meta.put(page.highWatermark, CURSOR_KEY);
+  meta.put(page.highWatermark, PROJECTION_CURSOR_KEY);
+  meta.put(page.replicaGeneration, REPLICA_GENERATION_KEY);
+  meta.put(page.snapshotVersion, SNAPSHOT_VERSION_KEY);
+  meta.put(7, REPLICA_MIGRATION_VERSION_KEY);
   await txDone(transaction);
+  await repairContactsFromLocalEvents(db);
 }
 
 async function eventsByType(db: IDBDatabase, type: string): Promise<SyncEvent[]> {

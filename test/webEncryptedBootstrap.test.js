@@ -15,7 +15,8 @@ test("PWA commits encrypted bootstrap before advancing to its high watermark", a
       return Response.json({ events: [], nextCursor: 0, hasMore: false });
     }
     if (path.includes("/web/bootstrap")) return Response.json({
-      protocolVersion: 3, snapshotVersion: 1, highWatermark: 77, hasMore: false, nextCursor: null,
+      protocolVersion: 3, replicaGeneration: "test-replica-generation", snapshotVersion: 1,
+      minimumAvailableSequence: 1, highWatermark: 77, hasMore: false, nextCursor: null,
       conversations: [{ conversationId: "opaque-c", revision: 1, sortKey: 10,
         envelope: Buffer.from("opaque-cipher").toString("base64"), encoding: "envelope.v3",
         schemaVersion: 1, cryptoVersion: 3, lastServerSequence: 70 }],

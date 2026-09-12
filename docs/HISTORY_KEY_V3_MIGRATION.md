@@ -22,14 +22,14 @@ history key cannot bypass those grants.
 3. With explicit operational approval, run
    `node scripts/migrate-history-v3.js --apply`.
 4. Deploy the matching API/PWA and Android builds together.
-5. Reset and pair the browser once, selecting `FULL_HISTORY`.
+5. Existing browsers detect the new replica generation and securely rebootstrap; pair only browsers that are not already authorized.
 6. Keep the generated `control-plane.pre-history-v3.*.db` backup until PWA
    diagnostics show decrypted history and a healthy projection.
 
-The apply step clears only encrypted `sync_events` and resets their sequence
-counters. Trust statements, linked-device records, commands, sessions,
-telemetry, and application settings are preserved. Android then replays its
-phone source of truth with deterministic v3 event IDs.
+The apply step purges data-plane replica events/current state, preserves
+key/control and trust metadata, keeps sequence counters monotonic, and assigns
+a new replica generation. Android then replays its phone source of truth with
+deterministic v3 event IDs.
 
 ## Rollback
 
