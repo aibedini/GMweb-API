@@ -4,6 +4,14 @@ data/
 .vscode/
 *.log
 *.code-workspace
+
+# Local backups. Installers and manual recovery leave these next to the
+# checkout — often ROOT-owned, so the manager's pre-update
+# "git stash --include-untracked" (which runs as the app user) failed with a
+# bare "Permission denied" and the update never started.
+.env.bak*
+*.bak
+*.bak-*
 .codex-temp-gmweb-repair-key
 .codex-temp-gmweb-repair-key.pub
 

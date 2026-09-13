@@ -595,10 +595,27 @@ update_app() {
   # Stash both, but leave ignored runtime state (notably .env/node_modules)
   # untouched. The stash remains available for explicit recovery; applying it
   # automatically would restore stale build output over the new release.
+  #
+  # Ownership FIRST. Installs and manual recovery routinely leave ROOT-owned
+  # artifacts in the checkout (a root-owned .env backup, a file edited over
+  # SSH). The stash below runs as the app user, so a single unreadable file
+  # used to abort the whole update with a bare "Permission denied ... Cannot
+  # save the untracked files" before anything was pulled.
+  chown -R "$APP_USER:$APP_USER" "$APP_DIR" 2>/dev/null || true
+
   local local_status stash_ref
   local_status="$(run_as_app "git -C '$APP_DIR' status --porcelain --untracked-files=normal")"
   if [[ -n "$local_status" ]]; then
-    run_as_app "git -C '$APP_DIR' stash push --include-untracked --message 'gmweb pre-update $(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+    if ! run_as_app "git -C '$APP_DIR' stash push --include-untracked --message 'gmweb pre-update $(date -u +%Y-%m-%dT%H:%M:%SZ)'"; then
+      echo "${C_RED}Could not save the local changes, so the update stopped before touching the checkout.${C_RESET}"
+      echo "Paths git reported:"
+      printf '%s\n' "$local_status" | sed 's/^/  /'
+      echo "A path the app user cannot read is the usual cause. Retry after:"
+      echo "  chown -R $APP_USER:$APP_USER $APP_DIR"
+      echo "Operator backups (.env.bak-*, *.bak) are git-ignored; an older one created as root can be moved out:"
+      echo "  mkdir -p /root/gmweb-env-backups && mv $APP_DIR/.env.bak-* /root/gmweb-env-backups/ 2>/dev/null || true"
+      return 1
+    fi
     stash_ref="$(run_as_app "git -C '$APP_DIR' rev-parse --short refs/stash")"
     echo "Local changes and generated files saved in Git stash $stash_ref."
     echo "Inspect later with: git -C '$APP_DIR' stash show --stat"
