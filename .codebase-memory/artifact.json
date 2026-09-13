@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "e2de90bd20d4d2f69c2130c2752253ab422c90d9",
-    "indexed_at": "2026-09-08T15:52:11Z",
+    "commit": "4d896f86db3ff9d8aceb29bd06998020f4aaea5e",
+    "indexed_at": "2026-09-13T19:18:58Z",
     "project": "gmweb-api",
-    "nodes": 4727,
-    "edges": 19184,
-    "original_size": 13041664,
-    "compressed_size": 3051948,
+    "nodes": 5137,
+    "edges": 21508,
+    "original_size": 14090240,
+    "compressed_size": 3351032,
     "compression_level": 9
 }
