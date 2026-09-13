@@ -242,6 +242,20 @@ test("the invalidate route reuses the same cancel decision as /send/cancel", () 
     "the outbox can revoke a pending or in-flight task");
   assert.ok(worker.includes("tombstones"),
     "an in-flight task keeps its identity after being revoked");
+
+  // A synchronous /send?wait=true must never report a superseded reminder as a
+  // completed send, and the 200 response schema must not strip the verdict.
+  const waitStart = server.indexOf("if (result?.superseded)");
+  const waitEnd = server.indexOf("if (result?.cancelled)");
+  assert.ok(waitStart !== -1 && waitEnd > waitStart,
+    "/send?wait=true has its own superseded branch before the cancelled one");
+  const waitBranch = server.slice(waitStart, waitEnd);
+  for (const fragment of ['status: "superseded"', "terminal: true",
+    "successful: false", "retryable: false", "counted: false"]) {
+    assert.ok(waitBranch.includes(fragment), `wait branch must report ${fragment}`);
+  }
+  assert.ok(server.includes('"cancelled", "failed", "superseded"\]'),
+    "the /send 200 response schema declares the superseded status");
 });
 
 test("the ledger migration is additive and old rows stay readable", () => {

@@ -277,6 +277,9 @@ curl -X POST https://YOUR_HOST/send/invalidate \\
 * Scope: `sms.invalidate` (part of the default project-key scopes, so an existing
   Eve key already has it).
 * A project key can only invalidate a service it has actually sent to.
+* One call examines at most 500 outstanding sends for the service. If a service
+  can have more than that in flight, call it repeatedly (the call is idempotent,
+  and the generation barrier keeps anything the loop did not reach undeliverable).
 * **Idempotent on `eventId`** — a retry after a lost response replays the original
   answer with `replayed: true` and cancels nothing twice.
 * **`currentGeneration` is a barrier.** Once 18 is recorded, every depletion

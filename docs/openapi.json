@@ -4162,7 +4162,8 @@
                         "duplicate_suppressed",
                         "unverified",
                         "cancelled",
-                        "failed"
+                        "failed",
+                        "superseded"
                       ]
                     },
                     "reason": {
@@ -4174,6 +4175,27 @@
                       "description": "Why a send was suppressed: already sent within the window, or still in flight."
                     },
                     "deduped": {
+                      "type": "boolean"
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "superseded"
+                      ]
+                    },
+                    "superseded": {
+                      "type": "boolean"
+                    },
+                    "terminal": {
+                      "type": "boolean"
+                    },
+                    "successful": {
+                      "type": "boolean"
+                    },
+                    "retryable": {
+                      "type": "boolean"
+                    },
+                    "counted": {
                       "type": "boolean"
                     },
                     "priority": {

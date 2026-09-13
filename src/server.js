@@ -3531,9 +3531,18 @@ app.post("/send", {
           requestId: { type: ["string", "null"] },
           statusUrl: { type: ["string", "null"] },
           jobId: { type: ["string", "null"] },
-          status: { type: "string", enum: ["completed", "duplicate_suppressed", "unverified", "cancelled", "failed"] },
+          status: { type: "string", enum: ["completed", "duplicate_suppressed", "unverified", "cancelled", "failed", "superseded"] },
           reason: { type: "string", enum: ["duplicate_suppressed", "duplicate_inflight"], description: "Why a send was suppressed: already sent within the window, or still in flight." },
           deduped: { type: "boolean" },
+          // Lifecycle invalidation result: terminal, NOT successful, NOT
+          // billable and NOT retryable. Declared here because Fastify's response
+          // schema strips anything undeclared.
+          state: { type: "string", enum: ["superseded"] },
+          superseded: { type: "boolean" },
+          terminal: { type: "boolean" },
+          successful: { type: "boolean" },
+          retryable: { type: "boolean" },
+          counted: { type: "boolean" },
           priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
           priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           result: { type: "object" }
@@ -3820,6 +3829,19 @@ app.post("/send", {
         return {
           ok: false, requestId, statusUrl: `/send/status/${requestId}`,
           jobId: job.id, status: "unverified", priority: sendPriority.name, priorityLevel: sendPriority.level, result
+        };
+      }
+      if (result?.superseded) {
+        // A lifecycle invalidation won the race with this very request: the
+        // customer renewed before the reminder left. Terminal, NOT successful,
+        // NOT billable, NOT retryable -- reporting it as "completed" would be a
+        // lie the consumer could act on.
+        return {
+          ok: false, requestId, statusUrl: `/send/status/${requestId}`,
+          jobId: job.id, status: "superseded", state: "superseded",
+          terminal: true, successful: false, superseded: true,
+          retryable: false, counted: false, reason: result.reason || null,
+          priority: sendPriority.name, priorityLevel: sendPriority.level, result
         };
       }
       if (result?.cancelled) {
