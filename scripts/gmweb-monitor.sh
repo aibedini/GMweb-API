@@ -19,6 +19,39 @@ mkdir -p "$LOG_DIR" "$STATE_DIR"
 
 log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
 
+# ── Disk hygiene ────────────────────────────────────────────────────────────
+# The watchdog is the one process that runs on every server every two minutes,
+# which makes it the right place to reclaim what the product leaks.
+#
+# Chrome unpacks CRX payloads into /tmp/com.google.Chrome.chromecrx_* and
+# Playwright makes /tmp/scoped_dir*; both are removed on a clean exit and BOTH
+# are left behind when the browser is killed — which this script does on every
+# wedge recovery. A field server reached 340 of them (6.8 GB of a 46 GB disk)
+# without anything noticing. Six hours is far longer than any live unpack, so
+# an entry that old is orphaned by definition.
+#
+# journald likewise has no size cap by default and can pin gigabytes.
+housekeeping() {
+  local stale before after
+  stale="$(find /tmp -maxdepth 1 \( -name 'com.google.Chrome.*' -o -name 'scoped_dir*' \) -mmin +360 2>/dev/null | wc -l)"
+  if (( stale > 0 )); then
+    before="$(du -sm /tmp 2>/dev/null | cut -f1 || echo 0)"
+    find /tmp -maxdepth 1 \( -name 'com.google.Chrome.*' -o -name 'scoped_dir*' \) -mmin +360 -exec rm -rf -- {} + 2>/dev/null || true
+    after="$(du -sm /tmp 2>/dev/null | cut -f1 || echo 0)"
+    log "housekeeping: pruned $stale stale browser temp dir(s) from /tmp, freed $(( before - after )) MB"
+  fi
+
+  if command -v journalctl >/dev/null 2>&1; then
+    local usage
+    usage="$(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+G' | head -1 || true)"
+    if [[ -n "$usage" ]]; then
+      journalctl --vacuum-size=200M >/dev/null 2>&1 && log "housekeeping: vacuumed journald (was $usage, cap 200M)"
+    fi
+  fi
+}
+
+housekeeping
+
 PORT="$(grep -m1 '^PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2- || echo 3030)"
 PORT="${PORT:-3030}"
 TOKEN="$(grep -m1 '^API_TOKEN=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2-)"

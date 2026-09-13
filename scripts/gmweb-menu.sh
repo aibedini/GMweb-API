@@ -494,6 +494,23 @@ adopt_git_checkout() {
   failed="$APP_DIR.failed-$stamp"
   UPDATE_QUEUE_WAS_PAUSED="true"
 
+  # Retention. A migration leaves three copies behind: the previous release, a
+  # data/ backup and a staging tree. Copies from EARLIER migrations are pure
+  # disk leak -- the field server was still carrying a 2.8 GB rollback release
+  # from months before, plus 449 MB of loose database snapshots. Clear them
+  # before this run adds another, so "one rollback point" stays true.
+  for old in "$app_parent"/.gmweb-update-stage-* \
+             "$APP_DIR".previous-* "$APP_DIR".failed-* "$APP_DIR".rollback-* \
+             /var/backups/gmweb/*; do
+    [[ -e "$old" ]] || continue
+    if [[ "$old" == "$stage" || "$old" == "$previous" || "$old" == "$failed" || "$old" == "$backup" ]]; then
+      continue
+    fi
+    if rm -rf -- "$old" 2>/dev/null; then
+      echo "Pruned older migration artifact: $old"
+    fi
+  done
+
   echo "Archive installation detected; converting it to a managed Git checkout."
   echo "Repository: $REPO_URL"
   [[ -f "$APP_DIR/.env" && -d "$APP_DIR/data" ]] || {
@@ -670,6 +687,19 @@ public_dashboard() {
   fi
 }
 
+# One rolling snapshot of the databases, never a growing pile of them. The
+# helper prunes its own older archives, so "backups" stays a single directory
+# with a single file.
+backup_now() {
+  need_root "$@"
+  if [[ -x "$APP_DIR/scripts/gmweb-backup.sh" ]]; then
+    "$APP_DIR/scripts/gmweb-backup.sh"
+  else
+    echo "${C_RED}Backup helper not found: $APP_DIR/scripts/gmweb-backup.sh${C_RESET}"
+    return 1
+  fi
+}
+
 render_menu() {
   clear || true
   echo "${C_BOLD}${C_BLUE}GMweb API Manager${C_RESET}"
@@ -690,6 +720,7 @@ render_menu() {
   echo " 13) Public dashboard setup"
   echo " 14) Reset dashboard username / password"
   echo " 15) Generate and activate a new API token"
+  echo " 16) Back up the database (keeps ONE snapshot)"
   echo "  0) Exit"
   echo
 }
@@ -733,6 +764,7 @@ menu_loop() {
         fi
         pause
         ;;
+      16) backup_now; pause ;;
       0) exit 0 ;;
       *) echo "${C_RED}Invalid option.${C_RESET}"; pause ;;
     esac
@@ -757,6 +789,7 @@ case "$cmd" in
   token-reset|rotate-token) rotate_api_token "$@" ;;
   logs) logs "$@" ;;
   update) update_app "$@" ;;
+  backup) backup_now "$@" ;;
   uninstall) uninstall_app "$@" ;;
   public-dashboard) public_dashboard "$@" ;;
   credentials|dashboard-credentials) dashboard_credentials "$@" ;;
@@ -779,6 +812,7 @@ Commands:
   token-reset      Generate, activate, and verify a new API token
   logs [target]    Follow logs: api, chrome, vnc, novnc
   update           Safe update; converts archive installs to Git once
+  backup           Back up the databases, keeping exactly one snapshot
   uninstall        Remove GMweb API from the server
   public-dashboard Manage public HTTPS dashboard exposure
   credentials      Reset dashboard username/password interactively

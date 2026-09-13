@@ -61,8 +61,42 @@ fi
 
 echo "==> Installing system packages"
 apt-get update
-apt-get install -y ca-certificates curl wget gnupg git rsync sudo tar xvfb x11vnc fluxbox novnc websockify redis-server jq
+apt-get install -y ca-certificates curl wget gnupg git rsync sudo tar xvfb x11vnc fluxbox novnc websockify redis-server jq logrotate
 systemctl enable --now redis-server
+
+# ── Log hygiene (bounded disk) ──────────────────────────────────────────────
+# A long-lived install fills the disk quietly without this. On the field server
+# that motivated it: journald had grown to 1.9 GB, /var/log/nginx/access.log to
+# 409 MB (logrotate was not even installed, so nothing ever rotated it) and
+# /var/log/btmp to 301 MB of brute-force login records. Ubuntu's default
+# journald has no size cap at all.
+if ! command -v logrotate >/dev/null 2>&1; then
+  apt-get install -y logrotate || true
+fi
+systemctl enable --now logrotate.timer 2>/dev/null || true
+
+install -d -m 755 /etc/systemd/journald.conf.d
+if [[ ! -f /etc/systemd/journald.conf.d/99-gmweb-size.conf ]]; then
+  cat >/etc/systemd/journald.conf.d/99-gmweb-size.conf <<'JOURNALD'
+[Journal]
+SystemMaxUse=200M
+SystemMaxFileSize=50M
+JOURNALD
+  systemctl restart systemd-journald 2>/dev/null || true
+fi
+
+# GMweb's own logs (watchdog, installer). copytruncate because the writer keeps
+# the file handle open.
+cat >/etc/logrotate.d/gmweb <<'LOGROTATE'
+/var/log/gmweb/*.log {
+  weekly
+  rotate 8
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+LOGROTATE
 
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'Number(process.versions.node.split(`.`)[0])')" -lt 20 ]]; then
   echo "==> Installing Node.js 22"
