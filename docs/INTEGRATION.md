@@ -205,6 +205,116 @@ Cancel only works before the worker starts sending the message. If the send is
 already active or already terminal, GMweb returns `409 { "error": "not_cancellable" }`.
 Project API keys can cancel only send requests created by that same key.
 
+---
+
+## 2c. Stale notification invalidation (the renewal race)
+
+A depletion reminder ("your volume ended") is only true at the moment it is
+computed. If the customer renews while that reminder is sitting in the queue — or
+already on the phone — sending it is a false statement and a support ticket.
+
+Cancelling one job is not enough: BullMQ cannot remove a job it already marked
+**active**, and nothing in the queue can recall a task the phone has already
+pulled. GMweb therefore makes invalidation **semantic and durable** rather than a
+queue operation.
+
+### Step 1 — tag every notification on the way in
+
+Add an optional `meta` object to `POST /send`. Without it the request behaves
+exactly as before (this is the backward-compatibility contract).
+
+```json
+{
+  "to": "+989121234567",
+  "text": "Your volume has ended",
+  "priority": "expired",
+  "meta": {
+    "source": "eve",
+    "serviceKey": "eve:<serverId>:<clientUuid>",
+    "notificationKind": "volume_ended",
+    "generation": 17,
+    "correlationId": "<uuid>",
+    "requiresValidation": true
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `source` | Consumer namespace. `"eve"`. Part of the service identity. |
+| `serviceKey` | Identity of **one service**: `eve:<serverId>:<clientUuid>`. **Never a phone number.** One customer can own several services on one MSISDN, and renewing one must not silence the others. |
+| `notificationKind` | `near_expiry` \| `low_volume` \| `expired` \| `volume_ended` \| `created` \| `renew` |
+| `generation` | The service lifecycle generation this message was computed from. Monotonic, non-negative integer. |
+| `correlationId` | Optional trace id, echoed in logs and events. |
+| `requiresValidation` | **Derived server-side, not trusted from the client**: `true` for `near_expiry`/`low_volume`/`expired`/`volume_ended`, `false` for `created`/`renew`. |
+
+Rules you can rely on:
+
+* A **partial or unknown** `meta` is rejected with `400 invalid_meta` — a tag that
+  cannot be revoked is worse than no tag.
+* `created` and `renew` confirmations are **never** invalidated, even if you list
+  them explicitly.
+* A send with no `meta` is never matched by an invalidation.
+
+### Step 2 — invalidate on renewal
+
+```bash
+curl -X POST https://YOUR_HOST/send/invalidate \\
+  -H "Authorization: Bearer gmw_..." -H "Content-Type: application/json" \\
+  -d '{
+        "source": "eve",
+        "serviceKey": "eve:12:2f1c-uuid",
+        "currentGeneration": 18,
+        "invalidateKinds": ["near_expiry","low_volume","expired","volume_ended"],
+        "reason": "renewed",
+        "correlationId": "8f2c-uuid",
+        "eventId": "renewal-2026-09-13-0001"
+      }'
+# -> 200 { "ok": true, "cancelledPending": 2, "revokedActive": 1,
+#          "revokedInflight": 1, "alreadyTerminal": 0, "currentGeneration": 18 }
+```
+
+* Scope: `sms.invalidate` (part of the default project-key scopes, so an existing
+  Eve key already has it).
+* A project key can only invalidate a service it has actually sent to.
+* **Idempotent on `eventId`** — a retry after a lost response replays the original
+  answer with `replayed: true` and cancels nothing twice.
+* **`currentGeneration` is a barrier.** Once 18 is recorded, every depletion
+  notification with generation ≤ 17 is invalid *forever* — including one that was
+  delayed in Redis, re-queued by a stall, or retried hours later. A request
+  carrying an older generation is refused with `409 stale_generation`.
+* Order the rollout as: **renew/upgrade first, then invalidate.** A stale
+  invalidation arriving after a newer one is refused, never applied.
+
+### What the counters mean
+
+| Field | Meaning |
+|---|---|
+| `cancelledPending` | Removed from the queue before any device saw it. |
+| `revokedActive` | Already being processed by a worker; flagged to stop at its next checkpoint. |
+| `revokedInflight` | Already pulled by the phone; the device is told to stand down and its task identity is kept until it answers or the lease expires. |
+| `alreadyTerminal` | Had already finished (sent/failed/cancelled). Reported honestly — GMweb never pretends it stopped something it did not. |
+
+### The impossible case
+
+If the SIM accepted the SMS **before** the invalidation reached GMweb, GMweb does
+not fake a cancellation. The send is reported as `sent`, the race is recorded as
+`sent_after_revocation`, the event `send_sent_after_revocation` is emitted, and
+the counter `sms_sent_after_revocation_total` is incremented. Poll
+`GET /send/status/:requestId` and treat a `superseded: true` status as
+"never delivered, never billed, never retry".
+
+### Android integration
+
+Device builds that pull tasks (`GET /gateway/pull`) receive the same `meta`
+object inside the task, and must call `POST /gateway/validate` with
+`{ "requestId": "..." }` immediately before submitting to the modem. The answer
+`{ "valid": false, "status": "superseded", "reason": "renewed" }` means: do not
+send. Report the outcome back with
+`{ "requestId": "...", "ok": false, "outcome": "superseded", "reason": "renewed" }`.
+Older builds that never call `validate` and only send `{requestId, ok}` keep
+working unchanged.
+
 ### Read incoming SMS
 ```bash
 # 1) list conversations, grab a href

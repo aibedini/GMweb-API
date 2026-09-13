@@ -101,6 +101,31 @@ shared id for polling/cancel; `jobId` is the current queue job id.
 Canonical priorities are `critical` (1), `expired` (3), `expiring` (6, default),
 and `announcement` (10). Lower levels run first and every lane is FIFO.
 
+Optional consumer notification metadata. Omit it and the request behaves exactly
+as before; supply it and the reminder can be revoked later by a renewal:
+
+```json
+{
+  "to": "+989195292411",
+  "text": "Your volume has ended",
+  "priority": "expired",
+  "meta": {
+    "source": "eve",
+    "serviceKey": "eve:12:2f1c-uuid",
+    "notificationKind": "volume_ended",
+    "generation": 17,
+    "correlationId": "8f2c-uuid",
+    "requiresValidation": true
+  }
+}
+```
+
+`notificationKind` is one of `near_expiry`, `low_volume`, `expired`,
+`volume_ended`, `created`, `renew`. `requiresValidation` is DERIVED server-side
+(true for the first four, false for `created`/`renew`); a client cannot opt a
+depletion claim out of validation. A partial or unknown `meta` is rejected with
+`400 invalid_meta` rather than stored unrevocable.
+
 ### GET /send/capacity
 
 Returns pending counts per priority and `announcement.{limit,pending,available,
@@ -118,6 +143,68 @@ audited. GMweb refuses to press Enter if the active recipient cannot be verified
 
 Cancels a queued send before it starts. Project API keys can cancel only their
 own sends. Returns `409 not_cancellable` when the send is already active/sent.
+
+### POST /send/invalidate
+
+Semantically invalidates every outstanding reminder of ONE service after a
+renewal — including one the queue already marked active. Requires the
+`sms.invalidate` scope (part of the default project-key scopes).
+
+```json
+{
+  "source": "eve",
+  "serviceKey": "eve:12:2f1c-uuid",
+  "currentGeneration": 18,
+  "invalidateKinds": ["near_expiry", "low_volume", "expired", "volume_ended"],
+  "reason": "renewed",
+  "correlationId": "8f2c-uuid",
+  "eventId": "renewal-2026-09-13-0001"
+}
+```
+
+```json
+{
+  "ok": true,
+  "serviceKey": "eve:12:2f1c-uuid",
+  "currentGeneration": 18,
+  "cancelledPending": 2,
+  "revokedActive": 1,
+  "revokedInflight": 1,
+  "alreadyTerminal": 0
+}
+```
+
+* `serviceKey` identifies one service, never a phone number: the same customer
+  can own several services on one MSISDN and renewing one must not silence the
+  others.
+* `currentGeneration` is a monotonic per-service watermark. A request carrying a
+  generation below one already recorded is refused with `409 stale_generation`;
+  every reminder below the watermark is invalid forever, so a delayed retry
+  cannot resurrect it.
+* Idempotent on `eventId`: repeating it replays the original answer
+  (`replayed: true`) and changes nothing.
+* A project key may only invalidate a service it has actually sent to; anything
+  else is `404 not_found`.
+
+### Android device bridge (`X-API-Key: <device key>`)
+
+Used by the Messages Android app when the transport is `android` in pull mode.
+
+* `GET /gateway/pull?waitMs=25000` — long-poll for the next task. Tasks whose
+  lifecycle was invalidated are terminalized as superseded and never handed out.
+  Returns `{task:{requestId,to,text,priority,meta}}` or `{task:null}`. `meta` is
+  `null` for sends that carried none, so older builds are unaffected.
+* `POST /gateway/validate` — `{requestId}` → `{valid,status,reason}`. The final
+  gate before the modem: it answers `valid:false, status:"superseded"` the
+  instant the service generation is invalidated, including while the task is
+  already in flight. It returns no task, customer or message metadata.
+* `POST /gateway/ack` — `{requestId, ok, outcome?, reason?}`.
+  `outcome` is `sent` | `failed` | `superseded`; when omitted it is derived from
+  `ok`, so legacy `{requestId, ok}` bodies keep working. `superseded` is
+  terminal, not successful, not billable and not retryable. A real submission
+  that arrives after its own revocation is recorded as
+  `send_sent_after_revocation` and counted in `sms_sent_after_revocation_total`
+  instead of being reported as a cancellation.
 
 ### GET /events
 

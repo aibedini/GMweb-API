@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.18.0",
+    "version": "0.19.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -226,6 +226,7 @@
                 "sms.status",
                 "sms.cancel",
                 "sms.capacity",
+                "sms.invalidate",
                 "conversations.read",
                 "events.read",
                 "commands.create",
@@ -596,6 +597,27 @@
                     "webApp": {
                       "type": "object",
                       "additionalProperties": true
+                    },
+                    "metrics": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "integer"
+                      },
+                      "description": "Durable lifecycle counters (sms_invalidations_total, sms_jobs_superseded_total, sms_inflight_revoked_total, sms_sent_after_revocation_total, sms_validation_requests_total, ...)."
+                    },
+                    "revocation": {
+                      "type": "object",
+                      "properties": {
+                        "superseded": {
+                          "type": "integer"
+                        },
+                        "revokedInflight": {
+                          "type": "integer"
+                        },
+                        "tombstones": {
+                          "type": "integer"
+                        }
+                      }
                     },
                     "system": {
                       "type": "object",
@@ -1028,7 +1050,7 @@
         "tags": [
           "Gateway"
         ],
-        "description": "Long-poll for devices in android transport pull mode. Authenticated with the device key (X-API-Key). Returns {task:null} or {task:{requestId,to,text,priority}}.",
+        "description": "Long-poll for devices in android transport pull mode. Authenticated with the device key (X-API-Key). Returns {task:null} or {task:{requestId,to,text,priority,meta}}. Tasks whose lifecycle was invalidated are never handed out: they are terminalized as superseded here. Older Android builds that ignore `meta` keep working unchanged.",
         "responses": {
           "200": {
             "description": "Default Response",
@@ -1054,6 +1076,48 @@
                         },
                         "priority": {
                           "type": "string"
+                        },
+                        "meta": {
+                          "type": [
+                            "null",
+                            "object"
+                          ],
+                          "description": "Consumer notification identity. Null for legacy sends without meta.",
+                          "properties": {
+                            "source": {
+                              "type": [
+                                "null",
+                                "string"
+                              ]
+                            },
+                            "serviceKey": {
+                              "type": [
+                                "null",
+                                "string"
+                              ]
+                            },
+                            "notificationKind": {
+                              "type": [
+                                "null",
+                                "string"
+                              ]
+                            },
+                            "generation": {
+                              "type": [
+                                "null",
+                                "integer"
+                              ]
+                            },
+                            "correlationId": {
+                              "type": [
+                                "null",
+                                "string"
+                              ]
+                            },
+                            "requiresValidation": {
+                              "type": "boolean"
+                            }
+                          }
                         }
                       }
                     }
@@ -1095,13 +1159,13 @@
         }
       }
     },
-    "/gateway/ack": {
+    "/gateway/validate": {
       "post": {
-        "summary": "Android device reports a delivery outcome",
+        "summary": "Android validates a task before submitting it to the SIM",
         "tags": [
           "Gateway"
         ],
-        "description": "Acknowledge a pulled task: ok=true marks it sent (drives ledger, SSE, webhooks); ok=false fails that attempt so BullMQ can retry.",
+        "description": "Final gate before the modem is touched. Answers `valid:false` the instant its service generation is invalidated, including while the task is already in flight. Returns only the verdict — never task, customer or message metadata.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1109,21 +1173,156 @@
               "schema": {
                 "type": "object",
                 "required": [
-                  "requestId",
-                  "ok"
+                  "requestId"
                 ],
                 "properties": {
                   "requestId": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 120
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "valid": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "valid",
+                        "superseded",
+                        "terminal"
+                      ]
+                    },
+                    "reason": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "known": {
+                      "type": "boolean",
+                      "description": "False when the gateway has no durable record of this task id."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/gateway/ack": {
+      "post": {
+        "summary": "Android device reports a delivery outcome",
+        "tags": [
+          "Gateway"
+        ],
+        "description": "Acknowledge a pulled task. `ok:true` marks it sent (drives ledger, SSE, webhooks); `ok:false` fails that attempt so BullMQ can retry. `outcome:\"superseded\"` means the device did NOT send it because the lifecycle was invalidated: terminal, not successful, not billable, not retryable and not a gateway failure. Legacy `{requestId, ok}` bodies keep working exactly as before.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "requestId"
+                ],
+                "properties": {
+                  "requestId": {
+                    "type": "string",
+                    "maxLength": 120
                   },
                   "ok": {
-                    "type": "boolean"
+                    "type": "boolean",
+                    "description": "Legacy flag. Derived from outcome when omitted."
+                  },
+                  "outcome": {
+                    "type": "string",
+                    "enum": [
+                      "sent",
+                      "failed",
+                      "superseded"
+                    ]
                   },
                   "reason": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 200
+                  },
+                  "error": {
+                    "type": "string",
+                    "maxLength": 300
+                  },
+                  "status": {
+                    "type": "string",
+                    "maxLength": 40
                   },
                   "sentAt": {
                     "type": "integer"
+                  },
+                  "requestedTo": {
+                    "type": "string"
+                  },
+                  "sentTo": {
+                    "type": "string"
+                  },
+                  "cancelled": {
+                    "type": "boolean"
                   }
                 }
               }
@@ -1140,6 +1339,40 @@
                   "properties": {
                     "ok": {
                       "type": "boolean"
+                    },
+                    "outcome": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "terminal": {
+                      "type": "boolean"
+                    },
+                    "successful": {
+                      "type": [
+                        "null",
+                        "boolean"
+                      ]
+                    },
+                    "counted": {
+                      "type": "boolean",
+                      "description": "False for superseded: it never counts toward send limits."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
                     }
                   }
                 }
@@ -3821,7 +4054,7 @@
         "tags": [
           "Messaging"
         ],
-        "description": "Queue an SMS/RCS message for delivery via Google Messages.\n\n**Asynchronous by default.** The message is added to a durable Redis-backed\nqueue and processed in the background by a single worker (one browser, one\nsend at a time). The endpoint returns a stable `requestId` plus the current\nBullMQ `jobId` immediately with HTTP 202.\n\n**Track delivery via:**\n- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps\n  (`jobId` is also accepted for backwards compatibility)\n- `POST /send/cancel/{requestId}` — cancel before the worker starts sending\n- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed` / `send_cancelled`\n\n**Retries:** failed sends retry up to 3 times with exponential backoff.\n\n**Synchronous mode:** pass `\"wait\": true` to block until the send finishes\n(up to 90s) and receive the result directly. Use only for low-volume callers.\n\n**Priority lanes:** use `critical` (purchase/renewal), `expired` (already expired),\n`expiring` (near expiry; default), or `announcement` (bulk/lowest). Lower numeric\nlevels run first and every lane remains FIFO. Legacy `high` maps to `critical`;\nlegacy `normal` maps to `expiring`.\n\n**Quiet hours:** non-critical messages are held from 02:00 through 07:59\n`Asia/Tehran` and released at 08:00. Delayed retries are also held even when\nCRITICAL; only a fresh critical first attempt bypasses quiet hours.\nAnnouncements are capped at the configured pending capacity (default 200).\n\n**Rate limits (project keys):** configurable per-minute and per-hour (default 30/min, 1000/hr).\n\n**Phone format:** include country code, e.g. `+989121234567`.\n\n**Auto de-dupe:** an identical `{to,text}` re-sent within ~120s (no Idempotency-Key needed) is suppressed and returns `status:\"duplicate_suppressed\"` with the original `jobId` — guards against accidental double-posting.",
+        "description": "Queue an SMS/RCS message for delivery via Google Messages.\n\n**Asynchronous by default.** The message is added to a durable Redis-backed\nqueue and processed in the background by a single worker (one browser, one\nsend at a time). The endpoint returns a stable `requestId` plus the current\nBullMQ `jobId` immediately with HTTP 202.\n\n**Track delivery via:**\n- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps\n  (`jobId` is also accepted for backwards compatibility)\n- `POST /send/cancel/{requestId}` — cancel before the worker starts sending\n- `POST /send/invalidate` — revoke every not-yet-started reminder for one service after a renewal\n- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed` / `send_cancelled`\n\n**Retries:** failed sends retry up to 3 times with exponential backoff.\n\n**Synchronous mode:** pass `\"wait\": true` to block until the send finishes\n(up to 90s) and receive the result directly. Use only for low-volume callers.\n\n**Priority lanes:** use `critical` (purchase/renewal), `expired` (already expired),\n`expiring` (near expiry; default), or `announcement` (bulk/lowest). Lower numeric\nlevels run first and every lane remains FIFO. Legacy `high` maps to `critical`;\nlegacy `normal` maps to `expiring`.\n\n**Quiet hours:** non-critical messages are held from 02:00 through 07:59\n`Asia/Tehran` and released at 08:00. Delayed retries are also held even when\nCRITICAL; only a fresh critical first attempt bypasses quiet hours.\nAnnouncements are capped at the configured pending capacity (default 200).\n\n**Rate limits (project keys):** configurable per-minute and per-hour (default 30/min, 1000/hr).\n\n**Phone format:** include country code, e.g. `+989121234567`.\n\n**Auto de-dupe:** an identical `{to,text}` re-sent within ~120s (no Idempotency-Key needed) is suppressed and returns `status:\"duplicate_suppressed\"` with the original `jobId` — guards against accidental double-posting.",
         "requestBody": {
           "required": true,
           "content": {
@@ -4278,7 +4511,9 @@
                         "delayed",
                         "unverified",
                         "cancelled",
-                        "suppressed"
+                        "suppressed",
+                        "superseded",
+                        "revoked"
                       ]
                     },
                     "status": {
@@ -4290,7 +4525,63 @@
                         "unverified",
                         "failed",
                         "cancelled",
-                        "suppressed"
+                        "suppressed",
+                        "superseded"
+                      ]
+                    },
+                    "superseded": {
+                      "type": "boolean",
+                      "description": "True when a lifecycle invalidation made this notification stale (terminal, not billable, never retried)."
+                    },
+                    "revoked": {
+                      "type": "boolean",
+                      "description": "True while a revocation is recorded but the task has not finished standing down yet."
+                    },
+                    "outcome": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "sent | superseded | cancelled | null"
+                    },
+                    "revokedAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "revocationReason": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Consumer reason carried by POST /send/invalidate (for example \"renewed\")."
+                    },
+                    "serviceKey": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "notificationKind": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "generation": {
+                      "type": [
+                        "null",
+                        "integer"
+                      ]
+                    },
+                    "requiresValidation": {
+                      "type": "boolean"
+                    },
+                    "correlationId": {
+                      "type": [
+                        "null",
+                        "string"
                       ]
                     },
                     "priority": {
@@ -4679,6 +4970,173 @@
                       ]
                     },
                     "state": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/send/invalidate": {
+      "post": {
+        "summary": "Invalidate outstanding notifications for a service",
+        "tags": [
+          "Messaging"
+        ],
+        "description": "Cancels every not-yet-started send that carries the matching `meta.source` + `meta.serviceKey`, optionally narrowed to `invalidateKinds`. Sends already started are revoked, not deleted. Idempotent on `eventId`. A `currentGeneration` lower than the watermark this gateway already recorded is refused with 409.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "source",
+                  "serviceKey"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32
+                  },
+                  "serviceKey": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": 200
+                  },
+                  "currentGeneration": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "invalidateKinds": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "items": {
+                      "type": "string",
+                      "maxLength": 48
+                    }
+                  },
+                  "reason": {
+                    "type": "string",
+                    "maxLength": 64
+                  },
+                  "correlationId": {
+                    "type": "string",
+                    "maxLength": 64
+                  },
+                  "eventId": {
+                    "type": "string",
+                    "maxLength": 200
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "serviceKey": {
+                      "type": "string"
+                    },
+                    "currentGeneration": {
+                      "type": [
+                        "null",
+                        "integer"
+                      ]
+                    },
+                    "cancelledPending": {
+                      "type": "integer"
+                    },
+                    "revokedActive": {
+                      "type": "integer"
+                    },
+                    "revokedInflight": {
+                      "type": "integer"
+                    },
+                    "alreadyTerminal": {
+                      "type": "integer"
+                    },
+                    "matched": {
+                      "type": "integer"
+                    },
+                    "reason": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "correlationId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "eventId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "replayed": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "stale_generation",
+                        "invalidate_generation_busy"
+                      ]
+                    },
+                    "serviceKey": {
+                      "type": "string"
+                    },
+                    "currentGeneration": {
+                      "type": [
+                        "null",
+                        "integer"
+                      ]
+                    },
+                    "receivedGeneration": {
+                      "type": [
+                        "null",
+                        "integer"
+                      ]
+                    },
+                    "correlationId": {
                       "type": [
                         "null",
                         "string"
@@ -5831,6 +6289,7 @@
                         "sms.status",
                         "sms.cancel",
                         "sms.capacity",
+                        "sms.invalidate",
                         "conversations.read",
                         "events.read",
                         "commands.create",
@@ -5938,6 +6397,7 @@
                         "sms.status",
                         "sms.cancel",
                         "sms.capacity",
+                        "sms.invalidate",
                         "conversations.read",
                         "events.read",
                         "commands.create",

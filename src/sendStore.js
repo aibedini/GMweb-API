@@ -17,6 +17,22 @@ function dedupeKey(to, text) {
   return crypto.createHash("sha256").update(`${to}\n${text}`).digest("hex");
 }
 
+// Consumer notification identity (lifecycle invalidation). The allowlist,
+// bounds and the "is this superseded?" barrier live in ONE pure module so the
+// HTTP layer, the durable ledger, the worker and the Android gateway can never
+// disagree about what a serviceKey/generation means.
+const {
+  NOTIFICATION_KINDS,
+  NOTIFICATION_TEXT_LIMITS,
+  MAX_GENERATION,
+  TERMINAL_SEND_STATUSES,
+  normalizeNotificationMeta,
+  selectInvalidatableSends,
+  summarizeInvalidation,
+  isSupersededNotification,
+  isTerminalSendStatus
+} = require("./notificationMeta");
+
 class SendStore {
   constructor(dbPath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -49,6 +65,28 @@ class SendStore {
       CREATE INDEX IF NOT EXISTS idx_sends_dedupe  ON sends (dedupe_key, status, sent_at);
       CREATE INDEX IF NOT EXISTS idx_sends_job     ON sends (job_id);
       CREATE INDEX IF NOT EXISTS idx_sends_status  ON sends (status);
+      CREATE TABLE IF NOT EXISTS service_generations (
+        source          TEXT NOT NULL,
+        service_key     TEXT NOT NULL,
+        generation      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        PRIMARY KEY (source, service_key)
+      );
+      CREATE TABLE IF NOT EXISTS invalidation_events (
+        event_id    TEXT PRIMARY KEY,
+        source      TEXT,
+        service_key TEXT,
+        response_json TEXT NOT NULL,
+        created_at  INTEGER NOT NULL
+      );
+      -- Durable lifecycle counters (sms_invalidations_total, ...). Kept in the
+      -- same SQLite file as the ledger so an operator can still answer "how many
+      -- stale reminders did we stop?" after a restart.
+      CREATE TABLE IF NOT EXISTS send_counters (
+        name       TEXT PRIMARY KEY,
+        value      INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS send_job_refs (
         job_id      TEXT PRIMARY KEY,
         send_id     INTEGER NOT NULL,
@@ -65,7 +103,38 @@ class SendStore {
       "ALTER TABLE sends ADD COLUMN active_at INTEGER",
       "ALTER TABLE sends ADD COLUMN stage_at INTEGER",
       "ALTER TABLE sends ADD COLUMN finished_at INTEGER",
-      "ALTER TABLE sends ADD COLUMN result_json TEXT"
+      "ALTER TABLE sends ADD COLUMN result_json TEXT",
+      // Consumer notification identity (Eve lifecycle invalidations). Nullable:
+      // every pre-existing row keeps working and is simply never matched by a
+      // serviceKey lookup.
+      "ALTER TABLE sends ADD COLUMN source TEXT",
+      "ALTER TABLE sends ADD COLUMN service_key TEXT",
+      "ALTER TABLE sends ADD COLUMN notification_kind TEXT",
+      "ALTER TABLE sends ADD COLUMN correlation_id TEXT",
+      "ALTER TABLE sends ADD COLUMN notification_generation INTEGER",
+      "ALTER TABLE sends ADD COLUMN requires_validation INTEGER NOT NULL DEFAULT 0",
+      // Durable revocation tombstone. revoked_at is set the moment an
+      // invalidation reaches this gateway -- BEFORE the worker, the pull bridge
+      // and /gateway/validate are told -- so a crash between "decided" and
+      // "delivered" cannot resurrect a stale reminder.
+      "ALTER TABLE sends ADD COLUMN revoked_at INTEGER",
+      "ALTER TABLE sends ADD COLUMN revocation_reason TEXT",
+      "ALTER TABLE sends ADD COLUMN revocation_json TEXT",
+      // Android gateway request id (pull_...). The phone's identity for a task
+      // must outlive the in-memory outbox, otherwise /gateway/validate cannot
+      // answer after a restart.
+      "ALTER TABLE sends ADD COLUMN gateway_request_id TEXT",
+      // Which notification KINDS the recorded watermark invalidated. A renewal
+      // that only revoked "volume_ended" must not silently block an "expired"
+      // reminder the consumer still considers valid.
+      "ALTER TABLE service_generations ADD COLUMN kinds TEXT"
+    ]) {
+      try { this.db.exec(sql); } catch { /* already present */ }
+    }
+    for (const sql of [
+      "CREATE INDEX IF NOT EXISTS idx_sends_service ON sends (source, service_key, status)",
+      "CREATE INDEX IF NOT EXISTS idx_sends_notification_generation ON sends (service_key, notification_generation)",
+      "CREATE INDEX IF NOT EXISTS idx_sends_gateway_request ON sends (gateway_request_id)"
     ]) {
       try { this.db.exec(sql); } catch { /* already present */ }
     }
@@ -123,6 +192,93 @@ class SendStore {
     );
     this._statsRows = this.db.prepare(`SELECT status, COUNT(*) AS n FROM sends GROUP BY status`);
     this._recent = this.db.prepare(`SELECT * FROM sends ORDER BY id DESC LIMIT ?`);
+    this._setNotification = this.db.prepare(
+      `UPDATE sends
+          SET source=@source, service_key=@service_key,
+              notification_kind=@notification_kind, correlation_id=@correlation_id,
+              notification_generation=@notification_generation,
+              requires_validation=@requires_validation, updated_at=@now
+        WHERE id=@id`
+    );
+    this._generationFor = this.db.prepare(
+      `SELECT generation FROM service_generations WHERE source=? AND service_key=?`
+    );
+    this._generationRecord = this.db.prepare(
+      `SELECT generation, kinds FROM service_generations WHERE source=? AND service_key=?`
+    );
+    this._advanceGeneration = this.db.prepare(
+      `INSERT INTO service_generations (source, service_key, generation, kinds, updated_at)
+       VALUES (@source, @service_key, @generation, @kinds, @now)
+       ON CONFLICT(source, service_key) DO UPDATE
+         SET generation=MAX(generation, excluded.generation), kinds=excluded.kinds, updated_at=excluded.updated_at`
+    );
+    this._invalidatable = this.db.prepare(
+      `SELECT * FROM sends
+        WHERE source=@source AND service_key=@service_key
+          AND status IN ('queued','active')
+          AND revoked_at IS NULL
+          AND (@key_name IS NULL OR key_name=@key_name)
+        ORDER BY created_at ASC LIMIT @limit`
+    );
+    this._serviceRows = this.db.prepare(
+      `SELECT * FROM sends
+        WHERE source=@source AND service_key=@service_key
+          AND (@key_name IS NULL OR key_name=@key_name)
+        ORDER BY created_at ASC LIMIT @limit`
+    );
+    this._byGatewayRequest = this.db.prepare(
+      `SELECT * FROM sends WHERE gateway_request_id=? LIMIT 1`
+    );
+    this._attachGatewayRequest = this.db.prepare(
+      `UPDATE sends SET gateway_request_id=@gateway_request_id, updated_at=@now WHERE id=@id`
+    );
+    // Tombstone ONLY: the durable "this may never be delivered" marker. The
+    // terminal status transition belongs to finalizeSuperseded() so the
+    // superseded counter is bumped exactly once per notification.
+    this._markRevoked = this.db.prepare(
+      `UPDATE sends
+          SET revoked_at=COALESCE(revoked_at, @now),
+              revocation_reason=COALESCE(revocation_reason, @reason),
+              revocation_json=COALESCE(revocation_json, @json),
+              updated_at=@now
+        WHERE id=@id
+          AND status NOT IN ('sent','unverified','failed','suppressed','cancelled','superseded')`
+    );
+    this._finalizeSuperseded = this.db.prepare(
+      `UPDATE sends
+          SET status='superseded',
+              finished_at=COALESCE(finished_at, @now),
+              error=COALESCE(error, @reason),
+              updated_at=@now
+        WHERE id=@id
+          AND status NOT IN ('sent','unverified','failed','suppressed','cancelled','superseded')`
+    );
+    this._markSentAfterRevocation = this.db.prepare(
+      `UPDATE sends
+          SET status='sent', sent_at=COALESCE(sent_at, @now),
+              finished_at=@now, updated_at=@now, result_json=@result_json
+        WHERE id=@id`
+    );
+    this._bumpCounter = this.db.prepare(
+      `INSERT INTO send_counters (name, value, updated_at) VALUES (@name, @delta, @now)
+       ON CONFLICT(name) DO UPDATE SET value=value + @delta, updated_at=excluded.updated_at`
+    );
+    this._counters = this.db.prepare(`SELECT name, value FROM send_counters ORDER BY name`);
+    this._revokedInflightCount = this.db.prepare(
+      `SELECT COUNT(*) AS n FROM sends WHERE revoked_at IS NOT NULL AND status='active'`
+    );
+    this._validationRequired = this.db.prepare(
+      `SELECT 1 AS present FROM sends WHERE service_key=? AND status='queued'
+         AND requires_validation=1 LIMIT 1`
+    );
+    this._invalidationEvent = this.db.prepare(
+      `SELECT response_json FROM invalidation_events WHERE event_id=?`
+    );
+    this._rememberInvalidation = this.db.prepare(
+      `INSERT INTO invalidation_events (event_id, source, service_key, response_json, created_at)
+       VALUES (@event_id, @source, @service_key, @response_json, @now)
+       ON CONFLICT(event_id) DO NOTHING`
+    );
     this._backfill = this.db.prepare(
       `INSERT INTO sends
          (dedupe_key, to_number, text, key_name, priority, idempotency_key, job_id,
@@ -140,7 +296,7 @@ class SendStore {
 
     // Claim runs in a transaction so two concurrent identical requests can't both
     // pass the de-dupe check and double-send.
-    this._claimTxn = this.db.transaction((to, text, keyName, priority, windowMs, now) => {
+    this._claimTxn = this.db.transaction((to, text, keyName, priority, windowMs, now, notification) => {
       const key = dedupeKey(to, text);
       const sent = this._lastSent.get(key, now - windowMs);
       if (sent) return { action: "duplicate_suppressed", row: sent };
@@ -150,7 +306,12 @@ class SendStore {
         dedupe_key: key, to_number: to, text, key_name: keyName || null,
         priority: priority || "normal", idempotency_key: null, now
       });
-      return { action: "new", id: Number(info.lastInsertRowid) };
+      const id = Number(info.lastInsertRowid);
+      // Same transaction as the insert: there is no instant where a
+      // revocation-eligible row exists WITHOUT its notification tag, which is
+      // exactly the window an invalidation could otherwise slip through.
+      if (notification) this._setNotification.run(this._notificationParams(id, notification, now));
+      return { action: "new", id };
     });
   }
 
@@ -158,19 +319,252 @@ class SendStore {
   //   { action:"new", id }                       -> caller should enqueue
   //   { action:"duplicate_suppressed", row }      -> identical sent within window
   //   { action:"duplicate_inflight", row }        -> identical already queued/active
-  claim({ to, text, keyName, priority = "normal", windowMs }) {
-    return this._claimTxn(to, text, keyName, priority, windowMs, Date.now());
+  claim({ to, text, keyName, priority = "normal", windowMs, notification = null }) {
+    return this._claimTxn(to, text, keyName, priority, windowMs, Date.now(),
+      notification ? normalizeNotificationMeta(notification) : null);
+  }
+
+  _notificationParams(id, meta, now) {
+    const clean = normalizeNotificationMeta(meta);
+    return {
+      id: Number(id),
+      source: clean.source,
+      service_key: clean.serviceKey,
+      notification_kind: clean.notificationKind,
+      correlation_id: clean.correlationId,
+      notification_generation: clean.generation,
+      requires_validation: clean.requiresValidation ? 1 : 0,
+      now
+    };
+  }
+
+  /**
+   * Attach the consumer's notification identity to a ledger row so a later
+   * lifecycle invalidation can find and cancel it by serviceKey alone. Only the
+   * whitelisted, bounded fields are persisted — never the message text beyond
+   * what the ledger already stores.
+   */
+  setNotification(id, meta = {}) {
+    if (!Number.isInteger(Number(id))) return false;
+    this._setNotification.run(this._notificationParams(id, meta, Date.now()));
+    return true;
+  }
+
+  /** Highest lifecycle generation this store has ever seen for a service. */
+  generationFor(source, serviceKey) {
+    const row = this._generationFor.get(String(source || ""), String(serviceKey || ""));
+    return row ? Number(row.generation) : null;
+  }
+
+  /**
+   * The full revocation barrier: the watermark PLUS the kinds it invalidated.
+   * A delayed retry, a stalled BullMQ job or a re-enqueued ledger row is judged
+   * against this instead of a per-row flag, so nothing can be resurrected.
+   */
+  revocationBarrier(source, serviceKey) {
+    const row = this._generationRecord.get(String(source || ""), String(serviceKey || ""));
+    if (!row) return null;
+    let kinds = [];
+    try { kinds = JSON.parse(row.kinds || "[]"); } catch { kinds = []; }
+    return { generation: Number(row.generation), kinds: Array.isArray(kinds) ? kinds : [] };
+  }
+
+  /** The barrier for a ledger row (no serviceKey -> no barrier). */
+  barrierForRow(row) {
+    if (!row || !row.service_key) return null;
+    return this.revocationBarrier(row.source, row.service_key);
+  }
+
+  /** True when this row may not be delivered any more, for any durable reason. */
+  isSuperseded(row) {
+    return isSupersededNotification(row, this.barrierForRow(row));
+  }
+
+  /**
+   * Monotonic watermark for a service generation. A duplicate or out-of-order
+   * invalidation (an older generation arriving after a newer one) must never
+   * cancel a notification that belongs to the newer lifecycle.
+   */
+  advanceGeneration(source, serviceKey, generation, kinds = null) {
+    const value = Number(generation);
+    if (!Number.isFinite(value) || value < 0) return null;
+    const origin = String(source || "");
+    const key = String(serviceKey || "");
+    // kinds is a UNION, never a replacement: gen 18 invalidating "volume_ended"
+    // followed by gen 19 invalidating "expired" must keep BOTH blocked below
+    // their respective watermarks.
+    const previous = this.revocationBarrier(origin, key);
+    const merged = new Set([...(previous?.kinds || [])]);
+    for (const kind of Array.isArray(kinds) ? kinds : []) {
+      const clean = String(kind || "").trim().toLowerCase();
+      if (clean) merged.add(clean);
+    }
+    this._advanceGeneration.run({
+      source: origin, service_key: key,
+      generation: Math.trunc(value),
+      kinds: JSON.stringify([...merged].sort()),
+      now: Date.now()
+    });
+    return this.generationFor(origin, key);
+  }
+
+  /** Non-terminal sends for one service, oldest first (cancel order). */
+  invalidatableSends(source, serviceKey, limit = 500, keyName = null) {
+    return this._invalidatable.all({
+      source: String(source || ""), service_key: String(serviceKey || ""),
+      key_name: keyName ? String(keyName) : null,
+      limit: Math.max(1, Math.min(Number(limit) || 500, 5000))
+    });
+  }
+
+  /**
+   * Every ledger row for a service, terminal ones included. Used to prove a
+   * project key really owns the serviceKey it is about to invalidate: an
+   * unguessable key is not authorization, and letting a foreign caller advance
+   * another service's watermark would be a denial-of-invalidation.
+   */
+  serviceRows(source, serviceKey, { limit = 500, keyName = null } = {}) {
+    return this._serviceRows.all({
+      source: String(source || ""), service_key: String(serviceKey || ""),
+      key_name: keyName ? String(keyName) : null,
+      limit: Math.max(1, Math.min(Number(limit) || 500, 5000))
+    });
+  }
+
+  ownsService(source, serviceKey, keyName) {
+    if (!keyName) return true;
+    return this.serviceRows(source, serviceKey, { limit: 1, keyName }).length > 0;
+  }
+
+  /** Bind the Android gateway's opaque task id to its ledger row. */
+  attachGatewayRequest(id, gatewayRequestId) {
+    if (!Number.isInteger(Number(id))) return false;
+    const value = String(gatewayRequestId || "").trim();
+    if (!value) return false;
+    this._attachGatewayRequest.run({
+      id: Number(id), gateway_request_id: value.slice(0, 120), now: Date.now()
+    });
+    return true;
+  }
+
+  byGatewayRequest(gatewayRequestId) {
+    const value = String(gatewayRequestId || "").trim();
+    if (!value) return null;
+    return this._byGatewayRequest.get(value) || null;
+  }
+
+  /**
+   * Durable tombstone. The revocation is written BEFORE the worker, the pull
+   * bridge and the validation endpoint are told, so a crash in between still
+   * leaves the reminder unsendable. Rows that already reached a terminal state
+   * are left untouched and reported so the caller can count them honestly.
+   */
+  revokeById(id, { reason = null, correlationId = null, eventId = null,
+                   generation = null, source = null, at = Date.now() } = {}) {
+    if (!Number.isInteger(Number(id))) return { ok: false, row: null };
+    const payload = JSON.stringify({
+      reason: reason || null,
+      correlationId: correlationId || null,
+      eventId: eventId || null,
+      generation: generation === null || generation === undefined ? null : Number(generation),
+      source: source || null,
+      revokedAt: new Date(at).toISOString()
+    }).slice(0, 2000);
+    const info = this._markRevoked.run({
+      id: Number(id), reason: reason || null, json: payload, now: at
+    });
+    const row = this.byId(id);
+    return { ok: (info.changes || 0) > 0, row };
+  }
+
+  /** Terminalize a task the phone/worker confirmed as superseded. */
+  finalizeSuperseded(id, reason = null) {
+    if (!Number.isInteger(Number(id))) return false;
+    const info = this._finalizeSuperseded.run({
+      id: Number(id), reason: reason || "superseded", now: Date.now()
+    });
+    return (info.changes || 0) > 0;
+  }
+
+  /**
+   * The impossible-unsend case: the phone reports a real physical submission
+   * AFTER the reminder was revoked. The physical truth wins -- the row becomes
+   * "sent" again, with the race recorded explicitly instead of pretending the
+   * SMS never left the device.
+   */
+  recordSentAfterRevocation(id, details = {}) {
+    if (!Number.isInteger(Number(id))) return false;
+    const now = Date.now();
+    let resultJson;
+    try {
+      resultJson = JSON.stringify({ ...details, sentAfterRevocation: true, auditedAt: new Date(now).toISOString() });
+    } catch { resultJson = JSON.stringify({ sentAfterRevocation: true }); }
+    this._markSentAfterRevocation.run({ id: Number(id), result_json: resultJson, now });
+    return true;
+  }
+
+  bumpCounters(entries, at = Date.now()) {
+    const list = Array.isArray(entries) ? entries : [entries];
+    const apply = this.db.transaction(() => {
+      for (const entry of list) {
+        if (!entry?.name) continue;
+        const delta = Number(entry.delta ?? 1);
+        if (!Number.isFinite(delta) || delta === 0) continue;
+        this._bumpCounter.run({ name: String(entry.name), delta: Math.trunc(delta), now: at });
+      }
+    });
+    apply();
+  }
+
+  /** Durable lifecycle counters, metric-name -> value. */
+  counters() {
+    const out = {};
+    for (const row of this._counters.all()) out[row.name] = Number(row.value);
+    return out;
+  }
+
+  revokedInflightCount() {
+    return Number(this._revokedInflightCount.get()?.n || 0);
+  }
+
+  /** True when a not-yet-started send for this service still needs validation. */
+  hasValidationRequired(serviceKey) {
+    return this._validationRequired.get(String(serviceKey || "")) !== undefined;
+  }
+
+  /** Replay a previously answered invalidation so a retry is a no-op. */
+  invalidationResult(eventId) {
+    const key = String(eventId || "");
+    if (!key) return null;
+    const row = this._invalidationEvent.get(key);
+    if (!row) return null;
+    try { return JSON.parse(row.response_json); } catch { return null; }
+  }
+
+  rememberInvalidation(eventId, { source, serviceKey, response }) {
+    const key = String(eventId || "");
+    if (!key) return false;
+    let payload;
+    try { payload = JSON.stringify(response); } catch { return false; }
+    this._rememberInvalidation.run({
+      event_id: key, source: source ? String(source).slice(0, 32) : null,
+      service_key: serviceKey ? String(serviceKey).slice(0, 200) : null,
+      response_json: payload, now: Date.now()
+    });
+    return true;
   }
 
   // Explicit-idempotency sends still need a durable observability row. The
   // idempotency reservation happens in Redis first, so retries never call this.
-  create({ to, text, keyName, priority = "normal", idempotencyKey = null }) {
+  create({ to, text, keyName, priority = "normal", idempotencyKey = null, notification = null }) {
     const now = Date.now();
     const info = this._insert.run({
       dedupe_key: dedupeKey(to, text), to_number: to, text,
       key_name: keyName || null, priority, idempotency_key: idempotencyKey, now
     });
-    return Number(info.lastInsertRowid);
+    const id = Number(info.lastInsertRowid);
+    if (notification) this._setNotification.run(this._notificationParams(id, notification, now));
+    return id;
   }
 
   backfillPending(job) {
@@ -276,8 +670,14 @@ class SendStore {
   }
 
   stats() {
-    const out = { queued: 0, active: 0, sent: 0, unverified: 0, failed: 0, suppressed: 0, cancelled: 0 };
+    const out = {
+      queued: 0, active: 0, sent: 0, unverified: 0, failed: 0,
+      suppressed: 0, cancelled: 0, superseded: 0
+    };
     for (const r of this._statsRows.all()) out[r.status] = r.n;
+    // Not a status: a row that is revoked but still 'active' is waiting for the
+    // phone's answer (superseded ACK or lease expiry).
+    out.revokedInflight = this.revokedInflightCount();
     return out;
   }
 
@@ -290,4 +690,18 @@ class SendStore {
   }
 }
 
-module.exports = { SendStore, dedupeKey };
+module.exports = {
+  SendStore,
+  dedupeKey,
+  // Re-exported from ./notificationMeta so existing importers (and tests) keep
+  // working against the single source of truth.
+  normalizeNotificationMeta,
+  selectInvalidatableSends,
+  summarizeInvalidation,
+  isSupersededNotification,
+  isTerminalSendStatus,
+  NOTIFICATION_KINDS,
+  NOTIFICATION_TEXT_LIMITS,
+  MAX_GENERATION,
+  TERMINAL_SEND_STATUSES
+};

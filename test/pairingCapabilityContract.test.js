@@ -74,8 +74,15 @@ test("the shared fixture carries the REAL Android linked-browser certificate vec
 
 test("Messages protocol copy is byte-identical (local drift guard; CI enforces remotely)", () => {
   const ours = fs.readFileSync(path.join(__dirname, "..", "shared", "pairing-protocol-v1.json"));
-  const theirs = path.resolve(__dirname, "..", "..", "Messages", "protocol", "pairing-protocol-v1.json");
-  if (!fs.existsSync(theirs)) return; // enforced by .github/workflows when this repo is alone
-  assert.deepEqual(fs.readFileSync(theirs), ours,
+  const theirsPath = path.resolve(__dirname, "..", "..", "Messages", "protocol", "pairing-protocol-v1.json");
+  if (!fs.existsSync(theirsPath)) return; // enforced by .github/workflows when this repo is alone
+  const theirs = fs.readFileSync(theirsPath);
+  // Both files are `*.json text eol=lf` in git, so the CONTENT that matters is
+  // the LF-normalised one. A Windows checkout of the sibling repo (no
+  // .gitattributes, core.autocrlf=true) rewrites every \n to \r\n and would
+  // otherwise fail this guard on an artifact git itself ignores; the strict byte
+  // comparison still runs in CI, which checks out both repos.
+  const lf = (buffer) => buffer.toString("utf8").replace(/\r\n/g, "\n");
+  assert.equal(lf(theirs), lf(ours),
     "Messages/protocol/pairing-protocol-v1.json drifted from GMweb-API/shared copy — fix both in the same commit");
 });

@@ -22,6 +22,13 @@ const {
 const { ActivityLogStore, classify: classifyActivity } = require("./activityLog");
 const { SendQueue } = require("./queue");
 const { SendStore } = require("./sendStore");
+const {
+  NOTIFICATION_TEXT_LIMITS,
+  normalizeNotificationMeta,
+  validateNotificationMeta
+} = require("./notificationMeta");
+const { createSendRevocation, METRICS: REVOCATION_METRICS } = require("./sendRevocation");
+const { registerGatewayRoutes } = require("./gatewayRoutes");
 const { SendPacingController } = require("./sendPacing");
 const { sendGate, DEFAULT_TIME_ZONE } = require("./sendSchedule");
 const { PRIORITY_LEVELS, PRIORITY_NAMES, normalizeSendPriority, priorityForJob } = require("./sendPriority");
@@ -97,7 +104,61 @@ const { registerPwaAuthRoutes, registerPwaTokenAdminRoutes } = require("./pwaAut
 const chromeClient = new GoogleMessagesClient(config);
 const androidClient = new AndroidGatewayClient(config);
 // Pull mode: the phone dials OUT to the server and picks up tasks (no tunnel).
-const androidOutbox = new AndroidOutbox();
+//
+// The outbox itself only knows "who is waiting on this task right now". The
+// durable revocation state lives in the send ledger, and these hooks are how
+// the two stay in sync -- which is what stops a stale depletion reminder from
+// reaching the SIM after a restart, a Redis reconnect or a phone that comes
+// back online later. sendRevocation is assigned right after the ledger is
+// constructed; hooks only run at request time.
+let sendRevocation = null;
+const androidOutbox = new AndroidOutbox({
+  hooks: {
+    // Durable barrier. Answers "superseded" for a revoked row even when this
+    // process has never seen the task (post-restart validation).
+    isRevoked: (gatewayRequestId) => {
+      const row = sendStore.byGatewayRequest(gatewayRequestId);
+      if (!row) return null;
+      if (row.revoked_at) {
+        return {
+          cause: row.status === "cancelled" ? "cancel" : "superseded",
+          reason: row.revocation_reason || (row.status === "cancelled" ? "cancelled" : "superseded"),
+          revokedAt: row.revoked_at
+        };
+      }
+      if (row.status === "cancelled") {
+        return { cause: "cancel", reason: row.error || "cancelled", revokedAt: null };
+      }
+      if (sendStore.isSuperseded(row)) {
+        return { cause: "superseded", reason: row.revocation_reason || "superseded", revokedAt: null };
+      }
+      return null;
+    },
+    // Bind the phone's opaque task id to its ledger row BEFORE the device can
+    // observe the task, so validation survives a restart.
+    onOffer: (gatewayRequestId, entry) => {
+      if (entry?.ledgerId) sendStore.attachGatewayRequest(entry.ledgerId, gatewayRequestId);
+    },
+    // Settlements are logged here; the single authoritative sent-after-
+    // revocation audit runs in handleSendCompleted (or in the gateway ACK
+    // fallback when no worker is left waiting), so it can never double-count.
+    onSettle: (gatewayRequestId, outcome, entry, details) => {
+      app.log.info({
+        gatewayRequestId,
+        state: outcome,
+        serviceKey: entry?.meta?.serviceKey || null,
+        notificationKind: entry?.meta?.notificationKind || null,
+        generation: entry?.meta?.generation ?? null,
+        correlationId: entry?.meta?.correlationId || null,
+        bullmqJobId: entry?.jobId || null,
+        revocationReason: entry?.revoked?.reason || details?.reason || null,
+        transport: "android-pull",
+        ackAt: new Date().toISOString()
+      }, "android gateway task settled");
+    },
+    leaseMs: Number(process.env.ANDROID_REVOCATION_LEASE_MS) || 120000
+  }
+});
 const client = createTransportSelector({
   chromeClient,
   androidClient,
@@ -1063,6 +1124,34 @@ let lastHardRestartAt = 0;
 let hardRecoveryScheduled = false;
 const activeSendCancellationRequests = new Set();
 
+// ── Notification lifecycle revocation (stale-SMS race) ─────────────────────
+// ONE durable decision, shared by POST /send/cancel, POST /send/invalidate, the
+// BullMQ processor and the Android pull bridge. The ordering contract that
+// makes it crash-safe (replay -> watermark -> ADVANCE -> revoke -> count) lives
+// in src/sendRevocation.js; server.js only wires it to HTTP, SSE and the log.
+sendRevocation = createSendRevocation({
+  sendStore,
+  queue: sendQueue,
+  outbox: androidOutbox,
+  activeCancellationRequests: activeSendCancellationRequests,
+  log: app.log,
+  // Same fan-out as every other send lifecycle event: live stream + webhook.
+  onEvent: (event) => { emitSse(event); postWebhook(event); },
+  // Durable operator trail. Only identity/ordering fields are recorded: never
+  // message text, never a phone number.
+  onAudit: (entry) => {
+    activityLogStore.append({
+      type: "action",
+      category: "messaging",
+      method: "POST",
+      path: entry.type === "lifecycle_invalidation" ? "/send/invalidate" : "/gateway/ack",
+      statusCode: 200,
+      title: `Notification ${entry.type}`,
+      details: { ...entry }
+    }).catch(() => {});
+  }
+});
+
 // --- Send power (global kill switch) ------------------------------------
 // "power-off" flips `sendPowerOn` to false and blocks EVERY send path: new
 // /send requests are rejected, the queue is paused, and any in-flight send is
@@ -1400,6 +1489,41 @@ async function handleSendCompleted(job, result) {
   // The consumer may have cancelled while Playwright was between two awaits.
   // Never let a late worker completion overwrite that terminal decision.
   if (sendStore.byJob(job.id)?.status === "cancelled") return;
+  // Lifecycle invalidation won the race: the reminder is terminal, NOT
+  // successful, NOT billable and NEVER retryable. It deliberately skips
+  // recordSuccessAndReleaseHigh() below, so a superseded notification cannot
+  // consume the successful-send budget that releases deferred high-priority
+  // work.
+  if (result?.superseded) {
+    const row = sendStore.byJob(job.id);
+    const reason = result.reason || row?.revocation_reason || "superseded";
+    if (row) sendRevocation.finalizeSuperseded(row, reason);
+    const event = {
+      type: "send_superseded",
+      requestId: requestIdForJob(job),
+      jobId: job.id,
+      status: "superseded",
+      state: "superseded",
+      terminal: true,
+      successful: false,
+      superseded: true,
+      retryable: false,
+      counted: false,
+      reason,
+      serviceKey: row?.service_key || null,
+      notificationKind: row?.notification_kind || null,
+      generation: row?.notification_generation ?? null,
+      correlationId: row?.correlation_id || null,
+      revokedAt: row?.revoked_at ? new Date(row.revoked_at).toISOString() : null,
+      to: job.data?.to,
+      priority: priority.name,
+      priorityLevel: priority.level,
+      at: result.at || new Date().toISOString()
+    };
+    emitSse(event);
+    postWebhook(event);
+    return;
+  }
   if (result?.cancelled) {
     sendStore.markStatus(job.id, "cancelled", {
       attempts: job.attemptsMade || 0,
@@ -1474,6 +1598,16 @@ async function handleSendCompleted(job, result) {
     return;
   }
   sendStore.markStatus(job.id, "sent", { attempts: job.attemptsMade || 0, result });
+  // Impossible-unsend: the revocation reached GMweb after the SIM had already
+  // accepted the message. The physical truth wins and the race is recorded,
+  // counted and audited -- it is never rewritten as a cancellation.
+  const sentAfterRevocation = Boolean(result?.sentAfterRevocation);
+  if (sentAfterRevocation) {
+    sendRevocation.auditSentAfterRevocation(sendStore.byJob(job.id), {
+      transport: client.name === "android" ? "android-pull" : client.name,
+      result
+    });
+  }
   const submission = result?.submission || {};
   const event = {
     type: "send_completed",
@@ -1490,6 +1624,10 @@ async function handleSendCompleted(job, result) {
     verificationStatus: submission.verificationStatus || null,
     verificationAttempts: Number(submission.verificationAttempts || 0),
     fastPath: result?.fastPath,
+    // A real submission that beat its own revocation: visible on the event so
+    // no consumer can misread it as a clean, expected send.
+    sentAfterRevocation,
+    revocation: sentAfterRevocation ? (result?.revocation || null) : null,
     at: result?.at || new Date().toISOString()
   };
   emitSse(event);
@@ -1514,6 +1652,22 @@ function startSendWorker() {
   sendQueue.startWorker(
     async (job) => {
       if (!sendPowerOn) return deferPowerOffJob(job);
+      // DURABLE revocation barrier, read from the SQLite ledger rather than an
+      // in-memory Set: a restarted process, a BullMQ-stalled job that got
+      // re-queued, or a delayed retry hours later all refuse to touch a
+      // transport for a notification whose lifecycle has moved on.
+      const guard = sendRevocation.guardForJob(job.id);
+      if (guard?.superseded) {
+        return {
+          superseded: true,
+          reason: guard.reason,
+          ledgerId: guard.row?.id ?? null,
+          at: new Date().toISOString()
+        };
+      }
+      if (guard?.cancelled) {
+        return { cancelled: true, error: "cancelled_by_consumer" };
+      }
       const priority = priorityForJob(job);
       // Runs in-process; shares the single Playwright browser via withBrowserLock.
       const schedule = sendGate(new Date(), {
@@ -1526,11 +1680,30 @@ function startSendWorker() {
       if (schedule.blocked) return deferQuietHoursJob(job, schedule.releaseAt);
       await waitForSendPace(job);
       try {
+        // The consumer notification identity is re-read from the ledger at send
+        // time so the Android bridge can hand it to the phone (meta) and bind
+        // the phone's task id for later /gateway/validate calls.
+        const ledgerRow = sendStore.byJob(job.id);
+        const notificationMeta = ledgerRow?.service_key ? {
+          source: ledgerRow.source,
+          serviceKey: ledgerRow.service_key,
+          notificationKind: ledgerRow.notification_kind,
+          generation: ledgerRow.notification_generation,
+          correlationId: ledgerRow.correlation_id,
+          requiresValidation: Boolean(ledgerRow.requires_validation)
+        } : null;
         const result = await Promise.race([
           client.sendMessage({
             to: job.data.to,
             text: job.data.text,
-            shouldCancel: () => !sendPowerOn || activeSendCancellationRequests.has(String(job.id)),
+            ledgerId: ledgerRow?.id ?? null,
+            jobId: job.id,
+            meta: notificationMeta,
+            // Cooperative stop: consulted between every browser step AND before
+            // the Android bridge hands the task to a phone.
+            shouldCancel: () => !sendPowerOn
+              || activeSendCancellationRequests.has(String(job.id))
+              || Boolean(sendRevocation.guardForJob(job.id)),
             // Per-message progress: record the stage in the ledger and stream it.
             onStage: (s) => {
               sendStore.markStage(job.id, s);
@@ -1544,6 +1717,12 @@ function startSendWorker() {
         return result;
       } catch (error) {
         if (error?.code === "SEND_CANCELLED") {
+          // A cooperative stop can mean "the consumer cancelled" or "the
+          // lifecycle was invalidated". The ledger knows which.
+          const stopped = sendRevocation.guardForJob(job.id);
+          if (stopped?.superseded) {
+            return { superseded: true, reason: stopped.reason, ledgerId: stopped.row?.id ?? null, at: new Date().toISOString() };
+          }
           return { cancelled: true, error: error.message };
         }
         if (error?.code === "SEND_UNVERIFIED") {
@@ -2341,6 +2520,19 @@ app.get("/admin/overview", {
           },
           browserAutomation: { type: "object", additionalProperties: true },
           webApp: { type: "object", additionalProperties: true },
+          metrics: {
+            type: "object",
+            additionalProperties: { type: "integer" },
+            description: "Durable lifecycle counters (sms_invalidations_total, sms_jobs_superseded_total, sms_inflight_revoked_total, sms_sent_after_revocation_total, sms_validation_requests_total, ...)."
+          },
+          revocation: {
+            type: "object",
+            properties: {
+              superseded: { type: "integer" },
+              revokedInflight: { type: "integer" },
+              tombstones: { type: "integer" }
+            }
+          },
           system: {
             type: "object",
             properties: {
@@ -2423,6 +2615,15 @@ app.get("/admin/overview", {
     readiness,
     browserAutomation,
     webApp,
+    // Lifecycle revocation observability (the stale-SMS race): durable counters
+    // in the project's sms_*_total style, plus the live bridge tombstones. No
+    // phone number, message text or service key is ever exposed here.
+    metrics: sendStore.counters(),
+    revocation: {
+      superseded: sendStore.stats().superseded,
+      revokedInflight: sendStore.revokedInflightCount(),
+      tombstones: androidOutbox.stats().tombstones
+    },
     system,
     services
   };
@@ -2708,72 +2909,20 @@ app.post("/admin/transport", {
 });
 
 // ── Android device pull bridge (phone dials OUT; no tunnel needed) ──────────
-// The phone long-polls /gateway/pull with its X-API-Key (GMWEB_ANDROID_DEVICE_KEY),
-// delivers the SMS over the SIM, then acks. The worker-side promise handed to
-// the outbox resolves here, so the BullMQ ledger/SSE/webhooks stay authoritative.
-// NOTE: checkDeviceKey lives next to requireToken (top-level) because the
-// global preHandler hook calls it — it is NOT visible inside app.after().
-
-app.get("/gateway/pull", {
-  schema: {
-    summary: "Android device pulls the next queued send",
-    description: "Long-poll for devices in android transport pull mode. Authenticated with the device key (X-API-Key). Returns {task:null} or {task:{requestId,to,text,priority}}.",
-    tags: ["Gateway"],
-    response: {
-      200: {
-        type: "object",
-        properties: {
-          task: {
-            type: ["object", "null"],
-            properties: {
-              requestId: { type: "string" },
-              to: { type: "string" },
-              text: { type: "string" },
-              priority: { type: "string" }
-            }
-          }
-        }
-      },
-      401: { type: "object", properties: { error: { type: "string" } } },
-      409: { type: "object", properties: { error: { type: "string" } } }
-    }
-  }
-}, async (request, reply) => {
-  if (!checkDeviceKey(request)) { reply.code(401).send({ error: "unauthorized" }); return; }
-  if (!client.outbox || !client.pullMode || client.name !== "android") {
-    reply.code(409).send({ error: "pull_mode_inactive" });
-    return;
-  }
-  const waitMs = Math.min(30000, Math.max(1000, Number(request.query?.waitMs) || 25000));
-  const task = await client.outbox.take(waitMs);
-  return { task };
-});
-
-app.post("/gateway/ack", {
-  schema: {
-    summary: "Android device reports a delivery outcome",
-    description: "Acknowledge a pulled task: ok=true marks it sent (drives ledger, SSE, webhooks); ok=false fails that attempt so BullMQ can retry.",
-    tags: ["Gateway"],
-    body: {
-      type: "object",
-      required: ["requestId", "ok"],
-      properties: {
-        requestId: { type: "string" },
-        ok: { type: "boolean" },
-        reason: { type: "string" },
-        sentAt: { type: "integer" }
-      }
-    },
-    response: {
-      200: { type: "object", properties: { ok: { type: "boolean" } } },
-      401: { type: "object", properties: { error: { type: "string" } } }
-    }
-  }
-}, async (request, reply) => {
-  if (!checkDeviceKey(request)) { reply.code(401).send({ error: "unauthorized" }); return; }
-  const { requestId, ok, reason } = request.body || {};
-  const handled = client.outbox?.ack(String(requestId || ""), Boolean(ok), { error: reason });
-  return { ok: handled === true };
+// GET /gateway/pull, POST /gateway/validate and POST /gateway/ack live in
+// src/gatewayRoutes.js: the bridge is where the stale-SMS race is won or lost,
+// and keeping it a separate boundary is what lets the whole supersede/validate
+// contract be tested against a real ledger with no Redis and no browser.
+// Auth is unchanged: the device key, checked by the global preHandler AND by
+// each handler (defence in depth).
+registerGatewayRoutes(app, {
+  outbox: androidOutbox,
+  sendStore,
+  revocation: sendRevocation,
+  checkDeviceKey,
+  checkRateLimit,
+  isPullModeActive: () => Boolean(client.pullMode && client.name === "android" && client.outbox),
+  log: app.log
 });
 
 // ── Phase 2 Control Plane (ADR-001/004, TechSpec §51–58) ────────────────────
@@ -3295,6 +3444,7 @@ app.post("/send", {
       "- `GET /send/status/{requestId}` — poll durable status, stage, result, and timestamps",
       "  (`jobId` is also accepted for backwards compatibility)",
       "- `POST /send/cancel/{requestId}` — cancel before the worker starts sending",
+    "- `POST /send/invalidate` — revoke every not-yet-started reminder for one service after a renewal",
       "- `GET /events` (SSE) — real-time `send_processing` / `send_completed` / `send_failed` / `send_cancelled`",
       "",
       "**Retries:** failed sends retry up to 3 times with exponential backoff.",
@@ -3477,14 +3627,39 @@ app.post("/send", {
     priority: z.union([
       z.enum([...PRIORITY_NAMES, "high", "normal"]),
       z.number().int().min(1).max(10)
-    ]).optional()
+    ]).optional(),
+    // Consumer notification identity. Eve attaches it to every notification so a
+    // later lifecycle change can invalidate exactly this service's outstanding
+    // reminders. Unknown keys are ignored and every value is bounded by
+    // normalizeNotificationMeta before it touches the ledger.
+    meta: z.object({
+      source: z.string().max(32).optional(),
+      serviceKey: z.string().max(200).optional(),
+      notificationKind: z.string().max(48).optional(),
+      generation: z.number().int().min(0).optional(),
+      correlationId: z.string().max(64).optional(),
+      requiresValidation: z.boolean().optional()
+    }).partial().optional()
   });
   const parsed = schema.safeParse(request.body);
   if (!parsed.success) {
     reply.code(400).send({ error: "invalid_body", details: parsed.error.flatten() });
     return;
   }
-  const { to, text, wait, priority } = parsed.data;
+  const { to, text, wait, priority, meta } = parsed.data;
+  // Optional consumer notification identity. No meta = the historical payload,
+  // handled exactly as before. A HALF-filled tag is rejected (400) rather than
+  // stored: a tag that cannot be revoked is worse than no tag at all.
+  const metaCheck = validateNotificationMeta(meta);
+  if (!metaCheck.ok) {
+    reply.code(400).send({
+      error: "invalid_meta",
+      reason: metaCheck.error,
+      allowedNotificationKinds: metaCheck.allowed || undefined
+    });
+    return;
+  }
+  const notificationMeta = metaCheck.meta;
   const sendPriority = normalizeSendPriority(priority);
   const enqueueOpts = { priority: sendPriority.level };
 
@@ -3562,7 +3737,8 @@ app.post("/send", {
   if (!idemKey) {
     const claim = sendStore.claim({
       to, text, keyName: projectKey?.name || "master",
-      priority: sendPriority.name, windowMs: SEND_DEDUPE_MS
+      priority: sendPriority.name, windowMs: SEND_DEDUPE_MS,
+      notification: notificationMeta
     });
     if (claim.action !== "new") {
       app.log.warn({ to, reason: claim.action }, "duplicate send suppressed by ledger");
@@ -3583,7 +3759,8 @@ app.post("/send", {
   } else {
     ledgerId = sendStore.create({
       to, text, keyName: projectKey?.name || "master",
-      priority: sendPriority.name, idempotencyKey: idemKey
+      priority: sendPriority.name, idempotencyKey: idemKey,
+      notification: notificationMeta
     });
   }
   const requestId = sendStore.requestId(ledgerId);
@@ -3611,6 +3788,9 @@ app.post("/send", {
   }
   if (idemKey) await sendQueue.setIdempotencyJob(idemKey, job.id, bodyHash).catch(() => {});
   if (ledgerId) sendStore.attachJob(ledgerId, job.id);
+  // The notification identity was written in the SAME transaction as the
+  // ledger claim above, so an invalidation that races this request sees a row
+  // that is already taggable -- there is no untagged window to slip through.
   emitSse({
     type: "send_queued", requestId, jobId: job.id, to,
     priority: sendPriority.name, priorityLevel: sendPriority.level,
@@ -3694,8 +3874,18 @@ app.get("/send/status/:reference", {
           requestId: { type: ["string", "null"] },
           jobId: { type: ["string", "null"] },
           id: { type: ["string", "null"], description: "Backwards-compatible alias of jobId" },
-          state: { type: "string", enum: ["waiting", "active", "completed", "failed", "delayed", "unverified", "cancelled", "suppressed"] },
-          status: { type: "string", enum: ["queued", "active", "sent", "unverified", "failed", "cancelled", "suppressed"] },
+          state: { type: "string", enum: ["waiting", "active", "completed", "failed", "delayed", "unverified", "cancelled", "suppressed", "superseded", "revoked"] },
+          status: { type: "string", enum: ["queued", "active", "sent", "unverified", "failed", "cancelled", "suppressed", "superseded"] },
+          superseded: { type: "boolean", description: "True when a lifecycle invalidation made this notification stale (terminal, not billable, never retried)." },
+          revoked: { type: "boolean", description: "True while a revocation is recorded but the task has not finished standing down yet." },
+          outcome: { type: ["string", "null"], description: "sent | superseded | cancelled | null" },
+          revokedAt: { type: ["string", "null"] },
+          revocationReason: { type: ["string", "null"], description: "Consumer reason carried by POST /send/invalidate (for example \"renewed\")." },
+          serviceKey: { type: ["string", "null"] },
+          notificationKind: { type: ["string", "null"] },
+          generation: { type: ["integer", "null"] },
+          requiresValidation: { type: "boolean" },
+          correlationId: { type: ["string", "null"] },
           priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
           priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           stage: { type: ["string", "null"] },
@@ -3780,10 +3970,17 @@ app.get("/send/status/:reference", {
   }
   const submission = result?.submission || result || {};
   const ledgerPriority = normalizeSendPriority(ledger.priority);
-  const terminal = ["sent", "unverified", "failed", "cancelled", "suppressed"].includes(ledger.status);
+  // A revoked row may still be 'active' for a moment: the tombstone is written
+  // first and the task finishes standing down after (superseded ACK or lease).
+  const revoked = Boolean(ledger.revoked_at);
+  const superseded = ledger.status === "superseded" || revoked || sendStore.isSuperseded(ledger);
+  const terminal = superseded
+    ? ledger.status === "superseded"
+    : ["sent", "unverified", "failed", "cancelled", "suppressed"].includes(ledger.status);
   const fallbackState = {
     queued: "waiting", active: "active", sent: "completed", failed: "failed",
-    unverified: "unverified", cancelled: "cancelled", suppressed: "suppressed"
+    unverified: "unverified", cancelled: "cancelled", suppressed: "suppressed",
+    superseded: "superseded"
   }[ledger.status] || "waiting";
   const timeline = [
     ledger.queued_at && { status: "queued", stage: null, at: iso(ledger.queued_at) },
@@ -3797,13 +3994,24 @@ app.get("/send/status/:reference", {
     requestId: sendStore.requestId(ledger.id),
     jobId: ledger.job_id || live?.id || null,
     id: ledger.job_id || live?.id || null,
-    state: live?.state || fallbackState,
+    state: superseded && !revoked ? "superseded" : (live?.state || fallbackState),
     status: ledger.status,
     priority: ledgerPriority.name,
     priorityLevel: ledgerPriority.level,
     stage: ledger.stage || null,
     terminal,
     successful: ledger.status === "sent" ? true : (terminal ? false : null),
+    superseded,
+    revoked,
+    outcome: superseded ? "superseded"
+      : (ledger.status === "sent" ? "sent" : (ledger.status === "cancelled" ? "cancelled" : null)),
+    revokedAt: iso(ledger.revoked_at),
+    revocationReason: ledger.revocation_reason || null,
+    serviceKey: ledger.service_key || null,
+    notificationKind: ledger.notification_kind || null,
+    generation: ledger.notification_generation ?? null,
+    requiresValidation: Boolean(ledger.requires_validation),
+    correlationId: ledger.correlation_id || null,
     to: ledger.to_number,
     requestedTo: result?.requestedTo || ledger.to_number,
     sentTo: result?.sentTo || null,
@@ -3876,6 +4084,20 @@ app.get("/send/capacity", {
   };
 });
 
+/**
+ * One cancel decision for a reference, shared by POST /send/cancel/:reference
+ * and POST /send/invalidate. The state machine itself lives in
+ * src/sendRevocation.js: it owns the durable tombstone, the generation barrier
+ * and the Android bridge hand-off, so cancel and invalidate can never diverge.
+ *
+ * Project-key isolation stays in the routes: this helper never widens what a
+ * key may reach, it only centralizes the state machine so both endpoints make
+ * the same decision.
+ */
+async function cancelOne(reference, options) {
+  return sendRevocation.cancelOne(reference, options);
+}
+
 app.post("/send/cancel/:reference", {
   schema: {
     summary: "Cancel a queued send request",
@@ -3934,164 +4156,137 @@ app.post("/send/cancel/:reference", {
   }
 }, async (request, reply) => {
   const reference = request.params.reference;
-  const ledger = sendStore.byReference(reference);
-
   // Project keys can cancel only sends created by that same project. Return
   // 404 instead of 403 so one project cannot probe another project's ids.
-  if (request._projectKey && (!ledger || ledger.key_name !== request._projectKey.name)) {
+  if (request._projectKey) {
+    const owned = sendStore.byReference(reference);
+    if (!owned || owned.key_name !== request._projectKey.name) {
+      reply.code(404).send({ error: "not_found" });
+      return;
+    }
+  }
+  const decision = await cancelOne(reference);
+  reply.code(decision.statusCode).send(decision.body);
+});
+
+
+/**
+ * Lifecycle invalidation for consumer-managed notifications.
+ *
+ * Eve tags every depletion reminder with {source, serviceKey, notificationKind,
+ * generation}. When a customer renews, Eve advances the service generation and
+ * calls this endpoint; every outstanding reminder for that service key that has
+ * not started yet is cancelled, and one that is already in flight is signalled
+ * to stop. Transactional confirmations (created / renew) carry
+ * requiresValidation:false and are therefore never matched.
+ *
+ * The request is idempotent on eventId: a retry after a lost response replays
+ * the original answer instead of cancelling a second time. The per-service
+ * generation watermark is monotonic, so a delayed invalidation that carries an
+ * OLD generation can never cancel a reminder that belongs to a NEWER lifecycle.
+ */
+app.post("/send/invalidate", {
+  schema: {
+    summary: "Invalidate outstanding notifications for a service",
+    description: [
+      "Cancels every not-yet-started send that carries the matching",
+      "`meta.source` + `meta.serviceKey`, optionally narrowed to",
+      "`invalidateKinds`. Sends already started are revoked, not deleted.",
+      "Idempotent on `eventId`. A `currentGeneration` lower than the",
+      "watermark this gateway already recorded is refused with 409."
+    ].join(" "),
+    tags: ["Messaging"],
+    body: {
+      type: "object",
+      required: ["source", "serviceKey"],
+      properties: {
+        source: { type: "string", minLength: 1, maxLength: 32 },
+        serviceKey: { type: "string", minLength: 3, maxLength: 200 },
+        currentGeneration: { type: "integer", minimum: 0 },
+        invalidateKinds: {
+          type: "array",
+          maxItems: 16,
+          items: { type: "string", maxLength: 48 }
+        },
+        reason: { type: "string", maxLength: 64 },
+        correlationId: { type: "string", maxLength: 64 },
+        eventId: { type: "string", maxLength: 200 }
+      }
+    },
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          source: { type: "string" },
+          serviceKey: { type: "string" },
+          currentGeneration: { type: ["integer", "null"] },
+          cancelledPending: { type: "integer" },
+          revokedActive: { type: "integer" },
+          revokedInflight: { type: "integer" },
+          alreadyTerminal: { type: "integer" },
+          matched: { type: "integer" },
+          reason: { type: ["string", "null"] },
+          correlationId: { type: ["string", "null"] },
+          eventId: { type: ["string", "null"] },
+          replayed: { type: "boolean" }
+        }
+      },
+      409: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          error: {
+            type: "string",
+            enum: ["stale_generation", "invalidate_generation_busy"]
+          },
+          serviceKey: { type: "string" },
+          currentGeneration: { type: ["integer", "null"] },
+          receivedGeneration: { type: ["integer", "null"] },
+          correlationId: { type: ["string", "null"] }
+        }
+      }
+    }
+  }
+}, async (request, reply) => {
+  const schema = z.object({
+    source: z.string().min(1).max(32),
+    serviceKey: z.string().min(3).max(200),
+    currentGeneration: z.number().int().min(0).max(2147483647).optional(),
+    invalidateKinds: z.array(z.string().min(1).max(48)).max(16).optional(),
+    reason: z.string().max(64).optional(),
+    correlationId: z.string().max(64).optional(),
+    eventId: z.string().max(200).optional()
+  });
+  const parsed = schema.safeParse(request.body);
+  if (!parsed.success) {
+    reply.code(400).send({ error: "invalid_body", details: parsed.error.flatten() });
+    return;
+  }
+  const source = normalizeNotificationMeta(parsed.data).source;
+  const serviceKey = String(parsed.data.serviceKey).trim().slice(0, NOTIFICATION_TEXT_LIMITS.serviceKey);
+  const projectKeyName = request._projectKey?.name || null;
+
+  // A project key may only invalidate a service it actually owns. An
+  // unguessable serviceKey is not authorization: without this check a foreign
+  // caller could advance another service's generation watermark and silently
+  // deny that consumer's legitimate renewals.
+  if (projectKeyName && !sendStore.ownsService(source, serviceKey, projectKeyName)) {
     reply.code(404).send({ error: "not_found" });
     return;
   }
 
-  if (!ledger) {
-    const live = await sendQueue.jobStatus(reference).catch(() => null);
-    if (!live) { reply.code(404).send({ error: "not_found" }); return; }
-    const result = await sendQueue.cancelPendingJob(reference).catch((error) => ({
-      cancelled: false,
-      reason: "queue_remove_failed",
-      error: error.message,
-      state: live.state
-    }));
-    if (!result.cancelled) {
-      reply.code(409).send({
-        ok: false,
-        error: "not_cancellable",
-        reason: result.reason === "active" ? "already_active" :
-          (["completed", "failed"].includes(result.state) ? "already_terminal" : result.reason),
-        requestId: null,
-        statusUrl: null,
-        jobId: live.id,
-        status: null,
-        state: result.state || live.state
-      });
-      return;
-    }
-    emitSse({ type: "send_cancelled", requestId: null, jobId: live.id, at: new Date().toISOString() });
-    return {
-      ok: true,
-      requestId: null,
-      statusUrl: null,
-      jobId: live.id,
-      status: "cancelled",
-      state: "cancelled",
-      cancelled: true,
-      alreadyCancelled: false,
-      cancelledFromState: result.state || live.state,
-      terminal: true
-    };
-  }
-
-  const requestId = sendStore.requestId(ledger.id);
-  const statusUrl = `/send/status/${requestId}`;
-  const jobId = ledger.job_id || null;
-
-  if (ledger.status === "cancelled") {
-    return {
-      ok: true,
-      requestId,
-      statusUrl,
-      jobId,
-      status: "cancelled",
-      state: "cancelled",
-      cancelled: true,
-      alreadyCancelled: true,
-      cancelledFromState: null,
-      terminal: true
-    };
-  }
-
-  if (["sent", "unverified", "failed", "suppressed"].includes(ledger.status)) {
-    reply.code(409).send({
-      ok: false,
-      error: "not_cancellable",
-      reason: "already_terminal",
-      requestId,
-      statusUrl,
-      jobId,
-      status: ledger.status,
-      state: ledger.status === "sent" ? "completed" : ledger.status
-    });
-    return;
-  }
-
-  const live = jobId ? await sendQueue.jobStatus(jobId).catch(() => null) : null;
-  if (live?.state === "active" || ledger.status === "active") {
-    if (jobId) activeSendCancellationRequests.add(String(jobId));
-    sendStore.markById(ledger.id, "cancelled", "cancelled_by_consumer_active");
-    emitSse({
-      type: "send_cancel_requested",
-      requestId,
-      jobId,
-      to: ledger.to_number,
-      at: new Date().toISOString()
-    });
-    return {
-      ok: true,
-      requestId,
-      statusUrl,
-      jobId,
-      status: "cancelled",
-      state: "cancelled",
-      cancelled: true,
-      alreadyCancelled: false,
-      cancelledFromState: "active",
-      terminal: true
-    };
-  }
-
-  if (jobId && live) {
-    const result = await sendQueue.cancelPendingJob(jobId).catch((error) => ({
-      cancelled: false,
-      reason: "queue_remove_failed",
-      error: error.message,
-      state: live.state
-    }));
-    if (!result.cancelled) {
-      reply.code(409).send({
-        ok: false,
-        error: "not_cancellable",
-        reason: result.reason === "active" ? "already_active" :
-          (["completed", "failed"].includes(result.state) ? "already_terminal" : result.reason),
-        requestId,
-        statusUrl,
-        jobId,
-        status: ledger.status,
-        state: result.state || live.state
-      });
-      return;
-    }
-    sendStore.markById(ledger.id, "cancelled", "cancelled_by_consumer");
-    emitSse({ type: "send_cancelled", requestId, jobId, to: ledger.to_number, at: new Date().toISOString() });
-    return {
-      ok: true,
-      requestId,
-      statusUrl,
-      jobId,
-      status: "cancelled",
-      state: "cancelled",
-      cancelled: true,
-      alreadyCancelled: false,
-      cancelledFromState: result.state || live.state,
-      terminal: true
-    };
-  }
-
-  // If Redis lost the pending job, cancel the durable ledger row so boot-time
-  // reconciliation will not re-enqueue it later.
-  sendStore.markById(ledger.id, "cancelled", "cancelled_by_consumer_missing_queue_job");
-  emitSse({ type: "send_cancelled", requestId, jobId, to: ledger.to_number, reason: "queue_job_missing", at: new Date().toISOString() });
-  return {
-    ok: true,
-    requestId,
-    statusUrl,
-    jobId,
-    status: "cancelled",
-    state: "cancelled",
-    cancelled: true,
-    alreadyCancelled: false,
-    cancelledFromState: null,
-    terminal: true
-  };
+  const outcome = await sendRevocation.invalidate({
+    source,
+    serviceKey,
+    currentGeneration: parsed.data.currentGeneration,
+    invalidateKinds: parsed.data.invalidateKinds,
+    reason: parsed.data.reason || null,
+    correlationId: parsed.data.correlationId || null,
+    eventId: parsed.data.eventId || null,
+    keyName: projectKeyName
+  });
+  reply.code(outcome.statusCode).send(outcome.body);
 });
 
 app.get("/admin/queue", {

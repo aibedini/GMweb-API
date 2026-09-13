@@ -1,21 +1,261 @@
 {
-  "version": 1,
+  "version": 3,
   "consumer": "eve",
   "projectKeyDefaults": {
     "scopes": [
       "sms.send",
       "sms.status",
       "sms.cancel",
-      "sms.capacity"
+      "sms.capacity",
+      "sms.invalidate"
     ],
     "ingressRatePerMinute": 30,
     "ingressRatePerHour": 1000
   },
+  "transport": {
+    "schemes": [
+      "http",
+      "https"
+    ],
+    "recommendedScheme": "https",
+    "plaintextWarnHosts": "non-local",
+    "authHeader": "Authorization: Bearer <projectKey>",
+    "idempotencyHeader": "Idempotency-Key",
+    "acceptHeader": "application/json",
+    "contentType": "application/json",
+    "timeoutSeconds": {
+      "default": 15,
+      "min": 3,
+      "max": 90,
+      "statusPollMax": 5
+    },
+    "retry": {
+      "attempts": 2,
+      "onlyWithIdempotencyKey": true,
+      "retriesOn": [
+        "timeout",
+        "connection_error",
+        "5xx"
+      ]
+    }
+  },
   "endpoints": [
-    { "method": "GET", "path": "/ready", "scope": "sms.capacity" },
-    { "method": "POST", "path": "/send", "scope": "sms.send" },
-    { "method": "GET", "path": "/send/status/{requestId}", "scope": "sms.status" },
-    { "method": "POST", "path": "/send/cancel/{requestId}", "scope": "sms.cancel" },
-    { "method": "GET", "path": "/send/capacity", "scope": "sms.capacity" }
-  ]
+    {
+      "key": "ready",
+      "method": "GET",
+      "path": "/ready",
+      "scope": "sms.capacity"
+    },
+    {
+      "key": "send",
+      "method": "POST",
+      "path": "/send",
+      "scope": "sms.send"
+    },
+    {
+      "key": "send_status",
+      "method": "GET",
+      "path": "/send/status/{requestId}",
+      "scope": "sms.status"
+    },
+    {
+      "key": "send_cancel",
+      "method": "POST",
+      "path": "/send/cancel/{requestId}",
+      "scope": "sms.cancel"
+    },
+    {
+      "key": "send_capacity",
+      "method": "GET",
+      "path": "/send/capacity",
+      "scope": "sms.capacity"
+    },
+    {
+      "key": "post_invalidate",
+      "method": "POST",
+      "path": "/send/invalidate",
+      "scope": "sms.invalidate"
+    }
+  ],
+  "sendRequest": {
+    "required": [
+      "to",
+      "text",
+      "priority"
+    ],
+    "priorityLanes": {
+      "critical": 1,
+      "expired": 3,
+      "expiring": 6,
+      "announcement": 10
+    },
+    "meta": {
+      "description": "Optional consumer notification identity. The gateway stores it with the queued message so a later lifecycle invalidation can revoke exactly this reminder.",
+      "fields": {
+        "source": "string (max 32) - consumer key, 'eve'",
+        "serviceKey": "string (max 200) - 'eve:<serverId>:<clientUuid>'",
+        "notificationKind": "near_expiry|low_volume|expired|volume_ended|created|renew",
+        "generation": "integer >= 0 - the service lifecycle generation this message was computed from",
+        "correlationId": "string (max 64)",
+        "requiresValidation": "boolean - true for every automated depletion reminder, false for transactional created/renew confirmations"
+      },
+      "invalidationEligibleKinds": [
+        "near_expiry",
+        "low_volume",
+        "expired",
+        "volume_ended"
+      ]
+    }
+  },
+  "sendResponse": {
+    "acceptedStatus": [
+      200,
+      202
+    ],
+    "fields": {
+      "requestId": "string",
+      "jobId": "string|integer",
+      "status": "sent|completed|unverified|failed|cancelled|superseded|duplicate_suppressed",
+      "statusUrl": "string (relative to the gateway origin)",
+      "terminal": "boolean",
+      "successful": "boolean",
+      "retryAfterSeconds": "integer",
+      "superseded": "boolean - a lifecycle invalidation made this notification stale"
+    },
+    "terminalStatuses": [
+      "sent",
+      "completed",
+      "unverified",
+      "failed",
+      "cancelled",
+      "superseded"
+    ],
+    "nonBillableTerminalStatuses": [
+      "cancelled",
+      "superseded",
+      "suppressed"
+    ]
+  },
+  "capacityResponse": {
+    "required": [
+      "announcement"
+    ],
+    "announcementFields": [
+      "limit",
+      "pending",
+      "available",
+      "recommendedBatchSize"
+    ]
+  },
+  "invalidationRequest": {
+    "required": [
+      "source",
+      "serviceKey"
+    ],
+    "fields": {
+      "source": "string (max 32)",
+      "serviceKey": "string (max 200)",
+      "currentGeneration": "integer >= 0 - the generation the renewal committed",
+      "invalidateKinds": [
+        "near_expiry",
+        "low_volume",
+        "expired",
+        "volume_ended"
+      ],
+      "reason": "string (max 64) - e.g. renewed",
+      "correlationId": "string (max 64)",
+      "eventId": "string (max 200) - stable id for this lifecycle transition; the request is idempotent on it"
+    },
+    "semantics": [
+      "Cancels every not-yet-started send whose meta.source and meta.serviceKey match and whose meta.notificationKind is in invalidateKinds (all kinds when the list is empty).",
+      "A send that already started is revoked (signalled to stop), not deleted; nothing can recall an SMS the phone already delivered.",
+      "currentGeneration is a monotonic per-service watermark: a request carrying a generation lower than one already recorded is refused with 409 stale_generation, so a delayed invalidation can never cancel a newer lifecycle's reminder.",
+      "Repeating the same eventId replays the original response and changes nothing."
+    ]
+  },
+  "invalidationResponse": {
+    "acceptedStatus": [
+      200
+    ],
+    "ok": true,
+    "fields": {
+      "ok": "boolean",
+      "currentGeneration": "integer",
+      "cancelledPending": "integer",
+      "revokedActive": "integer",
+      "revokedInflight": "integer",
+      "alreadyTerminal": "integer",
+      "matched": "integer",
+      "replayed": "boolean"
+    },
+    "conflictStatus": 409,
+    "conflictErrors": [
+      "stale_generation"
+    ],
+    "example": {
+      "ok": true,
+      "currentGeneration": 18,
+      "cancelledPending": 2,
+      "revokedActive": 1,
+      "revokedInflight": 1,
+      "alreadyTerminal": 0
+    }
+  },
+  "gateway": {
+    "description": "Android device bridge (transport=android, pull mode). Authenticated with the gateway device key.",
+    "pull": {
+      "method": "GET",
+      "path": "/gateway/pull",
+      "taskFields": ["requestId", "to", "text", "priority", "meta"],
+      "metaIsNullForLegacySends": true,
+      "revokedTasksAreNeverOffered": true
+    },
+    "validate": {
+      "method": "POST",
+      "path": "/gateway/validate",
+      "request": { "requestId": "string" },
+      "validResponse": { "valid": true, "status": "valid", "reason": null },
+      "supersededResponse": { "valid": false, "status": "superseded", "reason": "renewed" },
+      "terminalResponse": { "valid": false, "status": "terminal", "reason": "sent" },
+      "unknownIdResponse": { "valid": true, "status": "valid", "reason": null, "known": false },
+      "leaksTaskMetadata": false,
+      "calledBefore": "submitting the task to the modem"
+    },
+    "ack": {
+      "method": "POST",
+      "path": "/gateway/ack",
+      "outcomes": ["sent", "failed", "superseded"],
+      "legacyBodySupported": "{requestId, ok} - outcome is derived from ok when omitted",
+      "supersededSemantics": [
+        "terminal",
+        "not successful",
+        "not billable",
+        "not retryable",
+        "not a gateway/device failure"
+      ],
+      "lateRealSendIsAuditedAs": "sent_after_revocation"
+    }
+  },
+  "lifecycleMetrics": [
+    "sms_invalidations_total",
+    "sms_jobs_superseded_total",
+    "sms_inflight_revoked_total",
+    "sms_sent_after_revocation_total",
+    "sms_validation_requests_total",
+    "sms_validation_invalid_total",
+    "sms_stale_generation_rejections_total",
+    "sms_queue_removal_failures_total"
+  ],
+  "metricsEndpoint": "GET /admin/overview (master token) -> metrics",
+  "errorResponse": {
+    "fields": [
+      "error",
+      "message",
+      "reason",
+      "limits",
+      "used"
+    ],
+    "rateLimitStatus": 429,
+    "retryAfterHeader": "Retry-After"
+  }
 }
