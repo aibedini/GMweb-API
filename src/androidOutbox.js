@@ -21,6 +21,17 @@
 // the send ledger, and the injected isRevoked()/onOffer() hooks are how that
 // ledger is consulted and kept in sync. That is what makes the guarantee hold
 // across a Node restart, a Redis reconnect or a phone that reconnects later.
+// Wire shape for a task with no consumer notification identity. The fields are
+// deliberately present-and-null rather than omitted: see #task().
+const EMPTY_TASK_META = Object.freeze({
+  source: null,
+  serviceKey: null,
+  notificationKind: null,
+  generation: null,
+  correlationId: null,
+  requiresValidation: false
+});
+
 class AndroidOutbox {
   constructor(options = {}) {
     this.pending = new Map();   // offered, not yet claimed by a phone
@@ -94,27 +105,101 @@ class AndroidOutbox {
   }
 
   // ── worker side ───────────────────────────────────────────────────────────
-  /** Worker side: hand one send to the phone and wait for its ack. */
+  /**
+   * Worker side: hand one send to the phone and wait for its ack.
+   *
+   * The requestId is the LOGICAL identity of the send and is stable for the
+   * whole life of a BullMQ job: attempts, retries, ACK loss, transport
+   * timeouts, delayed retries and process restarts. Android dedupes on it, so
+   * a redelivery can never become a second physical SMS — but only if this
+   * method is idempotent for an id it already knows, which it now is:
+   *
+   *   already pending   -> attach the new waiter, keep the queued task
+   *   already inflight  -> move it back to pending (redelivery): the phone
+   *                        re-pulls, recognises the id and only re-acks
+   *   already settled   -> replay the recorded outcome, send nothing
+   */
   offer(requestId, item) {
     return new Promise((resolve, reject) => {
+      const key = String(requestId);
+      const waiter = { resolve, reject };
+
+      // 1) Redelivery of a task this process is already tracking.
+      const existing = this.pending.get(key) || this.inflight.get(key);
+      if (existing) {
+        existing.waiters.push(waiter);
+        if (this.inflight.has(key)) {
+          // The previous attempt gave up waiting (send_timeout) but the phone
+          // may still hold the task. Hand it out again rather than minting a
+          // new identity: Android answers with its existing terminal record.
+          this.inflight.delete(key);
+          this.pending.set(key, existing);
+          existing.redeliveries = (existing.redeliveries || 0) + 1;
+          existing.redeliveredAt = this.now();
+        }
+        try { this.onRedeliver?.(key, existing); } catch { /* observability only */ }
+        return;
+      }
+
+      // 2) This exact task already reached a terminal state. Replay it.
+      const known = this.tombstones.get(key);
+      if (known?.outcome === "sent" || known?.outcome === "sent_after_revocation") {
+        const at = known.settledAt ? new Date(known.settledAt).toISOString() : new Date(this.now()).toISOString();
+        resolve({
+          type: "sent",
+          requestedTo: known.requestedTo || item.to,
+          sentTo: known.sentTo || item.to,
+          sentAfterRevocation: known.outcome === "sent_after_revocation",
+          revocation: null,
+          duplicate: true,
+          submission: {
+            submittedOnce: true,
+            submittedAt: known.sentAt ? new Date(known.sentAt).toISOString() : at,
+            verified: true,
+            verificationStatus: "confirmed",
+            verificationAttempts: 0
+          },
+          at
+        });
+        return;
+      }
+      if (known?.outcome === "superseded") {
+        resolve({
+          type: "superseded", superseded: true, requestId: key, status: "superseded",
+          terminal: true, successful: false, duplicate: true, reason: known.reason || null,
+          at: new Date(this.now()).toISOString()
+        });
+        return;
+      }
+      if (known?.outcome === "cancelled") {
+        const cancelled = new Error(known.reason || "cancelled_by_consumer");
+        cancelled.code = "SEND_CANCELLED";
+        cancelled.statusCode = 409;
+        reject(cancelled);
+        return;
+      }
+      // A recorded device FAILURE is deliberately NOT replayed: that is a
+      // genuine retry, and the phone decides whether its local record allows it.
+
       const entry = {
-        requestId: String(requestId),
+        requestId: key,
         to: item.to,
         text: item.text,
         priority: item.priority,
-        // Consumer notification identity travels WITH the task so /gateway/pull
-        // can hand Android everything it needs to validate before sending.
-        meta: item.meta || null,
+        // The consumer notification identity, used by the phone to validate
+        // before submitting. Always an OBJECT (never null): the Android client
+        // keys its local dedupe record off the task it receives, and a null
+        // meta leaves it unable to track or acknowledge the task at all.
+        meta: item.meta || EMPTY_TASK_META,
         ledgerId: item.ledgerId ?? null,
         jobId: item.jobId ?? null,
-        resolve,
-        reject,
+        waiters: [waiter],
         offeredAt: this.now(),
         claimedAt: null,
         revoked: null
       };
 
-      // 1) The task may already be revoked before it is even offered (the
+      // 3) The task may already be revoked before it is even offered (the
       //    invalidation won the race with the worker). Never queue it.
       const verdict = this.revocationFor(entry.requestId, entry);
       if (verdict) {
@@ -122,18 +207,61 @@ class AndroidOutbox {
         return;
       }
 
-      // 2) A phone is already long-polling: wake it with this task immediately.
-      const waiter = this.waiters.shift();
-      if (waiter) {
-        clearTimeout(waiter.timer);
+      // 4) A phone is already long-polling: wake it with this task immediately.
+      const phone = this.waiters.shift();
+      if (phone) {
+        clearTimeout(phone.timer);
         this.inflight.set(entry.requestId, entry);
         entry.claimedAt = this.now();
-        waiter.resolve(this.#task(entry));
+        phone.resolve(this.#task(entry));
       } else {
         this.pending.set(entry.requestId, entry);
       }
       try { this.onOffer?.(entry.requestId, entry); } catch { /* ledger sync is best effort */ }
     });
+  }
+
+  /** 'pending' | 'inflight' | null — is this task still in the bridge? */
+  tracks(requestId) {
+    const key = String(requestId || "");
+    if (!key) return null;
+    if (this.inflight.has(key)) return "inflight";
+    if (this.pending.has(key)) return "pending";
+    return null;
+  }
+
+  /** Settle every worker waiting on this task exactly once. */
+  #settleWaiters(entry, kind, payload) {
+    const waiters = entry?.waiters || [];
+    entry.waiters = [];
+    for (const waiter of waiters) {
+      try {
+        if (kind === "resolve") waiter.resolve(payload);
+        else waiter.reject(payload);
+      } catch { /* the caller is gone; the ledger is still correct */ }
+    }
+  }
+
+  /**
+   * Drop the in-memory entry for a task whose job is over. The tombstone stays
+   * so a late ACK is still recognised, but nothing may accumulate forever.
+   */
+  release(requestId) {
+    const key = String(requestId || "");
+    if (!key) return false;
+    const entry = this.pending.get(key) || this.inflight.get(key) || null;
+    if (!entry) return false;
+    this.pending.delete(key);
+    this.inflight.delete(key);
+    this.#clearLease(key);
+    // A released task has no outcome yet, and the phone may still be working on
+    // it: keep the id so a late ACK is answered instead of discarded.
+    this.#remember(key, { outcome: "released", settledAt: this.now() });
+    const released = new Error("task_released");
+    released.code = "ANDROID_TASK_RELEASED";
+    released.statusCode = 409;
+    this.#settleWaiters(entry, "reject", released);
+    return true;
   }
 
   /**
@@ -177,14 +305,23 @@ class AndroidOutbox {
     }
   }
 
-  /** The exact wire shape the phone receives. Legacy tasks have meta:null. */
+  /**
+   * The exact wire shape the phone receives.
+   *
+   * `meta` is ALWAYS an object. The Messages client builds its local dedupe
+   * record — the one that carries the gateway request id and therefore the
+   * ability to acknowledge at all — inside `task.meta?.let { ... }`, so a null
+   * meta produces a task it can send but never report. That is exactly how one
+   * reminder became three physical SMS in production. Sends without consumer
+   * notification metadata simply get an all-null object.
+   */
   #task(entry) {
     return {
       requestId: entry.requestId,
       to: entry.to,
       text: entry.text,
       priority: entry.priority,
-      meta: entry.meta || null
+      meta: entry.meta || EMPTY_TASK_META
     };
   }
 
@@ -280,22 +417,20 @@ class AndroidOutbox {
       error.code = "SEND_CANCELLED";
       error.statusCode = 409;
       error.superseded = false;
-      try { entry.reject(error); } catch { /* already settled */ }
+      this.#settleWaiters(entry, "reject", error);
       try { this.onSettle?.(requestId, "cancelled", entry, verdict); } catch { /* audit only */ }
       return;
     }
-    try {
-      entry.resolve({
-        type: "superseded",
-        superseded: true,
-        requestId,
-        status: "superseded",
-        terminal: true,
-        successful: false,
-        reason,
-        at: new Date(this.now()).toISOString()
-      });
-    } catch { /* already settled */ }
+    this.#settleWaiters(entry, "resolve", {
+      type: "superseded",
+      superseded: true,
+      requestId,
+      status: "superseded",
+      terminal: true,
+      successful: false,
+      reason,
+      at: new Date(this.now()).toISOString()
+    });
     try { this.onSettle?.(requestId, "superseded", entry, verdict); } catch { /* audit only */ }
   }
 
@@ -335,7 +470,9 @@ class AndroidOutbox {
         this.#remember(key, { outcome: "sent_after_revocation", settledAt: this.now() });
         return { handled: true, outcome: "sent_after_revocation" };
       }
-      return { handled: true, outcome: "superseded" };
+      // A released-but-unsettled task reporting a non-success is an ordinary
+      // failure; anything else keeps its revocation semantics.
+      return { handled: true, outcome: known.outcome === "released" ? "failed" : "superseded" };
     }
 
     this.pending.delete(key);
@@ -357,16 +494,14 @@ class AndroidOutbox {
         const error = new Error(reason || "cancelled_by_consumer");
         error.code = "SEND_CANCELLED";
         error.statusCode = 409;
-        try { item.reject(error); } catch { /* settled */ }
+        this.#settleWaiters(item, "reject", error);
         try { this.onSettle?.(key, "cancelled", item, details); } catch { /* audit */ }
         return { handled: true, outcome: "cancelled" };
       }
-      try {
-        item.resolve({
-          type: "superseded", superseded: true, requestId: key, status: "superseded",
-          terminal: true, successful: false, reason, at: new Date(this.now()).toISOString()
-        });
-      } catch { /* settled */ }
+      this.#settleWaiters(item, "resolve", {
+        type: "superseded", superseded: true, requestId: key, status: "superseded",
+        terminal: true, successful: false, reason, at: new Date(this.now()).toISOString()
+      });
       try { this.onSettle?.(key, "superseded", item, details); } catch { /* audit */ }
       return { handled: true, outcome: "superseded" };
     }
@@ -377,9 +512,14 @@ class AndroidOutbox {
         cause: item.revoked?.cause || null,
         reason: item.revoked?.reason || null,
         outcome: sentAfterRevocation ? "sent_after_revocation" : "sent",
+        // Kept so a later retry of this same id can be answered from the
+        // tombstone without touching the radio again.
+        requestedTo: details.requestedTo || item.to,
+        sentTo: details.sentTo || item.to,
+        sentAt: details.sentAt || this.now(),
         settledAt: this.now()
       });
-      item.resolve({
+      this.#settleWaiters(item, "resolve", {
         type: "sent",
         requestedTo: details.requestedTo || item.to,
         sentTo: details.sentTo || item.to,
@@ -406,7 +546,7 @@ class AndroidOutbox {
     error.code = details.cancelled ? "SEND_CANCELLED" : "ANDROID_GATEWAY_FAILED";
     error.statusCode = 502;
     this.#remember(key, { outcome: "failed", settledAt: this.now() });
-    try { item.reject(error); } catch { /* settled */ }
+    this.#settleWaiters(item, "reject", error);
     try { this.onSettle?.(key, "failed", item, details); } catch { /* audit */ }
     return { handled: true, outcome: "failed" };
   }
@@ -419,6 +559,8 @@ class AndroidOutbox {
       waitingPhones: this.waiters.length,
       lastPullAt: this.lastPullAt || null,
       revokedInflight: [...this.inflight.values()].filter((item) => item.revoked).length,
+      redelivered: [...this.pending.values(), ...this.inflight.values()]
+        .filter((item) => item.redeliveries).length,
       tombstones: this.tombstones.size
     };
   }

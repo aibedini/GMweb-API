@@ -54,7 +54,14 @@ test("pull keeps the legacy shape for a send without meta", async () => {
     const app = await h.buildGatewayApp();
     const pulled = await app.inject({ method: "GET", url: "/gateway/pull", headers: { "x-api-key": h.deviceKey } });
     const task = pulled.json().task;
-    assert.equal(task.meta, null);
+    // meta is ALWAYS an object: the Messages client only records the gateway
+    // request id — and therefore can only acknowledge at all — inside
+    // task.meta?.let { ... }. A null meta produced tasks it could send but
+    // never report, which is how one reminder became three physical SMS.
+    assert.deepEqual(task.meta, {
+      source: null, serviceKey: null, notificationKind: null,
+      generation: null, correlationId: null, requiresValidation: false
+    });
     assert.deepEqual(Object.keys(task).sort(), ["meta", "priority", "requestId", "text", "to"]);
 
     await app.close();

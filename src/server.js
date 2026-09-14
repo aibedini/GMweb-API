@@ -1377,6 +1377,32 @@ function requestIdForJob(job) {
   return sendStore.requestId(ledgerId);
 }
 
+/**
+ * The key this job's task is held under in the Android bridge. The ledger row
+ * is authoritative (it is written when the task is offered); the requestId and
+ * the job-scoped fallback cover a job whose row was never bound.
+ */
+function gatewayTaskKey(job) {
+  try {
+    const row = job?.id ? sendStore.byJob(job.id) : null;
+    if (row?.gateway_request_id) return row.gateway_request_id;
+  } catch { /* fall through to the derived keys */ }
+  return requestIdForJob(job) || (job?.id ? `pull_${job.id}` : null);
+}
+
+/**
+ * Hand the bridge task back once its job is over. The durable tombstone stays
+ * in the ledger, so a late ACK is still recognised as a late ACK — this only
+ * stops in-memory entries from accumulating for the lifetime of the process.
+ */
+function releaseGatewayTask(job) {
+  try {
+    const key = gatewayTaskKey(job);
+    if (key) return androidOutbox.release(key);
+  } catch { /* bookkeeping must never break completion */ }
+  return false;
+}
+
 async function deferQuietHoursJob(job, releaseAt) {
   const priority = priorityForJob(job);
   const ledger = sendStore.byJob(job.id);
@@ -1484,6 +1510,9 @@ async function deferPowerOffJob(job) {
 
 async function handleSendCompleted(job, result) {
   activeSendCancellationRequests.delete(String(job.id));
+  // This BullMQ job is over, whatever its outcome: the phone's task identity
+  // belongs to the ledger tombstone now, not to a live promise.
+  releaseGatewayTask(job);
   if (result?.deferred) return;
   const priority = priorityForJob(job);
   // The consumer may have cancelled while Playwright was between two awaits.
@@ -1684,20 +1713,30 @@ function startSendWorker() {
         // time so the Android bridge can hand it to the phone (meta) and bind
         // the phone's task id for later /gateway/validate calls.
         const ledgerRow = sendStore.byJob(job.id);
-        const notificationMeta = ledgerRow?.service_key ? {
-          source: ledgerRow.source,
-          serviceKey: ledgerRow.service_key,
-          notificationKind: ledgerRow.notification_kind,
-          generation: ledgerRow.notification_generation,
-          correlationId: ledgerRow.correlation_id,
-          requiresValidation: Boolean(ledgerRow.requires_validation)
-        } : null;
+        // ALWAYS an object, even when the send carries no consumer notification
+        // identity. The phone builds its local dedupe record — the one holding
+        // the gateway request id, and therefore the ability to acknowledge at
+        // all — from this payload; a null meta produced tasks it could send but
+        // never report. That is how one renewal became three physical SMS.
+        const notificationMeta = {
+          source: ledgerRow?.source ?? null,
+          serviceKey: ledgerRow?.service_key ?? null,
+          notificationKind: ledgerRow?.notification_kind ?? null,
+          generation: ledgerRow?.notification_generation ?? null,
+          correlationId: ledgerRow?.correlation_id ?? null,
+          requiresValidation: Boolean(ledgerRow?.requires_validation)
+        };
+        // ONE logical identity for the whole life of this BullMQ job. A retry,
+        // a delayed retry or a transport timeout must NOT look like a new task
+        // to the phone, or a lost ACK turns into a duplicate SMS.
+        const gatewayRequestId = requestIdForJob(job) || `pull_${job.id}`;
         const result = await Promise.race([
           client.sendMessage({
             to: job.data.to,
             text: job.data.text,
             ledgerId: ledgerRow?.id ?? null,
             jobId: job.id,
+            requestId: gatewayRequestId,
             meta: notificationMeta,
             // Cooperative stop: consulted between every browser step AND before
             // the Android bridge hands the task to a phone.
@@ -1733,7 +1772,12 @@ function startSendWorker() {
             ...(error.details || {})
           };
         }
-        if (isBrowserAutomationWedge(error)) {
+        // A send timeout only means "the browser is wedged" when the BROWSER is
+        // the transport. On the Android pull transport the same timeout means
+        // the phone never acknowledged — restarting Chrome AND the API (which
+        // wipes this in-memory outbox) would turn a stalled task into a
+        // redelivery storm instead of fixing anything.
+        if (isBrowserAutomationWedge(error) && client.name !== "android") {
           sendStore.markStage(job.id, "browser_unresponsive");
           await scheduleHardBrowserRecovery(error.message, job.id);
         } else if (isPairingReadinessFailure(error)) {
@@ -1786,19 +1830,33 @@ function startSendWorker() {
         const priority = priorityForJob(job);
         // While BullMQ still has retries left the job goes back to waiting, so
         // keep the ledger row 'queued'; only mark 'failed' once it's terminal.
-        sendStore.markStatus(job?.id, willRetry ? "queued" : "failed", {
+        let status = willRetry ? "queued" : "failed";
+        let failure = err?.message || "send failed";
+        if (!willRetry && client.name === "android") {
+          // The task went to a phone and was never acknowledged, so it may well
+          // have been sent. Calling that "failed" invites a consumer retry that
+          // becomes a duplicate SMS; "unverified" is the honest terminal state
+          // and the documented contract for it is "never resend".
+          const key = gatewayTaskKey(job);
+          if (key && androidOutbox.tracks(key)) {
+            status = "unverified";
+            failure = "android_ack_missing";
+          }
+          releaseGatewayTask(job);
+        }
+        sendStore.markStatus(job?.id, status, {
           attempts: attemptsMade,
-          error: err?.message || "send failed"
+          error: failure
         });
         const event = {
           type: "send_failed",
           requestId: requestIdForJob(job),
           jobId: job?.id,
-          status: willRetry ? "queued" : "failed",
+          status,
           to: job?.data?.to,
           priority: priority.name,
           priorityLevel: priority.level,
-          error: err?.message || "send failed",
+          error: failure,
           attemptsMade,
           willRetry,
           at: new Date().toISOString()

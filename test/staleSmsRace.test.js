@@ -113,7 +113,9 @@ test("AndroidOutbox inflight -> invalidate -> validate returns false immediately
     });
     const worker = h.runWorker(jobId);
     const task = await h.outbox.take(50);        // the phone pulled it
-    assert.equal(task.requestId.startsWith("pull_"), true);
+    // The id the phone receives IS the logical send identity (send_<ledger>),
+    // stable for every attempt of the job.
+    assert.equal(task.requestId, h.store.requestId(ledgerId));
 
     const result = await h.invalidate();
     assert.equal(result.body.revokedInflight, 1, "the contract must report an inflight revocation");
@@ -391,7 +393,10 @@ test("legacy /send payload without meta continues to work end to end", async () 
 
     const worker = h.runWorker("job-legacy", { text: "legacy message" });
     const task = await h.outbox.take(50);
-    assert.equal(task.meta, null, "legacy tasks keep the old wire shape");
+    // Legacy sends carry no notification identity, but meta must still be an
+    // OBJECT: the phone builds its dedupe/ACK record from it.
+    assert.equal(typeof task.meta, "object");
+    assert.equal(task.meta.serviceKey, null, "legacy tasks keep an empty notification identity");
     h.outbox.acknowledge(task.requestId, true, {});
     const outcome = await worker;
     assert.equal(outcome.type, "sent");

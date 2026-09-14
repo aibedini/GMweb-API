@@ -151,8 +151,12 @@ function createHarness(options = {}) {
     try {
       let result;
       if (transport === "android") {
+        // Mirrors startSendWorker: the gateway request id is derived from the
+        // LEDGER row, so every attempt of one job reuses the same identity.
+        const gatewayRequestId = (row?.id ? store.requestId(row.id) : null) || `pull_${jobId}`;
         result = await outbox.sendMessage({
           to: target.to, text: target.text, ledgerId: row?.id ?? null, jobId, meta,
+          requestId: gatewayRequestId,
           shouldCancel: () => Boolean(revocation.guardForJob(jobId))
         });
       } else {
