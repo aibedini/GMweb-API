@@ -120,6 +120,11 @@ class SendStore {
       "ALTER TABLE sends ADD COLUMN revoked_at INTEGER",
       "ALTER TABLE sends ADD COLUMN revocation_reason TEXT",
       "ALTER TABLE sends ADD COLUMN revocation_json TEXT",
+      // The late-real-send audit is stamped on the row itself (first write
+      // wins, like revoked_at): the phone retries an ACK whose answer was
+      // lost, and one physical submission must never be recorded, counted or
+      // audited twice.
+      "ALTER TABLE sends ADD COLUMN sent_after_revocation_at INTEGER",
       // Android gateway request id (pull_...). The phone's identity for a task
       // must outlive the in-memory outbox, otherwise /gateway/validate cannot
       // answer after a restart.
@@ -265,11 +270,15 @@ class SendStore {
         WHERE id=@id
           AND status NOT IN ('sent','unverified','failed','suppressed','cancelled','superseded')`
     );
+    // First write wins. A retried ACK for the same physical submission is a
+    // no-op: no second counter, no rewritten outcome, no second audit entry.
     this._markSentAfterRevocation = this.db.prepare(
       `UPDATE sends
           SET status='sent', sent_at=COALESCE(sent_at, @now),
-              finished_at=@now, updated_at=@now, result_json=@result_json
-        WHERE id=@id`
+              finished_at=@now, updated_at=@now, result_json=@result_json,
+              sent_after_revocation_at=@now
+        WHERE id=@id
+          AND sent_after_revocation_at IS NULL`
     );
     this._bumpCounter = this.db.prepare(
       `INSERT INTO send_counters (name, value, updated_at) VALUES (@name, @delta, @now)
@@ -503,6 +512,10 @@ class SendStore {
    * AFTER the reminder was revoked. The physical truth wins -- the row becomes
    * "sent" again, with the race recorded explicitly instead of pretending the
    * SMS never left the device.
+   *
+   * @returns {boolean} true only when THIS call recorded the anomaly. The
+   * device retries an ACK whose response was lost, so the second report of one
+   * physical submission must be a no-op rather than a second audit.
    */
   recordSentAfterRevocation(id, details = {}) {
     if (!Number.isInteger(Number(id))) return false;
@@ -511,8 +524,8 @@ class SendStore {
     try {
       resultJson = JSON.stringify({ ...details, sentAfterRevocation: true, auditedAt: new Date(now).toISOString() });
     } catch { resultJson = JSON.stringify({ sentAfterRevocation: true }); }
-    this._markSentAfterRevocation.run({ id: Number(id), result_json: resultJson, now });
-    return true;
+    const info = this._markSentAfterRevocation.run({ id: Number(id), result_json: resultJson, now });
+    return (info.changes || 0) > 0;
   }
 
   bumpCounters(entries, at = Date.now()) {

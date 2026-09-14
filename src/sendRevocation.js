@@ -399,10 +399,14 @@ function createSendRevocation(deps = {}) {
    * The impossible-unsend case. A revoked task reported a REAL submission, so
    * the physical outcome wins: the row goes back to 'sent' with the race
    * recorded, counted and audited. It must never be reported as a cancellation.
+   *
+   * Exactly once per notification: the device retries an ACK whose response was
+   * lost, and the durable stamp on the row is what makes the second report a
+   * no-op instead of a second anomaly count.
    */
   function auditSentAfterRevocation(row, details = {}) {
     if (!row) return false;
-    sendStore.recordSentAfterRevocation(row.id, details.result || details);
+    if (!sendStore.recordSentAfterRevocation(row.id, details.result || details)) return false;
     bump(METRICS.sentAfterRevocation);
     const payload = {
       type: "send_sent_after_revocation",

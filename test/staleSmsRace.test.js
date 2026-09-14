@@ -514,6 +514,115 @@ test("late sent ACK after a restart is still audited (durable fallback)", async 
   });
 });
 
+test("a real send reported after the revocation lease expired is still recorded as sent", async () => {
+  // The phone pulled the reminder, the renewal revoked it, the device stayed
+  // offline past the revocation lease, and only THEN reported a real SIM
+  // submission. No worker is waiting any more, so the durable ledger is the
+  // only place the anomaly can be told -- and it MUST be told: leaving the row
+  // 'superseded' would claim a stale SMS never left the device.
+  const h = createHarness({ leaseMs: 1000 });
+  try {
+    const { ledgerId, jobId } = h.queueNotification({
+      kind: "volume_ended", generation: 17, text: "offline phone reminder"
+    });
+    const worker = h.runWorker(jobId);
+    const task = await h.outbox.take(50);
+    await h.invalidate();
+
+    // The bounded wait expires: the worker stops waiting, the row is terminal.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    assert.equal((await worker).superseded, true);
+    assert.equal(h.store.byId(ledgerId).status, "superseded");
+    assert.equal(h.store.counters().sms_sent_after_revocation_total ?? 0, 0);
+
+    const app = await h.buildGatewayApp();
+    const ack = await app.inject({
+      method: "POST", url: "/gateway/ack",
+      headers: { "x-api-key": h.deviceKey },
+      payload: { requestId: task.requestId, ok: true, outcome: "sent", sentAt: Date.now() }
+    });
+    assert.equal(ack.statusCode, 200);
+    assert.equal(ack.json().outcome, "sent_after_revocation");
+    assert.equal(ack.json().successful, true);
+
+    const row = h.store.byId(ledgerId);
+    assert.equal(row.status, "sent", "the physical truth beats the superseded row");
+    assert.ok(row.result_json.includes('"sentAfterRevocation":true'));
+    assert.equal(h.store.counters().sms_sent_after_revocation_total, 1);
+    assert.equal(h.store.counters().sms_jobs_superseded_total, 1);
+    assert.equal(h.audits.filter((entry) => entry.type === "sent_after_revocation").length, 1,
+      "the anomaly must reach the operator audit trail exactly once");
+
+    // The device retries the SAME ack (its response was lost): one physical
+    // submission, one audit -- never a second anomaly count.
+    const retry = await app.inject({
+      method: "POST", url: "/gateway/ack",
+      headers: { "x-api-key": h.deviceKey },
+      payload: { requestId: task.requestId, ok: true, outcome: "sent", sentAt: Date.now() }
+    });
+    assert.equal(retry.json().outcome, "sent_after_revocation");
+    assert.equal(h.store.counters().sms_sent_after_revocation_total, 1);
+    assert.equal(h.audits.filter((entry) => entry.type === "sent_after_revocation").length, 1);
+    await app.close();
+  } finally {
+    h.close();
+  }
+});
+
+test("a retried ACK for an ordinary send is never audited as sent after revocation", async () => {
+  // A device that never saw the 200 retries its ack. Nothing about that retry
+  // is the stale-SMS race: the row was never revoked, so the only honest answer
+  // is "this task is no longer mine", not a fabricated sent_after_revocation
+  // anomaly (which would corrupt the operator trail and the anomaly counter).
+  const h = createHarness();
+  try {
+    const { ledgerId, jobId } = h.queueNotification({
+      kind: "volume_ended", generation: 17, text: "ordinary reminder"
+    });
+    const worker = h.runWorker(jobId);
+    const task = await h.outbox.take(50);
+    const app = await h.buildGatewayApp();
+    const first = await app.inject({
+      method: "POST", url: "/gateway/ack",
+      headers: { "x-api-key": h.deviceKey }, payload: { requestId: task.requestId, ok: true }
+    });
+    assert.equal(first.json().outcome, "sent");
+    await worker;
+    assert.equal(h.store.byId(ledgerId).status, "sent");
+    const outcomeJson = h.store.byId(ledgerId).result_json;
+
+    // Same process, tombstone only.
+    const warm = await app.inject({
+      method: "POST", url: "/gateway/ack",
+      headers: { "x-api-key": h.deviceKey }, payload: { requestId: task.requestId, ok: true }
+    });
+    assert.equal(warm.json().outcome, "sent_after_revocation",
+      "the outbox still recognises a settled id (wire label is unchanged)");
+    assert.equal(h.store.counters().sms_sent_after_revocation_total ?? 0, 0);
+    assert.equal(h.store.byId(ledgerId).result_json, outcomeJson, "the retry must not rewrite the outcome");
+    assert.equal(h.audits.some((entry) => entry.type === "sent_after_revocation"), false);
+
+    // A restart is the same durable situation with no memory at all.
+    const cold = h.coldRestart();
+    const coldApp = await h.buildGatewayApp(cold);
+    const retry = await coldApp.inject({
+      method: "POST", url: "/gateway/ack",
+      headers: { "x-api-key": h.deviceKey }, payload: { requestId: task.requestId, ok: true }
+    });
+    assert.equal(retry.statusCode, 200);
+    assert.deepEqual(retry.json(), {
+      ok: false, outcome: null, terminal: false, successful: null, counted: false
+    });
+    assert.equal(cold.store.counters().sms_sent_after_revocation_total ?? 0, 0);
+    assert.equal(cold.store.byId(ledgerId).result_json, outcomeJson);
+    assert.equal(cold.store.byId(ledgerId).revoked_at, null);
+    assert.equal(h.audits.some((entry) => entry.type === "sent_after_revocation"), false);
+    await coldApp.close();
+  } finally {
+    h.close();
+  }
+});
+
 test("legacy ok:true / ok:false ACKs keep their old behaviour", async () => {
   await withHarness(async (h) => {
     const good = h.queueNotification({ kind: "volume_ended", generation: 17, text: "legacy ok true" });

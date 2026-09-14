@@ -250,6 +250,10 @@ function registerGatewayRoutes(app, deps = {}) {
     }
     const outcome = ["sent", "failed", "superseded"].includes(body.outcome) ? body.outcome : null;
     const ok = typeof body.ok === "boolean" ? body.ok : outcome === "sent";
+    // Whether this ACK settles a LIVE worker promise decides who records the
+    // late-real-send audit: handleSendCompleted owns the worker's result, and
+    // auditing the same submission here as well would count it twice.
+    const liveSettlement = outbox.tracks(requestId) !== null;
     const result = outbox.acknowledge(requestId, ok, {
       outcome: outcome || undefined,
       reason: body.reason,
@@ -261,15 +265,27 @@ function registerGatewayRoutes(app, deps = {}) {
       cancelled: body.cancelled
     });
 
+    // The one thing this bridge cannot prevent: a real submission that lands
+    // AFTER the lifecycle was revoked. The physical truth must reach the
+    // ledger, the anomaly counter and the operator trail -- exactly once, and
+    // whether or not this process still remembers the task (tombstone, lease
+    // expiry, release, restart). The DURABLE row decides, never the phone's
+    // report alone: a retried ACK for an ordinary send is not an anomaly, and a
+    // revoked row still counts as one even when only the tombstone is left.
+    const row = sendStore?.byGatewayRequest(requestId) || null;
+    const durablyStopped = Boolean(row) && (
+      Boolean(row.revoked_at) || row.status === "cancelled" || Boolean(sendStore.isSuperseded(row))
+    );
+    if (ok && durablyStopped && !liveSettlement) {
+      (revocation?.auditSentAfterRevocation || (() => false))(row, {
+        transport: "android-pull", result: { lateAck: true, reportedAt: body.sentAt || null }
+      });
+    }
+
     if (!result.handled) {
-      // The gateway already settled this task (restart, lease expiry). Consult
-      // the durable ledger: a real submission that lands AFTER the revocation
-      // is the impossible-unsend case and must be audited, not swallowed.
-      const row = sendStore?.byGatewayRequest(requestId) || null;
-      if (row && ok) {
-        (revocation?.auditSentAfterRevocation || (() => false))(row, {
-          transport: "android-pull", result: { lateAck: true, reportedAt: body.sentAt || null }
-        });
+      // This process no longer holds the task (restart, lease expiry, release):
+      // the durable ledger read above is the only answer left.
+      if (ok && durablyStopped) {
         return { ok: true, outcome: "sent_after_revocation", terminal: true, successful: true, counted: true };
       }
       return { ok: false, outcome: null, terminal: false, successful: null, counted: false };
