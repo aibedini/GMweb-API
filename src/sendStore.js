@@ -134,7 +134,11 @@ class SendStore {
     for (const sql of [
       "CREATE INDEX IF NOT EXISTS idx_sends_service ON sends (source, service_key, status)",
       "CREATE INDEX IF NOT EXISTS idx_sends_notification_generation ON sends (service_key, notification_generation)",
-      "CREATE INDEX IF NOT EXISTS idx_sends_gateway_request ON sends (gateway_request_id)"
+      "CREATE INDEX IF NOT EXISTS idx_sends_gateway_request ON sends (gateway_request_id)",
+      // Windowed outcome metrics ("last 24h") must be an index range scan, not a
+      // full table read pulled into JavaScript.
+      "CREATE INDEX IF NOT EXISTS idx_sends_terminal_time ON sends (status, finished_at)",
+      "CREATE INDEX IF NOT EXISTS idx_sends_finished ON sends (finished_at)"
     ]) {
       try { this.db.exec(sql); } catch { /* already present */ }
     }
@@ -163,7 +167,7 @@ class SendStore {
     );
     this._setById = this.db.prepare(
       `UPDATE sends SET status=@status, error=@error, updated_at=@now,
-         finished_at=CASE WHEN @status IN ('sent','unverified','failed','suppressed','cancelled') THEN @now ELSE finished_at END
+         finished_at=CASE WHEN @status IN ('sent','unverified','failed','suppressed','cancelled','superseded') THEN @now ELSE finished_at END
        WHERE id=@id`
     );
     this._setStage = this.db.prepare(`UPDATE sends SET stage=?, stage_at=?, updated_at=? WHERE job_id=?`);
@@ -182,7 +186,7 @@ class SendStore {
     this._setStatusByJob = this.db.prepare(
       `UPDATE sends SET status=@status, attempts=@attempts, error=@error, updated_at=@now,
          active_at = CASE WHEN @status='active' THEN @now ELSE active_at END,
-         finished_at = CASE WHEN @status IN ('sent','unverified','failed','suppressed','cancelled') THEN @now ELSE finished_at END,
+         finished_at = CASE WHEN @status IN ('sent','unverified','failed','suppressed','cancelled','superseded') THEN @now ELSE finished_at END,
          sent_at = CASE WHEN @status='sent' THEN @now ELSE sent_at END,
          result_json = CASE WHEN @result_json IS NOT NULL THEN @result_json ELSE result_json END
        WHERE job_id=@job_id`
@@ -191,6 +195,14 @@ class SendStore {
       `SELECT * FROM sends WHERE status IN ('queued','active') ORDER BY created_at ASC`
     );
     this._statsRows = this.db.prepare(`SELECT status, COUNT(*) AS n FROM sends GROUP BY status`);
+    // Terminal outcomes inside a time window. finished_at is the general
+    // terminal timestamp; sent_at/updated_at cover rows written before that
+    // column existed (the migration is additive, history is never rewritten).
+    this._statsSince = this.db.prepare(`
+      SELECT status, COUNT(*) AS n FROM sends
+       WHERE status IN ('sent','unverified','failed','suppressed','cancelled','superseded')
+         AND COALESCE(finished_at, sent_at, updated_at) >= ?
+       GROUP BY status`)
     this._recent = this.db.prepare(`SELECT * FROM sends ORDER BY id DESC LIMIT ?`);
     this._setNotification = this.db.prepare(
       `UPDATE sends
@@ -678,6 +690,25 @@ class SendStore {
     // Not a status: a row that is revoked but still 'active' is waiting for the
     // phone's answer (superseded ACK or lease expiry).
     out.revokedInflight = this.revokedInflightCount();
+    return out;
+  }
+
+  /**
+   * Terminal OUTCOMES whose delivery finished at/after `since` (epoch ms),
+   * aggregated in SQLite. This is what a "last 24h" card must read: an all-time
+   * total can never be presented as current queue activity.
+   *
+   * `sent` and `unverified` are distinct outcomes and are never folded
+   * together; `superseded` is not a failure.
+   */
+  statsSince(since) {
+    const cutoff = Number(since);
+    const out = { sent: 0, unverified: 0, failed: 0, suppressed: 0, cancelled: 0, superseded: 0, total: 0 };
+    if (!Number.isFinite(cutoff)) return out;
+    for (const row of this._statsSince.all(cutoff)) {
+      if (row.status in out) out[row.status] = Number(row.n);
+    }
+    out.total = out.sent + out.unverified + out.failed + out.suppressed + out.cancelled + out.superseded;
     return out;
   }
 

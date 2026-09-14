@@ -54,6 +54,10 @@ class AndroidOutbox {
     // is terminalized as superseded. Bounded so the worker's promise, the
     // BullMQ job and the ledger never hang on an offline device.
     this.leaseMs = Math.max(1000, Number(hooks.leaseMs) || 120000);
+    // How long a pull keeps the device "live". Owned here so every caller reads
+    // the same number instead of re-declaring 90_000 somewhere else.
+    const liveness = Number(hooks.livenessMs ?? process.env.ANDROID_PULL_LIVENESS_MS);
+    this.livenessMs = Number.isFinite(liveness) && liveness > 0 ? Math.trunc(liveness) : 90000;
     this.tombstoneTtlMs = Math.max(1000, Number(hooks.tombstoneTtlMs) || 30 * 60 * 1000);
     this.maxTombstones = Math.max(16, Number(hooks.maxTombstones) || 5000);
   }
@@ -568,23 +572,31 @@ class AndroidOutbox {
   /**
    * Readiness/status surface for the android transport. In pull mode the phone
    * dials OUT, so there is nothing to probe — liveness IS the long-poll:
-   * a waiter open right now, or a pull seen within the last 90s (3x the
-   * default 25s long-poll). Mirrors the shape GoogleMessagesClient.status()
-   * returns so server.js call sites stay uniform.
+   * a waiter open right now, or a pull seen within the liveness window
+   * (ANDROID_PULL_LIVENESS_MS, default 90s = 3x the default 25s long-poll).
+   *
+   * The threshold is a property of THIS bridge, exposed as livenessMs, so no
+   * endpoint has to re-declare the magic number and disagree with another.
    */
   readyState() {
     const stats = this.stats();
-    const freshPull = stats.lastPullAt && (this.now() - stats.lastPullAt) < 90000;
+    const livenessMs = this.livenessMs;
+    const lastPullAgeMs = stats.lastPullAt ? Math.max(0, this.now() - stats.lastPullAt) : null;
+    const freshPull = lastPullAgeMs !== null && lastPullAgeMs < livenessMs;
     const paired = Boolean(stats.waitingPhones > 0 || freshPull);
     return {
       paired,
+      state: paired ? "connected" : "stale",
       transport: "android-pull",
-      reason: paired ? null : "no_device_polling",
+      reason: paired ? null : "no_recent_device_pull",
       lastPullAt: stats.lastPullAt ? new Date(stats.lastPullAt).toISOString() : null,
+      lastPullAgeMs,
+      livenessMs,
       pending: stats.pending,
       inflight: stats.inflight,
       waitingPhones: stats.waitingPhones,
       revokedInflight: stats.revokedInflight,
+      redelivered: stats.redelivered,
       tombstones: stats.tombstones
     };
   }

@@ -21,3 +21,10 @@ graphify-out/cache/
 # Vite SPA console deps (build output in public/dashboard-next is committed)
 dashboard-next/node_modules/
 dashboard-next/dist/
+web/node_modules/
+
+# Build caches and build provenance. These change on every build (timestamps,
+# incremental state) but are NOT release artifacts, so committing them would
+# make every deployment dirty the working tree and hide real drift.
+*.tsbuildinfo
+public/web-app/build-info.json

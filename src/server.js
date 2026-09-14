@@ -29,6 +29,9 @@ const {
 } = require("./notificationMeta");
 const { createSendRevocation, METRICS: REVOCATION_METRICS } = require("./sendRevocation");
 const { registerGatewayRoutes } = require("./gatewayRoutes");
+const { createTransportHealth, STATE: TRANSPORT_STATE, REASON: TRANSPORT_REASON } = require("./transportHealth");
+const { applyStaticCachePolicy } = require("./staticCachePolicy");
+const { buildQueueReport } = require("./queueSnapshot");
 const { SendPacingController } = require("./sendPacing");
 const { sendGate, DEFAULT_TIME_ZONE } = require("./sendSchedule");
 const { PRIORITY_LEVELS, PRIORITY_NAMES, normalizeSendPriority, priorityForJob } = require("./sendPriority");
@@ -170,6 +173,18 @@ const client = createTransportSelector({
 const deviceKeyStore = new DeviceKeyStore({
   filePath: path.join(config.rootDir, "data", "device-key.json"),
   envValue: process.env.GMWEB_ANDROID_DEVICE_KEY
+});
+
+// ONE authoritative transport-health model (src/transportHealth.js).
+// /admin/overview and /admin/transport both read this snapshot, so two cards on
+// one dashboard refresh can never contradict each other — the old code built
+// "Delivery" from the ACTIVE transport and "Device bridge" from the direct-PUSH
+// client, which reported "No device" while pull mode was serving the phone.
+const transportHealth = createTransportHealth({
+  client,
+  chromeClient,
+  androidClient,
+  deviceKeyStore
 });
 
 // ── Phase 2 (ADR-001/004): Trust Registry relay + durable Command Engine ────
@@ -2309,7 +2324,7 @@ async function serviceInfo(name) {
   };
 }
 
-async function sendDashboardFile(reply, filename) {
+async function sendDashboardFile(reply, filename, urlPath = "/dashboard/") {
   const safeName = filename || "index.html";
   if (safeName.includes("/") || safeName.includes("\\") || safeName.includes("..")) {
     reply.code(404).send("Not found");
@@ -2319,6 +2334,7 @@ async function sendDashboardFile(reply, filename) {
   const ext = path.extname(filePath);
   try {
     const body = await fs.readFile(filePath);
+    applyStaticCachePolicy(reply, urlPath);
     reply.type(contentTypes[ext] || "application/octet-stream").send(body);
   } catch (error) {
     reply.code(404).send("Not found");
@@ -2328,18 +2344,20 @@ async function sendDashboardFile(reply, filename) {
 // Serve the Vite SPA build (public/dashboard-next) under /app. Unknown paths
 // fall back to index.html so client-side state routing works. relPath is the
 // part after "/app/" (may include "assets/...").
-async function sendSpaFile(reply, relPath) {
+async function sendSpaFile(reply, relPath, urlPath = "/app/") {
   const clean = String(relPath || "").replace(/\\/g, "/");
   if (clean.includes("..")) { reply.code(404).send("Not found"); return; }
   const candidate = clean && clean !== "/" ? path.join(spaDir, clean) : path.join(spaDir, "index.html");
   const ext = path.extname(candidate);
   try {
     const body = await fs.readFile(candidate);
+    applyStaticCachePolicy(reply, urlPath);
     reply.type(contentTypes[ext] || "application/octet-stream").send(body);
   } catch {
     // SPA fallback: serve index.html for any non-asset path
     try {
       const html = await fs.readFile(path.join(spaDir, "index.html"));
+      applyStaticCachePolicy(reply, "/app/index.html");
       reply.type("text/html; charset=utf-8").send(html);
     } catch {
       reply.code(404).send("Console not built. Run: npm --prefix dashboard-next run build");
@@ -2372,7 +2390,7 @@ function webAppSecurityHeaders(reply) {
   reply.header("Cross-Origin-Opener-Policy", "same-origin");
 }
 
-async function sendWebAppFile(reply, relPath) {
+async function sendWebAppFile(reply, relPath, urlPath = "/web/") {
   const clean = String(relPath || "").replace(/\\/g, "/");
   if (clean.includes("..")) { reply.code(404).send("Not found"); return; }
   const candidate = clean && clean !== "/" ? path.join(webAppDir, clean) : path.join(webAppDir, "index.html");
@@ -2380,6 +2398,7 @@ async function sendWebAppFile(reply, relPath) {
   try {
     const body = await fs.readFile(candidate);
     webAppSecurityHeaders(reply);
+    applyStaticCachePolicy(reply, urlPath);
     reply.type(contentTypes[ext] || "application/octet-stream").send(body);
   } catch {
     // SPA fallback for client-side routing (never for missing assets — but the
@@ -2387,6 +2406,7 @@ async function sendWebAppFile(reply, relPath) {
     try {
       const html = await fs.readFile(path.join(webAppDir, "index.html"));
       webAppSecurityHeaders(reply);
+      applyStaticCachePolicy(reply, "/web/index.html");
       reply.type("text/html; charset=utf-8").send(html);
     } catch {
       reply.code(404).send("Web app not built. Run: npm --prefix web run build");
@@ -2394,34 +2414,80 @@ async function sendWebAppFile(reply, relPath) {
   }
 }
 
+/**
+ * PWA build provenance + release integrity.
+ *
+ * Returns an explicit machine state (never just a boolean), so the dashboard
+ * can say WHY it is unhappy:
+ *   current | version_mismatch | pwa_assets_missing | pwa_not_built | pwa_manifest_invalid
+ *
+ * The revision comes from the build artifact written by `npm run build:pwa`
+ * (web/vite.config.ts). It is read from disk, never shelled out to git on a
+ * poll.
+ */
 async function webAppDeploymentInfo() {
+  const base = {
+    ok: false, state: "pwa_not_built", reason: "pwa_not_built",
+    version: null, revision: null, script: null, styles: [], matchesApi: false,
+    builtAt: null, path: "/web", missingAssets: []
+  };
+  let versionText;
+  let indexText;
+  let stat;
   try {
-    const [versionText, indexText, stat] = await Promise.all([
+    [versionText, indexText, stat] = await Promise.all([
       fs.readFile(path.join(webAppDir, "version.json"), "utf8"),
       fs.readFile(path.join(webAppDir, "index.html"), "utf8"),
       fs.stat(path.join(webAppDir, "index.html")),
     ]);
-    const build = JSON.parse(versionText);
-    const script = indexText.match(/\/web\/assets\/(index-[^"']+\.js)/)?.[1] || null;
-    return {
-      ok: Boolean(build.version && script),
-      version: String(build.version || "unknown"),
-      script,
-      matchesApi: build.version === pkg.version,
-      builtAt: stat.mtime.toISOString(),
-      path: "/web",
-    };
   } catch (error) {
     return {
-      ok: false,
-      version: null,
-      script: null,
-      matchesApi: false,
-      builtAt: null,
-      path: "/web",
-      reason: error.code === "ENOENT" ? "pwa_not_built" : "pwa_manifest_invalid",
+      ...base,
+      state: error.code === "ENOENT" ? "pwa_not_built" : "pwa_manifest_invalid",
+      reason: error.code === "ENOENT" ? "pwa_not_built" : "pwa_manifest_invalid"
     };
   }
+
+  let build;
+  try {
+    build = JSON.parse(versionText);
+  } catch {
+    return { ...base, state: "pwa_manifest_invalid", reason: "pwa_manifest_invalid" };
+  }
+  const version = String(build?.version || "");
+  if (!version) return { ...base, state: "pwa_manifest_invalid", reason: "pwa_manifest_invalid" };
+
+  // Optional provenance from the build (same version, different commit).
+  let info = {};
+  try { info = JSON.parse(await fs.readFile(path.join(webAppDir, "build-info.json"), "utf8")); } catch { /* optional */ }
+
+  const script = indexText.match(/\/web\/assets\/(index-[^"']+\.js)/)?.[1] || null;
+  const styles = [...indexText.matchAll(/\/web\/(assets\/[^"']+\.css)/g)].map((m) => m[1]);
+  const referenced = [...new Set([...(script ? [`assets/${script}`] : []), ...styles])];
+  const missingAssets = [];
+  for (const ref of referenced) {
+    try { await fs.access(path.join(webAppDir, ref)); } catch { missingAssets.push(ref); }
+  }
+
+  const matchesApi = version === pkg.version;
+  const complete = Boolean(script) && missingAssets.length === 0;
+  const state = !complete ? "pwa_assets_missing"
+    : (!matchesApi ? "version_mismatch" : "current");
+
+  return {
+    ok: complete && matchesApi,
+    state,
+    reason: state === "current" ? null : state,
+    version,
+    revision: String(info.revision || "") || null,
+    script,
+    styles,
+    missingAssets,
+    matchesApi,
+    // builtAt: what the build recorded, else when the entry file landed.
+    builtAt: info.builtAt || stat.mtime.toISOString(),
+    path: "/web",
+  };
 }
 
 app.get("/health", {
@@ -2450,18 +2516,18 @@ app.get("/health", {
 if (config.dashboardEnabled) {
   app.get("/", async (_request, reply) => reply.redirect("/dashboard"));
 
-  app.get("/dashboard", async (_request, reply) => sendDashboardFile(reply, "index.html"));
-  app.get("/dashboard/", async (_request, reply) => sendDashboardFile(reply, "index.html"));
-  app.get("/dashboard/:file", async (request, reply) => sendDashboardFile(reply, request.params.file));
+  app.get("/dashboard", async (request, reply) => sendDashboardFile(reply, "index.html", request.url));
+  app.get("/dashboard/", async (request, reply) => sendDashboardFile(reply, "index.html", request.url));
+  app.get("/dashboard/:file", async (request, reply) => sendDashboardFile(reply, request.params.file, request.url));
 
   // New React console (Vite SPA). Static assets + SPA fallback. Hidden from OpenAPI.
-  app.get("/app", { schema: { hide: true } }, async (_request, reply) => sendSpaFile(reply, "index.html"));
-  app.get("/app/", { schema: { hide: true } }, async (_request, reply) => sendSpaFile(reply, "index.html"));
-  app.get("/app/*", { schema: { hide: true } }, async (request, reply) => sendSpaFile(reply, request.params["*"]));
+  app.get("/app", { schema: { hide: true } }, async (request, reply) => sendSpaFile(reply, "index.html", request.url));
+  app.get("/app/", { schema: { hide: true } }, async (request, reply) => sendSpaFile(reply, "index.html", request.url));
+  app.get("/app/*", { schema: { hide: true } }, async (request, reply) => sendSpaFile(reply, request.params["*"], request.url));
   // web-01: the NEW secure PWA under /web (strict CSP §20, own artifact).
-  app.get("/web", { schema: { hide: true } }, async (_request, reply) => sendWebAppFile(reply, "index.html"));
-  app.get("/web/", { schema: { hide: true } }, async (_request, reply) => sendWebAppFile(reply, "index.html"));
-  app.get("/web/*", { schema: { hide: true } }, async (request, reply) => sendWebAppFile(reply, request.params["*"]));
+  app.get("/web", { schema: { hide: true } }, async (request, reply) => sendWebAppFile(reply, "index.html", request.url));
+  app.get("/web/", { schema: { hide: true } }, async (request, reply) => sendWebAppFile(reply, "index.html", request.url));
+  app.get("/web/*", { schema: { hide: true } }, async (request, reply) => sendWebAppFile(reply, request.params["*"], request.url));
 
   app.get("/dashboard/session", async (request) => {
     const session = dashboardSession(request);
@@ -2624,16 +2690,13 @@ app.get("/admin/overview", {
     }
   }
 }, async () => {
-  let readiness;
+  // ONE snapshot for this refresh. "Delivery" (readiness.ready) and "Device
+  // bridge" (transport.ready) are two readings of the SAME object, so the old
+  // "Phone ready + No device" contradiction is structurally impossible.
+  const transport = await transportHealth.snapshot();
+  const android = await transportHealth.android();
+  const readiness = { ready: transport.ready, status: transport };
   let browserAutomation = { ok: null, code: "not_checked" };
-  try {
-    // Non-blocking: serves the cached pairing status so this endpoint never
-    // queues behind in-flight sends on the single browser lock.
-    const status = await client.statusForDashboard();
-    readiness = { ready: status.paired, status };
-  } catch (error) {
-    readiness = { ready: false, error: error.message };
-  }
   try {
     browserAutomation = JSON.parse(await fs.readFile(browserHealthFile, "utf8"));
   } catch { /* watchdog has not written its first probe yet */ }
@@ -2645,8 +2708,19 @@ app.get("/admin/overview", {
     serviceInfo("gmweb-novnc.service")
   ]);
   const system = await readSystemMetrics();
-  const androidState = await androidClient.readyState();
   const webApp = await webAppDeploymentInfo();
+  // Queue NOW and ledger OUTCOMES are sampled together so one refresh can never
+  // mix a live count with a stale total, and they use the SAME builder as
+  // /admin/queue so the two endpoints cannot disagree.
+  const [queueCounts, queuePaused] = await Promise.all([
+    sendQueue.counts().catch(() => ({})),
+    sendQueue.isPaused().catch(() => false)
+  ]);
+  const queueReport = buildQueueReport({
+    bullmq: queueCounts,
+    ledgerAllTime: sendStore.stats(),
+    ledgerLast24h: sendStore.statsSince(Date.now() - 24 * 60 * 60 * 1000)
+  });
 
   return {
     ok: true,
@@ -2654,16 +2728,30 @@ app.get("/admin/overview", {
     version: pkg.version,
     now: new Date().toISOString(),
     adminActionsEnabled: config.adminActionsEnabled,
-    // Explicit transport identity for dashboards: client.status() duck-types to
-    // the active client, whose self-reported transport string varies
-    // ("android-pull" vs "android"). `name` is always exactly chrome|android.
+    // Explicit transport identity for dashboards. The normalised fields are
+    // authoritative; the aliases below keep existing consumers working
+    // (`name` is always exactly chrome|android, `transport` keeps the old
+    // "android-pull"/"android"/"chrome" string).
     transport: {
-      name: client.name,
-      mode: client.name === "android" ? (client.pullMode ? "pull" : "push") : null,
-      ...client.status(),
-      androidReady: androidState.paired,
-      androidReason: androidState.reason || null
+      ...transport,
+      name: transport.activeTransport,
+      paired: transport.ready,
+      transport: transport.activeTransport === "android"
+        ? (transport.mode === "pull" ? "android-pull" : "android")
+        : "chrome",
+      androidReady: android.ready,
+      androidReason: android.reason || null
     },
+    // Queue NOW (live BullMQ) and delivery OUTCOMES (durable ledger) are
+    // different questions with different time windows and are never merged.
+    queue: {
+      ...queueReport.queue,
+      paused: queuePaused,
+      manualPause: queueManualPause,
+      powerOn: sendPowerOn
+    },
+    idle: queueReport.idle,
+    ledger: queueReport.ledger,
     vnc: {
       proxyPath: "/vnc/vnc.html?autoconnect=true&resize=scale&path=vnc/websockify",
       target: config.vncProxyTarget,
@@ -2839,40 +2927,37 @@ app.get("/admin/transport", {
     }
   }
 }, async () => {
-  // Chrome exposes status()/statusForDashboard(); android exposes readyState().
-  const chromeState = await chromeClient.statusForDashboard()
-    .then((s) => ({ paired: Boolean(s?.paired) }))
-    .catch(() => ({ paired: false }));
-
-  const pullMode = Boolean(client.pullMode && client.outbox);
-  const androidState = client.outbox?.readyState?.() || null;
-  const stats = client.outbox ? client.outbox.stats() : { waitingPhones: 0, pending: 0, inflight: 0 };
-  let androidReady;
-  let androidConfigured;
-  if (pullMode) {
-    // Pull mode: the phone dials US. "Configured" = a device key exists to
-    // authenticate incoming devices; "ready" = a device is actively polling.
-    androidConfigured = deviceKeyStore.configured;
-    androidReady = Boolean(androidState?.paired);
-  } else {
-    // Push mode (tunnel): the server dials the phone at a configured URL.
-    const androidState = await androidClient.readyState();
-    androidConfigured = androidClient.configured;
-    androidReady = androidState.paired;
-  }
+  // ONE snapshot — the same object /admin/overview reports as `transport`, so
+  // the two endpoints can never disagree about the active device.
+  const health = await transportHealth.snapshot();
+  const android = await transportHealth.android();
 
   return {
     ok: true,
-    transport: client.name,
+    // ── normalised, authoritative ───────────────────────────────────────────
+    health,
+    activeTransport: health.activeTransport,
+    mode: health.mode,
+    // ── backward-compatible shape (existing dashboard + consumers) ───────────
+    // `transport` keeps meaning "the canonical active transport".
+    transport: health.activeTransport,
     available: ["chrome", "android"],
-    chromeReady: chromeState.paired,
-    androidReady,
-    androidConfigured,
-    androidMode: pullMode ? "pull" : "push",
-    androidDevices: stats.waitingPhones,
-    androidPending: stats.pending,
-    androidInflight: stats.inflight,
-    androidLastPullAt: androidState?.lastPullAt || null
+    chromeReady: health.activeTransport === "chrome"
+      ? health.ready
+      : Boolean(health.alternatives.chrome?.ready),
+    // androidReady answers "is the ANDROID bridge usable", independent of which
+    // transport is active — and in pull mode it is the pull bridge that answers,
+    // never the direct-push client.
+    androidReady: Boolean(android.ready),
+    androidConfigured: Boolean(android.configured),
+    androidMode: health.mode === "pull" ? "pull" : "push",
+    androidState: android.state,
+    androidReason: android.reason || null,
+    androidDevices: Number(android.waitingPhones || 0),
+    androidPending: Number(android.pending || 0),
+    androidInflight: Number(android.inflight || 0),
+    androidLastPullAt: android.lastPullAt || null,
+    androidLastPullAgeMs: android.lastPullAgeMs ?? null
   };
 });
 
@@ -4422,32 +4507,50 @@ app.get("/admin/queue", {
     }
   }
 }, async () => {
-  const qc = await sendQueue.counts();
-  const dbStats = sendStore.stats();
-  const android = client.outbox?.readyState?.() || {
-    paired: false, waitingPhones: 0, lastPullAt: null, pending: 0, inflight: 0
-  };
+  const [qc, paused, health] = await Promise.all([
+    sendQueue.counts(),
+    sendQueue.isPaused(),
+    transportHealth.snapshot()
+  ]);
+  const report = buildQueueReport({
+    bullmq: qc,
+    ledgerAllTime: sendStore.stats(),
+    ledgerLast24h: sendStore.statsSince(Date.now() - 24 * 60 * 60 * 1000)
+  });
+  const android = await transportHealth.android();
+
   return {
-    paused: await sendQueue.isPaused(),
+    paused,
     manualPause: queueManualPause,
     powerOn: sendPowerOn,
-    activeTransport: client.name,
+    activeTransport: health.activeTransport,
+    transport: health,
+    // ── additive, unambiguous blocks ────────────────────────────────────────
+    // QUEUE NOW is strictly live BullMQ state; DELIVERY OUTCOMES are durable
+    // ledger rows for a stated window. Nothing historical can make an idle
+    // queue look busy.
+    queue: report.queue,
+    idle: report.idle,
+    ledger: report.ledger,
     android: {
-      ready: Boolean(android.paired),
-      waitingPhones: android.waitingPhones,
-      lastPullAt: android.lastPullAt,
-      pending: android.pending,
-      inflight: android.inflight
+      // Authoritative: in pull mode this is the PULL BRIDGE, never the
+      // direct-push client.
+      ready: Boolean(android.ready),
+      state: android.state,
+      reason: android.reason || null,
+      configured: Boolean(android.configured),
+      mode: health.mode,
+      waitingPhones: Number(android.waitingPhones || 0),
+      lastPullAt: android.lastPullAt || null,
+      lastPullAgeMs: android.lastPullAgeMs ?? null,
+      livenessMs: android.livenessMs ?? null,
+      pending: Number(android.pending || 0),
+      inflight: Number(android.inflight || 0)
     },
-    counts: {
-      ...qc,
-      completed: dbStats.sent,
-      failed: dbStats.failed,
-      sent: dbStats.sent,
-      unverified: dbStats.unverified,
-      suppressed: dbStats.suppressed,
-      cancelled: dbStats.cancelled
-    },
+    // ── legacy shape, byte-for-byte compatible (deprecated) ─────────────────
+    // Older consumers read `counts.failed` as a ledger TOTAL. That stays true
+    // here; new code should read `queue` and `ledger`.
+    counts: report.counts,
     quietHours: currentQuietHours()
   };
 });

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ArrowUp, X, RefreshCw, Pause, Play, Moon, Rocket } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
-import type { QueueCounts, QueueJob, QueueQuietHours } from "@/lib/types";
+import type { LedgerOutcomes, QueueCounts, QueueJob, QueueNow, QueueQuietHours } from "@/lib/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -21,6 +21,8 @@ function elapsed(ms: number) {
 export function QueuePage() {
   const [jobs, setJobs] = useState<QueueJob[]>([]);
   const [counts, setCounts] = useState<QueueCounts | null>(null);
+  const [liveQueue, setLiveQueue] = useState<QueueNow | null>(null);
+  const [ledger, setLedger] = useState<{ allTime: LedgerOutcomes; last24h: LedgerOutcomes } | null>(null);
   const [paused, setPaused] = useState(false);
   const [quietHours, setQuietHours] = useState<QueueQuietHours | null>(null);
   const [delayedHighCount, setDelayedHighCount] = useState(0);
@@ -50,8 +52,13 @@ export function QueuePage() {
     setLoading(true);
     // Stats first, independent of rows.
     try {
-      const c = await api<{ counts: QueueCounts; paused: boolean; quietHours: QueueQuietHours }>("/admin/queue", { headers: { "Content-Type": "text/plain" } });
+      const c = await api<{ counts: QueueCounts; queue?: QueueNow; ledger?: { allTime: LedgerOutcomes; last24h: LedgerOutcomes }; paused: boolean; quietHours: QueueQuietHours }>("/admin/queue", { headers: { "Content-Type": "text/plain" } });
       setCounts(c.counts);
+      // Live queue state and durable outcomes are shown separately: the legacy
+      // `counts.failed` is an ALL-TIME ledger total and must never sit next to
+      // "waiting/active" as if the queue were currently failing.
+      setLiveQueue(c.queue ?? null);
+      setLedger(c.ledger ?? null);
       setPaused(c.paused);
       setQuietHours(c.quietHours);
       setStatsLoadedOnce(true);
@@ -238,7 +245,8 @@ export function QueuePage() {
         <div className="flex items-center gap-2">
           {counts && (
             <span className="text-xs text-muted-foreground">
-              {counts.waiting} waiting · {counts.active} active · {counts.failed} failed
+              {liveQueue?.waiting ?? counts.waiting} waiting · {liveQueue?.active ?? counts.active} active
+              {ledger ? ` · ${ledger.last24h.failed} failed (24h) · ${ledger.allTime.failed.toLocaleString()} failed all-time` : ""}
             </span>
           )}
           <Badge variant={paused ? "warning" : "secondary"}>{paused ? "PAUSED" : "RUNNING"}</Badge>

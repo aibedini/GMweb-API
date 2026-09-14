@@ -19,13 +19,109 @@ export interface ReadyStatus {
   };
 }
 
+/**
+ * Deterministic transport vocabulary from the server. Business logic keys off
+ * THESE values, never off transport display strings like "android-pull".
+ */
+export type TransportState =
+  | "connected"
+  | "stale"
+  | "unconfigured"
+  | "push_unreachable"
+  | "not_paired"
+  | "unknown";
+
+export interface TransportPeer {
+  configured?: boolean;
+  ready?: boolean;
+  state?: TransportState;
+  reason?: string | null;
+}
+
+/** One authoritative snapshot, shared by /admin/overview and /admin/transport. */
+export interface TransportHealth {
+  activeTransport: "chrome" | "android";
+  mode: "pull" | "push" | null;
+  configured: boolean;
+  ready: boolean;
+  state: TransportState;
+  reason: string | null;
+  lastPullAt: string | null;
+  lastPullAgeMs: number | null;
+  livenessMs: number;
+  waitingPhones: number;
+  pending: number;
+  inflight: number;
+  revokedInflight: number;
+  tombstones: number;
+  alternatives?: Record<string, TransportPeer | null>;
+  // legacy aliases (kept for older consumers)
+  name?: string;
+  paired?: boolean;
+  transport?: string;
+  androidReady?: boolean;
+  androidReason?: string | null;
+}
+
+/** Live BullMQ state only — never a historical total. */
+export interface QueueNow {
+  waiting: number;
+  active: number;
+  delayed: number;
+  prioritized: number;
+  paused: number;
+  completed: number;
+  failed: number;
+  manualPause?: boolean;
+  powerOn?: boolean;
+}
+
+/** Durable delivery outcomes for a stated window. */
+export interface LedgerOutcomes {
+  sent: number;
+  unverified: number;
+  failed: number;
+  suppressed: number;
+  cancelled: number;
+  superseded: number;
+  total?: number;
+  revokedInflight?: number;
+}
+
+export interface QueueStatus {
+  paused: boolean;
+  manualPause?: boolean;
+  powerOn?: boolean;
+  activeTransport?: "chrome" | "android";
+  transport?: TransportHealth;
+  queue: QueueNow;
+  ledger: { allTime: LedgerOutcomes; last24h: LedgerOutcomes };
+  /** @deprecated legacy merged shape; use `queue` + `ledger`. */
+  counts: QueueCounts & Record<string, number>;
+  quietHours?: QueueQuietHours;
+}
+
 export interface Overview {
   ok: boolean;
   version: string;
   readiness?: { ready: boolean; status?: Record<string, unknown> };
-  transport?: { name?: string; mode?: string | null; transport?: string; paired?: boolean; reason?: string | null; androidReady?: boolean; lastPullAt?: string | null };
+  transport?: TransportHealth;
+  queue?: QueueNow;
+  ledger?: { allTime: LedgerOutcomes; last24h: LedgerOutcomes };
   browserAutomation?: { ok: boolean | null; code: string; latencyMs?: number; error?: string };
-  webApp?: { ok: boolean; version: string | null; script: string | null; matchesApi: boolean; builtAt: string | null; path: string; reason?: string };
+  webApp?: {
+    ok: boolean;
+    state?: "current" | "version_mismatch" | "pwa_assets_missing" | "pwa_not_built" | "pwa_manifest_invalid";
+    reason?: string | null;
+    version: string | null;
+    revision?: string | null;
+    script: string | null;
+    styles?: string[];
+    missingAssets?: string[];
+    matchesApi: boolean;
+    builtAt: string | null;
+    path: string;
+  };
   system?: {
     cpu: { cores: number; usagePercent: number; load1: number; load5: number; load15: number; loadPercent: number };
     memory: { totalBytes: number; availableBytes: number; usedBytes: number; usagePercent: number };

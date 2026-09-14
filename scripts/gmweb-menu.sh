@@ -640,6 +640,27 @@ update_app() {
 
   run_as_app "git -C '$APP_DIR' pull --ff-only"
   chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+
+  # ── Release integrity ─────────────────────────────────────────────────────
+  # The front-ends are DEPLOYMENT PRODUCTS: they must be built from the exact
+  # revision just pulled, before anything is restarted. Skipping this is how the
+  # API reached 0.19.1 while /web still served a 0.18.0 bundle.
+  local revision port api_version pwa_version
+  revision="$(git -C "$APP_DIR" rev-parse HEAD)"
+  port="$(grep -m1 '^PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2- || true)"
+  port="${port:-3030}"
+
+  echo "Building front-ends (/app and /web) for ${revision:0:7} ..."
+  if ! run_as_app "cd '$APP_DIR' && GMWEB_BUILD_REVISION='$revision' npm run build:frontends"; then
+    echo "${C_RED}Front-end build failed. The API was NOT restarted and keeps serving the previous release.${C_RESET}"
+    echo "Fix the build (npm ci needs the npm registry), then run: sudo gmweb update"
+    return 1
+  fi
+  if ! run_as_app "cd '$APP_DIR' && node scripts/verify-frontend-artifacts.mjs"; then
+    echo "${C_RED}Built front-ends do not match the API version; refusing to restart.${C_RESET}"
+    return 1
+  fi
+
   run_as_app "cd '$APP_DIR' && npm ci --omit=dev"
   bash -n "$APP_DIR/scripts/gmweb-menu.sh"
   install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb
@@ -648,7 +669,15 @@ update_app() {
     echo "${C_RED}API restarted but did not become healthy. Check: journalctl -u $API_SERVICE -n 100${C_RESET}"
     return 1
   }
-  echo "${C_GREEN}Updated and restarted API.${C_RESET}"
+
+  # Post-deploy: API and the SERVED PWA must report the same version.
+  api_version="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+  pwa_version="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/web/version.json" 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  if [[ -n "$api_version" && "$api_version" != "$pwa_version" ]]; then
+    echo "${C_RED}Version drift after update: API $api_version but /web reports ${pwa_version:-unknown}.${C_RESET}"
+    return 1
+  fi
+  echo "${C_GREEN}Updated and restarted API. API and /web are both ${api_version:-unknown}.${C_RESET}"
 }
 
 # Wait for the API process to answer /health (liveness). Delivery readiness
