@@ -143,7 +143,13 @@ class SendStore {
       // Windowed outcome metrics ("last 24h") must be an index range scan, not a
       // full table read pulled into JavaScript.
       "CREATE INDEX IF NOT EXISTS idx_sends_terminal_time ON sends (status, finished_at)",
-      "CREATE INDEX IF NOT EXISTS idx_sends_finished ON sends (finished_at)"
+      "CREATE INDEX IF NOT EXISTS idx_sends_finished ON sends (finished_at)",
+      // EXPRESSION index that matches the window query CHARACTER FOR CHARACTER.
+      // A plain finished_at index cannot serve COALESCE(finished_at, sent_at,
+      // updated_at): SQLite only uses an expression index when the expression is
+      // identical, so this string and _statsSince must stay in lockstep
+      // (test/ledgerWindow.test.js proves it with EXPLAIN QUERY PLAN).
+      "CREATE INDEX IF NOT EXISTS idx_sends_terminal_window ON sends (status, COALESCE(finished_at, sent_at, updated_at))"
     ]) {
       try { this.db.exec(sql); } catch { /* already present */ }
     }
@@ -272,6 +278,14 @@ class SendStore {
     );
     // First write wins. A retried ACK for the same physical submission is a
     // no-op: no second counter, no rewritten outcome, no second audit entry.
+    // Exactly once by construction: the WHERE clause refuses a row that already
+    // carries the physical-send fact.
+    this._lateSent = this.db.prepare(
+      `UPDATE sends
+          SET status='sent', sent_at=COALESCE(sent_at, @now),
+              finished_at=@now, updated_at=@now, error=NULL, result_json=@result_json
+        WHERE id=@id AND status NOT IN ('sent','suppressed')`
+    );
     this._markSentAfterRevocation = this.db.prepare(
       `UPDATE sends
           SET status='sent', sent_at=COALESCE(sent_at, @now),
@@ -550,6 +564,44 @@ class SendStore {
 
   revokedInflightCount() {
     return Number(this._revokedInflightCount.get()?.n || 0);
+  }
+
+  /**
+   * Reconcile a LATE, authenticated `sent` ACK onto a row that does not already
+   * carry the physical-send fact (typically unverified/android_ack_missing, or a
+   * row whose attempt gave up before the ACK arrived, including across a
+   * process restart).
+   *
+   * The device timestamp is only trusted when the device reported one;
+   * otherwise the server receipt time is recorded.
+   *
+   * @returns {{changed: boolean, row: object|null}}
+   */
+  reconcileLateSent(id, { at = Date.now(), reason = null, sentAt = null } = {}) {
+    if (!Number.isInteger(Number(id))) return { changed: false, row: null };
+    const row = this.byId(id);
+    if (!row) return { changed: false, row: null };
+    const prior = String(row.status || "").toLowerCase();
+    if (prior === "sent" || prior === "suppressed") return { changed: false, row };
+
+    let payload;
+    try {
+      const parsed = row.result_json ? JSON.parse(row.result_json) : {};
+      payload = JSON.stringify({
+        ...parsed,
+        lateAck: {
+          reason: reason || "late_ack_confirmed",
+          fromStatus: prior,
+          at: new Date(at).toISOString(),
+          submittedAt: sentAt ? new Date(Number(sentAt)).toISOString() : new Date(at).toISOString()
+        }
+      });
+    } catch {
+      payload = JSON.stringify({ lateAck: { reason: reason || "late_ack_confirmed", fromStatus: prior } });
+    }
+
+    const info = this._lateSent.run({ id: Number(id), result_json: payload, now: at });
+    return { changed: (info.changes || 0) > 0, row: this.byId(id) };
   }
 
   /** True when a not-yet-started send for this service still needs validation. */

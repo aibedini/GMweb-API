@@ -142,6 +142,10 @@ const androidOutbox = new AndroidOutbox({
     onOffer: (gatewayRequestId, entry) => {
       if (entry?.ledgerId) sendStore.attachGatewayRequest(entry.ledgerId, gatewayRequestId);
     },
+    // Durable ACK replay: after a restart the bridge memory is gone, but the
+    // ledger row is not — so an ACK retried by the phone is still answered with
+    // the canonical truth instead of "unknown id".
+    durableLookup: (gatewayRequestId) => sendStore.byGatewayRequest(gatewayRequestId),
     // Settlements are logged here; the single authoritative sent-after-
     // revocation audit runs in handleSendCompleted (or in the gateway ACK
     // fallback when no worker is left waiting), so it can never double-count.
@@ -3345,19 +3349,24 @@ app.get("/ready", {
     }
   }
 }, async (request, reply) => {
-  // Android transport active: readiness is the phone's own /ready probe
-  // (reachable + default SMS app + queue running).
-  if (client.name === "android") {
-    const state = await client.readyState();
-    if (!state.paired) reply.code(503);
-    return { ready: state.paired, status: state };
-  }
-  // Non-blocking: cached status so /ready stays fast during send bursts.
-  const status = await client.statusForDashboard();
-  if (!status.paired) reply.code(503);
+  // ONE source of truth (src/transportHealth.js). This route used to re-derive
+  // its own liveness rule from the raw transport, which is how /ready and
+  // /admin/transport could disagree. A stale pull phone is never ready here,
+  // and the legacy push client can never make pull mode ready.
+  const health = await transportHealth.snapshot();
+  const transition = transportHealth.reportTransition(health);
+  if (transition) app.log.warn({ transport: transition }, "android transport state changed");
+  if (!health.ready) reply.code(503);
   return {
-    ready: status.paired,
-    status
+    ready: health.ready,
+    status: {
+      ...health,
+      // Back-compat aliases for consumers that read the old shape.
+      paired: health.ready,
+      transport: health.activeTransport === "android"
+        ? (health.mode === "pull" ? "android-pull" : "android")
+        : "chrome"
+    }
   };
 });
 
@@ -4247,6 +4256,9 @@ app.get("/send/capacity", {
   const priorities = await sendQueue.pendingCountsByPriority();
   const pending = priorities.announcement || 0;
   const available = Math.max(0, ANNOUNCEMENT_PENDING_LIMIT - pending);
+  // Same readiness truth as /ready and /admin/transport (additive: the capacity
+  // contract itself is unchanged, so existing feeders keep working).
+  const health = await transportHealth.snapshot();
   return {
     priorities,
     announcement: {
@@ -4254,6 +4266,13 @@ app.get("/send/capacity", {
       pending,
       available,
       recommendedBatchSize: Math.min(available, 50)
+    },
+    ready: health.ready,
+    transport: {
+      activeTransport: health.activeTransport,
+      mode: health.mode,
+      state: health.state,
+      reason: health.reason
     }
   };
 });
@@ -5156,6 +5175,67 @@ app.post("/admin/queue/jobs/bulk", {
 });
 
 // ─── API Key Management (master / dashboard only) ────────────────────────────
+
+// Operator diagnostic: which SMS consumer keys can SEND but cannot INVALIDATE a
+// stale renewal reminder. Renewal invalidation silently cannot work for such a
+// key (it receives 403 project_scope_denied), which is exactly the failure that
+// is invisible from the consumer side.
+//
+// This endpoint only REPORTS. Granting sms.invalidate stays a deliberate
+// operator action (PATCH /admin/api-keys/:id); never broaden a key here.
+app.get("/admin/project-key-diagnostics", {
+  schema: {
+    summary: "Project key capability diagnostics",
+    description: "Reports SMS consumer keys that can send but lack `sms.invalidate`, so lifecycle invalidation cannot work for them. **Master token only.** Read-only: it never changes a key.",
+    tags: ["Admin"],
+    response: {
+      200: {
+        type: "object",
+        properties: {
+          ok: { type: "boolean" },
+          checked: { type: "integer" },
+          missingInvalidationScope: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                name: { type: "string" },
+                scopes: { type: "array", items: { type: "string" } },
+                missing: { type: "string" },
+                warning: { type: "string" },
+                remedy: { type: "string" }
+              }
+            }
+          },
+          healthy: { type: "array", items: { type: "string" } }
+        }
+      }
+    }
+  }
+}, async () => {
+  const keys = apiKeyStore.list();
+  const missing = [];
+  const healthy = [];
+  for (const key of keys) {
+    const scopes = Array.isArray(key.scopes) ? key.scopes : [];
+    const canSend = apiKeyStore.hasScope(key, "sms.send");
+    const canInvalidate = apiKeyStore.hasScope(key, "sms.invalidate");
+    if (canSend && !canInvalidate) {
+      missing.push({
+        id: key.id,
+        name: key.name || "(unnamed)",
+        scopes: [...scopes],
+        missing: "sms.invalidate",
+        warning: `project key "${key.name || key.id}" can sms.send but lacks sms.invalidate; renewal invalidation cannot work.`,
+        remedy: `PATCH /admin/api-keys/${key.id} with scopes including "sms.invalidate"`
+      });
+    } else if (canSend) {
+      healthy.push(key.name || key.id);
+    }
+  }
+  return { ok: true, checked: keys.length, missingInvalidationScope: missing, healthy };
+});
 
 app.get("/admin/api-keys", {
   schema: {

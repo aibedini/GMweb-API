@@ -71,13 +71,18 @@ function buildQueueReport(input = {}) {
     superseded: allTime.superseded
   };
 
+  // "Idle" means there is NO OUTSTANDING LIVE WORK — not merely active=0. A
+  // queue holding 40 delayed retries and 3 prioritized jobs is NOT idle, and
+  // historical completed/failed totals never participate.
+  const outstanding = queue.waiting + queue.active + queue.delayed + queue.prioritized + queue.paused;
+
   return {
     queue,
     ledger,
     counts,
-    // The queue is idle purely from LIVE state. Historical failures can never
-    // make an empty queue look busy.
-    idle: queue.waiting + queue.active === 0,
+    idle: outstanding === 0,
+    executing: queue.active > 0,
+    outstanding,
     windowMs: count(input.windowMs) || DEFAULT_WINDOW_MS
   };
 }

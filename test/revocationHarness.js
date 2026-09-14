@@ -85,6 +85,9 @@ function createHarness(options = {}) {
       onOffer: (gatewayRequestId, entry) => {
         if (entry?.ledgerId) storeRef.attachGatewayRequest(entry.ledgerId, gatewayRequestId);
       },
+      // Mirrors server.js: after a restart the bridge memory is gone but the
+      // durable row is not, so a retried ACK is still answered.
+      durableLookup: (gatewayRequestId) => storeRef.byGatewayRequest(gatewayRequestId),
       onSettle: (gatewayRequestId, outcome, entry) => {
         logLines.push({ gatewayRequestId, outcome });
       },

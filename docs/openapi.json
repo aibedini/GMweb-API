@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.2",
+    "version": "0.19.3",
     "contact": {
       "name": "GMweb API"
     }
@@ -1320,7 +1320,7 @@
         "tags": [
           "Gateway"
         ],
-        "description": "Acknowledge a pulled task. `ok:true` marks it sent (drives ledger, SSE, webhooks); `ok:false` fails that attempt so BullMQ can retry. `outcome:\"superseded\"` means the device did NOT send it because the lifecycle was invalidated: terminal, not successful, not billable, not retryable and not a gateway failure. Legacy `{requestId, ok}` bodies keep working exactly as before.",
+        "description": "Acknowledge a pulled task. The reply is decided by ONE state machine (src/ackStateMachine.js) from the durable ledger row, the bridge state and what the device reported — so a retried ACK, a process restart and a real revocation race each get their canonical answer. terminal describes the TASK outcome; retryable says whether another attempt may still happen (a plain failed is retryable, everything else is not). Legacy {requestId, ok} bodies keep working.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1385,16 +1385,19 @@
                   "type": "object",
                   "properties": {
                     "ok": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "description": "True when the ACK was understood (including a replay)."
                     },
                     "outcome": {
                       "type": [
                         "null",
                         "string"
-                      ]
+                      ],
+                      "description": "sent | sent_after_revocation | superseded | cancelled | failed | null"
                     },
                     "terminal": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "description": "The TASK is finished. true for sent/sent_after_revocation/superseded/cancelled; false only while a failed task may still be retried."
                     },
                     "successful": {
                       "type": [
@@ -1402,9 +1405,28 @@
                         "boolean"
                       ]
                     },
+                    "retryable": {
+                      "type": "boolean",
+                      "description": "Another attempt may still happen (only a plain failed task)."
+                    },
+                    "duplicate": {
+                      "type": "boolean",
+                      "description": "This ACK replayed an outcome that was already recorded; nothing was mutated."
+                    },
+                    "newlyRecorded": {
+                      "type": "boolean",
+                      "description": "This ACK recorded the fact for the first time."
+                    },
                     "counted": {
                       "type": "boolean",
-                      "description": "False for superseded: it never counts toward send limits."
+                      "description": "May count toward successful-send limits. False for superseded and for replays."
+                    },
+                    "ackState": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Canonical decision reason for operators."
                     }
                   }
                 }
@@ -6306,6 +6328,70 @@
                     },
                     "message": {
                       "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/project-key-diagnostics": {
+      "get": {
+        "summary": "Project key capability diagnostics",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Reports SMS consumer keys that can send but lack `sms.invalidate`, so lifecycle invalidation cannot work for them. **Master token only.** Read-only: it never changes a key.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "checked": {
+                      "type": "integer"
+                    },
+                    "missingInvalidationScope": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "scopes": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          },
+                          "missing": {
+                            "type": "string"
+                          },
+                          "warning": {
+                            "type": "string"
+                          },
+                          "remedy": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "healthy": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
                     }
                   }
                 }

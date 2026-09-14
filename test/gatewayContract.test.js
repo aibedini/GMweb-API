@@ -107,7 +107,14 @@ test("ack derives the outcome from the legacy ok flag when outcome is absent", a
       method: "POST", url: "/gateway/ack",
       headers: { "x-api-key": h.deviceKey }, payload: { requestId: task.requestId, ok: true }
     });
-    assert.deepEqual(ack.json(), { ok: true, outcome: "sent", terminal: false, successful: true, counted: true });
+    // A successful send is TERMINAL for the task (the old contract reported
+    // terminal:false, which read as "still running"). Retryability is a separate
+    // field so the two concepts are never overloaded again.
+    assert.deepEqual(ack.json(), {
+      ok: true, outcome: "sent", terminal: true, successful: true,
+      retryable: false, duplicate: false, newlyRecorded: true, counted: true,
+      ackState: null
+    });
     await app.close();
     await worker;
   });

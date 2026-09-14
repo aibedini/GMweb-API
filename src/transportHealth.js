@@ -207,10 +207,30 @@ function createTransportHealth(deps = {}) {
     };
   }
 
+  // Transition observability: "the phone went quiet" and "the phone came back"
+  // are the two events an operator actually needs. The dashboard polls every
+  // 8 seconds, so an edge is reported once and re-reported at most per minute.
+  let lastState = null;
+  let lastReportedAt = 0;
+  const TRANSITION_INTERVAL_MS = 60000;
+
+  function reportTransition(next) {
+    if (!next) return null;
+    if (next.state === lastState) return null;
+    const previous = lastState;
+    lastState = next.state;
+    if (previous === null) return null; // first observation is not a transition
+    const at = now();
+    if (at - lastReportedAt < TRANSITION_INTERVAL_MS) return null;
+    lastReportedAt = at;
+    return { from: previous, to: next.state, reason: next.reason || null, at: new Date(at).toISOString() };
+  }
+
   return {
     snapshot,
     android: androidSnapshot,
     chrome: chromeSnapshot,
+    reportTransition,
     STATE,
     REASON,
     pullLivenessMs: () => pullLivenessMs(env)

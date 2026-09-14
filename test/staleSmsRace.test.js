@@ -443,7 +443,10 @@ test("superseded ACK is terminal, non-billable and non-retryable", async () => {
     });
     assert.equal(ack.statusCode, 200);
     assert.deepEqual(ack.json(), {
-      ok: true, outcome: "superseded", terminal: true, successful: false, counted: false
+      ok: true, outcome: "superseded", terminal: true, successful: false,
+      retryable: false, duplicate: false, newlyRecorded: true, counted: false,
+      // ackState carries the consumer reason the device reported.
+      ackState: "renewed"
     });
     await app.close();
 
@@ -596,8 +599,15 @@ test("a retried ACK for an ordinary send is never audited as sent after revocati
       method: "POST", url: "/gateway/ack",
       headers: { "x-api-key": h.deviceKey }, payload: { requestId: task.requestId, ok: true }
     });
-    assert.equal(warm.json().outcome, "sent_after_revocation",
-      "the outbox still recognises a settled id (wire label is unchanged)");
+    // Corrected replay semantics: repeating an ACK for a task that was NEVER
+    // revoked answers \`sent\` with duplicate=true. Labelling it
+    // sent_after_revocation (the old behaviour) is exactly the misclassification
+    // Invariant C forbids.
+    assert.equal(warm.json().outcome, "sent");
+    assert.equal(warm.json().duplicate, true);
+    assert.equal(warm.json().newlyRecorded, false);
+    assert.equal(warm.json().terminal, true);
+    assert.equal(warm.json().successful, true);
     assert.equal(h.store.counters().sms_sent_after_revocation_total ?? 0, 0);
     assert.equal(h.store.byId(ledgerId).result_json, outcomeJson, "the retry must not rewrite the outcome");
     assert.equal(h.audits.some((entry) => entry.type === "sent_after_revocation"), false);
@@ -609,9 +619,14 @@ test("a retried ACK for an ordinary send is never audited as sent after revocati
       method: "POST", url: "/gateway/ack",
       headers: { "x-api-key": h.deviceKey }, payload: { requestId: task.requestId, ok: true }
     });
+    // After a restart the in-memory bridge is empty, but the DURABLE row still
+    // knows this SMS was sent: the ACK is replayed from SendStore, never
+    // answered "unknown id" (Invariant D).
     assert.equal(retry.statusCode, 200);
     assert.deepEqual(retry.json(), {
-      ok: false, outcome: null, terminal: false, successful: null, counted: false
+      ok: true, outcome: "sent", terminal: true, successful: true,
+      retryable: false, duplicate: true, newlyRecorded: false, counted: false,
+      ackState: "durable_sent"
     });
     assert.equal(cold.store.counters().sms_sent_after_revocation_total ?? 0, 0);
     assert.equal(cold.store.byId(ledgerId).result_json, outcomeJson);
@@ -650,9 +665,13 @@ test("legacy ok:true / ok:false ACKs keep their old behaviour", async () => {
     assert.equal((await badWorker).failed, true, "a non-superseded failure is still retryable");
     await app.close();
 
-    // An unknown requestId stays a no-op, exactly as before.
+    // An unknown requestId stays a no-op, exactly as before: the state machine
+    // refuses to fabricate a delivery fact for an id nothing knows about.
     const unknown = await h.outbox.acknowledge("pull_unknown", true, {});
-    assert.deepEqual(unknown, { handled: false, outcome: null });
+    assert.equal(unknown.handled, false);
+    assert.equal(unknown.outcome, null);
+    assert.equal(unknown.decision.newlyRecorded, false);
+    assert.equal(unknown.decision.reason, "unknown_gateway_request_id");
   });
 });
 

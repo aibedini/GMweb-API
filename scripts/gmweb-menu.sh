@@ -485,7 +485,7 @@ wait_for_api_ready() {
 }
 
 adopt_git_checkout() {
-  local stamp app_parent stage previous backup failed data_kb free_kb required_kb
+  local stamp app_parent stage previous backup failed data_kb free_kb required_kb CANDIDATE_SHA
   stamp="$(date +%Y%m%d-%H%M%S)"
   app_parent="$(dirname "$APP_DIR")"
   stage="$app_parent/.gmweb-update-stage-$stamp"
@@ -526,13 +526,25 @@ adopt_git_checkout() {
     return 1
   fi
   chown -R "$APP_USER:$APP_USER" "$stage"
-  if ! run_as_app "cd '$stage' && npm ci --omit=dev" ||
+
+  # The staged checkout IS the pinned candidate: read it once and never fetch
+  # again during this migration.
+  CANDIDATE_SHA="$(git -C "$stage" rev-parse HEAD)"
+
+  # EVERY gate runs BEFORE the queue is drained and before the live install is
+  # replaced. This migration used to activate a candidate whose PWA and console
+  # had never been built, because it only ran --omit=dev + check.
+  if ! run_as_app "cd '$stage' && GMWEB_BUILD_REVISION='$CANDIDATE_SHA' npm ci --include=dev" ||
      ! run_as_app "cd '$stage' && npm run check" ||
+     ! run_as_app "cd '$stage' && npm test" ||
+     ! run_as_app "cd '$stage' && npm run build:frontends" ||
+     ! run_as_app "cd '$stage' && node scripts/verify-frontend-artifacts.mjs" ||
      ! bash -n "$stage/scripts/gmweb-menu.sh"; then
-    echo "${C_RED}The new release failed validation; existing installation was not changed.${C_RESET}"
+    echo "${C_RED}The new release failed validation; the existing installation was not changed and the queue was never paused.${C_RESET}"
     case "$stage" in "$app_parent"/.gmweb-update-stage-*) rm -rf -- "$stage" ;; esac
     return 1
   fi
+  echo "${C_GREEN}Staged release ${CANDIDATE_SHA:0:7} validated (build + tests + artifact verification).${C_RESET}"
 
   data_kb="$(du -sk "$APP_DIR/data" | awk '{print $1}')"
   free_kb="$(df -Pk "$app_parent" | awk 'NR==2 {print $4}')"
@@ -567,6 +579,9 @@ adopt_git_checkout() {
 
     mv "$APP_DIR" "$previous"
     mv "$stage" "$APP_DIR"
+    # The stage was installed WITH dev dependencies (needed to build the
+    # front-ends); production runs on the production tree only.
+    run_as_app "cd '$APP_DIR' && npm ci --omit=dev"
     install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb
 
     systemctl start "$CHROME_SERVICE"
@@ -607,17 +622,24 @@ update_app() {
     return
   fi
 
+  # ── Operator lock ─────────────────────────────────────────────────────────
+  # main is shared by multiple operator/AI sessions. A second updater must not
+  # race this one: take a non-blocking OS lock and exit immediately if held.
+  exec 9>/run/lock/gmweb-update.lock 2>/dev/null || exec 9>"$APP_DIR/data/.gmweb-update.lock"
+  if ! flock -n 9; then
+    echo "${C_RED}update_already_running${C_RESET}"
+    echo "Another gmweb update is in progress; try again when it finishes."
+    return 1
+  fi
+
   # Production checkouts can contain both manual edits and generated,
   # untracked frontend assets. Either kind can block a fast-forward update.
   # Stash both, but leave ignored runtime state (notably .env/node_modules)
-  # untouched. The stash remains available for explicit recovery; applying it
-  # automatically would restore stale build output over the new release.
+  # untouched.
   #
-  # Ownership FIRST. Installs and manual recovery routinely leave ROOT-owned
-  # artifacts in the checkout (a root-owned .env backup, a file edited over
-  # SSH). The stash below runs as the app user, so a single unreadable file
-  # used to abort the whole update with a bare "Permission denied ... Cannot
-  # save the untracked files" before anything was pulled.
+  # Ownership FIRST: the stash runs as the app user, and a single root-owned
+  # unreadable file used to abort the whole update with a bare "Permission
+  # denied ... Cannot save the untracked files".
   chown -R "$APP_USER:$APP_USER" "$APP_DIR" 2>/dev/null || true
 
   local local_status stash_ref
@@ -638,50 +660,112 @@ update_app() {
     echo "Inspect later with: git -C '$APP_DIR' stash show --stat"
   fi
 
-  run_as_app "git -C '$APP_DIR' pull --ff-only"
-  chown -R "$APP_USER:$APP_USER" "$APP_DIR"
-
-  # ── Release integrity ─────────────────────────────────────────────────────
-  # The front-ends are DEPLOYMENT PRODUCTS: they must be built from the exact
-  # revision just pulled, before anything is restarted. Skipping this is how the
-  # API reached 0.19.1 while /web still served a 0.18.0 bundle.
-  local revision port api_version pwa_version
-  revision="$(git -C "$APP_DIR" rev-parse HEAD)"
-  port="$(grep -m1 '^PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2- || true)"
-  port="${port:-3030}"
-
-  echo "Building front-ends (/app and /web) for ${revision:0:7} ..."
-  if ! run_as_app "cd '$APP_DIR' && GMWEB_BUILD_REVISION='$revision' npm run build:frontends"; then
-    echo "${C_RED}Front-end build failed. The API was NOT restarted and keeps serving the previous release.${C_RESET}"
-    echo "Fix the build (npm ci needs the npm registry), then run: sudo gmweb update"
+  # ── 1. Pin the candidate ONCE ─────────────────────────────────────────────
+  # If origin/main advances while the candidate is being built we keep building
+  # the pinned SHA; the newer commit waits for the next update.
+  local old_sha candidate candidate_short stage stage_version api_version pwa_version port
+  old_sha="$(git -C "$APP_DIR" rev-parse HEAD)"
+  if ! run_as_app "git -C '$APP_DIR' fetch origin main"; then
+    echo "${C_RED}Cannot reach origin/main; the live checkout was not touched.${C_RESET}"
     return 1
   fi
-  if ! run_as_app "cd '$APP_DIR' && node scripts/verify-frontend-artifacts.mjs"; then
-    echo "${C_RED}Built front-ends do not match the API version; refusing to restart.${C_RESET}"
+  candidate="$(git -C "$APP_DIR" rev-parse FETCH_HEAD)"
+  candidate_short="${candidate:0:7}"
+  if [[ "$candidate" == "$old_sha" ]]; then
+    echo "${C_GREEN}Already up to date at ${old_sha:0:7}.${C_RESET}"
+    return 0
+  fi
+  echo "Candidate: $candidate_short (live checkout stays at ${old_sha:0:7} until it passes)"
+
+  # ── 2. Stage and validate OUTSIDE the live checkout ───────────────────────
+  # INVARIANT A: an unvalidated candidate can never become the live checkout.
+  stage="$(mktemp -d /tmp/gmweb-update.XXXXXXXX)"
+  cleanup_stage() { case "$stage" in /tmp/gmweb-update.*) rm -rf -- "$stage" ;; esac; }
+  trap cleanup_stage RETURN
+
+  if ! git -C "$APP_DIR" archive "$candidate" | tar -x -C "$stage"; then
+    echo "${C_RED}Could not stage the candidate; the live checkout was not touched.${C_RESET}"
     return 1
   fi
 
-  run_as_app "cd '$APP_DIR' && npm ci --omit=dev"
-  bash -n "$APP_DIR/scripts/gmweb-menu.sh"
-  install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb
+  echo "Validating the candidate in $stage (live service keeps running, queue NOT paused yet)..."
+  if ! run_as_app "cd '$stage' && GMWEB_BUILD_REVISION='$candidate' npm ci --include=dev && npm run check && npm test && npm run build:frontends"; then
+    echo "${C_RED}Candidate validation FAILED. The live checkout is unchanged at ${old_sha:0:7} and was not restarted.${C_RESET}"
+    return 1
+  fi
+  if ! run_as_app "cd '$stage' && node scripts/verify-frontend-artifacts.mjs"; then
+    echo "${C_RED}Candidate front-ends do not match its package version. No promotion.${C_RESET}"
+    return 1
+  fi
+  if ! bash -n "$stage/scripts/gmweb-menu.sh"; then
+    echo "${C_RED}Candidate manager script has a syntax error. No promotion.${C_RESET}"
+    return 1
+  fi
+  stage_version="$(node -e "console.log(require('$stage/package.json').version)")"
+  echo "${C_GREEN}Candidate $candidate_short ($stage_version) validated.${C_RESET}"
+
+  # ── 3. Pause/drain only now (minutes of building already happened) ────────
+  if ! pause_and_drain_queue; then
+    echo "${C_RED}Could not pause/drain the queue; nothing was promoted.${C_RESET}"
+    return 1
+  fi
+
+  # ── 4. Promote the exact validated revision and artifacts ─────────────────
+  # Pre-promotion safety state. The backup helper needs ROOT (it writes to
+  # /root/gmweb-backup), so it must NOT go through run_as_app.
+  if ! bash "$APP_DIR/scripts/gmweb-backup.sh" >/dev/null 2>&1; then
+    echo "${C_YELLOW}Pre-promotion backup did not complete; continuing (an update never touches the ledger).${C_RESET}"
+  fi
+
+  local promoted=0
+  if run_as_app "git -C '$APP_DIR' merge --ff-only '$candidate'"; then
+    for app in web-app dashboard-next; do
+      mkdir -p "$APP_DIR/public/$app"
+      rsync -a --delete "$stage/public/$app/" "$APP_DIR/public/$app/"
+    done
+    chown -R "$APP_USER:$APP_USER" "$APP_DIR/public"
+    if run_as_app "cd '$APP_DIR' && npm ci --omit=dev" &&
+       bash -n "$APP_DIR/scripts/gmweb-menu.sh" &&
+       install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb; then
+      promoted=1
+    fi
+  fi
+
+  if (( promoted == 1 )); then
+    systemctl restart "$API_SERVICE"
+    port="$(grep -m1 '^PORT=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2- || true)"
+    port="${port:-3030}"
+    if wait_for_api_alive; then
+      api_version="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+      pwa_version="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/web/version.json" 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      if [[ "$api_version" == "$stage_version" && "$pwa_version" == "$stage_version" ]]; then
+        echo "${C_GREEN}Updated to $candidate_short. API and /web are both $api_version.${C_RESET}"
+        [[ "$UPDATE_QUEUE_WAS_PAUSED" == "true" ]] || queue_control resume || true
+        return 0
+      fi
+      echo "${C_RED}Post-deploy version check failed: API=${api_version:-?} /web=${pwa_version:-?} expected $stage_version.${C_RESET}"
+    else
+      echo "${C_RED}API did not become healthy after the restart.${C_RESET}"
+    fi
+  else
+    echo "${C_RED}Promotion failed before the restart.${C_RESET}"
+  fi
+
+  # ── 5. Rollback: source AND artifacts together, never a mixed pair ────────
+  echo "${C_YELLOW}Rolling back to ${old_sha:0:7}...${C_RESET}"
+  run_as_app "git -C '$APP_DIR' reset --hard '$old_sha'" || true
+  run_as_app "cd '$APP_DIR' && git clean -fd public/web-app public/dashboard-next" 2>/dev/null || true
+  run_as_app "cd '$APP_DIR' && npm ci --omit=dev" || true
+  install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb 2>/dev/null || true
   systemctl restart "$API_SERVICE"
-  wait_for_api_alive || {
-    echo "${C_RED}API restarted but did not become healthy. Check: journalctl -u $API_SERVICE -n 100${C_RESET}"
-    return 1
-  }
-
-  # Post-deploy: API and the SERVED PWA must report the same version.
-  api_version="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
-  pwa_version="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/web/version.json" 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-  if [[ -n "$api_version" && "$api_version" != "$pwa_version" ]]; then
-    echo "${C_RED}Version drift after update: API $api_version but /web reports ${pwa_version:-unknown}.${C_RESET}"
-    return 1
+  if wait_for_api_alive; then
+    echo "${C_GREEN}Rolled back to ${old_sha:0:7}; the previous release is serving again.${C_RESET}"
+  else
+    echo "${C_RED}Rollback restart did not become healthy. Inspect: journalctl -u $API_SERVICE -n 100${C_RESET}"
   fi
-  echo "${C_GREEN}Updated and restarted API. API and /web are both ${api_version:-unknown}.${C_RESET}"
+  [[ "$UPDATE_QUEUE_WAS_PAUSED" == "true" ]] || queue_control resume || true
+  return 1
 }
-
-# Wait for the API process to answer /health (liveness). Delivery readiness
-# (/ready) legitimately returns 503 when no transport is paired, so it must
 # never gate a successful update — that produced false update failures.
 wait_for_api_alive() {
   local waited=0 response

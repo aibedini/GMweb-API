@@ -152,10 +152,19 @@ test("release() drops the entry but a late ACK is still recognised", async () =>
   assert.equal(outbox.tracks("send_2"), null);
   await assert.rejects(() => worker, /task_released/);
 
-  // The phone's very late ACK is still answered, not swallowed.
+  // The phone's very late ACK is still answered, not swallowed — and it is a
+  // LATE SUCCESS, never a revocation anomaly: this task was never revoked
+  // (decision case 25 / Invariant C).
   const late = outbox.acknowledge("send_2", true, {});
   assert.equal(late.handled, true);
-  assert.equal(late.outcome, "sent_after_revocation");
+  assert.equal(late.outcome, "sent");
+  assert.equal(late.decision.newlyRecorded, true);
+  assert.equal(late.decision.audit, "late_ack_confirmed_unsettled");
+  // A repeat replays it and mutates nothing.
+  const again = outbox.acknowledge("send_2", true, {});
+  assert.equal(again.outcome, "sent");
+  assert.equal(again.decision.duplicate, true);
+  assert.equal(again.decision.newlyRecorded, false);
 });
 
 test("a caller that supplies no id still gets a unique one (backward compatible)", async () => {

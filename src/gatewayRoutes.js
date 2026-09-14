@@ -35,6 +35,51 @@ function registerGatewayRoutes(app, deps = {}) {
   };
   const metrics = revocation?.METRICS || {};
 
+  /**
+   * Apply the ONE durable transition a replayed ACK implies.
+   *
+   * Called only when no worker is waiting AND the state machine reports this is
+   * the first record of the fact, so each effect below happens at most once per
+   * physical SMS no matter how often the phone retries.
+   */
+  function applyDurableTransition(requestId, decision, body) {
+    const row = sendStore?.byGatewayRequest(requestId) || null;
+    if (!row) return;
+    try {
+      if (decision.transition === "sent") {
+        // Physical truth beats a recorded failure/unverified. The ledger write
+        // is unconditional-once by construction (WHERE status NOT IN sent...).
+        const res = sendStore.reconcileLateSent(row.id, { reason: decision.audit, sentAt: body.sentAt });
+        if (res.changed) {
+          bump("sms_late_ack_reconciliations_total");
+          log?.info?.({
+            gatewayRequestId: requestId, state: "sent", ackState: decision.audit, transport: "android-pull"
+          }, "late ACK reconciled an unsettled send");
+        }
+        return;
+      }
+      if (decision.transition === "sent_after_revocation") {
+        (revocation?.auditSentAfterRevocation || (() => false))(row, {
+          transport: "android-pull", result: { lateAck: true, reportedAt: body.sentAt || null }
+        });
+        return;
+      }
+      if (decision.transition === "superseded") {
+        (revocation?.finalizeSuperseded || (() => false))(row, decision.reason || "superseded");
+        return;
+      }
+      if (decision.transition === "failed") {
+        sendStore.markById(row.id, "failed", decision.reason || "android_gateway_failed");
+        return;
+      }
+      if (decision.transition === "cancelled") {
+        sendStore.markById(row.id, "cancelled", decision.reason || "cancelled_by_consumer");
+      }
+    } catch (error) {
+      log?.warn?.({ error, gatewayRequestId: requestId }, "durable ACK transition failed");
+    }
+  }
+
   const unauthorized = (reply) => {
     reply.code(401).send({ error: "unauthorized" });
   };
@@ -202,11 +247,13 @@ function registerGatewayRoutes(app, deps = {}) {
     schema: {
       summary: "Android device reports a delivery outcome",
       description: [
-        "Acknowledge a pulled task.",
-        "\`ok:true\` marks it sent (drives ledger, SSE, webhooks); \`ok:false\` fails that attempt so BullMQ can retry.",
-        "\`outcome:\"superseded\"\` means the device did NOT send it because the lifecycle was invalidated:",
-        "terminal, not successful, not billable, not retryable and not a gateway failure.",
-        "Legacy \`{requestId, ok}\` bodies keep working exactly as before."
+        "Acknowledge a pulled task. The reply is decided by ONE state machine",
+        "(src/ackStateMachine.js) from the durable ledger row, the bridge state and",
+        "what the device reported — so a retried ACK, a process restart and a real",
+        "revocation race each get their canonical answer.",
+        "terminal describes the TASK outcome; retryable says whether another attempt",
+        "may still happen (a plain failed is retryable, everything else is not).",
+        "Legacy {requestId, ok} bodies keep working."
       ].join(" "),
       tags: ["Gateway"],
       body: {
@@ -229,11 +276,15 @@ function registerGatewayRoutes(app, deps = {}) {
         200: {
           type: "object",
           properties: {
-            ok: { type: "boolean" },
-            outcome: { type: ["string", "null"] },
-            terminal: { type: "boolean" },
+            ok: { type: "boolean", description: "True when the ACK was understood (including a replay)." },
+            outcome: { type: ["string", "null"], description: "sent | sent_after_revocation | superseded | cancelled | failed | null" },
+            terminal: { type: "boolean", description: "The TASK is finished. true for sent/sent_after_revocation/superseded/cancelled; false only while a failed task may still be retried." },
             successful: { type: ["boolean", "null"] },
-            counted: { type: "boolean", description: "False for superseded: it never counts toward send limits." }
+            retryable: { type: "boolean", description: "Another attempt may still happen (only a plain failed task)." },
+            duplicate: { type: "boolean", description: "This ACK replayed an outcome that was already recorded; nothing was mutated." },
+            newlyRecorded: { type: "boolean", description: "This ACK recorded the fact for the first time." },
+            counted: { type: "boolean", description: "May count toward successful-send limits. False for superseded and for replays." },
+            ackState: { type: ["string", "null"], description: "Canonical decision reason for operators." }
           }
         },
         400: { type: "object", properties: { error: { type: "string" } } },
@@ -248,14 +299,11 @@ function registerGatewayRoutes(app, deps = {}) {
       reply.code(400).send({ error: "invalid_body" });
       return;
     }
-    const outcome = ["sent", "failed", "superseded"].includes(body.outcome) ? body.outcome : null;
-    const ok = typeof body.ok === "boolean" ? body.ok : outcome === "sent";
-    // Whether this ACK settles a LIVE worker promise decides who records the
-    // late-real-send audit: handleSendCompleted owns the worker's result, and
-    // auditing the same submission here as well would count it twice.
-    const liveSettlement = outbox.tracks(requestId) !== null;
+    const reportedOutcome = ["sent", "failed", "superseded"].includes(body.outcome) ? body.outcome : null;
+    const ok = typeof body.ok === "boolean" ? body.ok : reportedOutcome === "sent";
+
     const result = outbox.acknowledge(requestId, ok, {
-      outcome: outcome || undefined,
+      outcome: reportedOutcome || undefined,
       reason: body.reason,
       error: body.error || body.reason,
       status: body.status,
@@ -264,42 +312,27 @@ function registerGatewayRoutes(app, deps = {}) {
       sentTo: body.sentTo,
       cancelled: body.cancelled
     });
+    const decision = result.decision;
 
-    // The one thing this bridge cannot prevent: a real submission that lands
-    // AFTER the lifecycle was revoked. The physical truth must reach the
-    // ledger, the anomaly counter and the operator trail -- exactly once, and
-    // whether or not this process still remembers the task (tombstone, lease
-    // expiry, release, restart). The DURABLE row decides, never the phone's
-    // report alone: a retried ACK for an ordinary send is not an anomaly, and a
-    // revoked row still counts as one even when only the tombstone is left.
-    const row = sendStore?.byGatewayRequest(requestId) || null;
-    const durablyStopped = Boolean(row) && (
-      Boolean(row.revoked_at) || row.status === "cancelled" || Boolean(sendStore.isSuperseded(row))
-    );
-    if (ok && durablyStopped && !liveSettlement) {
-      (revocation?.auditSentAfterRevocation || (() => false))(row, {
-        transport: "android-pull", result: { lateAck: true, reportedAt: body.sentAt || null }
-      });
+    // ── Durable side effects ────────────────────────────────────────────────
+    // Only when the bridge held no live task (otherwise the worker owns the
+    // ledger write) AND this ACK is the FIRST to record the fact. That pair is
+    // what makes one physical SMS exactly one durable fact, however often the
+    // phone retries its ACK or a process restarts in between.
+    if (result.handled && decision.newlyRecorded && result.fromDurable && decision.transition) {
+      applyDurableTransition(requestId, decision, body);
     }
 
-    if (!result.handled) {
-      // This process no longer holds the task (restart, lease expiry, release):
-      // the durable ledger read above is the only answer left.
-      if (ok && durablyStopped) {
-        return { ok: true, outcome: "sent_after_revocation", terminal: true, successful: true, counted: true };
-      }
-      return { ok: false, outcome: null, terminal: false, successful: null, counted: false };
-    }
-
-    const terminal = result.outcome !== "sent" && result.outcome !== "failed";
     return {
-      ok: true,
-      outcome: result.outcome,
-      terminal,
-      successful: result.outcome === "sent" || result.outcome === "sent_after_revocation"
-        ? true : (result.outcome === "failed" || result.outcome === "superseded" || result.outcome === "cancelled" ? false : null),
-      // A superseded task must never consume a successful-send budget.
-      counted: result.outcome === "sent" || result.outcome === "sent_after_revocation"
+      ok: result.handled,
+      outcome: decision.outcome ?? null,
+      terminal: Boolean(decision.terminal),
+      successful: decision.successful === undefined ? null : decision.successful,
+      retryable: Boolean(decision.retryable),
+      duplicate: Boolean(decision.duplicate),
+      newlyRecorded: Boolean(decision.newlyRecorded),
+      counted: Boolean(decision.counted),
+      ackState: decision.reason || null
     };
   });
 

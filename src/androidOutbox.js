@@ -32,6 +32,8 @@ const EMPTY_TASK_META = Object.freeze({
   requiresValidation: false
 });
 
+const { decideAck, OUTCOME } = require("./ackStateMachine");
+
 class AndroidOutbox {
   constructor(options = {}) {
     this.pending = new Map();   // offered, not yet claimed by a phone
@@ -49,6 +51,9 @@ class AndroidOutbox {
     this.onOffer = hooks.onOffer || null;       // (requestId, entry) => void
     this.onSettle = hooks.onSettle || null;     // (requestId, outcome, entry, details)
     this.onPull = hooks.onPull || null;         // (requestId, entry) => void
+    // (requestId) => durable ledger row | null. Lets a RESTARTED process answer
+    // an ACK from SendStore instead of "unknown id".
+    this.durableLookup = hooks.durableLookup || null;
     this.now = hooks.now || Date.now;
     // How long an in-flight revoked task waits for the phone's answer before it
     // is terminalized as superseded. Bounded so the worker's promise, the
@@ -455,104 +460,116 @@ class AndroidOutbox {
 
   /**
    * Phone reports the SIM outcome; settles the worker's sendMessage promise.
-   * Returns { handled, outcome } where outcome is one of
-   * sent | sent_after_revocation | superseded | cancelled | failed.
+   *
+   * The DECISION is not made here. \`decideAck\` (src/ackStateMachine.js) owns the
+   * whole matrix — memory, tombstones and the durable ledger row — so a retried
+   * ACK, a restarted process and a genuinely revoked-then-sent race each get
+   * their canonical answer and a process restart cannot change semantics.
+   *
+   * @returns {{handled: boolean, outcome: string|null, decision: object, fromDurable: boolean}}
    */
   acknowledge(requestId, ok, details = {}) {
     const key = String(requestId || "");
-    const item = this.pending.get(key) || this.inflight.get(key);
-    const outcome = details.outcome || (ok ? "sent" : "failed");
+    const item = this.pending.get(key) || this.inflight.get(key) || null;
+    const known = this.tombstones.get(key) || null;
+    const settledOutcome = known && known.outcome && known.outcome !== "released" ? known.outcome : null;
+    // A released task keeps its identity so a late report is answered from
+    // durable state instead of being treated as an unknown id.
+    const released = known?.outcome === "released";
 
-    if (!item) {
-      // Unknown id. It may be a task this process already settled and forgot
-      // (restart, lease expiry) — the tombstone decides how to answer.
-      const known = this.tombstone(key);
-      if (!known) return { handled: false, outcome: null };
-      if (ok || outcome === "sent") {
-        // Physical truth arrived after the gateway had already given up on it.
-        try { this.onSettle?.(key, "sent_after_revocation", null, { ...details, tombstone: known }); } catch { /* audit only */ }
-        this.#remember(key, { outcome: "sent_after_revocation", settledAt: this.now() });
-        return { handled: true, outcome: "sent_after_revocation" };
-      }
-      // A released-but-unsettled task reporting a non-success is an ordinary
-      // failure; anything else keeps its revocation semantics.
-      return { handled: true, outcome: known.outcome === "released" ? "failed" : "superseded" };
+    let durable = null;
+    if (typeof this.durableLookup === "function") {
+      try { durable = this.durableLookup(key); } catch { durable = null; }
     }
 
-    this.pending.delete(key);
-    this.inflight.delete(key);
-    this.#clearLease(key);
+    const decision = decideAck({
+      reported: { ...details, ok, outcome: details.outcome },
+      memory: item ? (this.pending.has(key) ? "pending" : "inflight")
+        : (settledOutcome ? "settled" : (released ? "released" : null)),
+      memoryOutcome: settledOutcome,
+      revoked: item?.revoked || (known?.cause ? { cause: known.cause, reason: known.reason || null } : null),
+      durable
+    });
 
-    // Order matters. An explicit "superseded" outcome is the phone confirming
-    // it did NOT send. A revoked task whose attempt failed for an unrelated
-    // reason must not be retried either. But a revoked task that reports a REAL
-    // successful submission is the impossible-unsend case and must fall through
-    // to the success branch below, flagged — never downgraded to "cancelled".
-    if (outcome === "superseded" || (!ok && item.revoked)) {
-      const reason = details.reason || item.revoked?.reason || null;
-      this.#remember(key, {
-        cause: item.revoked?.cause || "superseded",
-        reason, outcome: "superseded", settledAt: this.now()
-      });
-      if (item.revoked?.cause === "cancel") {
-        const error = new Error(reason || "cancelled_by_consumer");
-        error.code = "SEND_CANCELLED";
-        error.statusCode = 409;
-        this.#settleWaiters(item, "reject", error);
-        try { this.onSettle?.(key, "cancelled", item, details); } catch { /* audit */ }
-        return { handled: true, outcome: "cancelled" };
-      }
-      this.#settleWaiters(item, "resolve", {
-        type: "superseded", superseded: true, requestId: key, status: "superseded",
-        terminal: true, successful: false, reason, at: new Date(this.now()).toISOString()
-      });
-      try { this.onSettle?.(key, "superseded", item, details); } catch { /* audit */ }
-      return { handled: true, outcome: "superseded" };
+    if (!decision.handled) {
+      return { handled: false, outcome: null, decision, fromDurable: false };
     }
 
-    if (ok) {
-      const sentAfterRevocation = Boolean(item.revoked);
+    const fromDurable = !item;
+
+    if (item) {
+      this.pending.delete(key);
+      this.inflight.delete(key);
+      this.#clearLease(key);
+      this.#settleWaitersForDecision(key, item, decision);
+    }
+
+    // The tombstone is the replay record. Only a NEW fact is recorded; a replay
+    // must leave it untouched so repeated ACKs keep answering the same way.
+    if (decision.newlyRecorded) {
       this.#remember(key, {
-        cause: item.revoked?.cause || null,
-        reason: item.revoked?.reason || null,
-        outcome: sentAfterRevocation ? "sent_after_revocation" : "sent",
-        // Kept so a later retry of this same id can be answered from the
-        // tombstone without touching the radio again.
-        requestedTo: details.requestedTo || item.to,
-        sentTo: details.sentTo || item.to,
-        sentAt: details.sentAt || this.now(),
-        settledAt: this.now()
+        outcome: decision.outcome,
+        reason: decision.reason || null,
+        settledAt: this.now(),
+        ...(decision.outcome === OUTCOME.SENT || decision.outcome === OUTCOME.SENT_AFTER_REVOCATION
+          ? {
+              requestedTo: details.requestedTo || item?.to || null,
+              sentTo: details.sentTo || item?.to || null,
+              sentAt: details.sentAt || this.now()
+            }
+          : {})
       });
-      this.#settleWaiters(item, "resolve", {
+    }
+
+    // Exactly-once side effects: the audit fires only for a newly recorded fact.
+    if (decision.newlyRecorded) {
+      try { this.onSettle?.(key, decision.outcome, item, { ...details, decision, fromDurable }); } catch { /* audit only */ }
+    }
+
+    return { handled: true, outcome: decision.outcome, decision, fromDurable };
+  }
+
+  /** Settle the worker promise(s) with the state machine's canonical outcome. */
+  #settleWaitersForDecision(requestId, entry, decision) {
+    if (decision.outcome === OUTCOME.SENT || decision.outcome === OUTCOME.SENT_AFTER_REVOCATION) {
+      this.#settleWaiters(entry, "resolve", {
         type: "sent",
-        requestedTo: details.requestedTo || item.to,
-        sentTo: details.sentTo || item.to,
-        // The voucher for the late-ack audit: a revoked task that physically
-        // went out anyway must never be reported as a clean cancellation.
-        sentAfterRevocation,
-        revocation: sentAfterRevocation
-          ? { reason: item.revoked?.reason || null, cause: item.revoked?.cause || null, revokedAt: item.revoked?.revokedAt || null }
+        requestedTo: entry.to,
+        sentTo: entry.to,
+        sentAfterRevocation: decision.outcome === OUTCOME.SENT_AFTER_REVOCATION,
+        revocation: decision.outcome === OUTCOME.SENT_AFTER_REVOCATION
+          ? { reason: entry.revoked?.reason || null, cause: entry.revoked?.cause || null, revokedAt: entry.revoked?.revokedAt || null }
           : null,
         submission: {
           submittedOnce: true,
-          submittedAt: details.sentAt ? new Date(details.sentAt).toISOString() : new Date(this.now()).toISOString(),
+          submittedAt: new Date(this.now()).toISOString(),
           verified: true,
           verificationStatus: "confirmed",
           verificationAttempts: 0
         },
         at: new Date(this.now()).toISOString()
       });
-      try { this.onSettle?.(key, sentAfterRevocation ? "sent_after_revocation" : "sent", item, details); } catch { /* audit */ }
-      return { handled: true, outcome: sentAfterRevocation ? "sent_after_revocation" : "sent" };
+      return;
     }
-
-    const error = new Error(details.error || details.reason || `android_gateway_${details.status || "failed"}`);
-    error.code = details.cancelled ? "SEND_CANCELLED" : "ANDROID_GATEWAY_FAILED";
-    error.statusCode = 502;
-    this.#remember(key, { outcome: "failed", settledAt: this.now() });
-    this.#settleWaiters(item, "reject", error);
-    try { this.onSettle?.(key, "failed", item, details); } catch { /* audit */ }
-    return { handled: true, outcome: "failed" };
+    if (decision.outcome === OUTCOME.SUPERSEDED) {
+      this.#settleWaiters(entry, "resolve", {
+        type: "superseded", superseded: true, requestId, status: "superseded",
+        terminal: true, successful: false, reason: decision.reason || null,
+        at: new Date(this.now()).toISOString()
+      });
+      return;
+    }
+    if (decision.outcome === OUTCOME.CANCELLED) {
+      const cancelled = new Error(decision.reason || "cancelled_by_consumer");
+      cancelled.code = "SEND_CANCELLED";
+      cancelled.statusCode = 409;
+      this.#settleWaiters(entry, "reject", cancelled);
+      return;
+    }
+    const failed = new Error(decision.reason || "android_gateway_failed");
+    failed.code = "ANDROID_GATEWAY_FAILED";
+    failed.statusCode = 502;
+    this.#settleWaiters(entry, "reject", failed);
   }
 
   // ── status surfaces ───────────────────────────────────────────────────────

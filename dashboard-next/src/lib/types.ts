@@ -90,6 +90,11 @@ export interface LedgerOutcomes {
 
 export interface QueueStatus {
   paused: boolean;
+  /** Backend SSOT: no outstanding live work (waiting+active+delayed+prioritized+paused === 0). */
+  idle?: boolean;
+  /** active > 0 */
+  executing?: boolean;
+  outstanding?: number;
   manualPause?: boolean;
   powerOn?: boolean;
   activeTransport?: "chrome" | "android";
@@ -107,6 +112,7 @@ export interface Overview {
   readiness?: { ready: boolean; status?: Record<string, unknown> };
   transport?: TransportHealth;
   queue?: QueueNow;
+  idle?: boolean;
   ledger?: { allTime: LedgerOutcomes; last24h: LedgerOutcomes };
   browserAutomation?: { ok: boolean | null; code: string; latencyMs?: number; error?: string };
   webApp?: {

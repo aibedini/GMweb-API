@@ -159,7 +159,9 @@ export function OverviewPage() {
   const queueNow = queue?.queue;
   const outcomes = queue?.ledger?.last24h;
   const allTime = queue?.ledger?.allTime;
-  const liveIdle = queueNow ? queueNow.waiting + queueNow.active === 0 : false;
+  // Backend is the single source of truth for "idle": it accounts for delayed,
+  // prioritized and paused jobs too. Recomputing it here would silently drift.
+  const liveIdle = queue?.idle ?? false;
   const queueCards: Array<{ k: string; v: number; tone: string }> = [
     { k: "Waiting", v: queueNow?.waiting ?? 0, tone: "text-amber-400" },
     { k: "Active", v: queueNow?.active ?? 0, tone: "text-primary" },
@@ -229,7 +231,7 @@ export function OverviewPage() {
           <span className="text-xs text-muted-foreground">live BullMQ state</span>
           {queue?.paused
             ? <Badge variant="warning">paused</Badge>
-            : queueNow && liveIdle && <Badge variant="success">idle</Badge>}
+            : liveIdle && <Badge variant="success">idle</Badge>}
           {queue?.powerOn === false && <Badge variant="warning">power off</Badge>}
         </div>
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
