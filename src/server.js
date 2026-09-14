@@ -2921,7 +2921,16 @@ app.get("/admin/transport", {
           androidDevices: { type: "integer", description: "Devices currently long-polling (pull mode)." },
           androidPending: { type: "integer", description: "Sends waiting for a device to pick up." },
           androidInflight: { type: "integer", description: "Sends a device is delivering right now." },
-          androidLastPullAt: { type: ["string", "null"], format: "date-time", description: "Most recent Android pull in pull mode." }
+          androidLastPullAt: { type: ["string", "null"], format: "date-time", description: "Most recent Android pull in pull mode." },
+          androidState: { type: "string", enum: ["connected", "stale", "unconfigured", "push_unreachable", "not_paired", "unknown"] },
+          androidReason: { type: ["string", "null"], description: "Machine reason, e.g. no_recent_device_pull or device_key_not_configured." },
+          androidLastPullAgeMs: { type: ["integer", "null"] },
+          // Additive + authoritative. Declared explicitly: Fastify's response
+          // serializer strips properties the schema does not list, so an
+          // undeclared field would silently never reach the dashboard.
+          activeTransport: { type: "string", enum: ["chrome", "android"] },
+          mode: { type: ["string", "null"], enum: ["pull", "push", null] },
+          health: { type: "object", additionalProperties: true, description: "The full normalized snapshot (same object /admin/overview returns as `transport`)." }
         }
       }
     }
@@ -4487,20 +4496,34 @@ app.get("/admin/queue", {
               releaseAt: { type: ["string", "null"] }
             }
           },
-          counts: {
+          // Live BullMQ state only. Declared here because Fastify's response
+          // serializer STRIPS anything the schema does not mention — an
+          // undeclared additive field silently disappears on the wire.
+          queue: {
             type: "object",
             properties: {
               waiting: { type: "integer" },
-              paused: { type: "integer" },
               active: { type: "integer" },
-              completed: { type: "integer" },
-              failed: { type: "integer" },
               delayed: { type: "integer" },
-              sent: { type: "integer" },
-              unverified: { type: "integer" },
-              suppressed: { type: "integer" },
-              cancelled: { type: "integer" }
+              prioritized: { type: "integer" },
+              paused: { type: "integer" },
+              completed: { type: "integer" },
+              failed: { type: "integer" }
             }
+          },
+          idle: { type: "boolean", description: "True when no job is waiting or active. Historical ledger failures never affect it." },
+          ledger: {
+            type: "object",
+            properties: {
+              allTime: { type: "object", additionalProperties: { type: "integer" } },
+              last24h: { type: "object", additionalProperties: { type: "integer" } }
+            }
+          },
+          transport: { type: "object", additionalProperties: true, description: "Authoritative transport snapshot (same object /admin/overview returns)." },
+          counts: {
+            type: "object",
+            description: "Deprecated merged shape: live BullMQ counts with ledger TOTALS for sent/unverified/failed/suppressed/cancelled. New code should read `queue` and `ledger`.",
+            additionalProperties: { type: "integer" }
           }
         }
       }

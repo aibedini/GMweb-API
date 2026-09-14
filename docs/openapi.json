@@ -858,6 +858,53 @@
                       ],
                       "format": "date-time",
                       "description": "Most recent Android pull in pull mode."
+                    },
+                    "androidState": {
+                      "type": "string",
+                      "enum": [
+                        "connected",
+                        "stale",
+                        "unconfigured",
+                        "push_unreachable",
+                        "not_paired",
+                        "unknown"
+                      ]
+                    },
+                    "androidReason": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "description": "Machine reason, e.g. no_recent_device_pull or device_key_not_configured."
+                    },
+                    "androidLastPullAgeMs": {
+                      "type": [
+                        "null",
+                        "integer"
+                      ]
+                    },
+                    "activeTransport": {
+                      "type": "string",
+                      "enum": [
+                        "chrome",
+                        "android"
+                      ]
+                    },
+                    "mode": {
+                      "type": [
+                        "null",
+                        "string"
+                      ],
+                      "enum": [
+                        "pull",
+                        "push",
+                        null
+                      ]
+                    },
+                    "health": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "The full normalized snapshot (same object /admin/overview returns as `transport`)."
                     }
                   }
                 }
@@ -5249,16 +5296,22 @@
                         }
                       }
                     },
-                    "counts": {
+                    "queue": {
                       "type": "object",
                       "properties": {
                         "waiting": {
                           "type": "integer"
                         },
-                        "paused": {
+                        "active": {
                           "type": "integer"
                         },
-                        "active": {
+                        "delayed": {
+                          "type": "integer"
+                        },
+                        "prioritized": {
+                          "type": "integer"
+                        },
+                        "paused": {
                           "type": "integer"
                         },
                         "completed": {
@@ -5266,22 +5319,40 @@
                         },
                         "failed": {
                           "type": "integer"
-                        },
-                        "delayed": {
-                          "type": "integer"
-                        },
-                        "sent": {
-                          "type": "integer"
-                        },
-                        "unverified": {
-                          "type": "integer"
-                        },
-                        "suppressed": {
-                          "type": "integer"
-                        },
-                        "cancelled": {
-                          "type": "integer"
                         }
+                      }
+                    },
+                    "idle": {
+                      "type": "boolean",
+                      "description": "True when no job is waiting or active. Historical ledger failures never affect it."
+                    },
+                    "ledger": {
+                      "type": "object",
+                      "properties": {
+                        "allTime": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "integer"
+                          }
+                        },
+                        "last24h": {
+                          "type": "object",
+                          "additionalProperties": {
+                            "type": "integer"
+                          }
+                        }
+                      }
+                    },
+                    "transport": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Authoritative transport snapshot (same object /admin/overview returns)."
+                    },
+                    "counts": {
+                      "type": "object",
+                      "description": "Deprecated merged shape: live BullMQ counts with ledger TOTALS for sent/unverified/failed/suppressed/cancelled. New code should read `queue` and `ledger`.",
+                      "additionalProperties": {
+                        "type": "integer"
                       }
                     }
                   }
