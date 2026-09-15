@@ -1,0 +1,52 @@
+name: Spec Kit Governance
+
+# Deterministic repository-state gate. It NEVER runs an LLM-dependent command
+# such as /speckit-converge - only the pinned CLI's own health report plus
+# on-disk validation. The existing CI workflow is intentionally untouched and
+# keeps owning npm check, npm test, frontend artifacts, OpenAPI sync and the
+# pairing/EVE contract drift jobs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  spec-kit-governance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Install the APPROVED, PINNED Spec Kit release. The repository files are
+      # committed; this CLI is only used to report integration health.
+      #
+      # pip is used rather than piping a remote installer script into a shell:
+      # this repository pins every action by SHA and should not curl | sh.
+      # --break-system-packages is the fallback for PEP 668 environments.
+      - name: Install the pinned Spec Kit CLI (v1.0.6)
+        run: |
+          set -euo pipefail
+          SPEC="specify-cli @ git+https://github.com/github/spec-kit.git@v1.0.6"
+          python -m pip install --user --disable-pip-version-check --quiet "$SPEC" \
+            || python -m pip install --user --break-system-packages --disable-pip-version-check --quiet "$SPEC"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          specify --version
+
+      - name: Read integration status using the real CLI
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          specify integration status --json | tee "$RUNNER_TEMP/integration-status.json"
+          echo "---- installed extensions ----"
+          # Spec Kit 1.0.6 has no --json for 'extension list' (it exits 2 with
+          # "No such option"). Human output is printed for the log only; the
+          # machine-readable check reads .specify/extensions/.registry.
+          specify extension list
+
+      - name: Validate repository governance state
+        run: node scripts/check-spec-kit-governance.mjs "$RUNNER_TEMP/integration-status.json"
