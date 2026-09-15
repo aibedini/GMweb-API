@@ -1,4 +1,4 @@
-const test = require("node:test");
+const { test, describe } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const fsp = require("node:fs/promises");
@@ -154,4 +154,76 @@ test("loading a pre-scope key grants no command capability", async (t) => {
   assert.deepEqual(key.scopes, [...DEFAULT_PROJECT_KEY_SCOPES]);
   assert.equal(store.hasScope(key, "commands.create"), false);
   assert.equal(store.hasScope(key, "commands.read"), false);
+});
+
+// The cross-repository guard used to assert that Eve's Python source contained
+// literal endpoint paths. Eve moved endpoint resolution into the shared
+// contract module, the literal disappeared, and CI went red on every pull
+// request while the two contract fixtures still matched byte for byte. These
+// cases pin the checks that actually protect the boundary.
+describe("Eve consumer contract resolution", () => {
+  const { verifyEveConsumer, verifyFixtures, endpointKeysReferencedBy } =
+    require("../scripts/check-eve-contract.js");
+  const localContract = require("../shared/eve-gmweb-contract-v1.json");
+
+  const consumerSource = (keys) => [
+    "from panel.services import gmweb_contract",
+    ...keys.map((key) => `    f"{base}{gmweb_contract.endpoint_path('${key}')}",`),
+    "    headers=gmweb_contract.request_headers(api_key, idempotency_key=idem)",
+  ].join("\n");
+  const CONTRACT_MODULE = "HEADER_IDEMPOTENCY = 'Idempotency-Key'\n";
+
+  test("a consumer that resolves every required key through the contract passes", () => {
+    const result = verifyEveConsumer({
+      localContract,
+      eveSource: consumerSource(["send", "send_capacity", "send_cancel", "post_invalidate", "send_status"]),
+      contractModuleSource: CONTRACT_MODULE,
+    });
+    assert.deepEqual(result.referenced,
+      ["post_invalidate", "send", "send_cancel", "send_capacity", "send_status"]);
+  });
+
+  test("a hard-coded path is no longer what the guard looks for, but losing the contract module is", () => {
+    // The old assertion would have accepted this: the literal path is present.
+    const hardCoded = `url = f"{base}/send/capacity"\nheaders = {'Idempotency-Key': k}\n`;
+    assert.throws(() => verifyEveConsumer({
+      localContract, eveSource: hardCoded, contractModuleSource: CONTRACT_MODULE,
+    }), /shared gmweb_contract module/);
+  });
+
+  test("resolving an endpoint key GMweb does not define fails", () => {
+    assert.throws(() => verifyEveConsumer({
+      localContract,
+      eveSource: consumerSource(["send", "send_capacity", "send_cancel", "post_invalidate", "send_status", "send_telepathy"]),
+      contractModuleSource: CONTRACT_MODULE,
+    }), /which GMweb does not define/);
+  });
+
+  test("dropping a lifecycle-critical endpoint fails", () => {
+    assert.throws(() => verifyEveConsumer({
+      localContract,
+      eveSource: consumerSource(["send", "send_capacity", "send_cancel", "post_invalidate"]),
+      contractModuleSource: CONTRACT_MODULE,
+    }), /no longer resolves the "send_status" endpoint/);
+  });
+
+  test("the contract module must own the Idempotency-Key header name", () => {
+    assert.throws(() => verifyEveConsumer({
+      localContract,
+      eveSource: consumerSource(["send", "send_capacity", "send_cancel", "post_invalidate", "send_status"]),
+      contractModuleSource: "# nothing here\n",
+    }), /Idempotency-Key header name/);
+  });
+
+  test("only endpoint_path() calls count as contract resolution", () => {
+    const keys = endpointKeysReferencedBy(
+      "gmweb_contract.endpoint_path('send')\nother.endpoint_path('nope')\n# endpoint_path('send_cancel')\n");
+    assert.deepEqual([...keys].sort(), ["nope", "send"]);
+  });
+
+  test("a drifted fixture still fails", () => {
+    const drifted = JSON.parse(JSON.stringify(localContract));
+    drifted.endpoints[0].path = "/definitely-not-the-same";
+    assert.throws(() => verifyFixtures(localContract, drifted), /contract fixtures differ/);
+  });
 });
