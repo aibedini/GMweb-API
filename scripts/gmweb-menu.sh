@@ -687,6 +687,11 @@ update_app() {
     echo "${C_RED}Could not stage the candidate; the live checkout was not touched.${C_RESET}"
     return 1
   fi
+  # mktemp creates a 0700 root-only directory while the validation below runs as
+  # the APP USER: hand the stage over first, or every gate fails with a silent
+  # "Permission denied" and the candidate is rejected for the wrong reason.
+  chmod 755 "$stage"
+  chown -R "$APP_USER:$APP_USER" "$stage"
 
   echo "Validating the candidate in $stage (live service keeps running, queue NOT paused yet)..."
   if ! run_as_app "cd '$stage' && GMWEB_BUILD_REVISION='$candidate' npm ci --include=dev && npm run check && npm test && npm run build:frontends"; then
