@@ -885,14 +885,42 @@ test("dashboard status refresh is single-flight and skipped during sidebar warm-
 });
 
 test("browser lock timeout includes time spent waiting for the previous owner", async () => {
+  // The contract is that the budget covers WAITING, so once the wait alone has
+  // consumed it the action must never run.
+  //
+  // This used to be asserted as `Date.now() - started < 500` - a wall-clock
+  // bound on a 30 ms timer. `node --test` runs test files concurrently, and
+  // under that load a timer can fire far later than requested, so the assertion
+  // failed for reasons that had nothing to do with the lock. It was measured at
+  // 1 failure in 6 full-suite runs locally. Asserting that the action never
+  // executes is the same contract with no clock in it.
   const c = client();
+  let actionRan = false;
   c.actionLock = new Promise(() => {});
-  const started = Date.now();
   await assert.rejects(
-    c.withBrowserLock(async () => true, { timeoutMs: 30 }),
+    c.withBrowserLock(async () => { actionRan = true; return true; }, { timeoutMs: 30 }),
     /browser_lock_wait_timeout/
   );
-  assert(Date.now() - started < 500);
+  assert.equal(actionRan, false,
+    "the action must not run once waiting alone has consumed the whole budget");
+});
+
+test("a wait that consumes the budget leaves only the remainder for the action", async () => {
+  // Deterministic companion to the case above: the previous owner releases the
+  // lock well inside the budget, so this owner does reach its action - but with
+  // only the remaining slice. A slow action must therefore lose the race to the
+  // watchdog. Both assertions here are on WHICH error wins, never on elapsed
+  // time, so scheduler delays cannot flip the outcome.
+  const c = client();
+  let release;
+  c.actionLock = new Promise((resolve) => { release = resolve; });
+  const waiting = c.withBrowserLock(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    return "finished";
+  }, { timeoutMs: 60 });
+  // 20 ms of a 60 ms budget: the action is left ~40 ms for work that takes 400.
+  setTimeout(release, 20);
+  await assert.rejects(waiting, /browser_lock_timeout/);
 });
 
 test("idempotent sends receive a complete durable SQLite timeline", () => {

@@ -61,6 +61,13 @@ class EventStore {
     this.onEventsAccepted = opts.onEventsAccepted || null;
     this.log = opts.log || null;
     this.debug = opts.debug || null;
+    // ONE clock for the whole store. Time-window behaviour (event retention age,
+    // ACK freshness) is a comparison against the wall clock, which made those
+    // tests race the millisecond: an event written and compacted inside the same
+    // millisecond was never "older than now". Injecting the clock makes the
+    // window deterministic under test and changes nothing in production, where
+    // the default is the real clock. Same convention as commandEngine/sendPacing.
+    this.now = typeof opts.now === "function" ? opts.now : () => Date.now();
     this.db = db;
     db.exec(`
       CREATE TABLE IF NOT EXISTS event_counters (
@@ -276,7 +283,7 @@ class EventStore {
           String(event.encoding || "envelope.v1"),
           Number(event.schemaVersion) || 1,
           Number(event.cryptoVersion) || 0,
-          Date.now()
+          this.now()
         );
         if (info.changes > 0) {
           this.bumpSeqStmt.run(accountId);
@@ -285,7 +292,7 @@ class EventStore {
           const conversationId = event.conversationId ? String(event.conversationId) : "";
           const messageId = event.messageId ? String(event.messageId) : "";
           const eventType = String(event.type || "UNKNOWN");
-          const now = Date.now();
+          const now = this.now();
           if (messageId && conversationId && ["MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED", "MESSAGE_DELETED"].includes(eventType)) {
             this.upsertMessageStateStmt.run(
               accountId, messageId, conversationId, revision, sortKey,
@@ -350,7 +357,7 @@ class EventStore {
     `);
     let row = select.get(accountId);
     if (!row) {
-      const now = Date.now();
+      const now = this.now();
       this.db.prepare(`
         INSERT OR IGNORE INTO replica_metadata
           (account_id, replica_generation, snapshot_version, minimum_available_sequence,
@@ -384,19 +391,24 @@ class EventStore {
         replica_generation = excluded.replica_generation,
         snapshot_version = excluded.snapshot_version,
         updated_at = excluded.updated_at
-    `).run(accountId, linkedDeviceId, cursor, replicaGeneration, snapshotVersion, Date.now());
+    `).run(accountId, linkedDeviceId, cursor, replicaGeneration, snapshotVersion, this.now());
     return { ok: true, cursor };
   }
 
   compact(accountId, { retainEvents = 100000, retainMs = 7 * 24 * 60 * 60 * 1000, limit = 5000 } = {}) {
-    const startedAt = Date.now();
+    const startedAt = this.now();
+    // ONE clock read for the whole pass. The candidate SELECT and the DELETE
+    // must agree on the window: reading the clock again between them let it
+    // tick, so a row could be selected as a candidate and then fail to match
+    // the DELETE predicate (or the reverse).
+    const now = startedAt;
     const highWatermark = this.highWatermark(accountId);
     const ackState = this.db.prepare(`
       SELECT MIN(CASE WHEN updated_at >= ? THEN last_acked_sequence END) AS activeSequence,
              COUNT(*) AS clientCount
       FROM linked_client_sync_state WHERE account_id = ?
-    `).get(Date.now() - retainMs, accountId);
-    if (!ackState.clientCount) return { rowsRemoved: 0, durationMs: Date.now() - startedAt };
+    `).get(now - retainMs, accountId);
+    if (!ackState.clientCount) return { rowsRemoved: 0, durationMs: this.now() - startedAt };
     const ack = Number.isSafeInteger(ackState.activeSequence) ? ackState.activeSequence : highWatermark;
     const maxSequence = Math.min(ack, Math.max(0, highWatermark - retainEvents));
     const candidates = this.db.prepare(`
@@ -407,8 +419,8 @@ class EventStore {
           'CONVERSATION_UPSERT', 'CONVERSATION_UPSERTED', 'CONVERSATION_DELETED', 'THREAD_READ'
         )
       ORDER BY sequence ASC LIMIT ?
-    `).all(accountId, maxSequence, Date.now() - retainMs, Math.max(1, Math.min(5000, limit)));
-    if (candidates.length === 0) return { rowsRemoved: 0, durationMs: Date.now() - startedAt };
+    `).all(accountId, maxSequence, now - retainMs, Math.max(1, Math.min(5000, limit)));
+    if (candidates.length === 0) return { rowsRemoved: 0, durationMs: this.now() - startedAt };
     const lastDeleted = candidates.at(-1).sequence;
     const result = this.db.transaction(() => {
       const removed = this.db.prepare(`
@@ -421,7 +433,7 @@ class EventStore {
             )
           ORDER BY sequence ASC LIMIT ?
         )
-      `).run(accountId, accountId, maxSequence, Date.now() - retainMs, candidates.length).changes;
+      `).run(accountId, accountId, maxSequence, now - retainMs, candidates.length).changes;
       this.db.prepare(`
         UPDATE replica_metadata
         SET minimum_available_sequence = MAX(minimum_available_sequence, ?)
@@ -431,7 +443,7 @@ class EventStore {
     })();
     const report = {
       rowsRemoved: result,
-      durationMs: Date.now() - startedAt,
+      durationMs: this.now() - startedAt,
       minimumAvailableSequence: this.replicaMetadata(accountId).minimumAvailableSequence,
     };
     this.log?.(`compaction rowsRemoved=${report.rowsRemoved} durationMs=${report.durationMs} minimumAvailableSequence=${report.minimumAvailableSequence}`);
