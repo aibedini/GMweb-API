@@ -180,20 +180,28 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
   });
 
   test("compaction keeps key events and rebuildable contact history", () => {
-    const store = new EventStore(new Database(":memory:"));
+    // The store clock is injected so the retention window is deterministic.
+    // This test used to rely on the wall clock advancing between ingest and
+    // compact, which made it pass or fail at random: ingest stamps created_at
+    // from the clock, and `retainMs: 0` compacts only rows strictly older than
+    // "now", so a row written and compacted in the same millisecond was never
+    // eligible and compaction silently removed nothing.
+    let clock = 1_000_000;
+    const store = new EventStore(new Database(":memory:"), { now: () => clock });
     const events = [
-      { eventId: "contacts-snapshot", type: "CONTACTS_SNAPSHOT", payload: Buffer.from("snapshot"), cryptoVersion: 1, createdAt: 1 },
+      { eventId: "contacts-snapshot", type: "CONTACTS_SNAPSHOT", payload: Buffer.from("snapshot"), cryptoVersion: 1 },
       ...Array.from({ length: 8 }, (_, index) => ({
         eventId: `message-${index}`, type: "MESSAGE_CREATED", conversationId: "thread",
-        payload: Buffer.from(`cipher-${index}`), cryptoVersion: 3, createdAt: 1,
+        payload: Buffer.from(`cipher-${index}`), cryptoVersion: 3,
       })),
-      { eventId: "contacts-change", type: "CONTACTS_CHANGED", payload: Buffer.from("change"), cryptoVersion: 1, createdAt: 1 },
-      { eventId: "key", type: "KEY_GRANT", payload: Buffer.from(JSON.stringify({ deviceId: "web" })), cryptoVersion: 1, createdAt: 1 },
+      { eventId: "contacts-change", type: "CONTACTS_CHANGED", payload: Buffer.from("change"), cryptoVersion: 1 },
+      { eventId: "key", type: "KEY_GRANT", payload: Buffer.from(JSON.stringify({ deviceId: "web" })), cryptoVersion: 1 },
     ];
     store.ingestBatch({ accountId: "a", events });
     const metadata = store.replicaMetadata("a");
     store.acknowledgeClient("a", "web", 11, metadata.replicaGeneration, metadata.snapshotVersion);
 
+    clock += 1;
     const report = store.compact("a", { retainEvents: 2, retainMs: 0, limit: 100 });
     assert.equal(report.rowsRemoved, 8);
     assert.equal(report.minimumAvailableSequence, 10);
@@ -202,6 +210,30 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     assert.deepEqual(store.bootstrap("a").contactEvents.map(event => event.eventId),
       ["contacts-snapshot", "contacts-change"]);
     assert.deepEqual(store.deviceGrantsAfter("a", "web", 0).events.map(event => event.eventId), ["key"]);
+  });
+
+  test("compaction eligibility is a strict comparison against one clock read", () => {
+    // Pins the exact boundary that made the suite flaky. Ingest stamps
+    // created_at from the store clock, so the compaction window must be judged
+    // against that same clock and with a strict "<": a row written in the
+    // current instant is NOT older than the window.
+    let clock = 5_000;
+    const store = new EventStore(new Database(":memory:"), { now: () => clock });
+    store.ingestBatch({ accountId: "a", events: [
+      { eventId: "m1", type: "MESSAGE_CREATED", conversationId: "t", payload: Buffer.from("c1"), cryptoVersion: 3 },
+    ] });
+    const metadata = store.replicaMetadata("a");
+    store.acknowledgeClient("a", "web", 1, metadata.replicaGeneration, metadata.snapshotVersion);
+
+    // Same instant: nothing is strictly older than "now", so nothing may go.
+    assert.equal(store.compact("a", { retainEvents: 0, retainMs: 0, limit: 100 }).rowsRemoved, 0);
+
+    // One millisecond later the very same row IS older than the window.
+    clock += 1;
+    assert.equal(store.compact("a", { retainEvents: 0, retainMs: 0, limit: 100 }).rowsRemoved, 1);
+
+    // A second pass at the same instant has nothing left to remove.
+    assert.equal(store.compact("a", { retainEvents: 0, retainMs: 0, limit: 100 }).rowsRemoved, 0);
   });
 
   test("newer conversation tombstone cannot be resurrected by stale snapshot", () => {
