@@ -27,7 +27,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      # gitleaks-action v2 requires GITHUB_TOKEN to enumerate the commits of a
+      # pull request. Without it the job died with
+      # "GITHUB_TOKEN is now required to scan pull requests" and the Security
+      # workflow was red on every PR - a configuration failure that looked like
+      # a detector failure. It scans nothing without this.
       - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
