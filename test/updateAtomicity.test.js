@@ -98,6 +98,51 @@ test("case 7: adoption validates the staged release before replacing the install
   assert.ok(body.includes("npm ci --omit=dev"), "production deps are installed after the swap");
 });
 
+test("case 24: the staged candidate is handed to the app user BEFORE any gate runs", () => {
+  // Field defect: update_app created its stage with mktemp -d, which is 0700 and
+  // root-owned, while every gate below runs through run_as_app. APP_USER could
+  // not even traverse the stage, so a perfectly valid candidate was rejected
+  // with a bare "cd: Permission denied" and the operator saw a failed update for
+  // the wrong reason. The handover MUST therefore precede the first gate.
+  const body = fnBody(MENU, "update_app() {");
+
+  const stageAt = body.indexOf('stage="$(mktemp -d');
+  assert.ok(stageAt !== -1, "update_app stages the candidate with mktemp -d");
+
+  const chmodAt = body.indexOf('chmod 755 "$stage"', stageAt);
+  const chownAt = body.indexOf('chown -R "$APP_USER:$APP_USER" "$stage"', stageAt);
+  assert.ok(chmodAt !== -1, "the stage root must become traversable by APP_USER");
+  assert.ok(chownAt !== -1, "the stage must be owned by the validating APP_USER");
+
+  const firstGateAt = body.indexOf('run_as_app "cd \'$stage\'', stageAt);
+  assert.ok(firstGateAt !== -1, "the gates run inside the stage as APP_USER");
+  assert.ok(chmodAt < firstGateAt, "chmod must precede the first gate");
+  assert.ok(chownAt < firstGateAt, "chown must precede the first gate");
+  assert.ok(chownAt > stageAt, "the handover happens after extraction, not before mktemp");
+});
+
+test("case 24b: the stage handover widens permissions no further than validation needs", () => {
+  const body = fnBody(MENU, "update_app() {");
+  const modes = [...body.matchAll(/chmod (\d{3,4}) "\$stage"/g)].map((m) => m[1]);
+  assert.ok(modes.length >= 1, "the stage mode is set explicitly");
+  for (const mode of modes) {
+    // Octal: r=4 w=2 x=1. The write bit is 2, not 1 — 755 is r-xr-xr-x and is
+    // correctly NOT group- or world-writable.
+    const [owner, group, other] = mode.slice(-3).split("").map(Number);
+    assert.equal(other & 2, 0, `the stage must not be world-writable (chmod ${mode})`);
+    assert.equal(group & 2, 0, `the stage must not be group-writable (chmod ${mode})`);
+    assert.equal(owner & 2, 2, `the validating APP_USER must be able to write the stage (chmod ${mode})`);
+    assert.equal(other & 1, 1, `the stage must stay traversable for root tooling such as rsync (chmod ${mode})`);
+  }
+  // Consistency: the sibling migration path hands its stage over the same way,
+  // so both update routes validate as the same account under the same model.
+  for (const signature of ["adopt_git_checkout() {"]) {
+    const sibling = fnBody(MENU, signature);
+    assert.ok(/chown -R "\$APP_USER:\$APP_USER" "\$stage"/.test(sibling),
+      `${signature} must also hand its stage to APP_USER`);
+  }
+});
+
 test("case 23: deploy-gmweb.sh keeps the same ordering guarantees", () => {
   assertOrder(DEPLOY, [
     'git archive "$CANDIDATE"',                 // staged, live untouched
