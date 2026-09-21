@@ -195,6 +195,8 @@ Used by the Messages Android app when the transport is `android` in pull mode.
   same shared device key as pull. It never opens a poll or refreshes liveness.
 * `GET /gateway/status` — detailed read-only server-side pull-bridge status.
   It never claims or mutates a task.
+  Diagnostic probes are rate-limited and return `429 rate_limited` with
+  `Retry-After` when their allowance is exceeded.
 
 * `GET /gateway/pull?waitMs=25000` — long-poll for the next task. Tasks whose
   lifecycle was invalidated are terminalized as superseded and never handed out.
@@ -221,6 +223,7 @@ Verifies the independently signed AgentAuth/control-plane identity and returns
 the authenticated device ID and role. It performs no durable application/sync
 mutation. A successful agent ping says nothing about `/gateway/*` Device Key
 health, and a successful gateway ping says nothing about AgentAuth.
+The probe is rate-limited independently from event ingestion.
 
 ### GET /admin/gateway-diagnostics
 

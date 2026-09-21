@@ -26,6 +26,7 @@ function registerGatewayRoutes(app, deps = {}) {
     isPullModeActive = () => true,
     checkRateLimit = null,
     validateLimit = { max: 600, windowMs: 60000 },
+    diagnosticLimit = { max: 120, windowMs: 60000 },
     log = null,
     telemetry = null
   } = deps;
@@ -88,6 +89,15 @@ function registerGatewayRoutes(app, deps = {}) {
     reply.code(401).send({ error: "unauthorized" });
   };
 
+  function enforceRateLimit(request, reply, bucket, limit) {
+    if (!checkRateLimit) return true;
+    const result = checkRateLimit(request, bucket, limit.max, limit.windowMs);
+    if (result.allowed) return true;
+    reply.header("retry-after", String(result.retryAfterSeconds));
+    reply.code(429).send({ error: "rate_limited" });
+    return false;
+  }
+
   function bridgeSnapshot() {
     const live = outbox.readyState();
     const observed = telemetry?.snapshot() || {};
@@ -131,10 +141,11 @@ function registerGatewayRoutes(app, deps = {}) {
       summary: "Verify Android pull-bridge credentials and reachability",
       description: "Uses the same X-API-Key as pull/validate/ack and does not refresh pull liveness.",
       tags: ["Gateway"],
-      response: { 200: gatewayStatusSchema, 401: { type: "object", properties: { error: { type: "string" } } }, 409: { type: "object", properties: { error: { type: "string" } } } }
+      response: { 200: gatewayStatusSchema, 401: { type: "object", properties: { error: { type: "string" } } }, 409: { type: "object", properties: { error: { type: "string" } } }, 429: { type: "object", properties: { error: { type: "string" } } } }
     }
   }, async (request, reply) => {
     if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-ping", diagnosticLimit)) return;
     if (!isPullModeActive()) return reply.code(409).send({ error: "pull_mode_inactive" });
     return { ok: true, serverTime: Date.now(), transport: "android-pull", pullModeActive: true, deviceKeyAccepted: true, protocolVersion: 1, bridge: bridgeSnapshot() };
   });
@@ -144,10 +155,11 @@ function registerGatewayRoutes(app, deps = {}) {
       summary: "Read Android pull-bridge status",
       description: "Detailed read-only bridge status using the shared gateway device key.",
       tags: ["Gateway"],
-      response: { 200: gatewayStatusSchema, 401: { type: "object", properties: { error: { type: "string" } } }, 409: { type: "object", properties: { error: { type: "string" } } } }
+      response: { 200: gatewayStatusSchema, 401: { type: "object", properties: { error: { type: "string" } } }, 409: { type: "object", properties: { error: { type: "string" } } }, 429: { type: "object", properties: { error: { type: "string" } } } }
     }
   }, async (request, reply) => {
     if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-status", diagnosticLimit)) return;
     if (!isPullModeActive()) return reply.code(409).send({ error: "pull_mode_inactive" });
     return { ok: true, serverTime: Date.now(), transport: "android-pull", pullModeActive: true, deviceKeyAccepted: true, protocolVersion: 1, bridge: bridgeSnapshot() };
   });
@@ -263,14 +275,7 @@ function registerGatewayRoutes(app, deps = {}) {
     }
   }, async (request, reply) => {
     if (!checkDeviceKey(request)) return unauthorized(request, reply);
-    if (checkRateLimit) {
-      const limit = checkRateLimit(request, "gateway-validate", validateLimit.max, validateLimit.windowMs);
-      if (!limit.allowed) {
-        reply.header("retry-after", String(limit.retryAfterSeconds));
-        reply.code(429).send({ error: "rate_limited" });
-        return;
-      }
-    }
+    if (!enforceRateLimit(request, reply, "gateway-validate", validateLimit)) return;
     const requestId = String(request.body?.requestId || "").slice(0, MAX_REQUEST_ID);
     if (!requestId) {
       reply.code(400).send({ error: "invalid_body" });

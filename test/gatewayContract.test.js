@@ -131,6 +131,24 @@ test("gateway status is read-only and inactive pull mode returns 409", async () 
   });
 });
 
+test("gateway diagnostic probes use the existing request limiter", async () => {
+  await withHarness(async (h) => {
+    let calls = 0;
+    const app = await h.buildGatewayApp({
+      checkRateLimit: () => (++calls > 1
+        ? { allowed: false, retryAfterSeconds: 9 }
+        : { allowed: true, retryAfterSeconds: 0 })
+    });
+    const first = await app.inject({ method: "GET", url: "/gateway/ping", headers: { "x-api-key": h.deviceKey } });
+    const limited = await app.inject({ method: "GET", url: "/gateway/ping", headers: { "x-api-key": h.deviceKey } });
+    assert.equal(first.statusCode, 200);
+    assert.equal(limited.statusCode, 429);
+    assert.equal(limited.headers["retry-after"], "9");
+    assert.deepEqual(limited.json(), { error: "rate_limited" });
+    await app.close();
+  });
+});
+
 test("legacy pull works while explicit IDs track distinct devices separately from active polls", async () => {
   await withHarness(async (h) => {
     let now = 1_700_000_000_000;

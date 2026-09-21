@@ -422,16 +422,26 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
             role: { type: ["string", "null"] },
             protocolVersion: { type: "integer" }
           }
-        }
+        },
+        429: { type: "object", properties: { error: { type: "string" } } }
       }
     }
-  }, async (request) => ({
-    ok: true,
-    serverTime: Date.now(),
-    deviceId: request.authenticatedAgentId,
-    role: agentAuthService?.getRole?.(request.authenticatedAgentId) || null,
-    protocolVersion: 1
-  }));
+  }, async (request, reply) => {
+    if (checkRateLimit) {
+      const limit = checkRateLimit(request, "agent-ping", 120, 60_000);
+      if (!limit.allowed) {
+        reply.header("retry-after", String(limit.retryAfterSeconds));
+        return reply.code(429).send({ error: "rate_limited" });
+      }
+    }
+    return {
+      ok: true,
+      serverTime: Date.now(),
+      deviceId: request.authenticatedAgentId,
+      role: agentAuthService?.getRole?.(request.authenticatedAgentId) || null,
+      protocolVersion: 1
+    };
+  });
 
   // ── Event batch upload + cursor sync (PR-09, §54/§55, LOCK 10) ──────────
 
