@@ -8,13 +8,14 @@
 
 ## Summary
 
-The original missing-limiter behavior no longer reproduces: the injected limiter is consulted and an exceeded diagnostic allowance returns 429 with Retry-After. The complete local regression suite and artifact checks pass.
+The original missing-limiter behavior no longer reproduces: the injected limiter is consulted and exceeded diagnostic or operational allowances return 429 with Retry-After before bridge work. The complete local regression suite and artifact checks pass.
 
 ## Checks Performed
 
 | Check | Command / Action | Result | Notes |
 |-------|------------------|--------|-------|
 | Reproduction after fix | Gateway contract sends two probes through a one-request allowance | pass | Second request returns 429 and does not enter bridge logic. |
+| Pull/ACK limiter | Gateway contract rejects pull and ACK through an exceeded allowance | pass | Both return 429 before outbox work. |
 | New and updated tests | `node --test test/gatewayContract.test.js test/gatewayAuthSeparation.test.js test/controlPlaneApi.test.js` | pass | Rate limiting and auth independence remain correct. |
 | Regression suite | `npm test` | pass | Complete repository suite passed. |
 | Syntax check | `npm run check` | pass | All configured syntax checks passed. |

@@ -7,13 +7,13 @@
 
 ## Summary
 
-Reused the repository's injected request limiter for gateway ping/status and AgentAuth ping. Diagnostic abuse now receives `429 rate_limited` without changing pull liveness, queue state or delivery decisions.
+Reused the repository's injected request limiter for gateway ping/status, pull/validate/ACK, and AgentAuth ping. Excessive requests now receive `429 rate_limited` before bridge state is touched, without changing pull liveness, queue state or delivery decisions.
 
 ## Changes
 
 | File | Change | Notes |
 |------|--------|-------|
-| `src/gatewayRoutes.js` | modified | Added a common diagnostic limiter and 429 contracts for ping/status. |
+| `src/gatewayRoutes.js` | modified | Added a common limiter and 429 contracts for all authenticated gateway routes. |
 | `src/controlPlaneRoutes.js` | modified | Added independent AgentAuth ping limiter and 429 contract. |
 | `test/gatewayContract.test.js` | updated test | Pins 429 and Retry-After behavior. |
 | `test/revocationHarness.js` | modified | Exposes the existing limiter injection to contract tests. |
@@ -21,7 +21,7 @@ Reused the repository's injected request limiter for gateway ping/status and Age
 
 ## Tests Added or Updated
 
-- `test/gatewayContract.test.js` — proves diagnostic probes use the injected limiter and return 429 safely.
+- `test/gatewayContract.test.js` — proves diagnostic, pull, and ACK routes use the injected limiter and return 429 safely.
 - Existing auth-separation and control-plane tests prove both authentication dimensions still behave independently.
 
 ## Local Verification
@@ -32,7 +32,7 @@ Reused the repository's injected request limiter for gateway ping/status and Age
 
 ## Deviations from Assessment
 
-AgentAuth ping received the same protection because the CodeQL finding covers authenticated diagnostic probes in both auth dimensions.
+AgentAuth ping and the operational pull/ACK routes received the same protection because the CodeQL finding covers authenticated handlers in both auth dimensions.
 
 ## Follow-ups
 

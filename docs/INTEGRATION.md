@@ -517,6 +517,8 @@ Two authentication dimensions are deliberately independent:
 - `GET /gateway/ping` and `GET /gateway/status` use the shared `X-API-Key`
   protecting the SMS pull bridge. Neither refreshes pull liveness or touches the
   queue. Excessive probes return `429 rate_limited` with `Retry-After`.
+- Pull, validation, and ACK operations have independent generous limits and
+  return the same `429 rate_limited` contract before bridge state is touched.
 - `POST /api/v1/agent/ping` uses signed AgentAuth protecting event/control-plane
   identity and performs no durable application/sync mutation.
 

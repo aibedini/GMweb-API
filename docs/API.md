@@ -198,7 +198,7 @@ Used by the Messages Android app when the transport is `android` in pull mode.
   Diagnostic probes are rate-limited and return `429 rate_limited` with
   `Retry-After` when their allowance is exceeded.
 
-* `GET /gateway/pull?waitMs=25000` — long-poll for the next task. Tasks whose
+* `GET /gateway/pull?waitMs=25000` — rate-limited long-poll for the next task. Tasks whose
   lifecycle was invalidated are terminalized as superseded and never handed out.
   Returns `{task:{requestId,to,text,priority,meta}}` or `{task:null}`. `meta` is
   `null` for sends that carried none, so older builds are unaffected.
@@ -206,7 +206,7 @@ Used by the Messages Android app when the transport is `android` in pull mode.
   gate before the modem: it answers `valid:false, status:"superseded"` the
   instant the service generation is invalidated, including while the task is
   already in flight. It returns no task, customer or message metadata.
-* `POST /gateway/ack` — `{requestId, ok, outcome?, reason?}`.
+* `POST /gateway/ack` — rate-limited `{requestId, ok, outcome?, reason?}`.
   `outcome` is `sent` | `failed` | `superseded`; when omitted it is derived from
   `ok`, so legacy `{requestId, ok}` bodies keep working. `superseded` is
   terminal, not successful, not billable and not retryable. A real submission

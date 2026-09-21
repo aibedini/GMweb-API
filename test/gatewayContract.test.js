@@ -149,6 +149,28 @@ test("gateway diagnostic probes use the existing request limiter", async () => {
   });
 });
 
+test("gateway pull and ack are rate-limited before bridge work", async () => {
+  await withHarness(async (h) => {
+    const app = await h.buildGatewayApp({
+      checkRateLimit: () => ({ allowed: false, retryAfterSeconds: 11 })
+    });
+    const headers = { "x-api-key": h.deviceKey };
+    const pull = await app.inject({ method: "GET", url: "/gateway/pull", headers });
+    const ack = await app.inject({
+      method: "POST",
+      url: "/gateway/ack",
+      headers,
+      payload: { requestId: "not-recorded", ok: true }
+    });
+    for (const response of [pull, ack]) {
+      assert.equal(response.statusCode, 429);
+      assert.equal(response.headers["retry-after"], "11");
+      assert.deepEqual(response.json(), { error: "rate_limited" });
+    }
+    await app.close();
+  });
+});
+
 test("legacy pull works while explicit IDs track distinct devices separately from active polls", async () => {
   await withHarness(async (h) => {
     let now = 1_700_000_000_000;

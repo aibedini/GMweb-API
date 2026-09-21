@@ -25,8 +25,8 @@ function registerGatewayRoutes(app, deps = {}) {
     revocation = null,
     isPullModeActive = () => true,
     checkRateLimit = null,
-    validateLimit = { max: 600, windowMs: 60000 },
     diagnosticLimit = { max: 120, windowMs: 60000 },
+    operationalLimit = { max: 600, windowMs: 60000 },
     log = null,
     telemetry = null
   } = deps;
@@ -203,11 +203,13 @@ function registerGatewayRoutes(app, deps = {}) {
           }
         },
         401: { type: "object", properties: { error: { type: "string" } } },
-        409: { type: "object", properties: { error: { type: "string" } } }
+        409: { type: "object", properties: { error: { type: "string" } } },
+        429: { type: "object", properties: { error: { type: "string" } } }
       }
     }
   }, async (request, reply) => {
     if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-pull", operationalLimit)) return;
     if (!isPullModeActive() || !outbox) {
       reply.code(409).send({ error: "pull_mode_inactive" });
       return;
@@ -275,7 +277,7 @@ function registerGatewayRoutes(app, deps = {}) {
     }
   }, async (request, reply) => {
     if (!checkDeviceKey(request)) return unauthorized(request, reply);
-    if (!enforceRateLimit(request, reply, "gateway-validate", validateLimit)) return;
+    if (!enforceRateLimit(request, reply, "gateway-validate", operationalLimit)) return;
     const requestId = String(request.body?.requestId || "").slice(0, MAX_REQUEST_ID);
     if (!requestId) {
       reply.code(400).send({ error: "invalid_body" });
@@ -376,11 +378,13 @@ function registerGatewayRoutes(app, deps = {}) {
           }
         },
         400: { type: "object", properties: { error: { type: "string" } } },
-        401: { type: "object", properties: { error: { type: "string" } } }
+        401: { type: "object", properties: { error: { type: "string" } } },
+        429: { type: "object", properties: { error: { type: "string" } } }
       }
     }
   }, async (request, reply) => {
     if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-ack", operationalLimit)) return;
     const body = request.body || {};
     const requestId = String(body.requestId || "").slice(0, MAX_REQUEST_ID);
     if (!requestId) {
