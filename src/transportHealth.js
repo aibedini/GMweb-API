@@ -32,7 +32,9 @@ const REASON = Object.freeze({
   ANDROID_GATEWAY_NOT_CONFIGURED: "android_gateway_not_configured",
   CHROME_NOT_PAIRED: "chrome_not_paired",
   CHROME_PROBE_FAILED: "chrome_probe_failed",
-  PULL_BRIDGE_UNAVAILABLE: "pull_bridge_unavailable"
+  PULL_BRIDGE_UNAVAILABLE: "pull_bridge_unavailable",
+  TASK_WAITING_NO_DEVICE: "task_waiting_no_device",
+  INFLIGHT_DEVICE_STALE: "inflight_device_stale"
 });
 
 const DEFAULT_PULL_LIVENESS_MS = 90000;
@@ -56,6 +58,7 @@ function createTransportHealth(deps = {}) {
     chromeClient = null,
     androidClient = null,
     deviceKeyStore = null,
+    gatewayTelemetry = null,
     now = Date.now,
     env = process.env
   } = deps;
@@ -85,6 +88,7 @@ function createTransportHealth(deps = {}) {
       };
     }
     const live = outbox.readyState();
+    const observed = gatewayTelemetry?.snapshot?.() || {};
     const lastPullAt = live.lastPullAt || null;
     const lastPullAgeMs = lastPullAt ? Math.max(0, now() - Date.parse(lastPullAt)) : null;
     const configured = Boolean(deviceKeyStore?.configured);
@@ -100,6 +104,13 @@ function createTransportHealth(deps = {}) {
     } else {
       state = STATE.STALE;
     }
+    const pending = Number(live.pending || 0);
+    const inflight = Number(live.inflight || 0);
+    const operationalReason = !ready && inflight > 0
+      ? REASON.INFLIGHT_DEVICE_STALE
+      : !ready && pending > 0
+        ? REASON.TASK_WAITING_NO_DEVICE
+        : null;
     return {
       configured,
       ready,
@@ -109,11 +120,22 @@ function createTransportHealth(deps = {}) {
       lastPullAgeMs,
       livenessMs,
       waitingPhones: Number(live.waitingPhones || 0),
-      pending: Number(live.pending || 0),
-      inflight: Number(live.inflight || 0),
+      activePolls: observed.activeLongPolls ?? Number(live.waitingPhones || 0),
+      distinctDevices: observed.distinctDevices ?? null,
+      pending,
+      inflight,
+      operationalReason,
       revokedInflight: Number(live.revokedInflight || 0),
       tombstones: Number(live.tombstones || 0),
-      redelivered: Number(live.redelivered || 0)
+      redelivered: Number(live.redelivered || 0),
+      lastSuccessfulPullAt: observed.lastSuccessfulPullAt || null,
+      lastEmptyPullAt: observed.lastEmptyPullAt || null,
+      lastTaskPulledAt: observed.lastTaskPulledAt || null,
+      lastValidateAt: observed.lastValidateAt || null,
+      lastValidateResult: observed.lastValidateResult || null,
+      lastAckAt: observed.lastAckAt || null,
+      lastAckOutcome: observed.lastAckOutcome || null,
+      authFailuresRecent: observed.authFailuresRecent || 0
     };
   }
 
@@ -199,10 +221,21 @@ function createTransportHealth(deps = {}) {
       lastPullAgeMs: current.lastPullAgeMs ?? null,
       livenessMs: current.livenessMs ?? pullLivenessMs(env),
       waitingPhones: current.waitingPhones || 0,
+      activePolls: current.activePolls || 0,
+      distinctDevices: current.distinctDevices ?? null,
       pending: current.pending || 0,
       inflight: current.inflight || 0,
       revokedInflight: current.revokedInflight || 0,
       tombstones: current.tombstones || 0,
+      lastSuccessfulPullAt: current.lastSuccessfulPullAt || null,
+      lastEmptyPullAt: current.lastEmptyPullAt || null,
+      lastTaskPulledAt: current.lastTaskPulledAt || null,
+      lastValidateAt: current.lastValidateAt || null,
+      lastValidateResult: current.lastValidateResult || null,
+      lastAckAt: current.lastAckAt || null,
+      lastAckOutcome: current.lastAckOutcome || null,
+      authFailuresRecent: current.authFailuresRecent || 0,
+      operationalReason: current.operationalReason || null,
       alternatives
     };
   }

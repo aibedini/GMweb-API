@@ -38,6 +38,7 @@ describe("Phase 2 control plane HTTP API", () => {
   before(async () => {
     app = Fastify({ logger: false });
     app.addHook("preHandler", (request, _reply, done) => {
+      if (request.headers["x-test-agent-device"]) request.authenticatedAgentId = String(request.headers["x-test-agent-device"]);
       if (request.headers["x-test-linked"]) request.linkedDevice = {
         deviceId: String(request.headers["x-test-linked"]),
         capabilities: ["READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "CONTACTS_READ"],
@@ -66,6 +67,20 @@ describe("Phase 2 control plane HTTP API", () => {
       },
     });
     await app.ready();
+  });
+
+  test("POST /api/v1/agent/ping returns bound identity without inserting an event", async () => {
+    const before = await app.inject({ method: "GET", url: "/api/v1/sync?after=0" });
+    const ping = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/ping",
+      headers: { "x-test-agent-device": "agent-ping-1", "x-test-agent-role": "PRIMARY_TRUST_AGENT" }
+    });
+    assert.equal(ping.statusCode, 200);
+    assert.equal(ping.json().deviceId, "agent-ping-1");
+    assert.equal(ping.json().protocolVersion, 1);
+    const after = await app.inject({ method: "GET", url: "/api/v1/sync?after=0" });
+    assert.deepEqual(after.json(), before.json());
   });
 
   after(async () => {

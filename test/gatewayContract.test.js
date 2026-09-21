@@ -6,6 +6,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createHarness } = require("./revocationHarness");
+const { GatewayPresenceTracker } = require("../src/gatewayPresence");
 
 function withHarness(fn) {
   const harness = createHarness();
@@ -92,6 +93,58 @@ test("pull requires the device key and an active pull transport", async () => {
     const denied = await app.inject({ method: "GET", url: "/gateway/pull" });
     assert.equal(denied.statusCode, 401);
     assert.deepEqual(denied.json(), { error: "unauthorized" });
+    await app.close();
+  });
+});
+
+test("gateway ping uses pull key and does not mutate pull liveness", async () => {
+  await withHarness(async (h) => {
+    const telemetry = new GatewayPresenceTracker();
+    const app = await h.buildGatewayApp({ telemetry });
+    const before = h.outbox.readyState().lastPullAt;
+    const ok = await app.inject({ method: "GET", url: "/gateway/ping", headers: { "x-api-key": h.deviceKey } });
+    assert.equal(ok.statusCode, 200);
+    assert.equal(ok.json().deviceKeyAccepted, true);
+    assert.equal(h.outbox.readyState().lastPullAt, before);
+    const denied = await app.inject({ method: "GET", url: "/gateway/ping", headers: { "x-api-key": "wrong" } });
+    assert.equal(denied.statusCode, 401);
+    assert.equal(telemetry.snapshot().authFailuresRecent, 1);
+    await app.close();
+  });
+});
+
+test("gateway status is read-only and inactive pull mode returns 409", async () => {
+  await withHarness(async (h) => {
+    const telemetry = new GatewayPresenceTracker();
+    const app = await h.buildGatewayApp({ telemetry });
+    const before = h.outbox.readyState().lastPullAt;
+    const status = await app.inject({ method: "GET", url: "/gateway/status", headers: { "x-api-key": h.deviceKey } });
+    assert.equal(status.statusCode, 200);
+    assert.equal(status.json().bridge.lastPullAt, before);
+    assert.equal(h.outbox.readyState().lastPullAt, before);
+    await app.close();
+
+    const inactive = await h.buildGatewayApp({ telemetry, isPullModeActive: () => false });
+    const conflict = await inactive.inject({ method: "GET", url: "/gateway/status", headers: { "x-api-key": h.deviceKey } });
+    assert.equal(conflict.statusCode, 409);
+    await inactive.close();
+  });
+});
+
+test("legacy pull works while explicit IDs track distinct devices separately from active polls", async () => {
+  await withHarness(async (h) => {
+    let now = 1_700_000_000_000;
+    const telemetry = new GatewayPresenceTracker({ now: () => now });
+    const app = await h.buildGatewayApp({ telemetry });
+    await app.inject({ method: "GET", url: "/gateway/pull?waitMs=1000", headers: { "x-api-key": h.deviceKey } });
+    assert.equal(telemetry.snapshot().distinctDevices, null);
+    for (const id of ["phone-a", "phone-b"]) {
+      now += 1;
+      await app.inject({ method: "GET", url: "/gateway/pull?waitMs=1000", headers: { "x-api-key": h.deviceKey, "x-gateway-device-id": id } });
+    }
+    const snapshot = telemetry.snapshot();
+    assert.equal(snapshot.activeLongPolls, 0);
+    assert.equal(snapshot.distinctDevices, 2);
     await app.close();
   });
 });
