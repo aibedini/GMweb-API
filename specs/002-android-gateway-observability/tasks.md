@@ -39,7 +39,7 @@
 - [x] T017 Update package version, `docs/API.md` and `docs/INTEGRATION.md`
 - [x] T018 Regenerate and verify `docs/openapi.json` using the repository workflow
 - [x] T019 Run focused tests then the one final complete gate
-- [ ] T020 Run Ponytail review, address findings, approve unchanged state, commit logical groups and push the feature branch
+- [x] T020 Run Ponytail review, address findings, approve unchanged state, commit logical groups and push the feature branch
 
 ## Dependencies & Execution Order
 
