@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.3",
+    "version": "0.19.5",
     "contact": {
       "name": "GMweb API"
     }
@@ -454,6 +454,12 @@
                     },
                     "version": {
                       "type": "string"
+                    },
+                    "serverTime": {
+                      "type": "integer"
+                    },
+                    "uptimeSeconds": {
+                      "type": "integer"
                     }
                   }
                 }
@@ -841,7 +847,17 @@
                     },
                     "androidDevices": {
                       "type": "integer",
-                      "description": "Devices currently long-polling (pull mode)."
+                      "deprecated": true,
+                      "description": "Deprecated compatibility alias for active polls; not a device count."
+                    },
+                    "androidActivePolls": {
+                      "type": "integer"
+                    },
+                    "androidDistinctDevices": {
+                      "type": [
+                        "null",
+                        "integer"
+                      ]
                     },
                     "androidPending": {
                       "type": "integer",
@@ -881,6 +897,21 @@
                       "type": [
                         "null",
                         "integer"
+                      ]
+                    },
+                    "androidLivenessMs": {
+                      "type": "integer"
+                    },
+                    "androidLastAckAt": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "androidLastTaskPulledAt": {
+                      "type": [
+                        "null",
+                        "string"
                       ]
                     },
                     "activeTransport": {
@@ -977,6 +1008,28 @@
                       "type": "string"
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/gateway-diagnostics": {
+      "get": {
+        "summary": "Privacy-safe Android pull-bridge diagnostics",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Returns operational gateway telemetry without keys, recipients, message bodies or raw request identifiers. **Master token only.**",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }
@@ -1091,6 +1144,186 @@
         }
       }
     },
+    "/gateway/ping": {
+      "get": {
+        "summary": "Verify Android pull-bridge credentials and reachability",
+        "tags": [
+          "Gateway"
+        ],
+        "description": "Uses the same X-API-Key as pull/validate/ack and does not refresh pull liveness.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "serverTime": {
+                      "type": "integer"
+                    },
+                    "transport": {
+                      "type": "string"
+                    },
+                    "pullModeActive": {
+                      "type": "boolean"
+                    },
+                    "deviceKeyAccepted": {
+                      "type": "boolean"
+                    },
+                    "protocolVersion": {
+                      "type": "integer"
+                    },
+                    "bridge": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/gateway/status": {
+      "get": {
+        "summary": "Read Android pull-bridge status",
+        "tags": [
+          "Gateway"
+        ],
+        "description": "Detailed read-only bridge status using the shared gateway device key.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "serverTime": {
+                      "type": "integer"
+                    },
+                    "transport": {
+                      "type": "string"
+                    },
+                    "pullModeActive": {
+                      "type": "boolean"
+                    },
+                    "deviceKeyAccepted": {
+                      "type": "boolean"
+                    },
+                    "protocolVersion": {
+                      "type": "integer"
+                    },
+                    "bridge": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/gateway/pull": {
       "get": {
         "summary": "Android device pulls the next queued send",
@@ -1189,6 +1422,21 @@
             }
           },
           "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
             "description": "Default Response",
             "content": {
               "application/json": {
@@ -1449,6 +1697,21 @@
             }
           },
           "401": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
             "description": "Default Response",
             "content": {
               "application/json": {
@@ -2072,6 +2335,62 @@
             }
           },
           "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/agent/ping": {
+      "post": {
+        "summary": "Verify Android AgentAuth identity",
+        "tags": [
+          "Agent"
+        ],
+        "description": "Validates the control-plane identity with no durable application/sync mutation.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "serverTime": {
+                      "type": "integer"
+                    },
+                    "deviceId": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "protocolVersion": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
             "description": "Default Response",
             "content": {
               "application/json": {

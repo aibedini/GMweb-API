@@ -405,6 +405,44 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     return { ok: true };
   });
 
+  // Pure control-plane credential probe. The global /api/v1/agent/* gate has
+  // already verified the signature exactly once and bound this identity.
+  app.post("/api/v1/agent/ping", {
+    schema: {
+      summary: "Verify Android AgentAuth identity",
+      description: "Validates the control-plane identity with no durable application/sync mutation.",
+      tags: ["Agent"],
+      response: {
+        200: {
+          type: "object",
+          properties: {
+            ok: { type: "boolean" },
+            serverTime: { type: "integer" },
+            deviceId: { type: "string" },
+            role: { type: ["string", "null"] },
+            protocolVersion: { type: "integer" }
+          }
+        },
+        429: { type: "object", properties: { error: { type: "string" } } }
+      }
+    }
+  }, async (request, reply) => {
+    if (checkRateLimit) {
+      const limit = checkRateLimit(request, "agent-ping", 120, 60_000);
+      if (!limit.allowed) {
+        reply.header("retry-after", String(limit.retryAfterSeconds));
+        return reply.code(429).send({ error: "rate_limited" });
+      }
+    }
+    return {
+      ok: true,
+      serverTime: Date.now(),
+      deviceId: request.authenticatedAgentId,
+      role: agentAuthService?.getRole?.(request.authenticatedAgentId) || null,
+      protocolVersion: 1
+    };
+  });
+
   // ── Event batch upload + cursor sync (PR-09, §54/§55, LOCK 10) ──────────
 
   app.post("/api/v1/agent/events/batch", {

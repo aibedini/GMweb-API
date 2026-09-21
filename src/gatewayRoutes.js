@@ -25,8 +25,10 @@ function registerGatewayRoutes(app, deps = {}) {
     revocation = null,
     isPullModeActive = () => true,
     checkRateLimit = null,
-    validateLimit = { max: 600, windowMs: 60000 },
-    log = null
+    diagnosticLimit = { max: 120, windowMs: 60000 },
+    operationalLimit = { max: 600, windowMs: 60000 },
+    log = null,
+    telemetry = null
   } = deps;
   if (!outbox) throw new Error("registerGatewayRoutes requires an outbox");
 
@@ -80,9 +82,87 @@ function registerGatewayRoutes(app, deps = {}) {
     }
   }
 
-  const unauthorized = (reply) => {
+  const deviceId = (request) => request.headers["x-gateway-device-id"] || null;
+  const unauthorized = (request, reply) => {
+    telemetry?.recordAuthFailure();
+    log?.warn?.({ event: "gateway_auth_failed" }, "gateway authentication failed");
     reply.code(401).send({ error: "unauthorized" });
   };
+
+  function enforceRateLimit(request, reply, bucket, limit) {
+    if (!checkRateLimit) return true;
+    const result = checkRateLimit(request, bucket, limit.max, limit.windowMs);
+    if (result.allowed) return true;
+    reply.header("retry-after", String(result.retryAfterSeconds));
+    reply.code(429).send({ error: "rate_limited" });
+    return false;
+  }
+
+  function bridgeSnapshot() {
+    const live = outbox.readyState();
+    const observed = telemetry?.snapshot() || {};
+    return {
+      state: live.state,
+      reason: live.reason,
+      lastPullAt: live.lastPullAt,
+      lastPullAgeMs: live.lastPullAgeMs,
+      lastSuccessfulPullAt: observed.lastSuccessfulPullAt || null,
+      lastEmptyPullAt: observed.lastEmptyPullAt || null,
+      lastTaskPulledAt: observed.lastTaskPulledAt || null,
+      lastValidateAt: observed.lastValidateAt || null,
+      lastValidateResult: observed.lastValidateResult || null,
+      lastAckAt: observed.lastAckAt || null,
+      lastAckOutcome: observed.lastAckOutcome || null,
+      livenessMs: live.livenessMs,
+      activePolls: observed.activeLongPolls ?? Number(live.waitingPhones || 0),
+      distinctDevices: observed.distinctDevices ?? null,
+      pending: Number(live.pending || 0),
+      inflight: Number(live.inflight || 0),
+      revokedInflight: Number(live.revokedInflight || 0),
+      authFailuresRecent: observed.authFailuresRecent || 0
+    };
+  }
+
+  const gatewayStatusSchema = {
+    type: "object",
+    properties: {
+      ok: { type: "boolean" },
+      serverTime: { type: "integer" },
+      transport: { type: "string" },
+      pullModeActive: { type: "boolean" },
+      deviceKeyAccepted: { type: "boolean" },
+      protocolVersion: { type: "integer" },
+      bridge: { type: "object", additionalProperties: true }
+    }
+  };
+
+  app.get("/gateway/ping", {
+    schema: {
+      summary: "Verify Android pull-bridge credentials and reachability",
+      description: "Uses the same X-API-Key as pull/validate/ack and does not refresh pull liveness.",
+      tags: ["Gateway"],
+      response: { 200: gatewayStatusSchema, 401: { type: "object", properties: { error: { type: "string" } } }, 409: { type: "object", properties: { error: { type: "string" } } }, 429: { type: "object", properties: { error: { type: "string" } } } }
+    }
+  }, async (request, reply) => {
+    if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-ping", diagnosticLimit)) return;
+    if (!isPullModeActive()) return reply.code(409).send({ error: "pull_mode_inactive" });
+    return { ok: true, serverTime: Date.now(), transport: "android-pull", pullModeActive: true, deviceKeyAccepted: true, protocolVersion: 1, bridge: bridgeSnapshot() };
+  });
+
+  app.get("/gateway/status", {
+    schema: {
+      summary: "Read Android pull-bridge status",
+      description: "Detailed read-only bridge status using the shared gateway device key.",
+      tags: ["Gateway"],
+      response: { 200: gatewayStatusSchema, 401: { type: "object", properties: { error: { type: "string" } } }, 409: { type: "object", properties: { error: { type: "string" } } }, 429: { type: "object", properties: { error: { type: "string" } } } }
+    }
+  }, async (request, reply) => {
+    if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-status", diagnosticLimit)) return;
+    if (!isPullModeActive()) return reply.code(409).send({ error: "pull_mode_inactive" });
+    return { ok: true, serverTime: Date.now(), transport: "android-pull", pullModeActive: true, deviceKeyAccepted: true, protocolVersion: 1, bridge: bridgeSnapshot() };
+  });
 
   // ── pull ─────────────────────────────────────────────────────────────────
   app.get("/gateway/pull", {
@@ -123,17 +203,29 @@ function registerGatewayRoutes(app, deps = {}) {
           }
         },
         401: { type: "object", properties: { error: { type: "string" } } },
-        409: { type: "object", properties: { error: { type: "string" } } }
+        409: { type: "object", properties: { error: { type: "string" } } },
+        429: { type: "object", properties: { error: { type: "string" } } }
       }
     }
   }, async (request, reply) => {
-    if (!checkDeviceKey(request)) return unauthorized(reply);
+    if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-pull", operationalLimit)) return;
     if (!isPullModeActive() || !outbox) {
       reply.code(409).send({ error: "pull_mode_inactive" });
       return;
     }
     const waitMs = Math.min(30000, Math.max(1000, Number(request.query?.waitMs) || 25000));
-    const task = await outbox.take(waitMs);
+    const pull = telemetry?.startPull(deviceId(request));
+    const startedAt = Date.now();
+    log?.info?.({ event: "gateway_pull_started", deviceId: pull?.deviceId || "legacy-shared-device", waitMs }, "android gateway pull started");
+    let task;
+    try {
+      task = await outbox.take(waitMs);
+      telemetry?.finishPull(pull, { task, status: 200 });
+    } catch (error) {
+      telemetry?.finishPull(pull, { status: Number(error?.statusCode || 500), failureKind: error?.code || "pull_failed" });
+      throw error;
+    }
     if (task) {
       const row = task.meta ? sendStore?.byGatewayRequest(task.requestId) : null;
       log?.info?.({
@@ -147,6 +239,9 @@ function registerGatewayRoutes(app, deps = {}) {
         transport: "android-pull",
         pullAt: new Date().toISOString()
       }, "android gateway task pulled");
+      log?.info?.({ event: "gateway_task_pulled", deviceId: pull?.deviceId || "legacy-shared-device", requestToken: telemetry?.snapshot().lastTaskRequestToken || null, durationMs: Date.now() - startedAt }, "android gateway task pulled safely");
+    } else {
+      log?.info?.({ event: "gateway_pull_empty", deviceId: pull?.deviceId || "legacy-shared-device", durationMs: Date.now() - startedAt }, "android gateway pull empty");
     }
     return { task };
   });
@@ -181,15 +276,8 @@ function registerGatewayRoutes(app, deps = {}) {
       }
     }
   }, async (request, reply) => {
-    if (!checkDeviceKey(request)) return unauthorized(reply);
-    if (checkRateLimit) {
-      const limit = checkRateLimit(request, "gateway-validate", validateLimit.max, validateLimit.windowMs);
-      if (!limit.allowed) {
-        reply.header("retry-after", String(limit.retryAfterSeconds));
-        reply.code(429).send({ error: "rate_limited" });
-        return;
-      }
-    }
+    if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-validate", operationalLimit)) return;
     const requestId = String(request.body?.requestId || "").slice(0, MAX_REQUEST_ID);
     if (!requestId) {
       reply.code(400).send({ error: "invalid_body" });
@@ -198,6 +286,7 @@ function registerGatewayRoutes(app, deps = {}) {
     bump(metrics.validationRequests || "sms_validation_requests_total");
 
     const verdict = validateTask(requestId);
+    telemetry?.recordValidate(requestId, verdict);
     if (!verdict.valid) bump(metrics.validationInvalid || "sms_validation_invalid_total");
     log?.info?.({
       gatewayRequestId: requestId,
@@ -205,6 +294,7 @@ function registerGatewayRoutes(app, deps = {}) {
       reason: verdict.reason,
       transport: "android-pull"
     }, "android gateway validation");
+    log?.info?.({ event: "gateway_validate", requestToken: telemetry?.snapshot().lastValidateRequestToken || null, verdict: verdict.status }, "android gateway validation observed");
     reply.header("cache-control", "no-store");
     return verdict;
   });
@@ -288,11 +378,13 @@ function registerGatewayRoutes(app, deps = {}) {
           }
         },
         400: { type: "object", properties: { error: { type: "string" } } },
-        401: { type: "object", properties: { error: { type: "string" } } }
+        401: { type: "object", properties: { error: { type: "string" } } },
+        429: { type: "object", properties: { error: { type: "string" } } }
       }
     }
   }, async (request, reply) => {
-    if (!checkDeviceKey(request)) return unauthorized(reply);
+    if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-ack", operationalLimit)) return;
     const body = request.body || {};
     const requestId = String(body.requestId || "").slice(0, MAX_REQUEST_ID);
     if (!requestId) {
@@ -313,6 +405,8 @@ function registerGatewayRoutes(app, deps = {}) {
       cancelled: body.cancelled
     });
     const decision = result.decision;
+    telemetry?.recordAck(deviceId(request), requestId, decision);
+    log?.info?.({ event: "gateway_ack", requestToken: telemetry?.snapshot().lastAckRequestToken || null, outcome: decision.outcome ?? null, duplicate: Boolean(decision.duplicate), newlyRecorded: Boolean(decision.newlyRecorded) }, "android gateway ACK observed");
 
     // ── Durable side effects ────────────────────────────────────────────────
     // Only when the bridge held no live task (otherwise the worker owns the

@@ -37,6 +37,7 @@ function health(overrides = {}) {
     chromeClient: overrides.chromeClient || chromeStub(),
     androidClient: overrides.androidClient || androidClientStub(),
     deviceKeyStore: { configured: overrides.deviceKeyConfigured !== false },
+    gatewayTelemetry: overrides.gatewayTelemetry || null,
     now: overrides.now || clock,
     env: overrides.env || {}
   });
@@ -87,6 +88,20 @@ test("case 3: pull older than the liveness window is STALE, not unconfigured", a
   assert.equal(snapshot.reason, REASON.NO_RECENT_DEVICE_PULL);
   assert.equal(snapshot.configured, true, "a configured device that went quiet is not 'unconfigured'");
   assert.equal(snapshot.lastPullAgeMs, 100000);
+});
+test("stale pull reports queue risk and keeps active polls distinct from devices", async () => {
+  const outbox = new AndroidOutbox({ hooks: { now: clock, livenessMs: 90000 } });
+  outbox.lastPullAt = NOW - 100_000;
+  const offered = outbox.offer("request-health", { to: "+10000000000", text: "synthetic" });
+  const snapshot = await health({
+    client: makeClient({ outbox }),
+    gatewayTelemetry: { snapshot: () => ({ activeLongPolls: 0, distinctDevices: 2 }) }
+  }).snapshot();
+  assert.equal(snapshot.operationalReason, REASON.TASK_WAITING_NO_DEVICE);
+  assert.equal(snapshot.activePolls, 0);
+  assert.equal(snapshot.distinctDevices, 2);
+  outbox.acknowledge("request-health", false, { outcome: "superseded" });
+  await offered;
 });
 
 test("case 3b: no device key at all is UNCONFIGURED with its own reason", async () => {

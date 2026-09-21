@@ -29,27 +29,70 @@ type TransportState = {
   androidConfigured: boolean;
   androidMode?: "pull" | "push";
   androidDevices?: number;
+  androidActivePolls?: number;
+  androidDistinctDevices?: number | null;
   androidPending?: number;
   androidInflight?: number;
+  androidState?: "connected" | "stale" | "unconfigured" | "push_unreachable" | "not_paired" | "unknown";
+  androidReason?: string | null;
+  androidLastPullAt?: string | null;
+  androidLastPullAgeMs?: number | null;
+  androidLivenessMs?: number;
+  androidLastAckAt?: string | null;
+  androidLastTaskPulledAt?: string | null;
 };
+
+type GatewayDiagnostics = {
+  serverTime: number;
+  deviceKey: { configured: boolean; source: string };
+  pullBridge: Record<string, unknown>;
+  devices: Array<Record<string, unknown>>;
+  queue: { pending: number; inflight: number; revokedInflight: number };
+};
+
+function ageLabel(age?: number | null) {
+  if (age == null) return "Never";
+  if (age < 60_000) return `${Math.max(0, Math.round(age / 1000))} sec ago`;
+  if (age < 3_600_000) return `${Math.round(age / 60_000)} min ago`;
+  return `${Math.round(age / 3_600_000)} hr ago`;
+}
+
+function timeLabel(value?: string | null) {
+  if (!value) return "Never";
+  const age = Date.now() - Date.parse(value);
+  return Number.isFinite(age) ? ageLabel(age) : "Unknown";
+}
 
 export function ControlsPage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [powerOn, setPowerOn] = useState<boolean | null>(null);
   const [transport, setTransport] = useState<TransportState | null>(null);
+  const [gatewayDiagnostics, setGatewayDiagnostics] = useState<GatewayDiagnostics | null>(null);
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState(false);
 
   const loadTransport = useCallback(() => {
     api<TransportState>("/admin/transport").then(setTransport).catch(() => setTransport(null));
+  }, []);
+  const loadGatewayDiagnostics = useCallback(() => {
+    api<GatewayDiagnostics>("/admin/gateway-diagnostics").then(setGatewayDiagnostics).catch(() => setGatewayDiagnostics(null));
   }, []);
 
   useEffect(() => {
     api<PowerResponse>("/admin/power").then((r) => setPowerOn(r.powerOn)).catch(() => setPowerOn(null));
     loadTransport();
+    loadGatewayDiagnostics();
     // Live-refresh transport state so device connections / queue depth stay current.
-    const t = setInterval(loadTransport, 5000);
+    const t = setInterval(() => { loadTransport(); loadGatewayDiagnostics(); }, 5000);
     return () => clearInterval(t);
-  }, [loadTransport]);
+  }, [loadGatewayDiagnostics, loadTransport]);
+
+  async function copyDiagnostics() {
+    if (!gatewayDiagnostics) return;
+    await navigator.clipboard.writeText(JSON.stringify(gatewayDiagnostics, null, 2));
+    setDiagnosticsCopied(true);
+    setTimeout(() => setDiagnosticsCopied(false), 2000);
+  }
 
   async function run(action: string) {
     setBusy(action);
@@ -125,7 +168,7 @@ export function ControlsPage() {
             </p>
           </div>
           <button
-            onClick={loadTransport}
+            onClick={() => { loadTransport(); loadGatewayDiagnostics(); }}
             className="text-muted-foreground transition-colors hover:text-foreground"
             title="Refresh"
           >
@@ -180,10 +223,16 @@ export function ControlsPage() {
                     The phone dials out to this server and picks up messages — no tunnel or static IP needed.
                   </p>
                   <DeviceKeyPanel />
-                  <div className="mt-2 grid grid-cols-3 gap-2">
-                    <Stat icon={Smartphone} label="Devices" value={transport.androidDevices ?? 0} tone={(transport.androidDevices ?? 0) > 0 ? "ok" : "muted"} />
+                  <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                    <Stat icon={Activity} label="Active polls" value={transport.androidActivePolls ?? 0} tone={(transport.androidActivePolls ?? 0) > 0 ? "ok" : "muted"} />
+                    <Stat icon={Smartphone} label="Known devices" value={transport.androidDistinctDevices ?? "—"} tone={(transport.androidDistinctDevices ?? 0) > 0 ? "ok" : "muted"} />
                     <Stat icon={Inbox} label="Waiting" value={transport.androidPending ?? 0} tone={(transport.androidPending ?? 0) > 0 ? "warn" : "muted"} />
-                    <Stat icon={SendIcon} label="Sending" value={transport.androidInflight ?? 0} tone={(transport.androidInflight ?? 0) > 0 ? "ok" : "muted"} />
+                    <Stat icon={SendIcon} label="In flight" value={transport.androidInflight ?? 0} tone={(transport.androidInflight ?? 0) > 0 ? "ok" : "muted"} />
+                  </div>
+                  <div className="mt-2 grid grid-cols-3 gap-2">
+                    <Stat icon={Activity} label="Last phone poll" value={ageLabel(transport.androidLastPullAgeMs)} tone={transport.androidState === "connected" ? "ok" : "warn"} />
+                    <Stat icon={Inbox} label="Last task" value={timeLabel(transport.androidLastTaskPulledAt)} tone="muted" />
+                    <Stat icon={CheckCircle2} label="Last ACK" value={timeLabel(transport.androidLastAckAt)} tone="muted" />
                   </div>
                   {!transport.androidConfigured && (
                     <p className="mt-2 flex items-start gap-1.5 text-amber-400">
@@ -191,12 +240,36 @@ export function ControlsPage() {
                       <span>No device key yet. Generate one above and paste it into the Messages app.</span>
                     </p>
                   )}
-                  {transport.androidConfigured && (transport.androidDevices ?? 0) === 0 && (
+                  {transport.androidConfigured && transport.androidState === "stale" && (
                     <p className="mt-2 flex items-start gap-1.5 text-muted-foreground">
                       <AlertTriangle className="mt-0.5 size-3 shrink-0 text-amber-400" />
-                      <span>Key is set but no device is polling yet. In the Messages app → Gateway → paste this server's URL and the device key above, then enable the gateway.</span>
+                      <span>Device key is configured, but GMweb has not seen a recent phone pull.</span>
                     </p>
                   )}
+                  {(transport.androidPending ?? 0) > 0 && transport.androidState !== "connected" && (
+                    <p className="mt-2 flex items-start gap-1.5 text-destructive"><AlertTriangle className="mt-0.5 size-3 shrink-0" /><span>Messages are waiting but no Android device is currently connected.</span></p>
+                  )}
+                  {(transport.androidInflight ?? 0) > 0 && transport.androidState !== "connected" && (
+                    <p className="mt-2 flex items-start gap-1.5 text-destructive"><AlertTriangle className="mt-0.5 size-3 shrink-0" /><span>An SMS task is in flight but the device connection is stale.</span></p>
+                  )}
+                  <details className="mt-3 rounded-md border border-border bg-background/40 p-2.5">
+                    <summary className="cursor-pointer font-medium">Gateway diagnostics</summary>
+                    <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                      <Stat icon={Activity} label="Pull bridge" value={transport.androidState ?? "Unknown"} tone={transport.androidState === "connected" ? "ok" : "warn"} />
+                      <Stat icon={KeyRound} label="Device key" value={transport.androidConfigured ? "Configured" : "Missing"} tone={transport.androidConfigured ? "ok" : "warn"} />
+                      <Stat icon={Activity} label="Last pull" value={ageLabel(transport.androidLastPullAgeMs)} tone={transport.androidState === "connected" ? "ok" : "warn"} />
+                      <Stat icon={Activity} label="Active polls" value={transport.androidActivePolls ?? 0} tone={(transport.androidActivePolls ?? 0) > 0 ? "ok" : "muted"} />
+                      <Stat icon={Inbox} label="Last task" value={timeLabel(transport.androidLastTaskPulledAt)} tone="muted" />
+                      <Stat icon={CheckCircle2} label="Last ACK" value={timeLabel(transport.androidLastAckAt)} tone="muted" />
+                      <Stat icon={Inbox} label="Pending" value={gatewayDiagnostics?.queue.pending ?? transport.androidPending ?? 0} tone={(transport.androidPending ?? 0) > 0 ? "warn" : "muted"} />
+                      <Stat icon={SendIcon} label="In flight" value={gatewayDiagnostics?.queue.inflight ?? transport.androidInflight ?? 0} tone={(transport.androidInflight ?? 0) > 0 ? "warn" : "muted"} />
+                      <Stat icon={Activity} label="Liveness threshold" value={`${Math.round((transport.androidLivenessMs ?? 0) / 1000)} sec`} tone="muted" />
+                    </div>
+                    <div className="mt-2 flex gap-2">
+                      <Button size="sm" variant="secondary" onClick={loadGatewayDiagnostics}><RefreshCw className="size-3.5" /> Refresh</Button>
+                      <Button size="sm" variant="secondary" disabled={!gatewayDiagnostics} onClick={copyDiagnostics}><Copy className="size-3.5" /> {diagnosticsCopied ? "Copied" : "Copy diagnostic JSON"}</Button>
+                    </div>
+                  </details>
                 </>
               ) : (
                 <p className="leading-relaxed text-muted-foreground">
@@ -387,7 +460,7 @@ function Stat({
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
-  value: number;
+  value: number | string;
   tone: Tone;
 }) {
   return (

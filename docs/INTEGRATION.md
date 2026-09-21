@@ -117,8 +117,8 @@ Full schemas are in [`openapi.json`](./openapi.json). The relevant subset:
 
 | Method & path | Purpose |
 |---|---|
-| `GET /health` | Public. Returns `{ ok, service, version }`. Used for **sync detection** (see §4). |
-| `GET /ready` | `200` when Google Messages is paired and ready; `503` otherwise. Check before sending. |
+| `GET /health` | Public. Returns `{ ok, service, version, serverTime, uptimeSeconds }`. Process reachability only; used for **sync detection** (see §4). |
+| `GET /ready` | `200` when the active delivery transport is usable; `503` otherwise. Check before sending. |
 | `POST /send` | Queue a message. Returns `202 { requestId, jobId }`. Pass `"wait": true` to block for the result. |
 | `GET /send/capacity` | Pending counts for all four lanes and remaining announcement capacity. |
 | `GET /send/status/:requestId` | Poll a send request: `queued` / `active` / `sent` / `failed` / `cancelled`. `jobId` is also accepted. |
@@ -511,6 +511,20 @@ later").
 The Messages app dials OUT to GMweb (`GET /gateway/pull`, `POST /gateway/ack`)
 authenticated with the dashboard-managed device key (`X-API-Key`; manage it via
 `GET/POST /admin/device-key*`). No tunnel or inbound port is required.
+
+Two authentication dimensions are deliberately independent:
+
+- `GET /gateway/ping` and `GET /gateway/status` use the shared `X-API-Key`
+  protecting the SMS pull bridge. Neither refreshes pull liveness or touches the
+  queue. Excessive probes return `429 rate_limited` with `Retry-After`.
+- Pull, validation, and ACK operations have independent generous limits and
+  return the same `429 rate_limited` contract before bridge state is touched.
+- `POST /api/v1/agent/ping` uses signed AgentAuth protecting event/control-plane
+  identity and performs no durable application/sync mutation.
+
+Success on either endpoint must never be interpreted as success on the other.
+New Android builds may send `X-Gateway-Device-Id` for observability; it is
+optional, bounded, and never an authorization credential.
 
 Transport-scoped endpoints while `android` is active:
 

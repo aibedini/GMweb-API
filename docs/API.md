@@ -16,7 +16,8 @@ Authorization: Bearer <API_TOKEN>
 
 ### GET /health
 
-Returns service health.
+Returns basic process reachability: `{ok,service,version,serverTime,uptimeSeconds}`.
+It does not assert that an Android phone is connected or that delivery is ready.
 
 ### GET /ready
 
@@ -190,7 +191,14 @@ renewal — including one the queue already marked active. Requires the
 
 Used by the Messages Android app when the transport is `android` in pull mode.
 
-* `GET /gateway/pull?waitMs=25000` — long-poll for the next task. Tasks whose
+* `GET /gateway/ping` — cheap credential and reachability probe using the exact
+  same shared device key as pull. It never opens a poll or refreshes liveness.
+* `GET /gateway/status` — detailed read-only server-side pull-bridge status.
+  It never claims or mutates a task.
+  Diagnostic probes are rate-limited and return `429 rate_limited` with
+  `Retry-After` when their allowance is exceeded.
+
+* `GET /gateway/pull?waitMs=25000` — rate-limited long-poll for the next task. Tasks whose
   lifecycle was invalidated are terminalized as superseded and never handed out.
   Returns `{task:{requestId,to,text,priority,meta}}` or `{task:null}`. `meta` is
   `null` for sends that carried none, so older builds are unaffected.
@@ -198,13 +206,30 @@ Used by the Messages Android app when the transport is `android` in pull mode.
   gate before the modem: it answers `valid:false, status:"superseded"` the
   instant the service generation is invalidated, including while the task is
   already in flight. It returns no task, customer or message metadata.
-* `POST /gateway/ack` — `{requestId, ok, outcome?, reason?}`.
+* `POST /gateway/ack` — rate-limited `{requestId, ok, outcome?, reason?}`.
   `outcome` is `sent` | `failed` | `superseded`; when omitted it is derived from
   `ok`, so legacy `{requestId, ok}` bodies keep working. `superseded` is
   terminal, not successful, not billable and not retryable. A real submission
   that arrives after its own revocation is recorded as
   `send_sent_after_revocation` and counted in `sms_sent_after_revocation_total`
   instead of being reported as a cancellation.
+
+The optional `X-Gateway-Device-Id` header is a bounded observability label only;
+it never grants access. Existing clients without it remain supported.
+
+### POST /api/v1/agent/ping
+
+Verifies the independently signed AgentAuth/control-plane identity and returns
+the authenticated device ID and role. It performs no durable application/sync
+mutation. A successful agent ping says nothing about `/gateway/*` Device Key
+health, and a successful gateway ping says nothing about AgentAuth.
+The probe is rate-limited independently from event ingestion.
+
+### GET /admin/gateway-diagnostics
+
+Master/dashboard-authenticated privacy-safe pull telemetry. Returns bridge,
+device-presence and queue aggregates without API keys, signatures, recipients,
+message bodies or raw request IDs.
 
 ### GET /events
 

@@ -29,6 +29,7 @@ const {
 } = require("./notificationMeta");
 const { createSendRevocation, METRICS: REVOCATION_METRICS } = require("./sendRevocation");
 const { registerGatewayRoutes } = require("./gatewayRoutes");
+const { GatewayPresenceTracker } = require("./gatewayPresence");
 const { createTransportHealth, STATE: TRANSPORT_STATE, REASON: TRANSPORT_REASON } = require("./transportHealth");
 const { applyStaticCachePolicy } = require("./staticCachePolicy");
 const { buildQueueReport } = require("./queueSnapshot");
@@ -178,6 +179,7 @@ const deviceKeyStore = new DeviceKeyStore({
   filePath: path.join(config.rootDir, "data", "device-key.json"),
   envValue: process.env.GMWEB_ANDROID_DEVICE_KEY
 });
+const gatewayTelemetry = new GatewayPresenceTracker();
 
 // ONE authoritative transport-health model (src/transportHealth.js).
 // /admin/overview and /admin/transport both read this snapshot, so two cards on
@@ -188,7 +190,8 @@ const transportHealth = createTransportHealth({
   client,
   chromeClient,
   androidClient,
-  deviceKeyStore
+  deviceKeyStore,
+  gatewayTelemetry
 });
 
 // ── Phase 2 (ADR-001/004): Trust Registry relay + durable Command Engine ────
@@ -721,6 +724,12 @@ function checkDeviceKey(request) {
     crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected));
 }
 
+function recordGatewayAuthFailure() {
+  gatewayTelemetry.recordAuthFailure();
+  try { sendStore?.bumpCounters([{ name: "gateway_auth_failures_total", delta: 1 }]); } catch { /* best effort */ }
+  app.log.warn({ event: "gateway_auth_failed" }, "gateway authentication failed");
+}
+
 function requireToken(request, reply, done) {
   if (requestPath(request.url) === "/api/v1/primary-enrollment" && request.method === "POST") return done();
   if (config.publicHealth && requestPath(request.url) === "/health") return done();
@@ -817,6 +826,7 @@ function requireToken(request, reply, done) {
   // (PR-08b) — the route handler/hook re-checks and binds the identity.
   if (requestPath(request.url).startsWith("/gateway/")) {
     if (checkDeviceKey(request)) return done();
+    recordGatewayAuthFailure();
     reply.code(401).send({ error: "unauthorized" });
     return;
   }
@@ -2506,7 +2516,9 @@ app.get("/health", {
         properties: {
           ok: { type: "boolean" },
           service: { type: "string" },
-          version: { type: "string" }
+          version: { type: "string" },
+          serverTime: { type: "integer" },
+          uptimeSeconds: { type: "integer" }
         }
       }
     }
@@ -2514,7 +2526,9 @@ app.get("/health", {
 }, async () => ({
   ok: true,
   service: pkg.name,
-  version: pkg.version
+  version: pkg.version,
+  serverTime: Date.now(),
+  uptimeSeconds: Math.floor(process.uptime())
 }));
 
 if (config.dashboardEnabled) {
@@ -2922,13 +2936,18 @@ app.get("/admin/transport", {
           androidReady: { type: "boolean" },
           androidConfigured: { type: "boolean" },
           androidMode: { type: "string", enum: ["pull", "push"] },
-          androidDevices: { type: "integer", description: "Devices currently long-polling (pull mode)." },
+          androidDevices: { type: "integer", deprecated: true, description: "Deprecated compatibility alias for active polls; not a device count." },
+          androidActivePolls: { type: "integer" },
+          androidDistinctDevices: { type: ["integer", "null"] },
           androidPending: { type: "integer", description: "Sends waiting for a device to pick up." },
           androidInflight: { type: "integer", description: "Sends a device is delivering right now." },
           androidLastPullAt: { type: ["string", "null"], format: "date-time", description: "Most recent Android pull in pull mode." },
           androidState: { type: "string", enum: ["connected", "stale", "unconfigured", "push_unreachable", "not_paired", "unknown"] },
           androidReason: { type: ["string", "null"], description: "Machine reason, e.g. no_recent_device_pull or device_key_not_configured." },
           androidLastPullAgeMs: { type: ["integer", "null"] },
+          androidLivenessMs: { type: "integer" },
+          androidLastAckAt: { type: ["string", "null"] },
+          androidLastTaskPulledAt: { type: ["string", "null"] },
           // Additive + authoritative. Declared explicitly: Fastify's response
           // serializer strips properties the schema does not list, so an
           // undeclared field would silently never reach the dashboard.
@@ -2967,10 +2986,44 @@ app.get("/admin/transport", {
     androidState: android.state,
     androidReason: android.reason || null,
     androidDevices: Number(android.waitingPhones || 0),
+    androidActivePolls: Number(android.activePolls || 0),
+    androidDistinctDevices: android.distinctDevices ?? null,
     androidPending: Number(android.pending || 0),
     androidInflight: Number(android.inflight || 0),
     androidLastPullAt: android.lastPullAt || null,
-    androidLastPullAgeMs: android.lastPullAgeMs ?? null
+    androidLastPullAgeMs: android.lastPullAgeMs ?? null,
+    androidLivenessMs: Number(android.livenessMs || 0),
+    androidLastAckAt: android.lastAckAt || null,
+    androidLastTaskPulledAt: android.lastTaskPulledAt || null
+  };
+});
+
+app.get("/admin/gateway-diagnostics", {
+  schema: {
+    summary: "Privacy-safe Android pull-bridge diagnostics",
+    description: "Returns operational gateway telemetry without keys, recipients, message bodies or raw request identifiers. **Master token only.**",
+    tags: ["Admin"],
+    response: { 200: { type: "object", additionalProperties: true } }
+  }
+}, async () => {
+  const transport = await transportHealth.android();
+  const bridge = gatewayTelemetry.snapshot();
+  return {
+    serverTime: Date.now(),
+    transport,
+    deviceKey: { configured: deviceKeyStore.configured, source: deviceKeyStore.source },
+    pullBridge: bridge,
+    devices: gatewayTelemetry.deviceSnapshot(),
+    queue: {
+      pending: Number(transport.pending || 0),
+      inflight: Number(transport.inflight || 0),
+      revokedInflight: Number(transport.revokedInflight || 0)
+    },
+    recent: {
+      lastTaskPulledAt: bridge.lastTaskPulledAt,
+      lastAckAt: bridge.lastAckAt,
+      lastValidateAt: bridge.lastValidateAt
+    }
   };
 });
 
@@ -3078,7 +3131,8 @@ registerGatewayRoutes(app, {
   checkDeviceKey,
   checkRateLimit,
   isPullModeActive: () => Boolean(client.pullMode && client.name === "android" && client.outbox),
-  log: app.log
+  log: app.log,
+  telemetry: gatewayTelemetry
 });
 
 // ── Phase 2 Control Plane (ADR-001/004, TechSpec §51–58) ────────────────────

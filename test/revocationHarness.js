@@ -215,8 +215,10 @@ function createHarness(options = {}) {
       sendStore: overrides.store || store,
       revocation: overrides.revocation || revocation,
       checkDeviceKey: (request) => String(request.headers["x-api-key"] || "") === DEVICE_KEY,
-      isPullModeActive: () => true,
-      log: { info: () => {}, error: () => {}, warn: () => {} }
+      checkRateLimit: overrides.checkRateLimit || null,
+      isPullModeActive: overrides.isPullModeActive || (() => true),
+      telemetry: overrides.telemetry || null,
+      log: overrides.log || { info: () => {}, error: () => {}, warn: () => {} }
     });
     await app.ready();
     return app;
