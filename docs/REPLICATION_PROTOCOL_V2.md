@@ -24,6 +24,8 @@ Android owns telephony observation and irreversible modem submission. GMweb owns
 
 ## V2 additive contract
 
+Implemented ingest slice: `POST /api/v1/agent/events/batch-v2` returns one indexed result per item: `ACCEPTED`, `DUPLICATE` with its original sequence, `CONFLICTING_DUPLICATE`, or `INVALID_EVENT` with a safe error code. The response includes the committed account `highWatermark`. The route binds source identity from agent authentication, not request body. V2 is not advertised as the preferred protocol until snapshot and command contracts are complete.
+
 V2 will expose explicit protocol capabilities and retain every V1 endpoint during transition. A batch response has one result per item: `ACCEPTED`, `DUPLICATE` with original sequence, or a safe rejection code. A rejected item consumes no sequence. Batch-level errors are reserved for malformed framing, authorization failure or exceeded batch limits.
 
 A V2 snapshot starts with a server-issued token, `replicaGeneration`, immutable `baselineSequence`, expiry and first page. Continuations use that token and a keyset cursor. The final page marks `snapshotComplete`. Browser storage keeps `snapshotCursor`, `eventCursor`, `keyCursor` and `projectionCursor` separately. The browser begins delta catch-up from `baselineSequence` only after all snapshot pages have committed. If a token expires or generation changes, it starts a new snapshot while preserving device identity.

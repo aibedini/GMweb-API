@@ -3,6 +3,10 @@
 const {
   policy: eventCryptoPolicy,
   validateWireBatch,
+  validateWireEvent,
+  validateStoredBatch,
+  MAX_BATCH_EVENTS,
+  MAX_DECODED_BATCH_BYTES,
   MAX_HTTP_BODY_BYTES,
 } = require("./eventCryptoPolicy");
 
@@ -550,6 +554,58 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       sourceDeviceId,
       events,
     });
+  });
+
+  app.post("/api/v1/agent/events/batch-v2", {
+    bodyLimit: MAX_HTTP_BODY_BYTES,
+    schema: {
+      summary: "Per-item encrypted event ingest outcomes",
+      tags: ["Agent"],
+      body: { type: "object", required: ["events"], properties: {
+        events: { type: "array", minItems: 1, maxItems: MAX_BATCH_EVENTS, items: { type: "object", additionalProperties: true } }
+      } },
+      response: { 200: { type: "object", properties: {
+        results: { type: "array", items: { type: "object", properties: {
+          index: { type: "integer" }, eventId: { type: "string" }, status: { type: "string" }, serverSequence: { type: "integer" }, error: { type: "string" }
+        } } },
+        highWatermark: { type: "integer" }
+      } } }
+    }
+  }, async (request, reply) => {
+    const submitted = request.body.events;
+    const valid = [];
+    const indices = [];
+    const results = new Array(submitted.length);
+    let decodedBytes = 0;
+    for (let index = 0; index < submitted.length; index++) {
+      const event = submitted[index];
+      try {
+        if (typeof event.eventId !== "string" || !event.eventId || event.eventId.length > 128) {
+          throw Object.assign(new Error("invalid_event_id"), { code: "invalid_event_id" });
+        }
+        const { payload } = validateWireEvent(event);
+        if ((event.conversationId != null && typeof event.conversationId !== "string") ||
+            (event.messageId != null && typeof event.messageId !== "string") ||
+            (event.revision != null && (!Number.isInteger(event.revision) || event.revision < 1)) ||
+            (event.sortKey != null && (!Number.isInteger(event.sortKey) || event.sortKey < 0))) {
+          throw Object.assign(new Error("invalid_metadata"), { code: "invalid_metadata" });
+        }
+        validateStoredBatch([{ ...event, payload }]);
+        decodedBytes += payload.length;
+        if (decodedBytes > MAX_DECODED_BATCH_BYTES) {
+          return reply.code(413).send({ error: "batch_payload_too_large" });
+        }
+        valid.push({ ...event, payload });
+        indices.push(index);
+      } catch (error) {
+        results[index] = { index, eventId: String(event.eventId || ""), status: "INVALID_EVENT", error: error.code || "invalid_event" };
+      }
+    }
+    const stored = valid.length
+      ? eventStore.ingestBatch({ accountId, sourceDeviceId: request.authenticatedAgentId || null, events: valid, perItem: true })
+      : { results: [], highWatermark: eventStore.highWatermark(accountId) };
+    stored.results.forEach((result, offset) => { results[indices[offset]] = { index: indices[offset], ...result }; });
+    return { results, highWatermark: stored.highWatermark };
   });
 
   app.get("/api/v1/sync", {

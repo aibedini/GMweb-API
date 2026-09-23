@@ -8,7 +8,7 @@
 - [X] T001 Record existing V1/V2 capability and compatibility inventory in `docs/REPLICATION_PROTOCOL_V2.md` (FR-010).
 - [X] T002 Add implemented-feature capability endpoints in `src/controlPlaneRoutes.js`, update `src/server.js` authorization, bump `package.json`, regenerate `docs/openapi.json`, and update `docs/INTEGRATION.md` (FR-010).
 - [X] T003 Add V1/V2 capability and authorization contract tests in `test/controlPlaneApi.test.js` (FR-010).
-- [ ] T004 Add per-item ingest outcome contract and duplicate original sequence in `src/eventStore.js` and `src/controlPlaneRoutes.js`, with V1 compatibility in `test/eventStore.test.js` and `test/controlPlaneApi.test.js` (FR-001–002, FR-010).
+- [X] T004 Add per-item ingest outcome contract and duplicate original sequence in `src/eventStore.js` and `src/controlPlaneRoutes.js`, with V1 compatibility in `test/eventStore.test.js` and `test/controlPlaneApi.test.js` (FR-001–002, FR-010).
 
 ## Phase 2: User Story 1 — Complete history on a new browser (P1)
 

@@ -243,7 +243,7 @@ class EventStore {
    * per-account sequence; duplicates (event_uuid already stored) are skipped
    * but DO NOT consume a sequence. Returns per-event results for partial ACK.
    */
-  ingestBatch({ accountId, sourceDeviceId, events }) {
+  ingestBatch({ accountId, sourceDeviceId, events, perItem = false }) {
     if (!Array.isArray(events) || events.length === 0) {
       this.log?.(`batch_received sourceDeviceId=${sourceDeviceId || "unknown"} count=0 types=`);
       this.log?.(`SYNC_REPORT sourceDeviceId=${sourceDeviceId || "unknown"} received=0 accepted=0 duplicates=0 types=`);
@@ -256,12 +256,13 @@ class EventStore {
     const accept = this.db.transaction((batch) => {
       this.counterStmt.run(accountId);
       const accepted = [];
+      const results = [];
       let duplicates = 0;
       let inserted = 0;
       for (const event of batch) {
         const uuid = String(event.eventId || "");
         const type = String(event.type || "UNKNOWN");
-        if (!uuid) { duplicates++; continue; }
+        if (!uuid) { duplicates++; results.push({ eventId: uuid, status: "INVALID_EVENT_ID" }); continue; }
         // Opaque-bytes guard: an undecodable/empty payload can never become a
         // durable row (LOCK 13 — no silently-dropped content). The caller's
         // missing-ACK path requeues it; a permanently malformed payload ends
@@ -269,7 +270,7 @@ class EventStore {
         const payloadBuf = Buffer.isBuffer(event.payload)
           ? event.payload
           : Buffer.from(String(event.payload || ""), "base64");
-        if (payloadBuf.length === 0) { duplicates++; continue; }
+        if (payloadBuf.length === 0) { duplicates++; results.push({ eventId: uuid, status: "INVALID_PAYLOAD" }); continue; }
         const seq = this.nextSeqStmt.get(accountId).next_sequence;
         const info = this.insertEventStmt.run(
           accountId, seq, uuid,
@@ -309,6 +310,7 @@ class EventStore {
             );
           }
           accepted.push({ eventId: uuid, serverSequence: seq });
+          results.push({ eventId: uuid, status: "ACCEPTED", serverSequence: seq });
           inserted++;
           this.debug?.(`event_accepted eventId=${uuid} sequence=${seq} type=${type} aggregateId=${event.conversationId ? String(event.conversationId) : ""} cryptoVersion=${Number(event.cryptoVersion) || 0}`);
         } else {
@@ -324,10 +326,13 @@ class EventStore {
               old.encoding === String(event.encoding || "envelope.v1") &&
               old.schema_version === (Number(event.schemaVersion) || 1) && old.crypto_version === (Number(event.cryptoVersion) || 0)) {
             accepted.push({ eventId: uuid, serverSequence: old.sequence });
+            results.push({ eventId: uuid, status: "DUPLICATE", serverSequence: old.sequence });
+          } else {
+            results.push({ eventId: uuid, status: "CONFLICTING_DUPLICATE" });
           }
         }
       }
-      return { accepted, duplicates, inserted };
+      return { accepted, duplicates, inserted, results };
     });
     const result = accept(events);
     this.log?.(`SYNC_REPORT accepted=${result.accepted.length} duplicates=${result.duplicates} inserted=${result.inserted}`);
@@ -336,7 +341,9 @@ class EventStore {
     if (result.inserted > 0 && this.onEventsAccepted) {
       try { this.onEventsAccepted(result.inserted); } catch { /* swallow */ }
     }
-    return { accepted: result.accepted, duplicates: result.duplicates };
+    return perItem
+      ? { results: result.results, highWatermark: this.nextSeqStmt.get(accountId).next_sequence - 1 }
+      : { accepted: result.accepted, duplicates: result.duplicates };
   }
 
   /** Cursor sync (§54): events after a per-account sequence cursor. */

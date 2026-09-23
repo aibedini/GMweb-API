@@ -265,6 +265,29 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.deepEqual(body.accepted.map((a) => a.serverSequence), [1, 2]);
   });
 
+  test("V2 batch returns indexed per-item outcomes while V1 remains compatible", async () => {
+    const event = { eventId: `v2-${Date.now()}`, type: "MESSAGE_CREATED", conversationId: "v2-conv",
+      encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3 };
+    const valid = { ...event, payload: encryptedPayload(event) };
+    const upload = events => app.inject({ method: "POST", url: "/api/v1/agent/events/batch-v2",
+      headers: { "x-test-agent-device": "v2-phone", "x-test-agent-role": "PRIMARY_TRUST_AGENT" },
+      payload: { sourceDeviceId: "spoofed-device", events } });
+    const first = await upload([valid, { ...valid, eventId: "bad", payload: "not-base64" }, valid]);
+    assert.equal(first.statusCode, 200);
+    assert.deepEqual(first.json().results.map(row => row.status), ["ACCEPTED", "INVALID_EVENT", "DUPLICATE"]);
+    assert.equal(first.json().results[0].serverSequence, first.json().results[2].serverSequence);
+    assert.equal(first.json().results[1].error, "invalid_payload_encoding");
+    const sync = await app.inject({ method: "GET", url: "/api/v1/sync?after=0&limit=1000" });
+    assert.equal(sync.json().events.find(row => row.eventId === event.eventId).sourceDeviceId, "v2-phone");
+    const conflict = await upload([{ ...valid, sortKey: 1 }]);
+    assert.equal(conflict.statusCode, 200);
+    assert.equal(conflict.json().results[0].status, "CONFLICTING_DUPLICATE");
+    assert.equal(conflict.json().highWatermark, first.json().highWatermark);
+    const v1 = await app.inject({ method: "POST", url: "/api/v1/agent/events/batch", payload: { events: [valid] } });
+    assert.equal(v1.statusCode, 200);
+    assert.ok(Array.isArray(v1.json().accepted));
+  });
+
   test("web sync ACK requires linked authorization and matching replica metadata", async () => {
     const headers = { "x-test-linked": "web-device" };
     const bootstrap = await app.inject({ method: "GET", url: "/api/v1/web/bootstrap", headers });

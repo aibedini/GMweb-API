@@ -6,6 +6,18 @@ const Database = require("better-sqlite3");
 const { EventStore } = require("../src/eventStore");
 
 describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => {
+  test("V2 reports accepted, identical replay, and conflicting replay without consuming sequence", () => {
+    const store = new EventStore(new Database(":memory:"));
+    const event = { eventId: "v2-1", type: "DEVICE_STATUS_CHANGED", payload: Buffer.from("x"), cryptoVersion: 1 };
+    const first = store.ingestBatch({ accountId: "a", sourceDeviceId: "phone", events: [event], perItem: true });
+    assert.deepEqual(first.results, [{ eventId: "v2-1", status: "ACCEPTED", serverSequence: 1 }]);
+    const replay = store.ingestBatch({ accountId: "a", sourceDeviceId: "phone", events: [event], perItem: true });
+    assert.deepEqual(replay.results, [{ eventId: "v2-1", status: "DUPLICATE", serverSequence: 1 }]);
+    const conflict = store.ingestBatch({ accountId: "a", sourceDeviceId: "phone", events: [{ ...event, payload: Buffer.from("y") }], perItem: true });
+    assert.deepEqual(conflict.results, [{ eventId: "v2-1", status: "CONFLICTING_DUPLICATE" }]);
+    assert.equal(conflict.highWatermark, 1);
+    assert.equal(store.count("a"), 1);
+  });
   test("sequences are strictly monotonic per account within a batch", () => {
     const store = new EventStore(new Database(":memory:"));
     const res = store.ingestBatch({
