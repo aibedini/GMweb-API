@@ -184,12 +184,16 @@ function serializeSync(run: () => Promise<number>): Promise<number> {
 export function syncNow(onProgress?: (applied: number) => void): Promise<number> {
   updateSyncStatus({ state: "SYNCING_HISTORY", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
   return serializeSync(async () => {
+    let keySyncDegraded = false;
     try {
-      await bootstrapKeyGrants();
+      // Key availability is deliberately independent from replica durability.
+      // A missing/unavailable key must leave ciphertext replication healthy so
+      // the browser can catch up and retry projection after the grant arrives.
+      keySyncDegraded = !(await syncKeysSafely());
       await bootstrapEncryptedState();
       await repairConversationProjection();
       const result = await drainSync(undefined, onProgress);
-      updateSyncStatus({ state: "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
+      updateSyncStatus({ state: keySyncDegraded ? "DEGRADED" : "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
       return result.applied;
     } catch (cause) {
       syncFailure("SYNC", cause, false);
@@ -206,13 +210,14 @@ export function syncNow(onProgress?: (applied: number) => void): Promise<number>
 export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): Promise<number> {
   updateSyncStatus({ state: "INITIALIZING", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
   return serializeSync(async () => {
+    let keySyncDegraded = false;
     try {
-      await bootstrapKeyGrants();
+      keySyncDegraded = !(await syncKeysSafely());
       await bootstrapEncryptedState();
       await repairConversationProjection();
       const result = await drainSync(maxPages, onProgress);
       updateSyncStatus({
-        state: result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY",
+        state: keySyncDegraded ? "DEGRADED" : (result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY"),
         lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied,
       });
       return result.applied;
@@ -221,6 +226,21 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
       throw cause;
     }
   });
+}
+
+/**
+ * Run key/bootstrap synchronization without making it a prerequisite for the
+ * encrypted replica. The return value is intentionally boolean so callers can
+ * surface a degraded key state while continuing event ingestion.
+ */
+async function syncKeysSafely(): Promise<boolean> {
+  try {
+    await bootstrapKeyGrants();
+    return true;
+  } catch (cause) {
+    syncFailure("KEY_SYNC", cause, false);
+    return false;
+  }
 }
 
 /** Catch-up synonym of syncNow() kept for call-site readability. */
