@@ -3,7 +3,37 @@
 const { test, describe } = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { EventStore } = require("../src/eventStore");
+
+test("snapshot token and immutable pages survive SQLite connection reopen", () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-snapshot-"));
+  let db;
+  try {
+    const filename = path.join(folder, "replica.sqlite");
+    db = new Database(filename);
+    const initial = new EventStore(db);
+    initial.ingestBatch({ accountId: "a", events: [1, 2].map(index => ({
+      eventId: `restart-${index}`, type: "CONVERSATION_UPSERTED", conversationId: `c-${index}`,
+      revision: 1, sortKey: index, payload: Buffer.from(`cipher-${index}`), cryptoVersion: 3,
+    })) });
+    const first = initial.beginSnapshot({ accountId: "a", linkedDeviceId: "browser", limit: 1 });
+    assert.equal(first.hasMore, true);
+    db.close();
+    db = new Database(filename);
+    const restarted = new EventStore(db);
+    const next = restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser",
+      token: first.token, cursor: first.nextCursor, limit: 1 });
+    assert.equal(next.baselineSequence, first.baselineSequence);
+    assert.equal(next.rows.length, 1);
+    assert.equal(next.hasMore, false);
+  } finally {
+    db?.close();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
 
 test("V2 snapshot remains immutable across pages, new events, and store restart", () => {
   const db = new Database(":memory:");
@@ -54,6 +84,23 @@ test("V2 snapshot remains immutable across pages, new events, and store restart"
 });
 
 describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => {
+  test("compaction preserves post-baseline deltas while a snapshot session is active", () => {
+    let now = 50_000;
+    const store = new EventStore(new Database(":memory:"), { now: () => now });
+    const event = (id, index) => ({ eventId: id, type: "MESSAGE_CREATED", conversationId: "thread",
+      messageId: id, revision: 1, sortKey: index, payload: Buffer.from(id), cryptoVersion: 3 });
+    store.ingestBatch({ accountId: "a", events: [event("before", 1)] });
+    const snapshot = store.beginSnapshot({ accountId: "a", linkedDeviceId: "slow-browser", limit: 1 });
+    store.ingestBatch({ accountId: "a", events: [event("after-1", 2), event("after-2", 3)] });
+    const metadata = store.replicaMetadata("a");
+    store.acknowledgeClient("a", "fast-browser", 3, metadata.replicaGeneration, metadata.snapshotVersion);
+    now += 1;
+    store.compact("a", { retainEvents: 0, retainMs: 0, limit: 100 });
+    assert.deepEqual(store.after("a", snapshot.baselineSequence).events.map(row => row.eventId), ["after-1", "after-2"]);
+    now = snapshot.expiresAt + 1;
+    store.compact("a", { retainEvents: 0, retainMs: 0, limit: 100 });
+    assert.deepEqual(store.after("a", snapshot.baselineSequence).events, []);
+  });
   test("V2 reports accepted, identical replay, and conflicting replay without consuming sequence", () => {
     const store = new EventStore(new Database(":memory:"));
     const event = { eventId: "v2-1", type: "DEVICE_STATUS_CHANGED", payload: Buffer.from("x"), cryptoVersion: 1 };

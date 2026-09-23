@@ -447,7 +447,15 @@ class EventStore {
     `).get(now - retainMs, accountId);
     if (!ackState.clientCount) return { rowsRemoved: 0, durationMs: this.now() - startedAt };
     const ack = Number.isSafeInteger(ackState.activeSequence) ? ackState.activeSequence : highWatermark;
-    const maxSequence = Math.min(ack, Math.max(0, highWatermark - retainEvents));
+    const metadata = this.replicaMetadata(accountId);
+    const activeSnapshot = this.db.prepare(`
+      SELECT MIN(baseline_sequence) AS baseline
+      FROM encrypted_snapshot_sessions
+      WHERE account_id = ? AND expires_at > ?
+        AND replica_generation = ? AND snapshot_version = ?
+    `).get(accountId, now, metadata.replicaGeneration, metadata.snapshotVersion);
+    const snapshotCeiling = activeSnapshot.baseline == null ? highWatermark : activeSnapshot.baseline;
+    const maxSequence = Math.min(ack, Math.max(0, highWatermark - retainEvents), snapshotCeiling);
     const candidates = this.db.prepare(`
       SELECT sequence FROM sync_events
       WHERE account_id = ? AND sequence <= ? AND created_at < ?
