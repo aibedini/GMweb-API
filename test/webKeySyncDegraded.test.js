@@ -15,18 +15,20 @@ test("key sync failure does not block durable ciphertext replica catch-up", asyn
     if (/\/linked-device\/(?:key-grants|keyring)/.test(path)) {
       throw new Error("key service unavailable");
     }
-    if (/\/web\/bootstrap/.test(path)) {
+    if (/\/web\/snapshot-v2/.test(path)) {
       return Response.json({
-        protocolVersion: 3,
+        token: "degraded-key-snapshot",
         snapshotVersion: 1,
-        highWatermark: 0,
+        baselineSequence: 0,
         replicaGeneration: "degraded-key-test-generation",
-        minimumAvailableSequence: 0,
-        conversations: [],
+        expiresAt: Date.now() + 60_000,
+        contactEvents: [],
+        rows: [],
         nextCursor: null,
         hasMore: false,
       });
     }
+    if (path.includes("/web/sync/ack")) return Response.json({ ok: true });
     eventRequests += 1;
     const after = Number(new URL(path, "https://example.test").searchParams.get("after") || 0);
     if (after === 0) {
@@ -54,7 +56,7 @@ test("key sync failure does not block durable ciphertext replica catch-up", asyn
   try {
     assert.equal(await sync.syncNow(), 1);
     assert.equal(await sync.getCursor(), 1);
-    assert.equal(eventRequests, 2);
+    assert.equal(eventRequests, 1);
     assert.equal(sync.getBrowserSyncStatus().state, "DEGRADED");
     assert.equal(sync.getBrowserSyncStatus().lastErrorPhase, "KEY_SYNC");
   } finally {

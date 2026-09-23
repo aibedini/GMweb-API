@@ -50,15 +50,20 @@ export interface EncryptedMessageState extends EncryptedConversationState {
   tombstone: boolean;
 }
 
-export interface WebBootstrapPage {
-  protocolVersion: number;
+export interface WebSnapshotRow extends EncryptedConversationState {
+  position: number;
+  kind: "conversation" | "message";
+  messageId: string | null;
+  type: string | null;
+}
+export interface WebSnapshotPage {
+  token: string;
   replicaGeneration: string;
   snapshotVersion: number;
-  minimumAvailableSequence: number;
-  migrationVersion?: number;
-  highWatermark: number;
+  baselineSequence: number;
+  expiresAt: number;
   contactEvents: SyncEvent[];
-  conversations: EncryptedConversationState[];
+  rows: WebSnapshotRow[];
   nextCursor: string | null;
   hasMore: boolean;
 }
@@ -108,9 +113,21 @@ export async function acknowledgeWebSync(cursor: number, replicaGeneration: stri
   await jsonOrThrow(res);
 }
 
-export async function fetchWebBootstrap(limit = 100): Promise<WebBootstrapPage> {
-  const res = await fetch(`${API}/web/bootstrap?limit=${limit}`, { credentials: "include", cache: "no-store" });
-  return jsonOrThrow<WebBootstrapPage>(res);
+export async function startWebSnapshot(limit = 100): Promise<WebSnapshotPage> {
+  const res = await fetch(`${API}/web/snapshot-v2`, {
+    method: "POST", credentials: "include", cache: "no-store",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ limit }),
+  });
+  return jsonOrThrow<WebSnapshotPage>(res);
+}
+
+export async function continueWebSnapshot(token: string, cursor: string, limit = 100): Promise<WebSnapshotPage> {
+  const query = new URLSearchParams({ token, cursor, limit: String(limit) });
+  const res = await fetch(`${API}/web/snapshot-v2?${query}`, { credentials: "include", cache: "no-store" });
+  if (res.status === 409) {
+    throw new SnapshotRequiredError(await res.json().catch(() => ({ error: "snapshot_required" })));
+  }
+  return jsonOrThrow<WebSnapshotPage>(res);
 }
 
 export async function fetchWebConversationPage(cursor?: string, limit = 100) {

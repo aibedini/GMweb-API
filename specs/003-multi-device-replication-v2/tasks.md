@@ -14,11 +14,11 @@
 
 **Independent test**: More than one snapshot page and an event arriving during pagination converge on a fresh and restarted browser.
 
-- [ ] T005 [US1] Add a failing multi-page snapshot and concurrent-event regression test in `test/webEncryptedBootstrap.test.js` (FR-004, SC-002).
+- [X] T005 [US1] Add a failing multi-page snapshot and concurrent-event regression test in `test/webEncryptedBootstrap.test.js` (FR-004, SC-002).
 - [X] T006 [US1] Add immutable snapshot session state, baseline, expiry and keyset page reads in `src/eventStore.js` (FR-004).
 - [X] T007 [US1] Add additive snapshot V2 endpoints and authorization in `src/controlPlaneRoutes.js` and `src/server.js`, bump `package.json`, regenerate `docs/openapi.json`, and update `docs/INTEGRATION.md` (FR-004, FR-010).
-- [ ] T008 [US1] Extend typed V2 snapshot responses in `web/src/lib/api.ts` (FR-004).
-- [ ] T009 [US1] Persist snapshot token/cursor/completion separately from event cursor, continue every page, and start delta at the baseline only after final commit in `web/src/lib/sync.ts` (FR-003–005, FR-012).
+- [X] T008 [US1] Extend typed V2 snapshot responses in `web/src/lib/api.ts` (FR-004).
+- [X] T009 [US1] Persist snapshot token/cursor/completion separately from event cursor, continue every page, and start delta at the baseline only after final commit in `web/src/lib/sync.ts` (FR-003–005, FR-012).
 - [ ] T010 [US1] Verify crash, expiry, generation mismatch, late event and two-page completion in `test/webEncryptedBootstrap.test.js` and `test/controlPlaneApi.test.js` (SC-001–002).
 
 ## Phase 3: User Story 2 — Key problems do not stop replication (P1)

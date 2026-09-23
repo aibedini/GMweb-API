@@ -51,11 +51,12 @@ test("v7 purges legacy plaintext state even when encrypted bootstrap is empty", 
     if (/\/linked-device\/(?:key-grants|keyring)/.test(path)) {
       return Response.json({ events: [], nextCursor: 0, hasMore: false });
     }
-    if (path.includes("/web/bootstrap")) return Response.json({
-      protocolVersion: 3, replicaGeneration: "empty-bootstrap-generation", snapshotVersion: 1,
-      minimumAvailableSequence: 1, highWatermark: 9, contactEvents: [],
-      conversations: [], nextCursor: null, hasMore: false,
+    if (path.includes("/web/snapshot-v2")) return Response.json({
+      token: "migration-snapshot", replicaGeneration: "empty-bootstrap-generation", snapshotVersion: 1,
+      baselineSequence: 9, expiresAt: Date.now() + 60_000, contactEvents: [],
+      rows: [], nextCursor: null, hasMore: false,
     });
+    if (path.includes("/web/sync/ack")) return Response.json({ ok: true });
     if (path.includes("/sync?after=9")) return Response.json({
       events: [], nextCursor: 9, hasMore: false,
       replicaGeneration: "empty-bootstrap-generation", snapshotVersion: 1, minimumAvailableSequence: 1,

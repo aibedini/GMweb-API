@@ -29,11 +29,12 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
       grantRequests++;
       return Response.json({ events: [], nextCursor: 0, hasMore: false });
     }
-    if (/\/web\/bootstrap/.test(String(url))) {
-      return Response.json({ protocolVersion: 3, snapshotVersion: 1, highWatermark: 0,
-        replicaGeneration: 'test-generation', minimumAvailableSequence: 0,
-        conversations: [], nextCursor: null, hasMore: false });
+    if (/\/web\/snapshot-v2/.test(String(url))) {
+      return Response.json({ token: "sync-test-snapshot", snapshotVersion: 1, baselineSequence: 0,
+        replicaGeneration: 'test-generation', expiresAt: Date.now() + 60_000,
+        contactEvents: [], rows: [], nextCursor: null, hasMore: false });
     }
+    if (String(url).includes("/web/sync/ack")) return Response.json({ ok: true });
     requests++;
     const after = Number(new URL(url, 'https://example.test').searchParams.get('after'));
     const events = rows.filter(row => row.sequence > after).slice(0, 500);
