@@ -36,7 +36,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     preferredProtocolVersion: 1,
     supportedProtocolVersions: [1],
     eventIngest: { maxBatchEvents: 100, perItemResults: false },
-    snapshot: { stablePagination: false },
+    snapshot: { stablePagination: true },
     keys: { deviceFiltered: true, independentFromEventCursor: true },
     commands: { durable: true, idempotent: true, leases: false },
   });
@@ -638,6 +638,53 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   });
 
   const webSnapshotHeaders = (reply) => reply.header("Cache-Control", "no-store");
+
+  app.post("/api/v1/web/snapshot-v2", {
+    schema: {
+      summary: "Start immutable encrypted replica snapshot",
+      tags: ["Sync"],
+      body: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 200 } } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    webSnapshotHeaders(reply);
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    }
+    if (checkRateLimit) {
+      const limit = checkRateLimit(request, `linked-snapshot:${request.linkedDevice.deviceId}`, 5, 60_000);
+      if (!limit.allowed) return reply.code(429).header("Retry-After", limit.retryAfterSeconds)
+        .send({ error: "rate_limited" });
+    }
+    return eventStore.beginSnapshot({ accountId, linkedDeviceId: request.linkedDevice.deviceId,
+      limit: request.body?.limit || 100 });
+  });
+  app.get("/api/v1/web/snapshot-v2", {
+    schema: {
+      summary: "Continue immutable encrypted replica snapshot",
+      tags: ["Sync"],
+      querystring: { type: "object", required: ["token"], properties: {
+        token: { type: "string", minLength: 32, maxLength: 128 },
+        cursor: { type: "string", maxLength: 64 },
+        limit: { type: "integer", minimum: 1, maximum: 200 },
+      } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    webSnapshotHeaders(reply);
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    }
+    try {
+      return eventStore.snapshotPage({ accountId, linkedDeviceId: request.linkedDevice.deviceId,
+        token: request.query.token, cursor: request.query.cursor, limit: request.query.limit || 100 });
+    } catch (error) {
+      return reply.code(error.code === "snapshot_forbidden" ? 403 : error.code === "invalid_snapshot_cursor" ? 400 : 409)
+        .send({ error: error.code || "snapshot_required" });
+    }
+  });
 
   app.get("/api/v1/web/bootstrap", {
     schema: {

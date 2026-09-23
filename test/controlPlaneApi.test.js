@@ -90,7 +90,7 @@ describe("Phase 2 control plane HTTP API", () => {
     });
     assert.equal(agent.statusCode, 200);
     assert.equal(agent.json().preferredProtocolVersion, 1);
-    assert.equal(agent.json().snapshot.stablePagination, false);
+    assert.equal(agent.json().snapshot.stablePagination, true);
     assert.equal(agent.json().eventIngest.perItemResults, false);
     assert.equal(agent.json().commands.leases, false);
 
@@ -286,6 +286,32 @@ describe("Phase 2 control plane HTTP API", () => {
     const v1 = await app.inject({ method: "POST", url: "/api/v1/agent/events/batch", payload: { events: [valid] } });
     assert.equal(v1.statusCode, 200);
     assert.ok(Array.isArray(v1.json().accepted));
+  });
+
+  test("V2 snapshot pages require the owning linked browser", async () => {
+    const events = [1, 2].map(index => {
+      const event = { eventId: `snapshot-http-${index}`, type: "CONVERSATION_UPSERTED",
+        conversationId: `snapshot-http-conv-${index}`, encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3 };
+      return { ...event, payload: encryptedPayload(event) };
+    });
+    const seed = await app.inject({ method: "POST", url: "/api/v1/agent/events/batch", payload: { events } });
+    assert.equal(seed.statusCode, 200);
+    const denied = await app.inject({ method: "POST", url: "/api/v1/web/snapshot-v2", payload: { limit: 1 } });
+    assert.equal(denied.statusCode, 401);
+    const start = await app.inject({ method: "POST", url: "/api/v1/web/snapshot-v2",
+      headers: { "x-test-linked": "snapshot-browser" }, payload: { limit: 1 } });
+    assert.equal(start.statusCode, 200);
+    assert.equal(start.headers["cache-control"], "no-store");
+    const first = start.json();
+    assert.ok(first.token);
+    assert.ok(first.baselineSequence >= 1);
+    assert.equal(first.rows.length, 1);
+    const nextUrl = `/api/v1/web/snapshot-v2?token=${encodeURIComponent(first.token)}&cursor=${encodeURIComponent(first.nextCursor)}&limit=1`;
+    const wrong = await app.inject({ method: "GET", url: nextUrl, headers: { "x-test-linked": "other-browser" } });
+    assert.equal(wrong.statusCode, 403);
+    const next = await app.inject({ method: "GET", url: nextUrl, headers: { "x-test-linked": "snapshot-browser" } });
+    assert.equal(next.statusCode, 200);
+    assert.equal(next.json().baselineSequence, first.baselineSequence);
   });
 
   test("web sync ACK requires linked authorization and matching replica metadata", async () => {

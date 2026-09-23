@@ -24,7 +24,9 @@ Android owns telephony observation and irreversible modem submission. GMweb owns
 
 ## V2 additive contract
 
-Implemented ingest slice: `POST /api/v1/agent/events/batch-v2` returns one indexed result per item: `ACCEPTED`, `DUPLICATE` with its original sequence, `CONFLICTING_DUPLICATE`, or `INVALID_EVENT` with a safe error code. The response includes the committed account `highWatermark`. The route binds source identity from agent authentication, not request body. V2 is not advertised as the preferred protocol until snapshot and command contracts are complete.
+Implemented ingest slice: `POST /api/v1/agent/events/batch-v2` returns one indexed result per item: `ACCEPTED`, `DUPLICATE` with its original sequence, `CONFLICTING_DUPLICATE`, or `INVALID_EVENT` with a safe error code. The response includes the committed account `highWatermark`. The route binds source identity from agent authentication, not request body. V2 is not advertised as the preferred protocol until browser and command contracts are complete.
+
+Implemented snapshot provider slice: `POST /api/v1/web/snapshot-v2` creates a device-bound, hour-lived snapshot session in one SQLite transaction at `baselineSequence`. Immutable ciphertext conversation, message and contact state is retained across server restarts. `GET /api/v1/web/snapshot-v2?token=&cursor=&limit=` continues its ordered pages; each response repeats baseline, generation and expiry. The browser consumer is not yet switched to these endpoints, so this provider slice does not fix the current PWA first-page bootstrap defect by itself.
 
 V2 will expose explicit protocol capabilities and retain every V1 endpoint during transition. A batch response has one result per item: `ACCEPTED`, `DUPLICATE` with original sequence, or a safe rejection code. A rejected item consumes no sequence. Batch-level errors are reserved for malformed framing, authorization failure or exceeded batch limits.
 

@@ -5,6 +5,54 @@ const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 const { EventStore } = require("../src/eventStore");
 
+test("V2 snapshot remains immutable across pages, new events, and store restart", () => {
+  const db = new Database(":memory:");
+  let now = 1_000_000;
+  const store = new EventStore(db, { now: () => now });
+  const events = Array.from({ length: 205 }, (_, index) => ({
+    eventId: `snapshot-conv-${index}`, type: "CONVERSATION_UPSERTED",
+    conversationId: `conversation-${index}`, revision: 1, sortKey: index,
+    payload: Buffer.from(`cipher-${index}`), cryptoVersion: 3,
+  }));
+  for (let index = 0; index < events.length; index += 100) {
+    store.ingestBatch({ accountId: "a", events: events.slice(index, index + 100) });
+  }
+  store.ingestBatch({ accountId: "a", events: [{ eventId: "snapshot-message", type: "MESSAGE_CREATED",
+    conversationId: "conversation-0", messageId: "message-0", revision: 1,
+    payload: Buffer.from("message-cipher"), cryptoVersion: 3 }] });
+  const first = store.beginSnapshot({ accountId: "a", linkedDeviceId: "browser-a", limit: 100 });
+  assert.equal(first.baselineSequence, 206);
+  assert.equal(first.rows.length, 100);
+  assert.equal(first.hasMore, true);
+  store.ingestBatch({ accountId: "a", events: [{ eventId: "late", type: "CONVERSATION_UPSERTED",
+    conversationId: "conversation-204", revision: 2, sortKey: 999,
+    payload: Buffer.from("late-cipher"), cryptoVersion: 3 }] });
+  const restarted = new EventStore(db, { now: () => now });
+  const second = restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: first.nextCursor, limit: 100 });
+  const third = restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: second.nextCursor, limit: 100 });
+  assert.equal(second.rows.length, 100);
+  assert.equal(third.rows.length, 6);
+  assert.equal(third.rows.at(-1).kind, "message");
+  assert.equal(third.rows.at(-1).messageId, "message-0");
+  assert.equal(third.hasMore, false);
+  assert.equal(third.baselineSequence, 206);
+  assert.equal([...first.rows, ...second.rows, ...third.rows].some(row => row.envelope === Buffer.from("late-cipher").toString("base64")), false);
+  assert.equal(restarted.after("a", first.baselineSequence).events[0].eventId, "late");
+  assert.throws(() => restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-b",
+    token: first.token, cursor: first.nextCursor, limit: 100 }), error => error.code === "snapshot_forbidden");
+  assert.throws(() => restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: "not-a-cursor", limit: 100 }), error => error.code === "invalid_snapshot_cursor");
+  now = first.expiresAt + 1;
+  assert.throws(() => restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: first.nextCursor, limit: 100 }), error => error.code === "snapshot_expired");
+  now = 1_000_000;
+  db.prepare("UPDATE replica_metadata SET snapshot_version = snapshot_version + 1 WHERE account_id = 'a'").run();
+  assert.throws(() => restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: first.nextCursor, limit: 100 }), error => error.code === "snapshot_required");
+});
+
 describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => {
   test("V2 reports accepted, identical replay, and conflicting replay without consuming sequence", () => {
     const store = new EventStore(new Database(":memory:"));

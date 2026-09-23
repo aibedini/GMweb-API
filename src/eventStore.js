@@ -159,6 +159,36 @@ class EventStore {
     ensureColumn(db, "sync_events", "sort_key", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "encrypted_message_state", "event_type", "TEXT NOT NULL DEFAULT 'MESSAGE_CREATED'");
     ensureColumn(db, "encrypted_conversation_state", "tombstone", "INTEGER NOT NULL DEFAULT 0");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS encrypted_snapshot_sessions (
+        token TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        linked_device_id TEXT NOT NULL,
+        replica_generation TEXT NOT NULL,
+        snapshot_version INTEGER NOT NULL,
+        baseline_sequence INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        contact_events TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS encrypted_snapshot_rows (
+        token TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        message_id TEXT,
+        revision INTEGER NOT NULL,
+        sort_key INTEGER NOT NULL,
+        tombstone INTEGER NOT NULL,
+        event_type TEXT,
+        envelope BLOB NOT NULL,
+        encoding TEXT NOT NULL,
+        schema_version INTEGER NOT NULL,
+        crypto_version INTEGER NOT NULL,
+        last_server_sequence INTEGER NOT NULL,
+        PRIMARY KEY (token, position)
+      );
+      CREATE INDEX IF NOT EXISTS idx_snapshot_expiry ON encrypted_snapshot_sessions(expires_at);
+    `);
     this.counterStmt = db.prepare(
       `INSERT INTO event_counters (account_id, next_sequence) VALUES (?, 1)
        ON CONFLICT(account_id) DO NOTHING`
@@ -478,6 +508,82 @@ class EventStore {
   highWatermark(accountId) {
     this.counterStmt.run(accountId);
     return Math.max(0, Number(this.nextSeqStmt.get(accountId)?.next_sequence || 1) - 1);
+  }
+
+  beginSnapshot({ accountId, linkedDeviceId, limit = 100 }) {
+    if (!linkedDeviceId) throw Object.assign(new Error("linked device required"), { code: "snapshot_forbidden" });
+    const token = crypto.randomBytes(32).toString("base64url");
+    const expiresAt = this.now() + 60 * 60 * 1000;
+    this.db.transaction(() => {
+      const expired = this.db.prepare("SELECT token FROM encrypted_snapshot_sessions WHERE expires_at <= ? LIMIT 10")
+        .all(this.now()).map(row => row.token);
+      for (const oldToken of expired) {
+        this.db.prepare("DELETE FROM encrypted_snapshot_rows WHERE token = ?").run(oldToken);
+        this.db.prepare("DELETE FROM encrypted_snapshot_sessions WHERE token = ?").run(oldToken);
+      }
+      const metadata = this.replicaMetadata(accountId);
+      const baseline = this.highWatermark(accountId);
+      this.db.prepare(`INSERT INTO encrypted_snapshot_sessions
+        (token, account_id, linked_device_id, replica_generation, snapshot_version, baseline_sequence, expires_at, contact_events)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(token, accountId, linkedDeviceId,
+        metadata.replicaGeneration, metadata.snapshotVersion, baseline, expiresAt,
+        JSON.stringify(this.contactBootstrapEvents(accountId)));
+      this.db.prepare(`INSERT INTO encrypted_snapshot_rows
+        (token, position, kind, conversation_id, message_id, revision, sort_key, tombstone,
+         event_type, envelope, encoding, schema_version, crypto_version, last_server_sequence)
+        SELECT ?, ROW_NUMBER() OVER (ORDER BY sort_key DESC, conversation_id DESC),
+          'conversation', conversation_id, NULL, revision, sort_key, tombstone,
+          NULL, envelope, encoding, schema_version, crypto_version, last_server_sequence
+        FROM encrypted_conversation_state WHERE account_id = ?`).run(token, accountId);
+      const conversationCount = this.db.prepare("SELECT COUNT(*) AS n FROM encrypted_conversation_state WHERE account_id = ?")
+        .get(accountId).n;
+      this.db.prepare(`INSERT INTO encrypted_snapshot_rows
+        (token, position, kind, conversation_id, message_id, revision, sort_key, tombstone,
+         event_type, envelope, encoding, schema_version, crypto_version, last_server_sequence)
+        SELECT ?, ? + ROW_NUMBER() OVER (ORDER BY conversation_id, sort_key DESC, message_id DESC),
+          'message', conversation_id, message_id, revision, sort_key, tombstone,
+          event_type, envelope, encoding, schema_version, crypto_version, last_server_sequence
+        FROM encrypted_message_state WHERE account_id = ?`).run(token, conversationCount, accountId);
+    })();
+    return this.snapshotPage({ accountId, linkedDeviceId, token, limit });
+  }
+
+  snapshotPage({ accountId, linkedDeviceId, token, cursor, limit = 100 }) {
+    const session = this.db.prepare("SELECT * FROM encrypted_snapshot_sessions WHERE token = ?").get(token);
+    if (!session) throw Object.assign(new Error("snapshot missing"), { code: "snapshot_required" });
+    if (session.account_id !== accountId || session.linked_device_id !== linkedDeviceId) {
+      throw Object.assign(new Error("snapshot forbidden"), { code: "snapshot_forbidden" });
+    }
+    if (this.now() >= session.expires_at) throw Object.assign(new Error("snapshot expired"), { code: "snapshot_expired" });
+    const currentMetadata = this.replicaMetadata(accountId);
+    if (session.replica_generation !== currentMetadata.replicaGeneration ||
+        session.snapshot_version !== currentMetadata.snapshotVersion) {
+      throw Object.assign(new Error("replica changed"), { code: "snapshot_required" });
+    }
+    const decodedCursor = cursor == null ? "0" : Buffer.from(String(cursor), "base64url").toString("utf8");
+    const position = Number(decodedCursor);
+    if (!Number.isSafeInteger(position) || position < 0 || String(position) !== decodedCursor ||
+        (cursor != null && Buffer.from(decodedCursor).toString("base64url") !== cursor)) {
+      throw Object.assign(new Error("invalid snapshot cursor"), { code: "invalid_snapshot_cursor" });
+    }
+    const capped = Math.max(1, Math.min(200, Number(limit) || 100));
+    const rows = this.db.prepare(`SELECT position, kind, conversation_id AS conversationId,
+      message_id AS messageId, revision, sort_key AS sortKey, tombstone, event_type AS type,
+      envelope, encoding, schema_version AS schemaVersion, crypto_version AS cryptoVersion,
+      last_server_sequence AS lastServerSequence
+      FROM encrypted_snapshot_rows WHERE token = ? AND position > ? ORDER BY position LIMIT ?`)
+      .all(token, position, capped + 1);
+    const hasMore = rows.length > capped;
+    const page = hasMore ? rows.slice(0, capped) : rows;
+    return {
+      token, replicaGeneration: session.replica_generation,
+      snapshotVersion: session.snapshot_version, baselineSequence: session.baseline_sequence,
+      expiresAt: session.expires_at,
+      contactEvents: position === 0 ? JSON.parse(session.contact_events) : [],
+      rows: page.map(row => ({ ...row, tombstone: Boolean(row.tombstone), envelope: Buffer.from(row.envelope).toString("base64") })),
+      nextCursor: hasMore ? Buffer.from(String(page.at(-1).position)).toString("base64url") : null,
+      hasMore,
+    };
   }
 
   conversations(accountId, cursor, limit = 100) {
