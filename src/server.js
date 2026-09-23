@@ -799,6 +799,7 @@ function requireToken(request, reply, done) {
           p === "/api/v1/linked-device/sync-diagnostics" ||
           p === "/api/v1/linked-device/key-grants" ||
           p === "/api/v1/linked-device/keyring" ||
+          p === "/api/v1/linked-device/replication-capabilities" ||
           p === "/api/v1/linked-session" ||
           p.startsWith("/api/v1/trust/"))) ||
       (caps.includes("READ_MESSAGES") && request.method === "POST" &&

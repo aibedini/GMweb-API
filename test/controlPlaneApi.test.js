@@ -83,6 +83,25 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.deepEqual(after.json(), before.json());
   });
 
+  test("replication capabilities expose only implemented protocol features to authorized clients", async () => {
+    const agent = await app.inject({
+      method: "GET", url: "/api/v1/agent/replication-capabilities",
+      headers: { "x-test-agent-role": "PRIMARY_TRUST_AGENT", "x-test-agent-device": "agent-capabilities" },
+    });
+    assert.equal(agent.statusCode, 200);
+    assert.equal(agent.json().preferredProtocolVersion, 1);
+    assert.equal(agent.json().snapshot.stablePagination, false);
+    assert.equal(agent.json().eventIngest.perItemResults, false);
+    assert.equal(agent.json().commands.leases, false);
+
+    const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/replication-capabilities" });
+    assert.equal(denied.statusCode, 401);
+    const linked = await app.inject({ method: "GET", url: "/api/v1/linked-device/replication-capabilities",
+      headers: { "x-test-linked": "browser-capabilities" } });
+    assert.equal(linked.statusCode, 200);
+    assert.deepEqual(linked.json(), agent.json());
+  });
+
   after(async () => {
     await app.close();
   });

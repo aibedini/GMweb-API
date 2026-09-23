@@ -28,6 +28,39 @@ const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ"])
  */
 function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentAuthService, checkRateLimit }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
+  const replicationCapabilities = () => ({
+    preferredProtocolVersion: 1,
+    supportedProtocolVersions: [1],
+    eventIngest: { maxBatchEvents: 100, perItemResults: false },
+    snapshot: { stablePagination: false },
+    keys: { deviceFiltered: true, independentFromEventCursor: true },
+    commands: { durable: true, idempotent: true, leases: false },
+  });
+  const capabilitiesSchema = {
+    schema: {
+      summary: "Implemented encrypted replication capabilities",
+      description: "Reports active protocol behavior. V2 remains unavailable until its snapshot, ingest and command contracts are implemented.",
+      tags: ["Sync"],
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  };
+
+  app.get("/api/v1/agent/replication-capabilities", capabilitiesSchema, async (request, reply) => {
+    if (!authorizeAgent(request, request.rawBody || Buffer.alloc(0))) {
+      return reply.code(401).send({ error: "agent_auth_required" });
+    }
+    reply.header("Cache-Control", "no-store");
+    return replicationCapabilities();
+  });
+
+  app.get("/api/v1/linked-device/replication-capabilities", capabilitiesSchema, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    }
+    reply.header("Cache-Control", "no-store");
+    return replicationCapabilities();
+  });
   const applyStatement = statement => trustRegistry.db.transaction(() => {
     const result = trustRegistry.applyStatement({ accountId, statement });
     if (result.applied && statement.operation === "DEVICE_REVOKED") {

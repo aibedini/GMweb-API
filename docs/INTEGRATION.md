@@ -361,6 +361,8 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `POST /api/v1/agent/commands/claim` | **Android Agent only** (device key). Atomically claims queued commands. | `X-API-Key` device key |
 | `POST /api/v1/agent/commands/:id/status` | Agent reports `ACCEPTED/EXECUTING/COMPLETED/FAILED`; guarded transitions, illegal jumps → `409`. | device key |
 | `POST /api/v1/agent/events/batch` | Agent uploads opaque event batches; response **partial-ACKs** per `eventId` with the assigned `serverSequence`; missing IDs stay pending on the device and retry. Duplicate IDs are skipped **without consuming a sequence**. | device key |
+| `GET /api/v1/agent/replication-capabilities` | Reports implemented replication protocol versions and ingest, snapshot, key and command features. Currently advertises V1 only; Android must not infer V2 availability. | Agent signature or compatible device key |
+| `GET /api/v1/linked-device/replication-capabilities` | Same implemented capability report for a paired browser; requires `READ_MESSAGES`. | Linked session |
 | `GET /api/v1/sync?after=&limit=` | **Cursor catch-up sync**: opaque ciphertext events with monotonic **per-account** sequences, `{events, nextCursor, hasMore}`. Apply transactionally into your local store; the cursor is your only sync state. | Bearer |
 | `GET /api/v1/web/bootstrap?limit=` | Atomic encrypted conversation bootstrap plus `highWatermark`; linked `READ_MESSAGES` cookie only. | Linked session |
 | `GET /api/v1/web/conversations?cursor=&limit=` | Encrypted conversation snapshots using keyset pagination. | Linked session |
