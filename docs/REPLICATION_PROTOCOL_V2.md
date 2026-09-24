@@ -42,6 +42,35 @@ Commands preserve `commandId`, idempotency key and `clientMessageId` across resp
 
 Existing V1 codes such as `snapshot_required`, `capability_denied`, `encrypted_payload_required`, `unsupported_schema_version`, `unsupported_crypto_version`, `invalid_payload_encoding` and `event_payload_too_large` retain their current meaning. V2 adds item-scoped rejection and snapshot-token expiry codes only when the corresponding implementation and OpenAPI are introduced. Error responses and diagnostics contain no SMS body, recipient, plaintext preview, private key or credential.
 
+## State machine and recovery boundaries
+
+| Stage | Durable boundary | Recovery |
+| --- | --- | --- |
+| Pairing | Linked browser session and per-device capability | Revocation invalidates only that browser; a new pairing cannot inherit its key grant. `historyStage` means grant evidence exists on the provider, not that the browser decrypted it. |
+| Snapshot | Device-bound server token, immutable rows and baseline; IndexedDB page cursor | Resume the same token after refresh. On expiry or generation change, start a new snapshot. Do not advance the event cursor before the final page commits. |
+| Delta | Per-account event sequence and local event cursor | SSE is only a wake-up hint. Poll from the durable cursor after a missed frame; repeated pages are idempotent. |
+| Keys and projection | Independent key/grant and projection cursors | Key outage is degraded, not a reason to discard valid ciphertext or stop event ingestion. Retry locked rows when a grant arrives. |
+| Send | Browser outbox identity and provider command identity | Reuse the same idempotency key after lost responses. V2 claim generations reject stale/foreign status updates, but leases remain disabled until Android modem-boundary dedupe is verified. |
+
+## Failure matrix and data lifecycle
+
+| Condition | Expected outcome | Release evidence still needed |
+| --- | --- | --- |
+| Invalid/expired snapshot token or changed generation | Reject continuation (`snapshot_required` or `snapshot_expired`); browser retries a fresh snapshot. | Real-browser restart and token expiry. |
+| Revoked or capability-denied browser | No snapshot, sync, diagnostics or command status outside its ownership. | Physical revocation while offline/reconnecting. |
+| Missing/invalid key grant | Store opaque encrypted events; report locked/degraded projection without plaintext fallback. | Android grant and real-browser decryption. |
+| Lost SSE or duplicated ingest/command response | Catch up from durable cursor; preserve original event/command identity. | Production-like network fault injection. |
+| Agent lease expiry or stale status | Guarded reclaim advances claim generation; old claimant cannot finalize. | Android persistent dedupe before V2 activation. |
+
+Encrypted current state and the bounded event log remain account-scoped on the
+provider; snapshot sessions are temporary and browser-bound. The browser keeps
+encrypted IndexedDB state plus separate snapshot, event, grant and projection
+progress. Compaction is constrained by linked-browser ACK positions; key events
+are retained. Migration or rollback must preserve ciphertext and stable device
+identities. Clearing IndexedDB or converting retained content to plaintext is
+not a recovery path. See [the replication ADR](ADR-MESSAGES-WEB-REPLICATION.md)
+for compaction and migration details.
+
 ## Compatibility and rollout
 
 1. Deploy additive GMweb schema and V2 routes with V1 still active.
