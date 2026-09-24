@@ -12,6 +12,7 @@ or physical-device acceptance.
 | Frontend build and release artifact version | PASS | `npm run build:frontends` and `npm run verify:artifacts`, exit 0; API and frontend artifacts report 0.19.13. |
 | 360,000-message synthetic snapshot | PASS | [Performance report](MESSAGES-WEB-PERFORMANCE-REPORT.md): 360,000 unique snapshot messages, 1 post-baseline realtime event, no snapshot duplicate. In-memory SQLite; not browser/device performance. |
 | Shared Android fixtures | PASS for committed blobs | [Cross-repository evidence](../specs/003-multi-device-replication-v2/phase6-contract-evidence.md) at Android `c5d43e5`; CI now compares both fixture files. Android V2 route consumption NOT VERIFIED. |
+| Local operational preflight | PASS, limited | `npm run doctor`, exit 0: Node/package, API token, Chrome/profile, disabled debug routes. This is not deployment smoke or send evidence. |
 | Physical phone, three-browser, modem dedupe, revocation, deployment | NOT RUN | No `adb` executable or connected test device in this environment; no physical APK or production-like deployment evidence. See [physical gate](MESSAGES-WEB-PHYSICAL-GATE.md). |
 
 Release decision: **BLOCKED for V2 activation**. `commands.leases` stays false.

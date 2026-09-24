@@ -1,6 +1,6 @@
 # Messages-for-Web physical release gate
 
-Current status: **NOT RUN — PHYSICAL DEVICE REQUIRED** (`adb` was unavailable in the 2026-09-24 candidate environment; the 2026-09-12 check also had no connected device).
+Current status: **NOT RUN — PHYSICAL DEVICE REQUIRED** (`adb` and Android SDK were unavailable in the 2026-09-24 candidate environment; no present Android/ADB USB device was detected. The 2026-09-12 check also had no connected device).
 
 Record sanitized evidence for: fresh FULL_HISTORY pairing; old incoming/outgoing decrypt; recent-first browsing during backfill; live incoming; phone-sent outgoing; Web-sent reconciliation; delivery/failure update; process death and phone reboot resume; API restart resume; browser refresh/offline cache; revoke while open/offline/reconnecting; tamper rejection; production plaintext canary; 360k completion without crash/OOM/ANR.
 
