@@ -109,8 +109,9 @@ test("PWA resumes a partly committed snapshot without advancing the event cursor
     await sync.resetLocal();
     assert.equal(await sync.syncStep(1), 0);
     assert.equal(await sync.getCursor(), 0);
-    assert.equal(await sync.syncNow(), 0);
-    assert.equal(await sync.getCursor(), 2);
+    const restarted = await import("../web/src/lib/sync.ts?resume-test-process=1");
+    assert.equal(await restarted.syncNow(), 0);
+    assert.equal(await restarted.getCursor(), 2);
     assert.equal(starts, 1);
     assert.equal(continuations, 1);
     const local = await sync.listConversations();

@@ -6,30 +6,59 @@ const Database = require("better-sqlite3");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { spawn } = require("node:child_process");
 const { EventStore } = require("../src/eventStore");
 
-test("snapshot token and immutable pages survive SQLite connection reopen", () => {
-  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-snapshot-"));
+test("snapshot continuation survives termination of its creator process", async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-snapshot-death-"));
+  const filename = path.join(folder, "replica.sqlite");
+  const script = `
+    const Database = require("better-sqlite3");
+    const { EventStore } = require("./src/eventStore");
+    const db = new Database(process.argv[1]);
+    const store = new EventStore(db);
+    store.ingestBatch({ accountId: "a", events: [1, 2].map(index => ({
+      eventId: "death-" + index, type: "CONVERSATION_UPSERTED",
+      conversationId: "c-" + index, revision: 1, sortKey: index,
+      payload: Buffer.from("cipher-" + index), cryptoVersion: 3,
+    })) });
+    const first = store.beginSnapshot({ accountId: "a", linkedDeviceId: "browser", limit: 1 });
+    process.stdout.write(JSON.stringify({ token: first.token, cursor: first.nextCursor,
+      baseline: first.baselineSequence }) + "\\n", () => setInterval(() => {}, 1000));
+  `;
+  const child = spawn(process.execPath, ["-e", script, filename], {
+    cwd: path.resolve(__dirname, ".."), stdio: ["ignore", "pipe", "pipe"],
+  });
   let db;
   try {
-    const filename = path.join(folder, "replica.sqlite");
+    const first = await new Promise((resolve, reject) => {
+      let output = "";
+      let errors = "";
+      const timeout = setTimeout(() => reject(new Error(`snapshot child timed out: ${errors}`)), 10_000);
+      child.stderr.on("data", chunk => { errors += chunk.toString(); });
+      child.stdout.on("data", chunk => {
+        output += chunk.toString();
+        if (!output.includes("\n")) return;
+        clearTimeout(timeout);
+        try { resolve(JSON.parse(output.split("\n")[0])); } catch (error) { reject(error); }
+      });
+      child.on("error", error => { clearTimeout(timeout); reject(error); });
+      child.on("exit", code => {
+        if (!output.includes("\n")) { clearTimeout(timeout); reject(new Error(`snapshot child exited ${code}: ${errors}`)); }
+      });
+    });
+    const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
+    assert.equal(child.kill("SIGKILL"), true);
+    assert.deepEqual(await exited, { code: null, signal: "SIGKILL" });
     db = new Database(filename);
-    const initial = new EventStore(db);
-    initial.ingestBatch({ accountId: "a", events: [1, 2].map(index => ({
-      eventId: `restart-${index}`, type: "CONVERSATION_UPSERTED", conversationId: `c-${index}`,
-      revision: 1, sortKey: index, payload: Buffer.from(`cipher-${index}`), cryptoVersion: 3,
-    })) });
-    const first = initial.beginSnapshot({ accountId: "a", linkedDeviceId: "browser", limit: 1 });
-    assert.equal(first.hasMore, true);
-    db.close();
-    db = new Database(filename);
-    const restarted = new EventStore(db);
-    const next = restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser",
-      token: first.token, cursor: first.nextCursor, limit: 1 });
-    assert.equal(next.baselineSequence, first.baselineSequence);
-    assert.equal(next.rows.length, 1);
+    const store = new EventStore(db);
+    const next = store.snapshotPage({ accountId: "a", linkedDeviceId: "browser",
+      token: first.token, cursor: first.cursor, limit: 1 });
+    assert.equal(next.baselineSequence, first.baseline);
+    assert.deepEqual(next.rows.map(row => row.conversationId), ["c-1"]);
     assert.equal(next.hasMore, false);
   } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
     db?.close();
     fs.rmSync(folder, { recursive: true, force: true });
   }

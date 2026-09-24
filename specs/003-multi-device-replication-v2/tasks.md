@@ -19,7 +19,7 @@
 - [X] T007 [US1] Add additive snapshot V2 endpoints and authorization in `src/controlPlaneRoutes.js` and `src/server.js`, bump `package.json`, regenerate `docs/openapi.json`, and update `docs/INTEGRATION.md` (FR-004, FR-010).
 - [X] T008 [US1] Extend typed V2 snapshot responses in `web/src/lib/api.ts` (FR-004).
 - [X] T009 [US1] Persist snapshot token/cursor/completion separately from event cursor, continue every page, and start delta at the baseline only after final commit in `web/src/lib/sync.ts` (FR-003–005, FR-012).
-- [ ] T010 [US1] Verify crash, expiry, generation mismatch, late event and two-page completion in `test/webEncryptedBootstrap.test.js` and `test/controlPlaneApi.test.js` (SC-001–002).
+- [X] T010 [US1] Verify crash, expiry, generation mismatch, late event and two-page completion in `test/webEncryptedBootstrap.test.js` and `test/controlPlaneApi.test.js` (SC-001–002).
 
 ## Phase 3: User Story 2 — Key problems do not stop replication (P1)
 
