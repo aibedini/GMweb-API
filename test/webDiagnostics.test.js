@@ -7,6 +7,10 @@ global.__GMWEB_VERSION__ = "0.16.2";
 
 test("diagnostics derive projection, contacts, sync, and build failures deterministically", async () => {
   const diagnostics = await import("../web/src/lib/diagnostics.ts");
+  assert.equal(diagnostics.phaseErrorClass("INITIAL_SYNC"), "HISTORY");
+  assert.equal(diagnostics.phaseErrorClass("KEY_SYNC"), "KEY");
+  assert.equal(diagnostics.phaseErrorClass("SSE_SYNC"), "EVENT");
+  assert.equal(diagnostics.phaseErrorClass("user supplied plaintext"), "UNKNOWN");
   const emptyCrypto = { decrypted: 0, accepted: 0, locked: 0, invalid: 0, reasons: {} };
 
   assert.equal(diagnostics.detectProjectionFailure(4, 0, 50, 50), "PROJECTION_DIVERGENCE");

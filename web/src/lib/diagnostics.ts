@@ -10,7 +10,7 @@ export interface WebDiagnosticReport {
   collectedAt: number;
   session: { linked: boolean; capabilities: string[]; apiVersion: string; pwaVersion: string; loadedScript: string; serviceWorker: string; online: boolean; buildMismatch: boolean };
   server: ServerSyncDiagnostics | null;
-  browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number };
+  browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number; phaseErrorClass: "HISTORY" | "KEY" | "EVENT" | "UNKNOWN" | null };
   replicaProgress?: { snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number };
   indexedDb: { total: number; byType: Record<string, number>; byCryptoVersion: Record<string, number>; nullAggregateCount: number; distinctMessageAggregateCount: number; conversationRows: number; contactRows: number };
   crypto: { browserIdentity: boolean; verifiedPrimary: boolean; primaryMatchesBrowser: boolean; messages: DecryptionCounts; keyGrants: DecryptionCounts };
@@ -166,6 +166,14 @@ function safeError(value: string | null): string | null {
   return http || "Sync operation failed";
 }
 
+export function phaseErrorClass(phase: string | null): "HISTORY" | "KEY" | "EVENT" | "UNKNOWN" | null {
+  if (!phase) return null;
+  if (phase === "INITIAL_SYNC") return "HISTORY";
+  if (phase === "KEY_SYNC") return "KEY";
+  if (phase === "SYNC" || phase === "SSE_SYNC") return "EVENT";
+  return "UNKNOWN";
+}
+
 async function probeKeyGrants(): Promise<Decryption[]> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -227,7 +235,8 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
       online: navigator.onLine, buildMismatch,
     },
     server,
-    browserSync: { ...runtime, lastErrorMessage: safeError(runtime.lastErrorMessage), cursor, projectionCursor, syncLag, projectionLag },
+    browserSync: { ...runtime, lastErrorMessage: safeError(runtime.lastErrorMessage),
+      phaseErrorClass: phaseErrorClass(runtime.lastErrorPhase), cursor, projectionCursor, syncLag, projectionLag },
     replicaProgress,
     indexedDb: {
       total: local.total, byType: local.byType, byCryptoVersion: local.byCryptoVersion,
@@ -276,6 +285,7 @@ export function formatWebDiagnostics(report: WebDiagnosticReport): string {
     `Browser cursor             ${report.browserSync.cursor}`,
     `Sync lag                   ${report.browserSync.syncLag ?? "unknown"}`,
     `Sync state                 ${report.browserSync.state}`,
+    `Sync error class           ${report.browserSync.phaseErrorClass ?? "none"}`,
     `Projection cursor          ${report.projection.cursor}`,
     `Projection lag             ${report.projection.lag}`,
     `Snapshot complete          ${report.replicaProgress?.snapshotComplete ?? "unknown"}`,

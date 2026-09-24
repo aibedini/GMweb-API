@@ -16,6 +16,9 @@ const EVENT_TYPES = Object.keys({
   ...eventCryptoPolicy.nonContentControl,
 });
 const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ"]);
+const SAFE_INGEST_ERROR_CODES = new Set(["invalid_event_id", "invalid_metadata", "invalid_payload_encoding",
+  "invalid_encrypted_envelope", "unsupported_schema_version", "unsupported_crypto_version",
+  "encrypted_payload_required", "event_payload_too_large"]);
 
 /**
  * Phase 2 Control Plane routes (TechSpec §51–58, ADR-001/004) as a REGISTERED
@@ -626,7 +629,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       } },
       response: { 200: { type: "object", properties: {
         results: { type: "array", items: { type: "object", properties: {
-          index: { type: "integer" }, eventId: { type: "string" }, status: { type: "string" }, serverSequence: { type: "integer" }, error: { type: "string" }
+          index: { type: "integer" }, eventId: { type: "string" }, status: { type: "string" }, serverSequence: { type: "integer" }, error: { type: "string" }, errorClass: { type: "string", enum: ["VALIDATION", "IDENTITY_CONFLICT"] }
         } } },
         highWatermark: { type: "integer" }
       } } }
@@ -658,13 +661,16 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         valid.push({ ...event, payload });
         indices.push(index);
       } catch (error) {
-        results[index] = { index, eventId: String(event.eventId || ""), status: "INVALID_EVENT", error: error.code || "invalid_event" };
+        results[index] = { index, eventId: String(event.eventId || ""), status: "INVALID_EVENT",
+          error: SAFE_INGEST_ERROR_CODES.has(error.code) ? error.code : "invalid_event", errorClass: "VALIDATION" };
       }
     }
     const stored = valid.length
       ? eventStore.ingestBatch({ accountId, sourceDeviceId: request.authenticatedAgentId || null, events: valid, perItem: true })
       : { results: [], highWatermark: eventStore.highWatermark(accountId) };
-    stored.results.forEach((result, offset) => { results[indices[offset]] = { index: indices[offset], ...result }; });
+    stored.results.forEach((result, offset) => { results[indices[offset]] = { index: indices[offset], ...result,
+      ...(result.status === "CONFLICTING_DUPLICATE" ? { errorClass: "IDENTITY_CONFLICT" }
+        : result.status === "ACCEPTED" || result.status === "DUPLICATE" ? {} : { errorClass: "VALIDATION" }) }; });
     return { results, highWatermark: stored.highWatermark };
   });
 

@@ -339,6 +339,7 @@ describe("Phase 2 control plane HTTP API", () => {
     const first = await upload([valid, { ...valid, eventId: "bad", payload: "not-base64" }, valid]);
     assert.equal(first.statusCode, 200);
     assert.deepEqual(first.json().results.map(row => row.status), ["ACCEPTED", "INVALID_EVENT", "DUPLICATE"]);
+    assert.deepEqual(first.json().results.map(row => row.errorClass ?? null), [null, "VALIDATION", null]);
     assert.equal(first.json().results[0].serverSequence, first.json().results[2].serverSequence);
     assert.equal(first.json().results[1].error, "invalid_payload_encoding");
     const sync = await app.inject({ method: "GET", url: "/api/v1/sync?after=0&limit=1000" });
@@ -346,6 +347,7 @@ describe("Phase 2 control plane HTTP API", () => {
     const conflict = await upload([{ ...valid, sortKey: 1 }]);
     assert.equal(conflict.statusCode, 200);
     assert.equal(conflict.json().results[0].status, "CONFLICTING_DUPLICATE");
+    assert.equal(conflict.json().results[0].errorClass, "IDENTITY_CONFLICT");
     assert.equal(conflict.json().highWatermark, first.json().highWatermark);
     const v1 = await app.inject({ method: "POST", url: "/api/v1/agent/events/batch", payload: { events: [valid] } });
     assert.equal(v1.statusCode, 200);
