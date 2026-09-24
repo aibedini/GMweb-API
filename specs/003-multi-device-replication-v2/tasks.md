@@ -52,7 +52,7 @@
 
 ## Phase 6: Scale and release evidence
 
-- [ ] T025 Add a deterministic 360k synthetic history and simultaneous realtime load profile in `scripts/benchmark-encrypted-replica.js`; record query plans, duration and peak memory in `docs/MESSAGES-WEB-PERFORMANCE-REPORT.md` (SC-001).
+- [X] T025 Add a deterministic 360k synthetic history and simultaneous realtime load profile in `scripts/benchmark-encrypted-replica.js`; record query plans, duration and peak memory in `docs/MESSAGES-WEB-PERFORMANCE-REPORT.md` (SC-001).
 - [ ] T026 Update V2 state machine, failure matrix, data lifecycle and migration documents in `docs/` (FR-001–012).
 - [ ] T027 Add shared cross-repository fixtures and run Android contract comparison in `shared/` and `scripts/check-pairing-release.js` (SC-006).
 - [ ] T028 Run `npm run check`, `npm test`, web build, artifact verification and OpenAPI consistency on the candidate; record exact results in `docs/REPLICATION_V2_ACCEPTANCE.md` (SC-001–006).

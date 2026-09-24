@@ -8,6 +8,8 @@ const count = Math.max(1, Number(process.argv[2]) || 360_000);
 const db = new Database(":memory:");
 const store = new EventStore(db);
 const payload = Buffer.alloc(256, 7);
+let peakRssBytes = process.memoryUsage().rss;
+const sampleMemory = () => { peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss); };
 const started = performance.now();
 for (let offset = 0; offset < count; offset += 100) {
   const events = [];
@@ -17,6 +19,7 @@ for (let offset = 0; offset < count; offset += 100) {
       payload, encoding: "envelope.v3", cryptoVersion: 3 });
   }
   store.ingestBatch({ accountId: "benchmark", sourceDeviceId: "phone", events });
+  if (offset % 10_000 === 0) sampleMemory();
 }
 for (let offset = 0; offset < 1_000; offset += 100) {
   const events = Array.from({ length: 100 }, (_, index) => {
@@ -28,6 +31,37 @@ for (let offset = 0; offset < 1_000; offset += 100) {
   store.ingestBatch({ accountId: "benchmark", sourceDeviceId: "phone", events });
 }
 const ingestMs = performance.now() - started;
+const snapshotStarted = performance.now();
+const firstPage = store.beginSnapshot({ accountId: "benchmark", linkedDeviceId: "benchmark-browser", limit: 200 });
+let snapshotRows = firstPage.rows.length;
+let cursor = firstPage.nextCursor;
+let pages = 1;
+const seen = new Set(firstPage.rows.filter(row => row.kind === "message").map(row => row.messageId));
+store.ingestBatch({ accountId: "benchmark", sourceDeviceId: "phone", events: [{
+  eventId: "realtime-during-snapshot", type: "MESSAGE_CREATED", messageId: "realtime-message",
+  conversationId: "conversation-0", revision: 1, sortKey: count + 1,
+  payload, encoding: "envelope.v3", cryptoVersion: 3,
+}] });
+while (cursor) {
+  const page = store.snapshotPage({ accountId: "benchmark", linkedDeviceId: "benchmark-browser",
+    token: firstPage.token, cursor, limit: 200 });
+  for (const row of page.rows) {
+    if (row.kind !== "message") continue;
+    if (seen.has(row.messageId)) throw new Error(`duplicate snapshot message: ${row.messageId}`);
+    seen.add(row.messageId);
+  }
+  snapshotRows += page.rows.length;
+  cursor = page.nextCursor;
+  pages += 1;
+  if (pages % 50 === 0) sampleMemory();
+}
+const delta = store.after("benchmark", firstPage.baselineSequence, 500);
+if (seen.size !== count || seen.has("realtime-message") ||
+    !delta.events?.some(event => event.eventId === "realtime-during-snapshot")) {
+  throw new Error(`snapshot/delta mismatch: ${seen.size} snapshot messages, ${delta.events?.length} delta events`);
+}
+sampleMemory();
+const snapshotMs = performance.now() - snapshotStarted;
 const samples = [];
 const conversationSamples = [];
 const syncSamples = [];
@@ -75,6 +109,9 @@ const plans = {
     .all(Date.now() - 7 * 24 * 60 * 60 * 1000, "benchmark").map(row => row.detail),
 };
 console.log(JSON.stringify({ count, ingestMs: Math.round(ingestMs),
+  snapshotMs: Math.round(snapshotMs), snapshotPages: pages, snapshotRows,
+  snapshotUniqueMessages: seen.size, realtimeAfterBaseline: delta.events.length,
+  peakRssMiB: Number((peakRssBytes / 1024 / 1024).toFixed(1)),
   messagesPerSecond: Math.round(count / (ingestMs / 1_000)),
   messageQueryP95Ms: Number(samples[Math.floor(samples.length * 0.95)].toFixed(3)),
   conversationQueryP95Ms: Number(conversationSamples[Math.floor(conversationSamples.length * 0.95)].toFixed(3)),
