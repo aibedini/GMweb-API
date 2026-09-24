@@ -1,5 +1,5 @@
 import { fetchKeyGrantsAfter, fetchKeyring, fetchSyncDiagnostics, health, type ServerSyncDiagnostics, type SyncEvent } from "./api.ts";
-import { getBrowserSyncStatus, getCursor, getProjectionCursor, type BrowserSyncStatus } from "./sync.ts";
+import { getBrowserSyncStatus, getCursor, getProjectionCursor, getReplicationProgress, type BrowserSyncStatus } from "./sync.ts";
 import { getStoredDeviceIdentity, loadCryptoRecord } from "./deviceKeys.ts";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "./buildInfo.ts";
 import { decryptMessage, receiveKeyGrants, type Decryption } from "./messageCrypto.ts";
@@ -11,6 +11,7 @@ export interface WebDiagnosticReport {
   session: { linked: boolean; capabilities: string[]; apiVersion: string; pwaVersion: string; loadedScript: string; serviceWorker: string; online: boolean; buildMismatch: boolean };
   server: ServerSyncDiagnostics | null;
   browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number };
+  replicaProgress?: { snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number };
   indexedDb: { total: number; byType: Record<string, number>; byCryptoVersion: Record<string, number>; nullAggregateCount: number; distinctMessageAggregateCount: number; conversationRows: number; contactRows: number };
   crypto: { browserIdentity: boolean; verifiedPrimary: boolean; primaryMatchesBrowser: boolean; messages: DecryptionCounts; keyGrants: DecryptionCounts };
   projection: { cursor: number; lag: number; rawMessageAggregates: number; rows: number; readyRows: number; lockedRows: number; failure: "PROJECTION_DIVERGENCE" | null };
@@ -165,6 +166,21 @@ function safeError(value: string | null): string | null {
   return http || "Sync operation failed";
 }
 
+async function probeKeyGrants(): Promise<Decryption[]> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.all([
+        fetchKeyring().then(page => page.events),
+        fetchKeyGrantsAfter(0, 20).then(page => page.events),
+      ]).then(pages => receiveKeyGrants(pages.flat())).catch(() => []),
+      new Promise<Decryption[]>(resolve => { timeout = setTimeout(() => resolve([]), 2_000); }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 async function shortHash(value: string): Promise<string> {
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
   return [...digest.slice(0, 6)].map(byte => byte.toString(16).padStart(2, "0")).join("");
@@ -189,12 +205,10 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     localCounts(), getStoredDeviceIdentity(),
     loadCryptoRecord<{ deviceId: string; encryptionPublicKey: string }>("verified-primary").catch(() => null),
     navigator.serviceWorker?.getRegistration().catch(() => undefined),
-    Promise.all([
-      fetchKeyring().then(page => page.events),
-      fetchKeyGrantsAfter(0, 20).then(page => page.events),
-    ]).then(pages => receiveKeyGrants(pages.flat())).catch(() => []),
+    probeKeyGrants(),
   ]);
   const runtime = getBrowserSyncStatus();
+  const replicaProgress = identity ? await getReplicationProgress(identity.deviceId) : undefined;
   const projectionLag = Math.max(0, cursor - projectionCursor);
   const syncLag = server ? Math.max(0, server.maxSequence - cursor) : null;
   const projectionFailure = detectProjectionFailure(local.distinctMessageAggregateCount, local.conversationRows, projectionCursor, cursor);
@@ -214,6 +228,7 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     },
     server,
     browserSync: { ...runtime, lastErrorMessage: safeError(runtime.lastErrorMessage), cursor, projectionCursor, syncLag, projectionLag },
+    replicaProgress,
     indexedDb: {
       total: local.total, byType: local.byType, byCryptoVersion: local.byCryptoVersion,
       nullAggregateCount: local.nullAggregateCount, distinctMessageAggregateCount: local.distinctMessageAggregateCount,
@@ -263,6 +278,10 @@ export function formatWebDiagnostics(report: WebDiagnosticReport): string {
     `Sync state                 ${report.browserSync.state}`,
     `Projection cursor          ${report.projection.cursor}`,
     `Projection lag             ${report.projection.lag}`,
+    `Snapshot complete          ${report.replicaProgress?.snapshotComplete ?? "unknown"}`,
+    `Snapshot baseline          ${report.replicaProgress?.snapshotBaseline ?? "unknown"}`,
+    `Keyring cursor             ${report.replicaProgress?.keyringCursor ?? "unknown"}`,
+    `Grant cursor               ${report.replicaProgress?.grantCursor ?? "unknown"}`,
     `Raw MESSAGE_CREATED        ${type("MESSAGE_CREATED")}`,
     `Raw KEY_GRANT              ${type("KEY_GRANT")}`,
     `Raw HISTORY_KEY_GRANT      ${type("HISTORY_KEY_GRANT")}`,

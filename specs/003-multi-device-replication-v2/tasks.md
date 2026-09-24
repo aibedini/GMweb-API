@@ -25,12 +25,12 @@
 
 **Independent test**: Key API failure leaves ciphertext and event progress intact; later grant unlocks only affected content.
 
-- [ ] T011 [US2] Add a failing decrypt-before-commit and key-timeout regression in `test/webKeySyncDegraded.test.js` (FR-005–006).
-- [ ] T012 [US2] Commit ciphertext and event cursor in one IndexedDB transaction before key import or decryption in `web/src/lib/sync.ts` (FR-003, FR-006).
-- [ ] T013 [US2] Add separate key and snapshot progress, plus migration from old metadata, in `web/src/lib/sync.ts` (FR-005, FR-012).
-- [ ] T014 [US2] Distinguish missing key, unsupported version and decrypt failure; retry affected locked events after grants in `web/src/lib/inbox.ts` and `web/src/lib/sync.ts` (FR-006).
-- [ ] T015 [US2] Add phase-specific progress and privacy-safe counts in `web/src/lib/diagnostics.ts` and `web/src/app/App.tsx` (FR-011).
-- [ ] T016 [US2] Verify key outage, late grant, restart and independent browser cursors in `test/webKeySyncDegraded.test.js`, `test/webProjection.test.js` and `test/webDiagnostics.test.js` (SC-003).
+- [X] T011 [US2] Add a failing decrypt-before-commit and key-timeout regression in `test/webKeySyncDegraded.test.js` (FR-005–006).
+- [X] T012 [US2] Commit ciphertext and event cursor in one IndexedDB transaction before key import or decryption in `web/src/lib/sync.ts` (FR-003, FR-006).
+- [X] T013 [US2] Add separate key and snapshot progress, plus migration from old metadata, in `web/src/lib/sync.ts` (FR-005, FR-012).
+- [X] T014 [US2] Distinguish missing key, unsupported version and decrypt failure; retry affected locked events after grants in `web/src/lib/inbox.ts` and `web/src/lib/sync.ts` (FR-006).
+- [X] T015 [US2] Add phase-specific progress and privacy-safe counts in `web/src/lib/diagnostics.ts` and `web/src/app/App.tsx` (FR-011).
+- [X] T016 [US2] Verify key outage, late grant, restart and independent browser cursors in `test/webKeySyncDegraded.test.js`, `test/webProjection.test.js` and `test/webDiagnostics.test.js` (SC-003).
 
 ## Phase 4: User Story 3 — Safe send through an offline phone (P1)
 

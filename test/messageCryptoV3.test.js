@@ -67,10 +67,6 @@ test("v3 FULL_HISTORY needs one origin-bound browser history key", async () => {
     pairingTranscriptHash: certificate.pairingTranscriptHash,
     wrappedKey, rootSignature: rawEcdsaToDer(rawSignature).toString("base64"),
   };
-  assert.deepEqual(await messageCrypto.receiveKeyGrant(
-    event("HISTORY_KEY_GRANT", "grant-1", "__history_master__", grant)
-  ), { state: "key-grant", reason: "Authorized history key stored" });
-
   const fields = ["history-1", "live-1", "READ_MESSAGES", "message-1", "MESSAGE_CREATED", "thread-1"];
   const seal = async (keyBytes, plaintext, aad) => {
     const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -92,8 +88,14 @@ test("v3 FULL_HISTORY needs one origin-bound browser history key", async () => {
     historyWrapIv: historyWrap.iv, historyWrappedDek: historyWrap.ciphertext,
     liveWrapIv: liveWrap.iv, liveWrappedDek: liveWrap.ciphertext,
   };
+  const encryptedMessage = event("MESSAGE_CREATED", "message-1", "thread-1", messageEnvelope);
+  assert.deepEqual(await messageCrypto.decryptMessage(encryptedMessage),
+    { state: "locked", reason: "Authorized history key unavailable" });
+  assert.deepEqual(await messageCrypto.receiveKeyGrant(
+    event("HISTORY_KEY_GRANT", "grant-1", "__history_master__", grant)
+  ), { state: "key-grant", reason: "Authorized history key stored" });
   const decrypted = await messageCrypto.decryptMessage(
-    event("MESSAGE_CREATED", "message-1", "thread-1", messageEnvelope)
+    encryptedMessage
   );
   assert.equal(decrypted.state, "decrypted");
   assert.deepEqual(decrypted.payload, { messageId: "m1", body: "full history" });

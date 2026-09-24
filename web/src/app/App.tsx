@@ -384,7 +384,10 @@ export default function App() {
   let syncBanner = `Syncing message history… ${syncStatus.appliedThisRun} event(s) applied`;
   if (serverStats) syncBanner = `Syncing message history… cursor ${cursor} / ${serverStats.maxSequence}`;
   if (syncStatus.state === "UP_TO_DATE") syncBanner = "Messages are up to date";
-  if (syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED") syncBanner = `Sync paused after sequence ${cursor}`;
+  if (syncStatus.state === "DEGRADED") syncBanner = syncStatus.lastErrorPhase === "KEY_SYNC"
+    ? `Encrypted history saved through sequence ${cursor}; waiting for keys`
+    : `Sync needs attention after sequence ${cursor}`;
+  if (syncStatus.state === "FAILED") syncBanner = `Sync paused after sequence ${cursor}`;
   let emptyInboxMessage = "Browser has not downloaded message history.";
   if (serverStats && serverTypeCount("MESSAGE_CREATED") === 0) emptyInboxMessage = "No message events have reached GMweb yet.";
   else if (cursor > 0 && events.some(event => event.decryption?.state === "locked")) emptyInboxMessage = "Messages downloaded but are waiting for keys.";
@@ -569,7 +572,7 @@ export default function App() {
           </div>
           {webDiagnostics && <div className="status-grid">
             <Card><CardContent className="status-card"><span>Server</span><strong>{webDiagnostics.session.linked && webDiagnostics.server ? "PASS" : "FAIL"}</strong><small>{webDiagnostics.server?.total ?? "Unavailable"} events · max sequence {webDiagnostics.server?.maxSequence ?? "—"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Browser Sync</span><strong>{webDiagnostics.browserSync.state === "UP_TO_DATE" ? "PASS" : webDiagnostics.browserSync.state === "FAILED" ? "FAIL" : webDiagnostics.browserSync.state === "DEGRADED" ? "WARN" : "SYNCING"}</strong><small>cursor {webDiagnostics.browserSync.cursor} · lag {webDiagnostics.browserSync.syncLag ?? "unknown"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Browser Sync</span><strong>{webDiagnostics.browserSync.state === "UP_TO_DATE" ? "PASS" : webDiagnostics.browserSync.state === "FAILED" ? "FAIL" : webDiagnostics.browserSync.state === "DEGRADED" ? "WARN" : "SYNCING"}</strong><small>cursor {webDiagnostics.browserSync.cursor} · lag {webDiagnostics.browserSync.syncLag ?? "unknown"} · snapshot {webDiagnostics.replicaProgress?.snapshotComplete ? "complete" : "pending"} · keyring {webDiagnostics.replicaProgress?.keyringCursor ?? "unknown"} · grants {webDiagnostics.replicaProgress?.grantCursor ?? "unknown"}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>IndexedDB</span><strong>PASS</strong><small>{webDiagnostics.indexedDb.total} raw events · {webDiagnostics.indexedDb.distinctMessageAggregateCount} message aggregates</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Crypto</span><strong>{webDiagnostics.crypto.messages.invalid || webDiagnostics.crypto.keyGrants.invalid ? "FAIL" : webDiagnostics.crypto.messages.locked ? "WARN" : "PASS"}</strong><small>{webDiagnostics.crypto.messages.decrypted} decrypted · {webDiagnostics.crypto.messages.locked} locked · {webDiagnostics.crypto.messages.invalid} invalid<br />Grant probe: {webDiagnostics.crypto.keyGrants.accepted} accepted · {Object.keys(webDiagnostics.crypto.keyGrants.reasons).join(", ") || "no rejection"}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Projection</span><strong>{webDiagnostics.projection.failure ? "FAIL" : webDiagnostics.projection.lag ? "SYNCING" : "PASS"}</strong><small>{webDiagnostics.projection.failure || `${webDiagnostics.projection.rows} rows`} · cursor {webDiagnostics.projection.cursor} · lag {webDiagnostics.projection.lag}</small></CardContent></Card>

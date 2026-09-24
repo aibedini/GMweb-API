@@ -147,14 +147,14 @@ export async function fetchWebMessagePage(conversationId: string, before?: strin
 }
 
 /** Read only opaque grant envelopes ahead of the main cursor during initial recovery. */
-export async function fetchKeyGrantsAfter(cursor: number, limit = 1000): Promise<SyncPage> {
-  const res = await fetch(`${API}/linked-device/key-grants?after=${cursor}&limit=${limit}`, { credentials: "include" });
+export async function fetchKeyGrantsAfter(cursor: number, limit = 1000, signal?: AbortSignal): Promise<SyncPage> {
+  const res = await fetch(`${API}/linked-device/key-grants?after=${cursor}&limit=${limit}`, { credentials: "include", signal });
   return jsonOrThrow<SyncPage>(res);
 }
 
 /** Browser-bound v2 capability keys and v3 history key, outside the message cursor. */
-export async function fetchKeyring(limit = 1000): Promise<SyncPage> {
-  const res = await fetch(`${API}/linked-device/keyring?limit=${limit}`, { credentials: "include" });
+export async function fetchKeyring(limit = 1000, signal?: AbortSignal): Promise<SyncPage> {
+  const res = await fetch(`${API}/linked-device/keyring?limit=${limit}`, { credentials: "include", signal });
   return jsonOrThrow<SyncPage>(res);
 }
 

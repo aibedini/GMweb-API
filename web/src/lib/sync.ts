@@ -176,6 +176,20 @@ export async function getProjectionCursor(): Promise<number> {
   return v ?? 0;
 }
 
+/** Independent durable positions; neither key cursor advances the event cursor. */
+export async function getReplicationProgress(deviceId: string): Promise<{
+  snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number;
+}> {
+  const db = await openDb();
+  const [snapshotComplete, snapshotBaseline, keyringCursor, grantCursor] = await Promise.all([
+    metaValue<boolean>(db, SNAPSHOT_COMPLETE_KEY),
+    metaNumber(db, SNAPSHOT_BASELINE_KEY),
+    metaNumber(db, `${KEYRING_CURSOR_PREFIX}${deviceId}`),
+    metaNumber(db, `${KEY_GRANT_CURSOR_PREFIX}${deviceId}`),
+  ]);
+  return { snapshotComplete: snapshotComplete === true, snapshotBaseline, keyringCursor, grantCursor };
+}
+
 /** §43: apply pages transactionally until the server says hasMore=false. */
 let runningSync: Promise<number> | null = null;
 function serializeSync(run: () => Promise<number>): Promise<number> {
@@ -197,7 +211,7 @@ export function syncNow(onProgress?: (applied: number) => void): Promise<number>
       await bootstrapEncryptedState();
       await repairConversationProjection();
       const result = await drainSync(undefined, onProgress);
-      updateSyncStatus({ state: keySyncDegraded ? "DEGRADED" : "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
+      updateSyncStatus({ state: keySyncDegraded || result.keyDegraded ? "DEGRADED" : "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
       return result.applied;
     } catch (cause) {
       syncFailure("SYNC", cause, false);
@@ -225,7 +239,7 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
       await repairConversationProjection();
       const result = await drainSync(maxPages, onProgress);
       updateSyncStatus({
-        state: keySyncDegraded ? "DEGRADED" : (result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY"),
+        state: keySyncDegraded || result.keyDegraded ? "DEGRADED" : (result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY"),
         lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied,
       });
       return result.applied;
@@ -242,21 +256,29 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
  * surface a degraded key state while continuing event ingestion.
  */
 async function syncKeysSafely(): Promise<boolean> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const controller = new AbortController();
   try {
-    await Promise.race([
-      bootstrapKeyGrants(),
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error("Key bootstrap timed out")), 2_000);
-      }),
-    ]);
+    await boundedKeyWork(bootstrapKeyGrants(controller.signal), controller);
     return true;
   } catch (cause) {
     syncFailure("KEY_SYNC", cause, false);
     return false;
-  } finally {
-    if (timeout) clearTimeout(timeout);
   }
+}
+
+function boundedKeyWork(work: Promise<unknown>, controller?: AbortController): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    work,
+    new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        controller?.abort();
+        reject(new Error("Key processing timed out"));
+      }, 2_000);
+    }),
+  ]).then(() => undefined).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
 }
 
 /** Catch-up synonym of syncNow() kept for call-site readability. */
@@ -264,7 +286,7 @@ export function syncUntilCaughtUp(onProgress?: (applied: number) => void): Promi
   return syncNow(onProgress);
 }
 
-interface DrainResult { applied: number; lastPageCount: number; caughtUp: boolean }
+interface DrainResult { applied: number; lastPageCount: number; caughtUp: boolean; keyDegraded: boolean }
 async function drainSync(maxPages?: number, onProgress?: (applied: number) => void): Promise<DrainResult> {
   let cursor = await getCursor();
   const db = await openDb();
@@ -273,6 +295,7 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
   let applied = 0;
   let pages = 0;
   let lastPageCount = 0;
+  let keyDegraded = false;
   const pendingAggregates = new Set<string>();
   let projectionThrough = cursor;
   const flushProjection = async () => {
@@ -324,7 +347,7 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
       if (replicaGeneration && Number.isSafeInteger(snapshotVersion)) {
         await acknowledgeWebSync(cursor, replicaGeneration, snapshotVersion!);
       }
-      return { applied, lastPageCount, caughtUp: true };
+      return { applied, lastPageCount, caughtUp: true, keyDegraded };
     }
     if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor ||
         page.events.some(ev => !Number.isSafeInteger(ev.sequence) || ev.sequence <= cursor || ev.sequence > page.nextCursor)) {
@@ -372,18 +395,28 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
     // Raw ciphertext and its cursor are durable before any fallible key work.
     // The next key bootstrap or projection repair can retry from stored events.
     try {
-      await receiveKeyGrants(page.events.filter(event =>
+      const grantEvents = page.events.filter(event =>
         (event.cryptoVersion === 1 && (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")) ||
         (event.cryptoVersion === 2 && event.type === "KEYRING_ENTRY") ||
-        (event.cryptoVersion === 3 && event.type === "HISTORY_KEY_GRANT")));
-      for (const event of page.events) {
-        if ((event.cryptoVersion === 1 || event.cryptoVersion === 2) &&
-            (event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
-          const decoded = await decryptMessage(event);
-          if (decoded.state === "decrypted") await applyContacts(decoded.payload);
-        }
+        (event.cryptoVersion === 3 && event.type === "HISTORY_KEY_GRANT"));
+      if (grantEvents.length > 0 || page.events.some(event =>
+        event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
+        await boundedKeyWork((async () => {
+          const grants = await receiveKeyGrants(grantEvents);
+          if (grants.some(result => result.state === "invalid" || result.state === "locked")) {
+            throw new Error("Key grant could not be installed");
+          }
+          for (const event of page.events) {
+            if ((event.cryptoVersion === 1 || event.cryptoVersion === 2) &&
+                (event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
+              const decoded = await decryptMessage(event);
+              if (decoded.state === "decrypted") await applyContacts(decoded.payload);
+            }
+          }
+        })());
       }
     } catch (cause) {
+      keyDegraded = true;
       syncFailure("KEY_SYNC", cause, false);
     }
     if (page.replicaGeneration && Number.isSafeInteger(page.snapshotVersion)) {
@@ -403,8 +436,8 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
     pages += 1;
     const stopping = !page.hasMore || (maxPages !== undefined && pages >= maxPages);
     if (pages % 10 === 0 || stopping) await flushProjection();
-    if (!page.hasMore) return { applied, lastPageCount, caughtUp: true };
-    if (maxPages !== undefined && pages >= maxPages) return { applied, lastPageCount, caughtUp: false };
+    if (!page.hasMore) return { applied, lastPageCount, caughtUp: true, keyDegraded };
+    if (maxPages !== undefined && pages >= maxPages) return { applied, lastPageCount, caughtUp: false, keyDegraded };
   }
 }
 
@@ -890,10 +923,12 @@ async function repairContactsFromLocalEvents(db: IDBDatabase): Promise<void> {
  * addressed to this browser, then retry local projections. The normal sync
  * cursor remains the sole raw-event cursor and is never advanced here.
  */
-async function bootstrapKeyGrants(): Promise<void> {
+async function bootstrapKeyGrants(signal: AbortSignal): Promise<void> {
   const db = await openDb();
   const deviceId = (await getOrCreateDeviceKeys()).deviceId;
-  const keyring = await fetchKeyring();
+  signal.throwIfAborted();
+  const keyring = await fetchKeyring(1000, signal);
+  signal.throwIfAborted();
   if (keyring.hasMore || keyring.events.some(event =>
     !((event.type === "KEYRING_ENTRY" && event.cryptoVersion === 2) ||
       (event.type === "HISTORY_KEY_GRANT" && event.cryptoVersion === 3)))) {
@@ -903,6 +938,7 @@ async function bootstrapKeyGrants(): Promise<void> {
   const previousKeyringCursor = await metaNumber(db, keyringCursorKey);
   if (keyring.nextCursor > previousKeyringCursor) {
     const keyringResults = await receiveKeyGrants(keyring.events);
+    signal.throwIfAborted();
     const rejectedKey = keyringResults.find(result => result.state !== "key-grant" ||
       (result.reason !== "Authorized account key stored" &&
        result.reason !== "Authorized history key stored"));
@@ -912,6 +948,7 @@ async function bootstrapKeyGrants(): Promise<void> {
       .objectStore(STORE_CONVERSATIONS).getAllKeys())).filter((key): key is string => typeof key === "string");
     await refreshConversationProjectionsInDb(db, aggregateIds);
     await repairContactsFromLocalEvents(db);
+    signal.throwIfAborted();
     await setMetaNumber(keyringCursorKey, keyring.nextCursor);
   }
 
@@ -920,7 +957,8 @@ async function bootstrapKeyGrants(): Promise<void> {
   const acceptedAggregates = new Set<string>();
   let contactsGrantAccepted = false;
   for (;;) {
-    const page = await fetchKeyGrantsAfter(cursor);
+    const page = await fetchKeyGrantsAfter(cursor, 1000, signal);
+    signal.throwIfAborted();
     if (page.events.length === 0) break;
     if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor ||
         page.events.some(event => !Number.isSafeInteger(event.sequence) || event.sequence <= cursor ||
@@ -928,6 +966,7 @@ async function bootstrapKeyGrants(): Promise<void> {
       throw new Error("Invalid key-grant bootstrap page");
     }
     const results = await receiveKeyGrants(page.events);
+    signal.throwIfAborted();
     const rejected = results.find(result => result.state !== "key-grant" ||
       result.reason !== "Authorized epoch key stored");
     if (rejected) throw new Error(`Key-grant bootstrap failed: ${"reason" in rejected ? rejected.reason : "unexpected result"}`);
@@ -947,6 +986,7 @@ async function bootstrapKeyGrants(): Promise<void> {
     await refreshConversationProjectionsInDb(db, [...acceptedAggregates].filter(id => projected.has(id)));
   }
   if (contactsGrantAccepted) await repairContactsFromLocalEvents(db);
+  signal.throwIfAborted();
   await setMetaNumber(cursorKey, cursor);
 }
 
