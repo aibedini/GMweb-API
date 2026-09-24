@@ -701,11 +701,23 @@ class EventStore {
   }
 
   /** Privacy-safe server truth for a READ_MESSAGES linked browser. */
-  syncDiagnostics(accountId) {
+  syncDiagnostics(accountId, linkedDeviceId = null) {
     const scalar = (sql) => Number(this.db.prepare(sql).get(accountId)?.value || 0);
+    const scoped = (sql) => linkedDeviceId
+      ? Number(this.db.prepare(sql).get(accountId, linkedDeviceId)?.value || 0) : 0;
+    const eventCursor = scalar("SELECT COALESCE(MAX(sequence), 0) value FROM sync_events WHERE account_id = ?");
     return {
       total: scalar("SELECT COUNT(*) value FROM sync_events WHERE account_id = ?"),
-      maxSequence: scalar("SELECT COALESCE(MAX(sequence), 0) value FROM sync_events WHERE account_id = ?"),
+      maxSequence: eventCursor,
+      phases: {
+        eventCursor,
+        snapshotActive: linkedDeviceId ? this.db.prepare(`SELECT COUNT(*) value FROM encrypted_snapshot_sessions
+          WHERE account_id = ? AND linked_device_id = ? AND expires_at > ?`)
+          .get(accountId, linkedDeviceId, Date.now()).value > 0 : false,
+        historyRows: scalar("SELECT COUNT(*) value FROM encrypted_message_state WHERE account_id = ?"),
+        browserAckCursor: scoped(`SELECT COALESCE(MAX(last_acked_sequence), 0) value
+          FROM linked_client_sync_state WHERE account_id = ? AND linked_device_id = ?`),
+      },
       countsByType: this.db.prepare(
         "SELECT event_type type, COUNT(*) count FROM sync_events WHERE account_id = ? GROUP BY event_type ORDER BY event_type"
       ).all(accountId).map(row => ({ type: String(row.type), count: Number(row.count) })),
@@ -719,6 +731,15 @@ class EventStore {
         "SELECT COUNT(*) value FROM sync_events WHERE account_id = ? AND aggregate_id IS NULL"
       ),
     };
+  }
+
+  /** Durable provider evidence only: the browser may still need to import it. */
+  historyGrantAvailable(accountId, linkedDeviceId) {
+    return Boolean(this.db.prepare(`SELECT 1 FROM sync_events
+      WHERE account_id = ? AND event_type = 'HISTORY_KEY_GRANT'
+        AND json_valid(CAST(ciphertext AS TEXT))
+        AND json_extract(CAST(ciphertext AS TEXT), '$.deviceId') = ?
+      LIMIT 1`).get(accountId, linkedDeviceId));
   }
 }
 

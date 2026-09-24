@@ -39,6 +39,7 @@ describe("pairingRevokeE2E", () => {
   let phone;
   let browser;
   let commandEngine;
+  let eventStore;
 
   before(async () => {
     app = Fastify({ logger: false });
@@ -83,12 +84,13 @@ describe("pairingRevokeE2E", () => {
       return done();
     });
 
-    registerPairingRoutes(app, { agentAuthService: svc, config: {} });
+    eventStore = new EventStore(db);
+    registerPairingRoutes(app, { agentAuthService: svc, config: {}, eventStore, accountId: "default" });
     commandEngine = new CommandEngine(db);
     registerControlPlaneRoutes(app, {
       trustRegistry: new TrustRegistry(db),
       commandEngine,
-      eventStore: new EventStore(db),
+      eventStore,
       accountId: "default",
       linkedSessions,
       authorizeAgent: (request) => {
@@ -166,6 +168,17 @@ describe("pairingRevokeE2E", () => {
     const cookie = complete.cookies.find((c) => c.name === linkedSessions.COOKIE_NAME);
     assert.ok(cookie, "linked session cookie must be issued");
     assert.ok(linkedSessions.resolve(cookie.value), "session live before revocation");
+    const linkedBeforeGrant = await app.inject({ method: "GET", url: "/api/v1/linked-session",
+      headers: { cookie: `${cookie.name}=${cookie.value}` } });
+    assert.equal(linkedBeforeGrant.json().historyStage, "WAITING_FOR_HISTORY_GRANT");
+    eventStore.ingestBatch({ accountId: "default", sourceDeviceId: PHONE, events: [{
+      eventId: "history-for-browser", type: "HISTORY_KEY_GRANT",
+      conversationId: "__history_master__", payload: Buffer.from(JSON.stringify({ deviceId: WEB })),
+      encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3,
+    }] });
+    const linkedAfterGrant = await app.inject({ method: "GET", url: "/api/v1/linked-session",
+      headers: { cookie: `${cookie.name}=${cookie.value}` } });
+    assert.equal(linkedAfterGrant.json().historyStage, "HISTORY_GRANT_AVAILABLE");
 
     // Sync is allowed while the session is live.
     const syncBefore = await app.inject({
@@ -178,6 +191,9 @@ describe("pairingRevokeE2E", () => {
       type: "SEND_SMS", ciphertext: Buffer.from("opaque"), targetAgentId: PHONE,
       sourceClientId: WEB }).command.id;
     const otherCookie = linkedSessions.issue("other-browser", ["READ_MESSAGES", "SEND_MESSAGES"]);
+    const otherHistory = await app.inject({ method: "GET", url: "/api/v1/linked-session",
+      headers: { cookie: `${linkedSessions.COOKIE_NAME}=${otherCookie}` } });
+    assert.equal(otherHistory.json().historyStage, "WAITING_FOR_HISTORY_GRANT");
     const ownerStatus = await app.inject({ method: "GET", url: `/api/v1/commands/${commandId}`,
       headers: { cookie: `${cookie.name}=${cookie.value}` } });
     assert.equal(ownerStatus.statusCode, 200);

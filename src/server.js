@@ -3169,6 +3169,8 @@ registerPairingRoutes(app, {
   agentAuthService,
   config,
   checkRateLimit,
+  eventStore,
+  accountId: DEFAULT_ACCOUNT_ID,
 });
 
 registerPwaAuthRoutes(app, {

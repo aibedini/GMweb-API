@@ -841,7 +841,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (!request.linkedDevice?.capabilities?.includes("READ_MESSAGES")) {
       return reply.code(403).send({ error: "capability_denied" });
     }
-    return eventStore.syncDiagnostics(accountId);
+    return eventStore.syncDiagnostics(accountId, request.linkedDevice.deviceId);
   });
 
   app.get("/api/v1/linked-device/key-grants", {

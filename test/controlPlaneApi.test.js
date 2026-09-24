@@ -399,6 +399,12 @@ describe("Phase 2 control plane HTTP API", () => {
     const accepted = await app.inject({ method: "POST", url: "/api/v1/web/sync/ack", headers, payload });
     assert.equal(accepted.statusCode, 200);
     assert.equal(accepted.json().cursor, snapshot.highWatermark);
+    const own = await app.inject({ method: "GET", url: "/api/v1/linked-device/sync-diagnostics", headers });
+    const other = await app.inject({ method: "GET", url: "/api/v1/linked-device/sync-diagnostics",
+      headers: { "x-test-linked": "unrelated-browser" } });
+    assert.equal(own.json().phases.browserAckCursor, snapshot.highWatermark);
+    assert.equal(other.json().phases.browserAckCursor, 0);
+    assert.equal(JSON.stringify(other.json()).includes("web-device"), false);
   });
 
   test("event ingest rejects plaintext, malformed, unknown, and oversized input", async () => {
@@ -511,6 +517,11 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.ok(body.total > 0);
     assert.ok(body.maxSequence > 0);
     assert.ok(Array.isArray(body.countsByType));
+    assert.ok(body.phases);
+    assert.equal(typeof body.phases.eventCursor, "number");
+    assert.equal(typeof body.phases.snapshotActive, "boolean");
+    assert.equal(typeof body.phases.historyRows, "number");
+    assert.equal(typeof body.phases.browserAckCursor, "number");
     assert.equal("ciphertext" in body, false);
     assert.equal(JSON.stringify(body).includes("eventId"), false);
     assert.equal(JSON.stringify(body).includes("aggregateId"), false);

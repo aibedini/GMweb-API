@@ -46,9 +46,9 @@
 
 **Independent test**: Both protocol versions work together and diagnostics identify the delayed phase without content.
 
-- [ ] T022 [US4] Add durable pairing/history stages and explicit revocation tests in `src/pairingRoutes.js` and `test/pairingRevokeE2E.test.js` (FR-007, FR-011).
-- [ ] T023 [US4] Add stage-specific server diagnostics and secure negative tests in `src/eventStore.js`, `src/controlPlaneRoutes.js` and `test/controlPlaneApi.test.js` (FR-011).
-- [ ] T024 [US4] Confirm SSE loss recovers by cursor in `test/webSync.test.js` (FR-009).
+- [X] T022 [US4] Add durable pairing/history stages and explicit revocation tests in `src/pairingRoutes.js` and `test/pairingRevokeE2E.test.js` (FR-007, FR-011).
+- [X] T023 [US4] Add stage-specific server diagnostics and secure negative tests in `src/eventStore.js`, `src/controlPlaneRoutes.js` and `test/controlPlaneApi.test.js` (FR-011).
+- [X] T024 [US4] Confirm SSE loss recovers by cursor in `test/webSync.test.js` (FR-009).
 
 ## Phase 6: Scale and release evidence
 
