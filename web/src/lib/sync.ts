@@ -242,12 +242,20 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
  * surface a degraded key state while continuing event ingestion.
  */
 async function syncKeysSafely(): Promise<boolean> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    await bootstrapKeyGrants();
+    await Promise.race([
+      bootstrapKeyGrants(),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("Key bootstrap timed out")), 2_000);
+      }),
+    ]);
     return true;
   } catch (cause) {
     syncFailure("KEY_SYNC", cause, false);
     return false;
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 
@@ -322,17 +330,6 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
         page.events.some(ev => !Number.isSafeInteger(ev.sequence) || ev.sequence <= cursor || ev.sequence > page.nextCursor)) {
       throw new Error("Invalid sync page: non-advancing cursor or event sequence");
     }
-    await receiveKeyGrants(page.events.filter(event =>
-      (event.cryptoVersion === 1 && (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")) ||
-      (event.cryptoVersion === 2 && event.type === "KEYRING_ENTRY") ||
-      (event.cryptoVersion === 3 && event.type === "HISTORY_KEY_GRANT")));
-    for (const event of page.events) {
-      if ((event.cryptoVersion === 1 || event.cryptoVersion === 2) &&
-          (event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
-        const decoded = await decryptMessage(event);
-        if (decoded.state === "decrypted") await applyContacts(decoded.payload);
-      }
-    }
     await new Promise<void>((resolve, reject) => {
       const t = db.transaction([STORE_EVENTS, STORE_META, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES], "readwrite");
       const store = t.objectStore(STORE_EVENTS);
@@ -372,6 +369,23 @@ async function drainSync(maxPages?: number, onProgress?: (applied: number) => vo
       t.onerror = () => reject(t.error);
       t.onabort = () => reject(t.error ?? new Error("Sync transaction aborted"));
     });
+    // Raw ciphertext and its cursor are durable before any fallible key work.
+    // The next key bootstrap or projection repair can retry from stored events.
+    try {
+      await receiveKeyGrants(page.events.filter(event =>
+        (event.cryptoVersion === 1 && (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")) ||
+        (event.cryptoVersion === 2 && event.type === "KEYRING_ENTRY") ||
+        (event.cryptoVersion === 3 && event.type === "HISTORY_KEY_GRANT")));
+      for (const event of page.events) {
+        if ((event.cryptoVersion === 1 || event.cryptoVersion === 2) &&
+            (event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
+          const decoded = await decryptMessage(event);
+          if (decoded.state === "decrypted") await applyContacts(decoded.payload);
+        }
+      }
+    } catch (cause) {
+      syncFailure("KEY_SYNC", cause, false);
+    }
     if (page.replicaGeneration && Number.isSafeInteger(page.snapshotVersion)) {
       await acknowledgeWebSync(page.nextCursor, page.replicaGeneration, page.snapshotVersion!);
     }
