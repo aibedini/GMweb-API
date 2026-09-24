@@ -36,11 +36,11 @@
 
 **Independent test**: Queue offline, replay a lost response, restart and reclaim an expired lease without changing logical identity.
 
-- [ ] T017 [US3] Add lease expiry, lost-response replay after restart, claim ownership and guarded recovery tests in `test/commandEngine.test.js` (FR-008, SC-004).
-- [ ] T018 [US3] Add additive lease fields and transactional claim/reclaim in `src/commandEngine.js` (FR-008).
-- [ ] T019 [US3] Add command V2 result/identity fields and authorized status routes in `src/controlPlaneRoutes.js`, update `src/server.js`, bump `package.json`, regenerate `docs/openapi.json`, and update `docs/INTEGRATION.md` (FR-008, FR-010).
-- [ ] T020 [US3] Reconcile optimistic messages by `clientMessageId` in `web/src/app/App.tsx` and `web/src/lib/api.ts` (FR-008).
-- [ ] T021 [US3] Verify revoked-device denial and unaffected second device in `test/pairingRevokeE2E.test.js` (FR-007, SC-005).
+- [X] T017 [US3] Add lease expiry, lost-response replay after restart, claim ownership and guarded recovery tests in `test/commandEngine.test.js` (FR-008, SC-004).
+- [X] T018 [US3] Add additive lease fields and transactional claim/reclaim in `src/commandEngine.js` (FR-008).
+- [X] T019 [US3] Add command V2 result/identity fields and authorized status routes in `src/controlPlaneRoutes.js`, update `src/server.js`, bump `package.json`, regenerate `docs/openapi.json`, and update `docs/INTEGRATION.md` (FR-008, FR-010).
+- [X] T020 [US3] Reconcile optimistic messages by `clientMessageId` in `web/src/app/App.tsx` and `web/src/lib/api.ts` (FR-008).
+- [X] T021 [US3] Verify revoked-device denial and unaffected second device in `test/pairingRevokeE2E.test.js` (FR-007, SC-005).
 
 ## Phase 5: User Story 4 — Operable and compatible rollout (P2)
 

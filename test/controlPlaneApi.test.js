@@ -9,6 +9,21 @@ const { CommandEngine } = require("../src/commandEngine");
 const { EventStore } = require("../src/eventStore");
 const { registerControlPlaneRoutes } = require("../src/controlPlaneRoutes");
 
+test("lease endpoints are closed unless the provider explicitly enables the protocol", async () => {
+  const app = Fastify({ logger: false });
+  const db = new Database(":memory:");
+  try {
+    registerControlPlaneRoutes(app, { trustRegistry: new TrustRegistry(db),
+      commandEngine: new CommandEngine(db), eventStore: new EventStore(db), accountId: "a",
+      authorizeAgent: () => ({ deviceId: "phone", role: "PRIMARY_TRUST_AGENT" }),
+      linkedSessions: require("../src/linkedSessions") });
+    await app.ready();
+    const claim = await app.inject({ method: "POST", url: "/api/v1/agent/commands/claim-v2", payload: {} });
+    assert.equal(claim.statusCode, 409);
+    assert.equal(claim.json().error, "lease_protocol_unavailable");
+  } finally { await app.close(); db.close(); }
+});
+
 function encryptedPayload(event) {
   const b64 = length => Buffer.alloc(length, 7).toString("base64");
   const envelope = {
@@ -52,6 +67,7 @@ describe("Phase 2 control plane HTTP API", () => {
       commandEngine: new CommandEngine(db),
       eventStore: new EventStore(db),
       accountId: "test-account",
+      enableCommandLeases: true,
       // Test auth stub: request header X-Test-Agent-Role simulates the
       // server's real authorizeAgent (signature → {deviceId, role}).
       linkedSessions: require("../src/linkedSessions"),
@@ -92,7 +108,7 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.equal(agent.json().preferredProtocolVersion, 1);
     assert.equal(agent.json().snapshot.stablePagination, true);
     assert.equal(agent.json().eventIngest.perItemResults, false);
-    assert.equal(agent.json().commands.leases, false);
+    assert.equal(agent.json().commands.leases, true);
 
     const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/replication-capabilities" });
     assert.equal(denied.statusCode, 401);
@@ -100,6 +116,50 @@ describe("Phase 2 control plane HTTP API", () => {
       headers: { "x-test-linked": "browser-capabilities" } });
     assert.equal(linked.statusCode, 200);
     assert.deepEqual(linked.json(), agent.json());
+  });
+
+  test("V2 claims require a bound agent and reject stale or foreign status", async () => {
+    const target = "phone-v2-route";
+    const created = await app.inject({ method: "POST", url: "/api/v1/commands", payload: {
+      type: "SEND_SMS", payload: Buffer.from("opaque-command").toString("base64"),
+      idempotencyKey: `route-v2-${Date.now()}`, targetAgentId: target,
+    } });
+    assert.equal(created.statusCode, 202);
+    const id = created.json().commandId;
+    const unsigned = await app.inject({ method: "POST", url: "/api/v1/agent/commands/claim-v2", payload: {} });
+    assert.equal(unsigned.statusCode, 403);
+    const claimed = await app.inject({ method: "POST", url: "/api/v1/agent/commands/claim-v2",
+      headers: { "x-test-agent-role": "PRIMARY_TRUST_AGENT", "x-test-agent-device": target }, payload: {} });
+    assert.equal(claimed.statusCode, 200);
+    const command = claimed.json().commands.find(row => row.id === id);
+    assert.equal(command.claimGeneration, 1);
+    assert.ok(command.leaseExpiresAt > 0);
+    const old = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${id}/status`,
+      payload: { state: "ACCEPTED" } });
+    assert.equal(old.statusCode, 409);
+    const foreign = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${id}/status-v2`,
+      headers: { "x-test-agent-role": "PRIMARY_TRUST_AGENT", "x-test-agent-device": "another-phone" },
+      payload: { state: "ACCEPTED", claimGeneration: 1 } });
+    assert.equal(foreign.statusCode, 409);
+    const accepted = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${id}/status-v2`,
+      headers: { "x-test-agent-role": "PRIMARY_TRUST_AGENT", "x-test-agent-device": target },
+      payload: { state: "ACCEPTED", claimGeneration: 1 } });
+    assert.equal(accepted.statusCode, 200);
+  });
+
+  test("linked command status belongs only to its creating browser", async () => {
+    const created = await app.inject({ method: "POST", url: "/api/v1/commands",
+      headers: { "x-test-linked": "browser-owner" }, payload: {
+        type: "SEND_SMS", payload: Buffer.from("opaque").toString("base64"),
+        encoding: "envelope.v1", cryptoVersion: 1, schemaVersion: 1,
+        idempotencyKey: `owned-${Date.now()}`, targetAgentId: "phone-owner",
+      } });
+    assert.equal(created.statusCode, 202);
+    const url = `/api/v1/commands/${created.json().commandId}`;
+    assert.equal((await app.inject({ method: "GET", url,
+      headers: { "x-test-linked": "browser-owner" } })).statusCode, 200);
+    assert.equal((await app.inject({ method: "GET", url,
+      headers: { "x-test-linked": "browser-other" } })).statusCode, 404);
   });
 
   after(async () => {
@@ -151,12 +211,16 @@ describe("Phase 2 control plane HTTP API", () => {
     });
     const second = await app.inject({
       method: "POST", url: "/api/v1/commands",
-      payload: { type: "SEND_SMS", payload: Buffer.from("y").toString("base64"), idempotencyKey: key },
+      payload: { type: "SEND_SMS", payload: Buffer.from("x").toString("base64"), idempotencyKey: key },
     });
     assert.equal(first.statusCode, 202);
     assert.equal(second.statusCode, 202);
     assert.equal(second.json().created, false);
     assert.equal(second.json().commandId, first.json().commandId);
+    const conflict = await app.inject({ method: "POST", url: "/api/v1/commands",
+      payload: { type: "SEND_SMS", payload: Buffer.from("y").toString("base64"), idempotencyKey: key } });
+    assert.equal(conflict.statusCode, 409);
+    assert.equal(conflict.json().error, "idempotency_key_reused");
   });
 
   test("claim → accept → execute → complete lifecycle over HTTP", async () => {

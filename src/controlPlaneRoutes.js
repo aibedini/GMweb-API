@@ -30,7 +30,7 @@ const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ"])
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentAuthService, checkRateLimit }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentAuthService, checkRateLimit, enableCommandLeases = false }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
   const replicationCapabilities = () => ({
     preferredProtocolVersion: 1,
@@ -38,7 +38,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     eventIngest: { maxBatchEvents: 100, perItemResults: false },
     snapshot: { stablePagination: true },
     keys: { deviceFiltered: true, independentFromEventCursor: true },
-    commands: { durable: true, idempotent: true, leases: false },
+    commands: { durable: true, idempotent: true, leases: enableCommandLeases },
   });
   const capabilitiesSchema = {
     schema: {
@@ -309,7 +309,8 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
           type: "object",
           properties: { commandId: { type: "string" }, state: { type: "string" }, created: { type: "boolean" } }
         },
-        400: { type: "object", properties: { error: { type: "string" } } }
+        400: { type: "object", properties: { error: { type: "string" } } },
+        409: { type: "object", properties: { error: { type: "string" } } }
       }
     }
   }, async (request, reply) => {
@@ -352,15 +353,18 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         schemaVersion: body.schemaVersion,
         cryptoVersion: body.cryptoVersion,
         targetAgentId: body.targetAgentId ?? null,
-        sourceClientId: body.sourceClientId ?? null,
+        sourceClientId: request.linkedDevice?.deviceId ?? body.sourceClientId ?? null,
         clientSignature: body.clientSignature
           ? Buffer.from(String(body.clientSignature), "base64")
           : null,
         expiresAt: body.expiresAt ?? undefined,
       });
+      if (request.linkedDevice && command.sourceClientId !== request.linkedDevice.deviceId) {
+        return reply.code(409).send({ error: "idempotency_owner_mismatch" });
+      }
       reply.code(202).send({ commandId: command.id, state: command.state, created });
     } catch (error) {
-      reply.code(400).send({ error: error.message });
+      reply.code(error.code === "idempotency_key_reused" ? 409 : 400).send({ error: error.message });
     }
   });
 
@@ -373,6 +377,9 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   }, async (request, reply) => {
     const command = commandEngine.get(String(request.params.id));
     if (!command) { reply.code(404).send({ error: "command_not_found" }); return; }
+    if (request.linkedDevice && command.sourceClientId !== request.linkedDevice.deviceId) {
+      return reply.code(404).send({ error: "command_not_found" });
+    }
     return { ...command, ciphertext: b64(command.ciphertext), clientSignature: b64(command.clientSignature) };
   });
 
@@ -410,6 +417,58 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     return { commands };
   });
 
+  // V2 is opt-in and requires a signed, device-bound agent identity. Android
+  // must dedupe commandId locally before this route is enabled in a rollout.
+  app.post("/api/v1/agent/commands/claim-v2", {
+    schema: {
+      summary: "Claim or reclaim a leased command with stable identity",
+      tags: ["Agent"],
+      body: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 100 } } },
+      response: { 200: { type: "object", properties: { commands: { type: "array", items: { type: "object", additionalProperties: true } } } } },
+    },
+  }, async (request, reply) => {
+    if (!enableCommandLeases) return reply.code(409).send({ error: "lease_protocol_unavailable" });
+    const identity = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (!identity || !request.authenticatedAgentId || identity.deviceId !== request.authenticatedAgentId) {
+      return reply.code(403).send({ error: "signed_agent_identity_required" });
+    }
+    const limit = Math.max(1, Math.min(100, Number(request.body?.limit) || 25));
+    const commands = commandEngine.claimForAgentV2(identity.deviceId, { limit }).map((command) => ({
+      ...command, ciphertext: b64(command.ciphertext), clientSignature: b64(command.clientSignature),
+    }));
+    return { commands };
+  });
+
+  app.post("/api/v1/agent/commands/:id/status-v2", {
+    schema: {
+      summary: "Report a leased command status with claim generation",
+      tags: ["Agent"],
+      body: { type: "object", required: ["state", "claimGeneration"], properties: {
+        state: { type: "string", enum: ["ACCEPTED", "EXECUTING", "COMPLETED", "FAILED"] },
+        claimGeneration: { type: "integer", minimum: 1 },
+        result: { type: "string", nullable: true },
+      } },
+      response: { 200: { type: "object", properties: { ok: { type: "boolean" } } },
+        409: { type: "object", properties: { error: { type: "string" } } } },
+    },
+  }, async (request, reply) => {
+    if (!enableCommandLeases) return reply.code(409).send({ error: "lease_protocol_unavailable" });
+    const identity = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (!identity || !request.authenticatedAgentId || identity.deviceId !== request.authenticatedAgentId) {
+      return reply.code(403).send({ error: "signed_agent_identity_required" });
+    }
+    const { state, result, claimGeneration } = request.body || {};
+    const from = {
+      ACCEPTED: ["DELIVERED_TO_AGENT"], EXECUTING: ["ACCEPTED_BY_AGENT"],
+      COMPLETED: ["EXECUTING", "ACCEPTED_BY_AGENT"],
+      FAILED: ["EXECUTING", "ACCEPTED_BY_AGENT", "DELIVERED_TO_AGENT"],
+    }[String(state)];
+    if (!from) return reply.code(400).send({ error: "invalid_state" });
+    const ok = commandEngine.transitionClaim(String(request.params.id), state === "ACCEPTED" ? "ACCEPTED_BY_AGENT" : state,
+      { agentId: identity.deviceId, claimGeneration, fromStates: from, result: result ?? null });
+    return ok ? { ok: true } : reply.code(409).send({ error: "stale_or_illegal_claim" });
+  });
+
   app.post("/api/v1/agent/commands/:id/status", {
     schema: {
       summary: "Android Agent reports command lifecycle status (§58)",
@@ -426,6 +485,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     }
   }, async (request, reply) => {
     const id = String(request.params.id);
+    if (commandEngine.get(id)?.claimGeneration > 0) return reply.code(409).send({ error: "lease_protocol_required" });
     const { state, result } = request.body || {};
     const from = {
       ACCEPTED: ["DELIVERED_TO_AGENT"],

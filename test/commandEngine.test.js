@@ -3,6 +3,9 @@
 const { test, describe } = require("node:test");
 const assert = require("node:assert");
 const Database = require("better-sqlite3");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { CommandEngine } = require("../src/commandEngine");
 
 describe("CommandEngine durability + exactly-once", () => {
@@ -30,11 +33,14 @@ describe("CommandEngine durability + exactly-once", () => {
     });
     const second = engine.createCommand({
       accountId: "acc1", idempotencyKey: "k1", type: "SEND_SMS",
-      ciphertext: Buffer.from("y"), targetAgentId: "agent-1",
+      ciphertext: Buffer.from("x"), targetAgentId: "agent-1",
     });
     assert.equal(first.created, true);
     assert.equal(second.created, false);
     assert.equal(second.command.id, first.command.id);
+    assert.throws(() => engine.createCommand({ accountId: "acc1", idempotencyKey: "k1",
+      type: "SEND_SMS", ciphertext: Buffer.from("y"), targetAgentId: "agent-1" }),
+    /idempotency_key_reused/);
   });
 
   test("same idempotency key on a DIFFERENT account is a separate command", () => {
@@ -88,5 +94,83 @@ describe("CommandEngine durability + exactly-once", () => {
     engine.claimForAgent("ag");
     assert.equal(engine.counts("a").DELIVERED_TO_AGENT, 2);
     assert.equal(engine.counts("b").DELIVERED_TO_AGENT, 1);
+  });
+
+  test("V2 lease reclaims the same command identity after a lost claim response and restart", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gm-command-lease-"));
+    const file = path.join(dir, "commands.sqlite");
+    let now = 10_000;
+    let db = new Database(file);
+    try {
+      let engine = new CommandEngine(db, { now: () => now, claimLeaseMs: 1_000 });
+      const original = engine.createCommand({ accountId: "a", idempotencyKey: "sms-1",
+        type: "SEND_SMS", ciphertext: Buffer.from("opaque"), targetAgentId: "phone-a" }).command;
+      const first = engine.claimForAgentV2("phone-a", { limit: 1 })[0];
+      assert.equal(first.id, original.id);
+      assert.equal(first.claimGeneration, 1);
+      assert.equal(first.leaseExpiresAt, 11_000);
+      assert.deepEqual(engine.claimForAgentV2("phone-b"), []);
+      db.close();
+      db = new Database(file);
+      engine = new CommandEngine(db, { now: () => now, claimLeaseMs: 1_000 });
+      assert.deepEqual(engine.claimForAgentV2("phone-a"), []);
+      now = 11_001;
+      const replay = engine.claimForAgentV2("phone-a", { limit: 1 })[0];
+      assert.equal(replay.id, original.id);
+      assert.equal(replay.idempotencyKey, original.idempotencyKey);
+      assert.equal(replay.claimGeneration, 2);
+      assert.equal(replay.leaseExpiresAt, 12_001);
+      assert.equal(engine.transitionClaim(replay.id, "ACCEPTED_BY_AGENT", {
+        agentId: "phone-a", claimGeneration: 1, fromStates: ["DELIVERED_TO_AGENT"],
+      }), false);
+      assert.equal(engine.transitionClaim(replay.id, "ACCEPTED_BY_AGENT", {
+        agentId: "phone-b", claimGeneration: 2, fromStates: ["DELIVERED_TO_AGENT"],
+      }), false);
+      assert.equal(engine.transitionClaim(replay.id, "ACCEPTED_BY_AGENT", {
+        agentId: "phone-a", claimGeneration: 2, fromStates: ["DELIVERED_TO_AGENT"],
+      }), true);
+    } finally {
+      db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("two SQLite connections cannot claim one live V2 lease twice", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gm-command-race-"));
+    const file = path.join(dir, "commands.sqlite");
+    const leftDb = new Database(file);
+    const rightDb = new Database(file);
+    try {
+      const left = new CommandEngine(leftDb, { now: () => 5_000, claimLeaseMs: 1_000 });
+      const right = new CommandEngine(rightDb, { now: () => 5_000, claimLeaseMs: 1_000 });
+      left.createCommand({ accountId: "a", idempotencyKey: "one", type: "SEND_SMS",
+        ciphertext: Buffer.from("opaque"), targetAgentId: "phone" });
+      assert.equal(left.claimForAgentV2("phone").length, 1);
+      assert.deepEqual(right.claimForAgentV2("phone"), []);
+    } finally {
+      leftDb.close();
+      rightDb.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("existing command rows migrate to nullable V2 lease columns without losing identity", () => {
+    const db = new Database(":memory:");
+    try {
+      db.exec(`CREATE TABLE commands (
+        id TEXT PRIMARY KEY, account_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+        target_agent_id TEXT, source_client_id TEXT, type TEXT NOT NULL, ciphertext BLOB NOT NULL,
+        encoding TEXT NOT NULL, schema_version INTEGER NOT NULL, crypto_version INTEGER NOT NULL,
+        client_signature BLOB, state TEXT NOT NULL, created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL, accepted_at INTEGER, completed_at INTEGER, result TEXT,
+        UNIQUE(account_id, idempotency_key))`);
+      db.prepare(`INSERT INTO commands (id, account_id, idempotency_key, target_agent_id,
+        type, ciphertext, encoding, schema_version, crypto_version, state, created_at, expires_at)
+        VALUES ('old', 'a', 'same', 'phone', 'SEND_SMS', ?, 'envelope.v1', 1, 1, 'QUEUED', 1, 999999)`).run(Buffer.from("opaque"));
+      const engine = new CommandEngine(db, { now: () => 2 });
+      assert.equal(engine.get("old").claimGeneration, 0);
+      assert.equal(engine.claimForAgentV2("phone")[0].id, "old");
+      assert.equal(engine.get("old").claimGeneration, 1);
+    } finally { db.close(); }
   });
 });

@@ -196,6 +196,7 @@ export async function createCommand(body: {
   type: "SEND_SMS" | "MARK_THREAD_READ";
   payload: string;
   idempotencyKey: string;
+  targetAgentId: string;
 }): Promise<{ commandId: string; state: string; created: boolean }> {
   const res = await fetch(`${API}/commands`, {
     method: "POST", credentials: "include", headers: { "Content-Type": "application/json" },
