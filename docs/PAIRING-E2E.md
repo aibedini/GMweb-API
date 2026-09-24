@@ -58,7 +58,7 @@ Run `node scripts/check-pairing-release.js --fingerprint` after builds are
 final. Create an external JSON report containing `kind` set to
 `physical-phone-pairing-e2e`, `physicalDevice: true`, `tester`, `deviceModel`,
 `androidVersion`, `browserVersion`, `serverSha256`, `apkSha256`,
-`fixtureSha256`, and `steps`. Each step key from the table must have
+`fixtureSha256`, `replicationFixtureSha256`, and `steps`. Each step key from the table must have
 `passed: true`, an ISO timestamp `at`, and `evidence` identifying the sanitized
 log, screenshot or observation. Timestamps must follow the table order.
 Never record QR claims, poll secrets, cookie values, private keys or SMS text.

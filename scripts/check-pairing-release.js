@@ -24,11 +24,12 @@ function fingerprint() {
   for (const input of ["src", "shared", "public/web-app", "public/dashboard-next", "package.json", "package-lock.json"]) visit(input);
   return hash.digest("hex");
 }
-function validate(report, { serverSha256, apkSha256, fixtureSha256 }) {
+function validate(report, { serverSha256, apkSha256, fixtureSha256, replicationFixtureSha256 }) {
   if (report.kind !== "physical-phone-pairing-e2e" || report.physicalDevice !== true ||
       !report.tester || !report.deviceModel || !report.androidVersion || !report.browserVersion)
     throw new Error("A named tester and a physical phone/browser report are required");
-  if (report.serverSha256 !== serverSha256 || report.apkSha256 !== apkSha256 || report.fixtureSha256 !== fixtureSha256)
+  if (!replicationFixtureSha256 || report.serverSha256 !== serverSha256 || report.apkSha256 !== apkSha256 ||
+      report.fixtureSha256 !== fixtureSha256 || report.replicationFixtureSha256 !== replicationFixtureSha256)
     throw new Error("E2E evidence does not match these release artifacts");
   let previous = 0;
   for (const name of REQUIRED_STEPS) {
@@ -41,14 +42,17 @@ function validate(report, { serverSha256, apkSha256, fixtureSha256 }) {
 }
 function main() {
   if (process.argv[2] === "--fingerprint") {
-    console.log(JSON.stringify({ serverSha256: fingerprint(), fixtureSha256: sha256(fs.readFileSync(path.join(root, "shared/pairing-protocol-v1.json"))) }, null, 2));
+    console.log(JSON.stringify({ serverSha256: fingerprint(),
+      fixtureSha256: sha256(fs.readFileSync(path.join(root, "shared/pairing-protocol-v1.json"))),
+      replicationFixtureSha256: sha256(fs.readFileSync(path.join(root, "shared/messages-web-replication-v3.json"))) }, null, 2));
     return;
   }
   const [reportFile, apkFile] = process.argv.slice(2);
   if (!reportFile || !apkFile) throw new Error("Release blocked: provide physical E2E report and tested APK paths");
   const report = JSON.parse(fs.readFileSync(reportFile, "utf8"));
   validate(report, { serverSha256: fingerprint(), apkSha256: sha256(fs.readFileSync(apkFile)),
-    fixtureSha256: sha256(fs.readFileSync(path.join(root, "shared/pairing-protocol-v1.json"))) });
+    fixtureSha256: sha256(fs.readFileSync(path.join(root, "shared/pairing-protocol-v1.json"))),
+    replicationFixtureSha256: sha256(fs.readFileSync(path.join(root, "shared/messages-web-replication-v3.json"))) });
   console.log("Physical pairing E2E gate passed for these exact release artifacts.");
 }
 if (require.main === module) {

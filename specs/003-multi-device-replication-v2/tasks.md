@@ -54,7 +54,7 @@
 
 - [X] T025 Add a deterministic 360k synthetic history and simultaneous realtime load profile in `scripts/benchmark-encrypted-replica.js`; record query plans, duration and peak memory in `docs/MESSAGES-WEB-PERFORMANCE-REPORT.md` (SC-001).
 - [X] T026 Update V2 state machine, failure matrix, data lifecycle and migration documents in `docs/` (FR-001–012).
-- [ ] T027 Add shared cross-repository fixtures and run Android contract comparison in `shared/` and `scripts/check-pairing-release.js` (SC-006).
+- [X] T027 Byte-compare shared cross-repository fixtures, bind both to release evidence in `scripts/check-pairing-release.js`, and record Android comparison (SC-006; V2 consumer activation remains gated).
 - [ ] T028 Run `npm run check`, `npm test`, web build, artifact verification and OpenAPI consistency on the candidate; record exact results in `docs/REPLICATION_V2_ACCEPTANCE.md` (SC-001–006).
 - [ ] T029 Complete controlled physical-device, three-browser, revocation and modem acceptance in `docs/MESSAGES-WEB-PHYSICAL-GATE.md`, then record actual evidence in `docs/REPLICATION_V2_ACCEPTANCE.md` (SC-007).
 - [ ] T030 Define item and phase error taxonomy in `src/controlPlaneRoutes.js` and `web/src/lib/diagnostics.ts`, with safe contract tests in `test/controlPlaneApi.test.js` (FR-011).
