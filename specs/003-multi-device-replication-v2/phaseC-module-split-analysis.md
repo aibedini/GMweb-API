@@ -17,7 +17,9 @@ sanitizer reference; it was fixed before the successful rerun. T032 moves key
 page validation, browser-bound cursor naming, the grant import loop, and bounded
 degraded retry into `key-sync.ts` while passing existing DB/projection operations
 through a temporary host boundary. Targeted key outage, snapshot, projection and
-cursor tests pass. Later tasks
+cursor tests pass. T033 moves immutable snapshot page validation and transactional
+continuation into `snapshot-sync.ts`, with shared store constants in `schema.ts`;
+the existing restart/expiry/generation and new position/cursor tests pass. Later tasks
 must keep per-browser cursors and snapshot-commit ordering unchanged.
 
 The `specify` and DSH CLIs are unavailable in this environment, so the repository

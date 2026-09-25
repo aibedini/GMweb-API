@@ -60,7 +60,7 @@
 - [X] T030 Define item and phase error taxonomy in `src/controlPlaneRoutes.js` and `web/src/lib/diagnostics.ts`, with safe contract tests in `test/controlPlaneApi.test.js` (FR-011).
 - [X] T031 [US2] Extract sync runtime state and error taxonomy from `web/src/lib/sync.ts` into focused modules without changing its public API or cursor semantics; run browser sync/diagnostics regression tests (FR-003, FR-006).
 - [X] T032 [US2] Extract key-grant paging and degraded retry coordination into `web/src/lib/sync/key-sync.ts` with independent cursor tests (FR-005–006).
-- [ ] T033 [US1] Extract immutable snapshot continuation into `web/src/lib/sync/snapshot-sync.ts` with restart/expiry/generation tests (FR-004).
+- [X] T033 [US1] Extract immutable snapshot continuation into `web/src/lib/sync/snapshot-sync.ts` with restart/expiry/generation tests (FR-004).
 - [ ] T034 [US2] Extract projection rebuilding into `web/src/lib/sync/projection-engine.ts` with late-grant and restart tests (FR-006).
 - [ ] T035 [US2] Extract replica event draining and live invalidation into focused modules, preserving `sync.ts` as compatibility facade; run full PWA suite and build (FR-003, FR-009).
 
