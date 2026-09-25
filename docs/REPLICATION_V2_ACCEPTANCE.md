@@ -17,7 +17,7 @@ or physical-device acceptance.
 
 Release decision: **BLOCKED for V2 activation**. `commands.leases` stays false.
 The Phase C module separation explicitly requested in the source plan is also
-incomplete; T031–T033 passed but T034–T035 remain open in the feature task ledger.
+incomplete; T031–T034 passed but T035 remains open in the feature task ledger.
 Existing tests establish behavior, not the remaining architectural requirement.
 Provider lease generation guards do not prove Android modem-boundary dedupe or
 an exactly-once physical SMS outcome. Real-phone history grant/decryption,

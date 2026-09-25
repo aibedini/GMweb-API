@@ -11,17 +11,21 @@
 import { acknowledgeWebSync, fetchEventsAfter, fetchWebConversationPage, fetchWebMessagePage, SnapshotRequiredError,
   type EncryptedConversationState, type EncryptedMessageState, type SyncEvent, type SyncPage } from "./api.ts";
 import { receiveKeyGrant, receiveKeyGrants, decryptMessage, type Decryption } from "./messageCrypto.ts";
-import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
+import { decodeEventPayload, type ConversationProjection } from "./inbox.ts";
 import { getOrCreateDeviceKeys } from "./deviceKeys.ts";
 import { assertSupportedContentEvent, isContentBearingEvent } from "./eventCryptoPolicy.ts";
 import { syncFailure, updateSyncStatus } from "./sync/sync-state.ts";
 import { boundedKeyWork, grantCursorKey, keyringCursorKey, runKeySync, syncKeysSafely } from "./sync/key-sync.ts";
 import { runSnapshotBootstrap } from "./sync/snapshot-sync.ts";
+import { createProjectionEngine, conversationStateEvent, messageStateEvent } from "./sync/projection-engine.ts";
 export { getBrowserSyncStatus } from "./sync/sync-state.ts";
 export type { BrowserSyncState, BrowserSyncStatus } from "./sync/sync-state.ts";
 
-import { DB_NAME, DB_VERSION, STORE_EVENTS, STORE_META, STORE_CONTACTS, CURSOR_KEY, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, PROJECTION_VERSION_KEY, PROJECTION_CURSOR_KEY, REPLICA_GENERATION_KEY, SNAPSHOT_VERSION_KEY, SNAPSHOT_TOKEN_KEY, SNAPSHOT_BASELINE_KEY, SNAPSHOT_COMPLETE_KEY, REPLICA_MIGRATION_VERSION_KEY, RECONSTRUCTABLE_STATE_EVENTS } from "./sync/schema.ts";
+import { DB_NAME, DB_VERSION, STORE_EVENTS, STORE_META, STORE_CONTACTS, CURSOR_KEY, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, PROJECTION_CURSOR_KEY, REPLICA_GENERATION_KEY, SNAPSHOT_VERSION_KEY, SNAPSHOT_TOKEN_KEY, SNAPSHOT_BASELINE_KEY, SNAPSHOT_COMPLETE_KEY, REPLICA_MIGRATION_VERSION_KEY, RECONSTRUCTABLE_STATE_EVENTS } from "./sync/schema.ts";
 export { PROJECTION_CURSOR_KEY } from "./sync/schema.ts";
+const { refreshConversationProjectionsInDb, repairConversationProjectionGap, ensureConversationProjectionRebuilt } = createProjectionEngine({
+  requestToPromise, txDone, metaNumber, contactsFromDb, decryptForDisplay,
+});
 const volatileContacts = new Map<string, StoredContact>();
 
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -649,68 +653,9 @@ async function contactsFromDb(db: IDBDatabase): Promise<StoredContact[]> {
   return [...volatileContacts.values()];
 }
 
-async function aggregateIdsInSequenceRange(db: IDBDatabase, after: number, through: number): Promise<string[]> {
-  if (through <= after) return [];
-  const ids = new Set<string>();
-  await new Promise<void>((resolve, reject) => {
-    const transaction = db.transaction(STORE_EVENTS, "readonly");
-    const req = transaction.objectStore(STORE_EVENTS).openCursor(IDBKeyRange.bound(after, through, true, false));
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (!cursor) return;
-      const id = (cursor.value as SyncEvent).aggregateId;
-      if (typeof id === "string" && id.length > 0) ids.add(id);
-      cursor.continue();
-    };
-    req.onerror = () => reject(req.error);
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error);
-    transaction.onabort = () => reject(transaction.error ?? new Error("Projection repair scan aborted"));
-  });
-  return [...ids];
-}
 
-async function refreshConversationProjectionsInDb(db: IDBDatabase, aggregateIds: string[]): Promise<void> {
-  const encryptedCount = await requestToPromise(db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readonly")
-    .objectStore(STORE_ENCRYPTED_CONVERSATIONS).count());
-  if (encryptedCount > 0) return;
-  const contactMap = new Map((await contactsFromDb(db)).map(contact => [contact.normalizedPhone, contact.displayName]));
-  for (const aggregateId of aggregateIds) {
-    const rows = await requestToPromise(db.transaction(STORE_EVENTS, "readonly")
-      .objectStore(STORE_EVENTS).index("by_aggregate").getAll(aggregateId)) as SyncEvent[];
-    const row = conversationProjectionFromEvents(await decryptForDisplay(rows), aggregateId, contactMap);
-    const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
-    if (row) transaction.objectStore(STORE_CONVERSATIONS).put(row);
-    else transaction.objectStore(STORE_CONVERSATIONS).delete(aggregateId);
-    await txDone(transaction);
-  }
-}
 
-function conversationStateEvent(row: EncryptedConversationState): SyncEvent {
-  return {
-    sequence: row.lastServerSequence,
-    eventId: `snapshot:${row.conversationId}:${row.revision}`,
-    type: "CONVERSATION_UPSERTED",
-    aggregateId: row.conversationId,
-    sourceDeviceId: null,
-    ciphertext: row.envelope,
-    encoding: row.encoding,
-    schemaVersion: row.schemaVersion,
-    cryptoVersion: row.cryptoVersion,
-    createdAt: row.sortKey,
-    revision: row.revision,
-    sortKey: row.sortKey,
-  };
-}
 
-function messageStateEvent(row: EncryptedMessageState): SyncEvent {
-  return {
-    ...conversationStateEvent(row),
-    eventId: `state:${row.messageId}:${row.revision}`,
-    type: row.type,
-    messageId: row.messageId,
-  };
-}
 
 
 function bootstrapEncryptedState(force = false, maxPages = Infinity): Promise<boolean> {
@@ -750,17 +695,6 @@ async function bootstrapKeyGrants(signal: AbortSignal): Promise<void> {
     repairContactsFromLocalEvents });
 }
 
-async function repairConversationProjectionGap(db: IDBDatabase): Promise<void> {
-  const [cursor, projectionCursor] = await Promise.all([
-    metaNumber(db, CURSOR_KEY), metaNumber(db, PROJECTION_CURSOR_KEY),
-  ]);
-  if (projectionCursor >= cursor) return;
-  const ids = await aggregateIdsInSequenceRange(db, projectionCursor, cursor);
-  await refreshConversationProjectionsInDb(db, ids);
-  const transaction = db.transaction(STORE_META, "readwrite");
-  transaction.objectStore(STORE_META).put(cursor, PROJECTION_CURSOR_KEY);
-  await txDone(transaction);
-}
 
 export async function repairConversationProjection(): Promise<void> {
   await repairConversationProjectionGap(await openDb());
@@ -889,42 +823,8 @@ export async function listConversations(
 }
 
 /**
- * One-time migration rebuild: after the schema moves to v4, recompute the
- * whole projection from locally stored events. Raw events, the cursor and the
- * browser identity/crypto keys are never touched. Idempotent (meta marker).
+ * List transient contacts reconstructed from encrypted local events.
  */
-async function ensureConversationProjectionRebuilt(db: IDBDatabase): Promise<void> {
-  const versionReq = db.transaction(STORE_META, "readonly")
-    .objectStore(STORE_META).get(PROJECTION_VERSION_KEY) as IDBRequest<number | undefined>;
-  const version = await requestToPromise(versionReq);
-  if (version !== undefined) return;
-
-  const keyReq = db.transaction(STORE_EVENTS, "readonly")
-    .objectStore(STORE_EVENTS).index("by_aggregate").getAllKeys() as IDBRequest<IDBValidKey[]>;
-  const keys = await requestToPromise(keyReq);
-  const ids = [...new Set(keys.filter((k): k is string => typeof k === "string" && k.length > 0))];
-
-  const contactMap = new Map((await contactsFromDb(db)).map((contact) => [contact.normalizedPhone, contact.displayName]));
-
-  for (let offset = 0; offset < ids.length; offset += 50) {
-    for (const aggregateId of ids.slice(offset, offset + 50)) {
-      const getReq = db.transaction(STORE_EVENTS, "readonly")
-        .objectStore(STORE_EVENTS).index("by_aggregate").getAll(aggregateId) as IDBRequest<SyncEvent[]>;
-      const events = await decryptForDisplay(await requestToPromise(getReq));
-      const row = conversationProjectionFromEvents(events, aggregateId, contactMap);
-      const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
-      const store = transaction.objectStore(STORE_CONVERSATIONS);
-      if (row) store.put(row);
-      else store.delete(aggregateId);
-      await txDone(transaction);
-    }
-  }
-  const rebuiltThrough = await metaNumber(db, CURSOR_KEY);
-  const metaTx = db.transaction(STORE_META, "readwrite");
-  metaTx.objectStore(STORE_META).put(1, PROJECTION_VERSION_KEY);
-  metaTx.objectStore(STORE_META).put(rebuiltThrough, PROJECTION_CURSOR_KEY);
-  await txDone(metaTx);
-}
 
 
 export async function listContacts(): Promise<StoredContact[]> {

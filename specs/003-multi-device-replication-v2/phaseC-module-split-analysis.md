@@ -24,5 +24,6 @@ must keep per-browser cursors and snapshot-commit ordering unchanged.
 
 The `specify` and DSH CLIs are unavailable in this environment, so the repository
 Spec Kit artifacts were updated and checked manually. This is not a claim that
-the CLI integration health check or Phase C convergence has passed; T032–T035
-remain open until implemented and verified.
+the CLI integration health check or Phase C convergence has passed. T034 moved
+projection adapters, gap repair and restart rebuild into `projection-engine.ts`;
+targeted projection, key-grant, snapshot and sync tests passed. T035 remains open.
