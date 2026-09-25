@@ -1,6 +1,6 @@
 # Replication V2 acceptance — candidate 0.19.13
 
-Feature ID: `multi-device-replication-v2`. Evidence collected 2026-09-24 from
+Feature ID: `multi-device-replication-v2`. Evidence refreshed 2026-09-25 from
 the GMweb working tree on Windows x64. This is a **candidate**, not production
 or physical-device acceptance.
 
@@ -17,7 +17,7 @@ or physical-device acceptance.
 
 Release decision: **BLOCKED for V2 activation**. `commands.leases` stays false.
 The Phase C module separation explicitly requested in the source plan is also
-incomplete; T031 passed but T032–T035 remain open in the feature task ledger.
+incomplete; T031–T032 passed but T033–T035 remain open in the feature task ledger.
 Existing tests establish behavior, not the remaining architectural requirement.
 Provider lease generation guards do not prove Android modem-boundary dedupe or
 an exactly-once physical SMS outcome. Real-phone history grant/decryption,

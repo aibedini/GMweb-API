@@ -13,7 +13,11 @@ classification; its regression scope is sync, key outage, snapshot, projection,
 diagnostics, the complete test suite and production frontend build. The 2026-09-25
 T031 slice passed targeted Web tests, `npm run check`, `npm test`, the full frontend
 build and `npm run verify:artifacts`. The first build exposed a leftover error
-sanitizer reference; it was fixed before the successful rerun. Later tasks
+sanitizer reference; it was fixed before the successful rerun. T032 moves key
+page validation, browser-bound cursor naming, the grant import loop, and bounded
+degraded retry into `key-sync.ts` while passing existing DB/projection operations
+through a temporary host boundary. Targeted key outage, snapshot, projection and
+cursor tests pass. Later tasks
 must keep per-browser cursors and snapshot-commit ordering unchanged.
 
 The `specify` and DSH CLIs are unavailable in this environment, so the repository

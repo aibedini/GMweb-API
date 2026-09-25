@@ -8,13 +8,14 @@
  * without touching storage or UI.
  */
 
-import { acknowledgeWebSync, continueWebSnapshot, fetchEventsAfter, fetchKeyGrantsAfter, fetchKeyring, fetchWebConversationPage, fetchWebMessagePage, startWebSnapshot, SnapshotRequiredError,
+import { acknowledgeWebSync, continueWebSnapshot, fetchEventsAfter, fetchWebConversationPage, fetchWebMessagePage, startWebSnapshot, SnapshotRequiredError,
   type EncryptedConversationState, type EncryptedMessageState, type SyncEvent, type SyncPage, type WebSnapshotPage } from "./api.ts";
 import { receiveKeyGrant, receiveKeyGrants, decryptMessage, type Decryption } from "./messageCrypto.ts";
 import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
 import { getOrCreateDeviceKeys } from "./deviceKeys.ts";
 import { assertSupportedContentEvent, isContentBearingEvent } from "./eventCryptoPolicy.ts";
 import { syncFailure, updateSyncStatus } from "./sync/sync-state.ts";
+import { boundedKeyWork, grantCursorKey, keyringCursorKey, runKeySync, syncKeysSafely } from "./sync/key-sync.ts";
 export { getBrowserSyncStatus } from "./sync/sync-state.ts";
 export type { BrowserSyncState, BrowserSyncStatus } from "./sync/sync-state.ts";
 
@@ -41,8 +42,6 @@ const RECONSTRUCTABLE_STATE_EVENTS = new Set([
   "MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED", "MESSAGE_DELETED",
   "CONVERSATION_UPSERT", "CONVERSATION_UPSERTED", "CONVERSATION_DELETED", "THREAD_READ",
 ]);
-const KEY_GRANT_CURSOR_PREFIX = "key_grant_bootstrap_v2_cursor:";
-const KEYRING_CURSOR_PREFIX = "account_keyring_v2_cursor:";
 const volatileContacts = new Map<string, StoredContact>();
 
 let dbPromise: Promise<IDBDatabase> | null = null;
@@ -156,8 +155,8 @@ export async function getReplicationProgress(deviceId: string): Promise<{
   const [snapshotComplete, snapshotBaseline, keyringCursor, grantCursor] = await Promise.all([
     metaValue<boolean>(db, SNAPSHOT_COMPLETE_KEY),
     metaNumber(db, SNAPSHOT_BASELINE_KEY),
-    metaNumber(db, `${KEYRING_CURSOR_PREFIX}${deviceId}`),
-    metaNumber(db, `${KEY_GRANT_CURSOR_PREFIX}${deviceId}`),
+    metaNumber(db, keyringCursorKey(deviceId)),
+    metaNumber(db, grantCursorKey(deviceId)),
   ]);
   return { snapshotComplete: snapshotComplete === true, snapshotBaseline, keyringCursor, grantCursor };
 }
@@ -179,7 +178,7 @@ export function syncNow(onProgress?: (applied: number) => void): Promise<number>
       // Key availability is deliberately independent from replica durability.
       // A missing/unavailable key must leave ciphertext replication healthy so
       // the browser can catch up and retry projection after the grant arrives.
-      keySyncDegraded = !(await syncKeysSafely());
+      keySyncDegraded = !(await syncKeysSafely(bootstrapKeyGrants));
       await bootstrapEncryptedState();
       await repairConversationProjection();
       const result = await drainSync(undefined, onProgress);
@@ -202,7 +201,7 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
   return serializeSync(async () => {
     let keySyncDegraded = false;
     try {
-      keySyncDegraded = !(await syncKeysSafely());
+      keySyncDegraded = !(await syncKeysSafely(bootstrapKeyGrants));
       const snapshotComplete = await bootstrapEncryptedState(false, maxPages);
       if (!snapshotComplete) {
         updateSyncStatus({ state: keySyncDegraded ? "DEGRADED" : "FIRST_PAINT_READY", lastPageCount: 0, appliedThisRun: 0 });
@@ -227,31 +226,6 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
  * encrypted replica. The return value is intentionally boolean so callers can
  * surface a degraded key state while continuing event ingestion.
  */
-async function syncKeysSafely(): Promise<boolean> {
-  const controller = new AbortController();
-  try {
-    await boundedKeyWork(bootstrapKeyGrants(controller.signal), controller);
-    return true;
-  } catch (cause) {
-    syncFailure("KEY_SYNC", cause, false);
-    return false;
-  }
-}
-
-function boundedKeyWork(work: Promise<unknown>, controller?: AbortController): Promise<void> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  return Promise.race([
-    work,
-    new Promise<never>((_, reject) => {
-      timeout = setTimeout(() => {
-        controller?.abort();
-        reject(new Error("Key processing timed out"));
-      }, 2_000);
-    }),
-  ]).then(() => undefined).finally(() => {
-    if (timeout) clearTimeout(timeout);
-  });
-}
 
 /** Catch-up synonym of syncNow() kept for call-site readability. */
 export function syncUntilCaughtUp(onProgress?: (applied: number) => void): Promise<number> {
@@ -898,68 +872,9 @@ async function repairContactsFromLocalEvents(db: IDBDatabase): Promise<void> {
 async function bootstrapKeyGrants(signal: AbortSignal): Promise<void> {
   const db = await openDb();
   const deviceId = (await getOrCreateDeviceKeys()).deviceId;
-  signal.throwIfAborted();
-  const keyring = await fetchKeyring(1000, signal);
-  signal.throwIfAborted();
-  if (keyring.hasMore || keyring.events.some(event =>
-    !((event.type === "KEYRING_ENTRY" && event.cryptoVersion === 2) ||
-      (event.type === "HISTORY_KEY_GRANT" && event.cryptoVersion === 3)))) {
-    throw new Error("Invalid or oversized account keyring");
-  }
-  const keyringCursorKey = `${KEYRING_CURSOR_PREFIX}${deviceId}`;
-  const previousKeyringCursor = await metaNumber(db, keyringCursorKey);
-  if (keyring.nextCursor > previousKeyringCursor) {
-    const keyringResults = await receiveKeyGrants(keyring.events);
-    signal.throwIfAborted();
-    const rejectedKey = keyringResults.find(result => result.state !== "key-grant" ||
-      (result.reason !== "Authorized account key stored" &&
-       result.reason !== "Authorized history key stored"));
-    if (rejectedKey) throw new Error(`Account keyring failed: ${"reason" in rejectedKey ? rejectedKey.reason : "unexpected result"}`);
-
-    const aggregateIds = (await requestToPromise(db.transaction(STORE_CONVERSATIONS, "readonly")
-      .objectStore(STORE_CONVERSATIONS).getAllKeys())).filter((key): key is string => typeof key === "string");
-    await refreshConversationProjectionsInDb(db, aggregateIds);
-    await repairContactsFromLocalEvents(db);
-    signal.throwIfAborted();
-    await setMetaNumber(keyringCursorKey, keyring.nextCursor);
-  }
-
-  const cursorKey = `${KEY_GRANT_CURSOR_PREFIX}${deviceId}`;
-  let cursor = await metaNumber(db, cursorKey);
-  const acceptedAggregates = new Set<string>();
-  let contactsGrantAccepted = false;
-  for (;;) {
-    const page = await fetchKeyGrantsAfter(cursor, 1000, signal);
-    signal.throwIfAborted();
-    if (page.events.length === 0) break;
-    if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor ||
-        page.events.some(event => !Number.isSafeInteger(event.sequence) || event.sequence <= cursor ||
-          event.sequence > page.nextCursor || (event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT"))) {
-      throw new Error("Invalid key-grant bootstrap page");
-    }
-    const results = await receiveKeyGrants(page.events);
-    signal.throwIfAborted();
-    const rejected = results.find(result => result.state !== "key-grant" ||
-      result.reason !== "Authorized epoch key stored");
-    if (rejected) throw new Error(`Key-grant bootstrap failed: ${"reason" in rejected ? rejected.reason : "unexpected result"}`);
-    for (let index = 0; index < page.events.length; index += 1) {
-      const event = page.events[index];
-      const result = results[index];
-      if (result.state !== "key-grant" || result.reason !== "Authorized epoch key stored") continue;
-      if (event.type === "CONTACTS_KEY_GRANT") contactsGrantAccepted = true;
-      else if (event.aggregateId) acceptedAggregates.add(event.aggregateId);
-    }
-    cursor = page.nextCursor;
-    if (!page.hasMore) break;
-  }
-  if (acceptedAggregates.size > 0) {
-    const projected = new Set((await requestToPromise(db.transaction(STORE_CONVERSATIONS, "readonly")
-      .objectStore(STORE_CONVERSATIONS).getAllKeys())).filter((key): key is string => typeof key === "string"));
-    await refreshConversationProjectionsInDb(db, [...acceptedAggregates].filter(id => projected.has(id)));
-  }
-  if (contactsGrantAccepted) await repairContactsFromLocalEvents(db);
-  signal.throwIfAborted();
-  await setMetaNumber(cursorKey, cursor);
+  await runKeySync(signal, db, deviceId, { conversationStore: STORE_CONVERSATIONS,
+    metaNumber, setMetaNumber, requestToPromise, refreshConversationProjectionsInDb,
+    repairContactsFromLocalEvents });
 }
 
 async function repairConversationProjectionGap(db: IDBDatabase): Promise<void> {
