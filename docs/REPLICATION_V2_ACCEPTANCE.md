@@ -16,9 +16,9 @@ or physical-device acceptance.
 | Physical phone, three-browser, modem dedupe, revocation, deployment | NOT RUN | No `adb` executable or connected test device in this environment; no physical APK or production-like deployment evidence. See [physical gate](MESSAGES-WEB-PHYSICAL-GATE.md). |
 
 Release decision: **BLOCKED for V2 activation**. `commands.leases` stays false.
-The Phase C module separation explicitly requested in the source plan is also
-incomplete; T031–T034 passed but T035 remains open in the feature task ledger.
-Existing tests establish behavior, not the remaining architectural requirement.
+The Phase C module separation explicitly requested in the source plan is complete:
+T031–T035 passed targeted tests, the full suite and the production frontend build.
+This is code-level evidence, not physical-device acceptance.
 Provider lease generation guards do not prove Android modem-boundary dedupe or
 an exactly-once physical SMS outcome. Real-phone history grant/decryption,
 three-browser isolation and the 360k device/browser run remain open. V1 remains

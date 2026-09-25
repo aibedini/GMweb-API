@@ -26,4 +26,8 @@ The `specify` and DSH CLIs are unavailable in this environment, so the repositor
 Spec Kit artifacts were updated and checked manually. This is not a claim that
 the CLI integration health check or Phase C convergence has passed. T034 moved
 projection adapters, gap repair and restart rebuild into `projection-engine.ts`;
-targeted projection, key-grant, snapshot and sync tests passed. T035 remains open.
+targeted projection, key-grant, snapshot and sync tests passed. T035 moved event
+draining and SSE invalidation into `replica-sync.ts` and `live-invalidation.ts`,
+keeping `sync.ts` as the public facade. Targeted tests, `npm run check`,
+`npm test`, `npm run build:frontends`, and `npm run verify:artifacts` passed.
+Physical-device convergence remains unverified under T029.

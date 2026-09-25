@@ -62,7 +62,7 @@
 - [X] T032 [US2] Extract key-grant paging and degraded retry coordination into `web/src/lib/sync/key-sync.ts` with independent cursor tests (FR-005–006).
 - [X] T033 [US1] Extract immutable snapshot continuation into `web/src/lib/sync/snapshot-sync.ts` with restart/expiry/generation tests (FR-004).
 - [X] T034 [US2] Extract projection rebuilding into `web/src/lib/sync/projection-engine.ts` with late-grant and restart tests (FR-006).
-- [ ] T035 [US2] Extract replica event draining and live invalidation into focused modules, preserving `sync.ts` as compatibility facade; run full PWA suite and build (FR-003, FR-009).
+- [X] T035 [US2] Extract replica event draining and live invalidation into focused modules, preserving `sync.ts` as compatibility facade; run full PWA suite and build (FR-003, FR-009).
 
 ## Dependencies and execution order
 
