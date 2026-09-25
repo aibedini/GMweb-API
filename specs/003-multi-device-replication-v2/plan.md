@@ -31,7 +31,7 @@ No constitution exception is planned. The codebase currently has known incomplet
 
 1. **Phase A — diagnostics and contract**: Inventory existing behavior, publish V2 capability and error vocabulary, align protocol document and OpenAPI while preserving V1.
 2. **Phase B — ingest V2**: Add per-item accepted/duplicate/rejected ACK, safe validation and source binding; verify concurrency and restart.
-3. **Phase C — browser replica separation**: Persist ciphertext and event cursor together, isolate key and projection failures, introduce separate progress and locked states.
+3. **Phase C — browser replica separation**: Persist ciphertext and event cursor together, isolate key and projection failures, introduce separate progress and locked states. Refactor the existing `web/src/lib/sync.ts` implementation into focused state/error, key, snapshot, projection, replica and live-invalidation modules behind its unchanged public API; retain IndexedDB schema and cursor semantics.
 4. **Phase D — snapshot V2**: Freeze a stable baseline, page all encrypted state, resume after crash, and begin delta from baseline only after snapshot completion.
 5. **Phase E — pairing V2**: Expose durable explicit stages, full-history authorization, revoke access and progress.
 6. **Phase F — command broker**: Extend existing command queue with lease recovery and client identity reconciliation while preserving current V1 command behavior.

@@ -3,6 +3,8 @@ import { getBrowserSyncStatus, getCursor, getProjectionCursor, getReplicationPro
 import { getStoredDeviceIdentity, loadCryptoRecord } from "./deviceKeys.ts";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "./buildInfo.ts";
 import { decryptMessage, receiveKeyGrants, type Decryption } from "./messageCrypto.ts";
+import { phaseErrorClass, safeSyncError, type PhaseErrorClass } from "./sync/sync-errors.ts";
+export { phaseErrorClass } from "./sync/sync-errors.ts";
 
 const EVENT_TYPES = ["MESSAGE_CREATED", "MESSAGE_UPDATED", "KEY_GRANT", "CONTACTS_KEY_GRANT", "KEYRING_ENTRY", "HISTORY_KEY_GRANT", "CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"];
 
@@ -10,7 +12,7 @@ export interface WebDiagnosticReport {
   collectedAt: number;
   session: { linked: boolean; capabilities: string[]; apiVersion: string; pwaVersion: string; loadedScript: string; serviceWorker: string; online: boolean; buildMismatch: boolean };
   server: ServerSyncDiagnostics | null;
-  browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number; phaseErrorClass: "HISTORY" | "KEY" | "EVENT" | "UNKNOWN" | null };
+  browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number; phaseErrorClass: PhaseErrorClass };
   replicaProgress?: { snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number };
   indexedDb: { total: number; byType: Record<string, number>; byCryptoVersion: Record<string, number>; nullAggregateCount: number; distinctMessageAggregateCount: number; conversationRows: number; contactRows: number };
   crypto: { browserIdentity: boolean; verifiedPrimary: boolean; primaryMatchesBrowser: boolean; messages: DecryptionCounts; keyGrants: DecryptionCounts };
@@ -159,21 +161,6 @@ async function localCounts() {
   } finally { db.close(); }
 }
 
-function safeError(value: string | null): string | null {
-  if (!value) return null;
-  if (/Invalid sync page/i.test(value)) return "Invalid sync page";
-  const http = value.match(/HTTP\s+\d{3}/i)?.[0];
-  return http || "Sync operation failed";
-}
-
-export function phaseErrorClass(phase: string | null): "HISTORY" | "KEY" | "EVENT" | "UNKNOWN" | null {
-  if (!phase) return null;
-  if (phase === "INITIAL_SYNC") return "HISTORY";
-  if (phase === "KEY_SYNC") return "KEY";
-  if (phase === "SYNC" || phase === "SSE_SYNC") return "EVENT";
-  return "UNKNOWN";
-}
-
 async function probeKeyGrants(): Promise<Decryption[]> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -235,7 +222,7 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
       online: navigator.onLine, buildMismatch,
     },
     server,
-    browserSync: { ...runtime, lastErrorMessage: safeError(runtime.lastErrorMessage),
+    browserSync: { ...runtime, lastErrorMessage: safeSyncError(runtime.lastErrorMessage),
       phaseErrorClass: phaseErrorClass(runtime.lastErrorPhase), cursor, projectionCursor, syncLag, projectionLag },
     replicaProgress,
     indexedDb: {
@@ -267,7 +254,7 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     locked: selected.events.filter(event => event.decryption?.state === "locked").length,
     invalid: selected.events.filter(event => event.decryption?.state === "invalid").length,
     state: selected.state, firstPageDurationMs: selected.firstPageDurationMs,
-    lastPageError: safeError(selected.lastPageError),
+    lastPageError: safeSyncError(selected.lastPageError),
   };
   return report;
 }

@@ -7,6 +7,9 @@ global.__GMWEB_VERSION__ = "0.16.2";
 
 test("diagnostics derive projection, contacts, sync, and build failures deterministically", async () => {
   const diagnostics = await import("../web/src/lib/diagnostics.ts");
+  const { safeSyncError } = await import("../web/src/lib/sync/sync-errors.ts");
+  assert.equal(safeSyncError("recipient +989121234567 failed"), "Sync operation failed");
+  assert.equal(safeSyncError("HTTP 503: sensitive detail"), "HTTP 503");
   assert.equal(diagnostics.phaseErrorClass("INITIAL_SYNC"), "HISTORY");
   assert.equal(diagnostics.phaseErrorClass("KEY_SYNC"), "KEY");
   assert.equal(diagnostics.phaseErrorClass("SSE_SYNC"), "EVENT");

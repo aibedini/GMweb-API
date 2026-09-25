@@ -14,6 +14,9 @@ import { receiveKeyGrant, receiveKeyGrants, decryptMessage, type Decryption } fr
 import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
 import { getOrCreateDeviceKeys } from "./deviceKeys.ts";
 import { assertSupportedContentEvent, isContentBearingEvent } from "./eventCryptoPolicy.ts";
+import { syncFailure, updateSyncStatus } from "./sync/sync-state.ts";
+export { getBrowserSyncStatus } from "./sync/sync-state.ts";
+export type { BrowserSyncState, BrowserSyncStatus } from "./sync/sync-state.ts";
 
 const DB_NAME = "gmweb-messages";
 const DB_VERSION = 7;
@@ -41,37 +44,6 @@ const RECONSTRUCTABLE_STATE_EVENTS = new Set([
 const KEY_GRANT_CURSOR_PREFIX = "key_grant_bootstrap_v2_cursor:";
 const KEYRING_CURSOR_PREFIX = "account_keyring_v2_cursor:";
 const volatileContacts = new Map<string, StoredContact>();
-
-export type BrowserSyncState = "INITIALIZING" | "FIRST_PAINT_READY" | "SYNCING_HISTORY" |
-  "UP_TO_DATE" | "DEGRADED" | "FAILED";
-export interface BrowserSyncStatus {
-  state: BrowserSyncState;
-  lastSuccessfulSyncAt: number | null;
-  lastPageCount: number;
-  appliedThisRun: number;
-  lastErrorPhase: string | null;
-  lastErrorCode: string | null;
-  lastErrorMessage: string | null;
-}
-let syncStatus: BrowserSyncStatus = {
-  state: "INITIALIZING",
-  lastSuccessfulSyncAt: null,
-  lastPageCount: 0,
-  appliedThisRun: 0,
-  lastErrorPhase: null,
-  lastErrorCode: null,
-  lastErrorMessage: null,
-};
-export function getBrowserSyncStatus(): BrowserSyncStatus { return { ...syncStatus }; }
-function updateSyncStatus(change: Partial<BrowserSyncStatus>) { syncStatus = { ...syncStatus, ...change }; }
-function syncFailure(phase: string, cause: unknown, fatal: boolean) {
-  updateSyncStatus({
-    state: fatal ? "FAILED" : "DEGRADED",
-    lastErrorPhase: phase,
-    lastErrorCode: cause instanceof DOMException ? cause.name : "SYNC_ERROR",
-    lastErrorMessage: cause instanceof Error ? cause.message : String(cause),
-  });
-}
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
