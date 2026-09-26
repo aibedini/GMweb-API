@@ -169,9 +169,11 @@ test("snapshot and key cursors remain separate for two browser identities", asyn
     assert.equal(await sync.getCursor(), 90);
     assert.deepEqual(await sync.getReplicationProgress("browser-a"), {
       snapshotComplete: true, snapshotBaseline: 80, keyringCursor: 4, grantCursor: 7,
+      snapshotPosition: 0, snapshotPageCount: 0, snapshotStartedAt: 0, lastSnapshotPageAt: 0, lastSnapshotPageMs: 0,
     });
     assert.deepEqual(await sync.getReplicationProgress("browser-b"), {
       snapshotComplete: true, snapshotBaseline: 80, keyringCursor: 2, grantCursor: 0,
+      snapshotPosition: 0, snapshotPageCount: 0, snapshotStartedAt: 0, lastSnapshotPageAt: 0, lastSnapshotPageMs: 0,
     });
     assert.equal(await sync.getCursor(), 90);
   } finally { db.close(); }

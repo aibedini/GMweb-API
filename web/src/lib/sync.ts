@@ -23,7 +23,7 @@ import { createProjectionEngine, conversationStateEvent, messageStateEvent } fro
 export { getBrowserSyncStatus } from "./sync/sync-state.ts";
 export type { BrowserSyncState, BrowserSyncStatus } from "./sync/sync-state.ts";
 
-import { DB_NAME, DB_VERSION, STORE_EVENTS, STORE_META, STORE_CONTACTS, CURSOR_KEY, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, PROJECTION_CURSOR_KEY, SNAPSHOT_TOKEN_KEY, SNAPSHOT_BASELINE_KEY, SNAPSHOT_COMPLETE_KEY, REPLICA_MIGRATION_VERSION_KEY, RECONSTRUCTABLE_STATE_EVENTS } from "./sync/schema.ts";
+import { DB_NAME, DB_VERSION, STORE_EVENTS, STORE_META, STORE_CONTACTS, CURSOR_KEY, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, PROJECTION_CURSOR_KEY, SNAPSHOT_TOKEN_KEY, SNAPSHOT_BASELINE_KEY, SNAPSHOT_COMPLETE_KEY, SNAPSHOT_STARTED_AT_KEY, SNAPSHOT_LAST_PAGE_AT_KEY, SNAPSHOT_LAST_PAGE_MS_KEY, SNAPSHOT_PAGE_COUNT_KEY, SNAPSHOT_POSITION_KEY, REPLICA_MIGRATION_VERSION_KEY, RECONSTRUCTABLE_STATE_EVENTS } from "./sync/schema.ts";
 export { PROJECTION_CURSOR_KEY } from "./sync/schema.ts";
 const { refreshConversationProjectionsInDb, repairConversationProjectionGap, ensureConversationProjectionRebuilt } = createProjectionEngine({
   requestToPromise, txDone, metaNumber, contactsFromDb, decryptForDisplay,
@@ -136,15 +136,23 @@ export async function getProjectionCursor(): Promise<number> {
 /** Independent durable positions; neither key cursor advances the event cursor. */
 export async function getReplicationProgress(deviceId: string): Promise<{
   snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number;
+  snapshotPosition: number; snapshotPageCount: number; snapshotStartedAt: number;
+  lastSnapshotPageAt: number; lastSnapshotPageMs: number;
 }> {
   const db = await openDb();
-  const [snapshotComplete, snapshotBaseline, keyringCursor, grantCursor] = await Promise.all([
+  const [snapshotComplete, snapshotBaseline, keyringCursor, grantCursor, snapshotPosition, snapshotPageCount, snapshotStartedAt, lastSnapshotPageAt, lastSnapshotPageMs] = await Promise.all([
     metaValue<boolean>(db, SNAPSHOT_COMPLETE_KEY),
     metaNumber(db, SNAPSHOT_BASELINE_KEY),
     metaNumber(db, keyringCursorKey(deviceId)),
     metaNumber(db, grantCursorKey(deviceId)),
+    metaNumber(db, SNAPSHOT_POSITION_KEY),
+    metaNumber(db, SNAPSHOT_PAGE_COUNT_KEY),
+    metaNumber(db, SNAPSHOT_STARTED_AT_KEY),
+    metaNumber(db, SNAPSHOT_LAST_PAGE_AT_KEY),
+    metaNumber(db, SNAPSHOT_LAST_PAGE_MS_KEY),
   ]);
-  return { snapshotComplete: snapshotComplete === true, snapshotBaseline, keyringCursor, grantCursor };
+  return { snapshotComplete: snapshotComplete === true, snapshotBaseline, keyringCursor, grantCursor,
+    snapshotPosition, snapshotPageCount, snapshotStartedAt, lastSnapshotPageAt, lastSnapshotPageMs };
 }
 
 /** §43: apply pages transactionally until the server says hasMore=false. */

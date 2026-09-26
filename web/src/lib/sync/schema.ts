@@ -16,6 +16,11 @@ export const SNAPSHOT_TOKEN_KEY = "snapshot_token_v2";
 export const SNAPSHOT_CURSOR_KEY = "snapshot_cursor_v2";
 export const SNAPSHOT_BASELINE_KEY = "snapshot_baseline_v2";
 export const SNAPSHOT_COMPLETE_KEY = "snapshot_complete_v2";
+export const SNAPSHOT_STARTED_AT_KEY = "snapshot_started_at_v2";
+export const SNAPSHOT_LAST_PAGE_AT_KEY = "snapshot_last_page_at_v2";
+export const SNAPSHOT_LAST_PAGE_MS_KEY = "snapshot_last_page_ms_v2";
+export const SNAPSHOT_PAGE_COUNT_KEY = "snapshot_page_count_v2";
+export const SNAPSHOT_POSITION_KEY = "snapshot_position_v2";
 export const REPLICA_MIGRATION_VERSION_KEY = "replica_migration_version";
 export const RECONSTRUCTABLE_STATE_EVENTS = new Set([
   "MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED", "MESSAGE_DELETED",
