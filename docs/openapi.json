@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.14",
+    "version": "0.19.15",
     "contact": {
       "name": "GMweb API"
     }
@@ -230,7 +230,8 @@
                 "conversations.read",
                 "events.read",
                 "commands.create",
-                "commands.read"
+                "commands.read",
+                "transport:read"
               ]
             }
           },
@@ -1006,6 +1007,152 @@
                   "properties": {
                     "error": {
                       "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/eve/v1/transport-health": {
+      "get": {
+        "summary": "Delivery transport health for the Eve consumer",
+        "tags": [
+          "Eve"
+        ],
+        "description": "Read-only projection of the authoritative transport snapshot (the same object /admin/transport serves), scoped with `transport:read` instead of the master token. Never exposes device keys, credentials, recipients or message content. The response shape is declared in shared/eve-gmweb-contract-v1.json, and the schema below is derived from that file so no declared field can be silently stripped by the response serializer.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "contract_version": {
+                      "type": "integer"
+                    },
+                    "observed_at": {
+                      "type": "string"
+                    },
+                    "gmweb": {
+                      "type": "object",
+                      "properties": {
+                        "ready": {
+                          "type": "boolean"
+                        },
+                        "reason": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "transport": {
+                      "type": "object",
+                      "properties": {
+                        "active": {
+                          "type": "string"
+                        },
+                        "mode": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
+                        },
+                        "state": {
+                          "type": "string"
+                        },
+                        "reason": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "device": {
+                      "type": "object",
+                      "properties": {
+                        "state": {
+                          "type": "string"
+                        },
+                        "reason": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
+                        },
+                        "last_seen_at": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
+                        },
+                        "last_seen_age_ms": {
+                          "type": [
+                            "null",
+                            "integer"
+                          ]
+                        },
+                        "age_ms": {
+                          "type": [
+                            "null",
+                            "integer"
+                          ],
+                          "deprecated": true,
+                          "description": "Alias of device.last_seen_age_ms, kept so that a provider-first or consumer-first rollout cannot silently drop the field. Consumers MUST read last_seen_age_ms."
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "queue": {
+                      "type": "object",
+                      "properties": {
+                        "pending": {
+                          "type": "integer"
+                        },
+                        "inflight": {
+                          "type": "integer"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "last_ack": {
+                      "type": "object",
+                      "properties": {
+                        "at": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
+                        },
+                        "outcome": {
+                          "type": [
+                            "null",
+                            "string"
+                          ]
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "diagnostics": {
+                      "type": "object",
+                      "properties": {
+                        "androidPull": {
+                          "type": [
+                            "null",
+                            "object"
+                          ],
+                          "additionalProperties": true
+                        }
+                      },
+                      "additionalProperties": true
                     }
                   }
                 }
@@ -7212,7 +7359,8 @@
                         "conversations.read",
                         "events.read",
                         "commands.create",
-                        "commands.read"
+                        "commands.read",
+                        "transport:read"
                       ]
                     },
                     "description": "Explicit capabilities. Omit for the documented legacy messaging defaults."
@@ -7320,7 +7468,8 @@
                         "conversations.read",
                         "events.read",
                         "commands.create",
-                        "commands.read"
+                        "commands.read",
+                        "transport:read"
                       ]
                     }
                   },

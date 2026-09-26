@@ -10,6 +10,7 @@ const PROJECT_KEY_SCOPES = Object.freeze([
   "events.read",
   "commands.create",
   "commands.read",
+  "transport:read",
 ]);
 
 // Existing project keys predate scopes. Limit them to the documented legacy
@@ -25,6 +26,12 @@ const DEFAULT_PROJECT_KEY_SCOPES = Object.freeze([
   "sms.invalidate",
   "conversations.read",
   "events.read",
+  // Transport health is the same story as invalidation above: the consumer's
+  // key was minted before the scope existed. It is read-only operational data
+  // about the very bridge that consumer drives, and without it the consumer's
+  // health probe is answered with project_scope_denied and every delivery card
+  // renders as "unknown".
+  "transport:read",
 ]);
 
 function normalizeProjectKeyScopes(scopes, fallback = DEFAULT_PROJECT_KEY_SCOPES) {
@@ -48,6 +55,10 @@ function requiredProjectKeyScope(method, requestUrl) {
   if (verb === "GET" && (pathname === "/api/v1/commands" || pathname.startsWith("/api/v1/commands/"))) {
     return "commands.read";
   }
+  // The consumer's own transport-health projection. Read-only by construction:
+  // it reports the state of the active delivery transport and never accepts
+  // input, so it can never change a delivery decision.
+  if (verb === "GET" && pathname === "/eve/v1/transport-health") return "transport:read";
   return null;
 }
 
