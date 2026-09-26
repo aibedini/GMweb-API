@@ -48,11 +48,15 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       summary: "Implemented encrypted replication capabilities",
       description: "Reports active protocol behavior. V2 remains unavailable until its snapshot, ingest and command contracts are implemented.",
       tags: ["Sync"],
-      response: { 200: { type: "object", additionalProperties: true } },
+      response: { 200: { type: "object", additionalProperties: true },
+        429: { type: "object", properties: { error: { type: "string" } } } },
     },
   };
 
   app.get("/api/v1/agent/replication-capabilities", capabilitiesSchema, async (request, reply) => {
+    const rate = checkRateLimit(request, "agent-replication-capabilities", 60, 60_000);
+    if (!rate.allowed) return reply.code(429).header("Retry-After", rate.retryAfterSeconds)
+      .send({ error: "agent_rate_limit" });
     if (!authorizeAgent(request, request.rawBody || Buffer.alloc(0))) {
       return reply.code(401).send({ error: "agent_auth_required" });
     }
@@ -427,10 +431,14 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       summary: "Claim or reclaim a leased command with stable identity",
       tags: ["Agent"],
       body: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 100 } } },
-      response: { 200: { type: "object", properties: { commands: { type: "array", items: { type: "object", additionalProperties: true } } } } },
+      response: { 200: { type: "object", properties: { commands: { type: "array", items: { type: "object", additionalProperties: true } } } },
+        429: { type: "object", properties: { error: { type: "string" } } } },
     },
   }, async (request, reply) => {
     if (!enableCommandLeases) return reply.code(409).send({ error: "lease_protocol_unavailable" });
+    const rate = checkRateLimit(request, "agent-claim-v2", 60, 60_000);
+    if (!rate.allowed) return reply.code(429).header("Retry-After", rate.retryAfterSeconds)
+      .send({ error: "agent_rate_limit" });
     const identity = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
     if (!identity || !request.authenticatedAgentId || identity.deviceId !== request.authenticatedAgentId) {
       return reply.code(403).send({ error: "signed_agent_identity_required" });
@@ -452,10 +460,14 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         result: { type: "string", nullable: true },
       } },
       response: { 200: { type: "object", properties: { ok: { type: "boolean" } } },
-        409: { type: "object", properties: { error: { type: "string" } } } },
+        409: { type: "object", properties: { error: { type: "string" } } },
+        429: { type: "object", properties: { error: { type: "string" } } } },
     },
   }, async (request, reply) => {
     if (!enableCommandLeases) return reply.code(409).send({ error: "lease_protocol_unavailable" });
+    const rate = checkRateLimit(request, "agent-status-v2", 120, 60_000);
+    if (!rate.allowed) return reply.code(429).header("Retry-After", rate.retryAfterSeconds)
+      .send({ error: "agent_rate_limit" });
     const identity = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
     if (!identity || !request.authenticatedAgentId || identity.deviceId !== request.authenticatedAgentId) {
       return reply.code(403).send({ error: "signed_agent_identity_required" });

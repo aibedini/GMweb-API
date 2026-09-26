@@ -1,5 +1,11 @@
 ## GMweb 0.18.0 / Messages 3.3.0: fail-closed encrypted replication
 
+GMweb 0.19.14 rate-limits signed-agent replication capabilities (60/min/IP),
+V2 command claims (60/min/IP), and V2 command status (120/min/IP) before
+authorization. Exhausted requests return `429 agent_rate_limit` with
+`Retry-After` seconds. Disabled V2 lease routes still return
+`409 lease_protocol_unavailable`; this change does not activate leases.
+
 The `/web` inbox bootstraps revision-aware encrypted conversation/message state instead of replaying the complete event log. Android publishes newest-first bounded history with realtime priority. Full history continues to use one browser-bound v3 History Master Key.
 
 Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use

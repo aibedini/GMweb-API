@@ -71,7 +71,10 @@ describe("Phase 2 control plane HTTP API", () => {
       // Test auth stub: request header X-Test-Agent-Role simulates the
       // server's real authorizeAgent (signature → {deviceId, role}).
       linkedSessions: require("../src/linkedSessions"),
-      checkRateLimit: (_request, key, max) => {
+      checkRateLimit: (request, key, max) => {
+        if (request.headers["x-test-rate-limit"] === "deny") {
+          return { allowed: false, retryAfterSeconds: 60 };
+        }
         const count = (rateBuckets.get(key) || 0) + 1;
         rateBuckets.set(key, count);
         return { allowed: count <= max, retryAfterSeconds: 60 };
@@ -116,6 +119,18 @@ describe("Phase 2 control plane HTTP API", () => {
       headers: { "x-test-linked": "browser-capabilities" } });
     assert.equal(linked.statusCode, 200);
     assert.deepEqual(linked.json(), agent.json());
+  });
+
+  test("agent replication routes rate-limit before authorization", async () => {
+    for (const [method, url, payload] of [
+      ["GET", "/api/v1/agent/replication-capabilities", undefined],
+      ["POST", "/api/v1/agent/commands/claim-v2", {}],
+      ["POST", "/api/v1/agent/commands/unknown/status-v2", { state: "ACCEPTED", claimGeneration: 1 }],
+    ]) {
+      const response = await app.inject({ method, url, payload, headers: { "x-test-rate-limit": "deny" } });
+      assert.equal(response.statusCode, 429, url);
+      assert.equal(response.headers["retry-after"], "60");
+    }
   });
 
   test("V2 claims require a bound agent and reject stale or foreign status", async () => {
