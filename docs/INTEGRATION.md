@@ -598,9 +598,22 @@ same size that is not the old default is also left alone.
 | new | new, key without `transport:read` | `403 scope_denied` (a restricted key, or a pre-scope key whose migration did not run) |
 | new | new, key with `transport:read` | healthy |
 
-Deploy **GMweb first** — an old Eve then degrades gracefully instead of crashing —
-but deploy the two close together: a new GMweb alone does **not** make the health
-cards healthy, because the old consumer cannot authenticate to the new route.
+**Deploy Eve first, then GMweb.**
+
+1. **Eve first.** While GMweb is still old, the new Eve receives `404` and
+   classifies it as `contract_missing` with the explicit "upgrade GMweb"
+   diagnostic — the graceful path, and there is no authentication ambiguity.
+2. **GMweb second.** Existing default project keys are migrated to
+   `transport:read` during load, the health route becomes available, and the cards
+   become healthy.
+
+Deploying GMweb first is survivable if the two land nearly back-to-back, but
+during that window the order matters: the old Eve receives **`401 auth_failed`**,
+not `contract_missing`, because it still sends `X-API-Key` to a route that accepts
+`Authorization: Bearer`. That window deliberately produces an authentication
+failure instead of the designed graceful path, which is why Eve-first is the
+recommended order. Either way the cards only become healthy once **both** sides are
+new and the key actually holds `transport:read`.
 
 ---
 
