@@ -555,6 +555,53 @@ Transport-scoped endpoints while `android` is active:
   `chrome_only_endpoint`** instead of a generic error — switch transport to use
   them.
 
+### Consumer transport-health contract (`transport:read`)
+
+The [Eve](https://github.com/aibedini/eve) consumer reads delivery-transport state
+through one read-only projection instead of the master-token-only
+`/admin/transport`:
+
+- `GET /eve/v1/transport-health` — declared in
+  `shared/eve-gmweb-contract-v1.json` (`transportHealthResponse`, contract version
+  1) and served from the same snapshot `/admin/transport` and `/admin/overview`
+  use, so two cards on one screen cannot disagree.
+- Authorised with an ordinary project key holding the **`transport:read`** scope —
+  never the master token. The body carries states, reasons, ISO timestamps and
+  queue counters only: no device key, no master token, no recipient, no message
+  body.
+- `device` describes the ACTIVE transport. Chrome has no pull presence, so its
+  `last_seen_at` is `null`, and a non-active Android bridge appears only under
+  `diagnostics.androidPull` marked `authoritative: false`.
+- A never-measured age is `null`, never `0`.
+
+#### Scope migration for existing project keys
+
+`transport:read` joined `DEFAULT_PROJECT_KEY_SCOPES`, but that alone does **not**
+reach a key that already exists: `normalizeProjectKeyScopes` applies the defaults
+only when a key has no `scopes` array, and every key persisted by a previous
+release carries one. `ApiKeyStore.load()` therefore migrates a key whose stored
+scopes are **exactly** the previous default set (order-insensitive, deduplicated)
+by appending the new default scopes and persisting the result once. It is
+idempotent, so repeated loads change nothing.
+
+Deliberately NOT migrated: any restricted or custom set. A key scoped to
+`["sms.send"]` stays `["sms.send"]` — it may have been least-privilege on purpose,
+and a migration must never widen an operator's deliberate choice. A set of the
+same size that is not the old default is also left alone.
+
+#### Deployment matrix
+
+| GMweb | Eve | Result |
+|---|---|---|
+| old | new | `404` → `probe_state: contract_missing`, graceful ("upgrade GMweb") |
+| new | old | `401 auth_failed` — the old Eve sends `X-API-Key`, while this route accepts `Authorization: Bearer` like every other GMweb call |
+| new | new, key without `transport:read` | `403 scope_denied` (a restricted key, or a pre-scope key whose migration did not run) |
+| new | new, key with `transport:read` | healthy |
+
+Deploy **GMweb first** — an old Eve then degrades gracefully instead of crashing —
+but deploy the two close together: a new GMweb alone does **not** make the health
+cards healthy, because the old consumer cannot authenticate to the new route.
+
 ---
 
 ## 6. Administrative activity log
