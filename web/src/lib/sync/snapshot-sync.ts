@@ -1,5 +1,5 @@
 import { continueWebSnapshot, startWebSnapshot, SnapshotRequiredError, type SyncEvent, type WebSnapshotPage } from "../api.ts";
-import { STORE_EVENTS, STORE_META, CURSOR_KEY, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, PROJECTION_CURSOR_KEY, REPLICA_GENERATION_KEY, SNAPSHOT_VERSION_KEY, SNAPSHOT_TOKEN_KEY, SNAPSHOT_CURSOR_KEY, SNAPSHOT_BASELINE_KEY, SNAPSHOT_COMPLETE_KEY, REPLICA_MIGRATION_VERSION_KEY, RECONSTRUCTABLE_STATE_EVENTS } from "./schema.ts";
+import { STORE_EVENTS, STORE_META, CURSOR_KEY, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, PROJECTION_CURSOR_KEY, REPLICA_GENERATION_KEY, SNAPSHOT_VERSION_KEY, SNAPSHOT_TOKEN_KEY, SNAPSHOT_CURSOR_KEY, SNAPSHOT_BASELINE_KEY, SNAPSHOT_COMPLETE_KEY, SNAPSHOT_STARTED_AT_KEY, SNAPSHOT_LAST_PAGE_AT_KEY, SNAPSHOT_LAST_PAGE_MS_KEY, SNAPSHOT_PAGE_COUNT_KEY, SNAPSHOT_POSITION_KEY, REPLICA_MIGRATION_VERSION_KEY, RECONSTRUCTABLE_STATE_EVENTS } from "./schema.ts";
 
 interface SnapshotHost {
   openDb: () => Promise<IDBDatabase>;
@@ -22,6 +22,7 @@ export async function runSnapshotBootstrap(host: SnapshotHost, force = false, ma
   let expectedVersion = force ? null : storedSnapshotVersion;
   const pageLimit = 100;
   for (let fetched = 0; fetched < Math.max(1, maxPages); fetched++) {
+    const pageStartedAt = Date.now();
     let page: WebSnapshotPage;
     let firstPage = !token || !cursor;
     try {
@@ -39,6 +40,8 @@ export async function runSnapshotBootstrap(host: SnapshotHost, force = false, ma
       firstPage = true;
     }
     assertValidSnapshotPage(page, { token, cursor, baseline, expectedGeneration, expectedVersion, pageLimit });
+    const pageCount = firstPage ? 1 : (await metaValue<number>(db, SNAPSHOT_PAGE_COUNT_KEY) ?? 0) + 1;
+    const previousPosition = firstPage ? 0 : (await metaValue<number>(db, SNAPSHOT_POSITION_KEY) ?? 0);
     const transaction = db.transaction(
       [STORE_EVENTS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, STORE_CONVERSATIONS, STORE_META], "readwrite");
     if (firstPage) {
@@ -66,6 +69,13 @@ export async function runSnapshotBootstrap(host: SnapshotHost, force = false, ma
     meta.put(page.replicaGeneration, REPLICA_GENERATION_KEY);
     meta.put(page.snapshotVersion, SNAPSHOT_VERSION_KEY);
     meta.put(!page.hasMore, SNAPSHOT_COMPLETE_KEY);
+    if (firstPage) {
+      meta.put(pageStartedAt, SNAPSHOT_STARTED_AT_KEY);
+    }
+    meta.put(Date.now(), SNAPSHOT_LAST_PAGE_AT_KEY);
+    meta.put(Date.now() - pageStartedAt, SNAPSHOT_LAST_PAGE_MS_KEY);
+    meta.put(pageCount, SNAPSHOT_PAGE_COUNT_KEY);
+    meta.put(page.rows.at(-1)?.position ?? previousPosition, SNAPSHOT_POSITION_KEY);
     if (firstPage && page.hasMore) {
       meta.put(0, CURSOR_KEY);
       meta.put(0, PROJECTION_CURSOR_KEY);

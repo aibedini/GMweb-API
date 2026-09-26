@@ -13,7 +13,7 @@ export interface WebDiagnosticReport {
   session: { linked: boolean; capabilities: string[]; apiVersion: string; pwaVersion: string; loadedScript: string; serviceWorker: string; online: boolean; buildMismatch: boolean };
   server: ServerSyncDiagnostics | null;
   browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number; phaseErrorClass: PhaseErrorClass };
-  replicaProgress?: { snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number };
+  replicaProgress?: { snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number; snapshotPosition?: number; snapshotPageCount?: number; snapshotStartedAt?: number; lastSnapshotPageAt?: number; lastSnapshotPageMs?: number };
   indexedDb: { total: number; byType: Record<string, number>; byCryptoVersion: Record<string, number>; nullAggregateCount: number; distinctMessageAggregateCount: number; conversationRows: number; contactRows: number };
   crypto: { browserIdentity: boolean; verifiedPrimary: boolean; primaryMatchesBrowser: boolean; messages: DecryptionCounts; keyGrants: DecryptionCounts };
   projection: { cursor: number; lag: number; rawMessageAggregates: number; rows: number; readyRows: number; lockedRows: number; failure: "PROJECTION_DIVERGENCE" | null };
@@ -204,7 +204,9 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
   ]);
   const runtime = getBrowserSyncStatus();
   const replicaProgress = identity ? await getReplicationProgress(identity.deviceId) : undefined;
-  const projectionLag = Math.max(0, cursor - projectionCursor);
+  const projectionLag = replicaProgress && !replicaProgress.snapshotComplete
+    ? Math.max(0, local.distinctMessageAggregateCount - local.conversationRows)
+    : Math.max(0, cursor - projectionCursor);
   const syncLag = server ? Math.max(0, server.maxSequence - cursor) : null;
   const projectionFailure = detectProjectionFailure(local.distinctMessageAggregateCount, local.conversationRows, projectionCursor, cursor);
   const contactsFailure = detectContactsFailure(local.byType, local.contactPayloadCrypto, local.contactRows);
@@ -276,6 +278,11 @@ export function formatWebDiagnostics(report: WebDiagnosticReport): string {
     `Projection cursor          ${report.projection.cursor}`,
     `Projection lag             ${report.projection.lag}`,
     `Snapshot complete          ${report.replicaProgress?.snapshotComplete ?? "unknown"}`,
+    `Snapshot position          ${report.replicaProgress?.snapshotPosition ?? "unknown"}`,
+    `Snapshot pages             ${report.replicaProgress?.snapshotPageCount ?? "unknown"}`,
+    `Snapshot started at        ${report.replicaProgress?.snapshotStartedAt ?? "unknown"}`,
+    `Last snapshot page at      ${report.replicaProgress?.lastSnapshotPageAt ?? "unknown"}`,
+    `Last snapshot page ms      ${report.replicaProgress?.lastSnapshotPageMs ?? "unknown"}`,
     `Snapshot baseline          ${report.replicaProgress?.snapshotBaseline ?? "unknown"}`,
     `Keyring cursor             ${report.replicaProgress?.keyringCursor ?? "unknown"}`,
     `Grant cursor               ${report.replicaProgress?.grantCursor ?? "unknown"}`,
