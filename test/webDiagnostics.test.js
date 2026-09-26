@@ -7,6 +7,13 @@ global.__GMWEB_VERSION__ = "0.16.2";
 
 test("diagnostics derive projection, contacts, sync, and build failures deterministically", async () => {
   const diagnostics = await import("../web/src/lib/diagnostics.ts");
+  const { safeSyncError } = await import("../web/src/lib/sync/sync-errors.ts");
+  assert.equal(safeSyncError("recipient +989121234567 failed"), "Sync operation failed");
+  assert.equal(safeSyncError("HTTP 503: sensitive detail"), "HTTP 503");
+  assert.equal(diagnostics.phaseErrorClass("INITIAL_SYNC"), "HISTORY");
+  assert.equal(diagnostics.phaseErrorClass("KEY_SYNC"), "KEY");
+  assert.equal(diagnostics.phaseErrorClass("SSE_SYNC"), "EVENT");
+  assert.equal(diagnostics.phaseErrorClass("user supplied plaintext"), "UNKNOWN");
   const emptyCrypto = { decrypted: 0, accepted: 0, locked: 0, invalid: 0, reasons: {} };
 
   assert.equal(diagnostics.detectProjectionFailure(4, 0, 50, 50), "PROJECTION_DIVERGENCE");
@@ -47,6 +54,7 @@ test("diagnostic report is privacy-safe and exposes an old PWA build", async () 
     session: { linked: true, capabilities: ["READ_MESSAGES"], apiVersion: "0.16.2", pwaVersion: "0.16.1", loadedScript: "index-old.js", serviceWorker: "ACTIVE", online: true, buildMismatch: true },
     server: { total: 2, maxSequence: 2, countsByType: [], countsByCryptoVersion: [], distinctAggregateCount: 1, nullAggregateCount: 0 },
     browserSync: { state: "UP_TO_DATE", lastSuccessfulSyncAt: 1, lastPageCount: 0, appliedThisRun: 2, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null, cursor: 2, projectionCursor: 2, syncLag: 0, projectionLag: 0 },
+    replicaProgress: { snapshotComplete: true, snapshotBaseline: 1, keyringCursor: 2, grantCursor: 3 },
     indexedDb: { total: 2, byType: { MESSAGE_CREATED: 1 }, byCryptoVersion: { 1: 2 }, nullAggregateCount: 0, distinctMessageAggregateCount: 1, conversationRows: 1, contactRows: 0 },
     crypto: { browserIdentity: true, verifiedPrimary: true, primaryMatchesBrowser: true, messages: { ...emptyCrypto, decrypted: 1 }, keyGrants: { ...emptyCrypto, accepted: 1 } },
     projection: { cursor: 2, lag: 0, rawMessageAggregates: 1, rows: 1, readyRows: 1, lockedRows: 0, failure: null },
@@ -57,6 +65,9 @@ test("diagnostic report is privacy-safe and exposes an old PWA build", async () 
   };
   const text = formatWebDiagnostics(report);
   assert.match(text, /0\.16\.2 \/ 0\.16\.1 FAIL/);
+  assert.match(text, /Snapshot complete\s+true/);
+  assert.match(text, /Keyring cursor\s+2/);
+  assert.match(text, /Grant cursor\s+3/);
   assert.doesNotMatch(text, new RegExp(secret));
   for (const field of ["body", "phone", "contactName", "ciphertext", "signature", "cookie", "token", "aggregateId"])
     assert.doesNotMatch(text, new RegExp(field, "i"));
@@ -67,10 +78,11 @@ test("decrypt diagnostics group safe reasons and surface invalid payloads", asyn
   const result = countDecryptions([
     { state: "decrypted", payload: {} },
     { state: "locked", reason: "Authorized key grant unavailable" },
+    { state: "locked", reason: "Unsupported crypto version" },
     { state: "invalid", reason: "OperationError: secret browser detail" },
   ]);
   assert.deepEqual(result, {
-    decrypted: 1, accepted: 0, locked: 1, invalid: 1,
-    reasons: { "Authorized key grant unavailable": 1, "AEAD authentication failed": 1 },
+    decrypted: 1, accepted: 0, locked: 2, invalid: 1,
+    reasons: { "Authorized key grant unavailable": 1, "Unsupported crypto version": 1, "AEAD authentication failed": 1 },
   });
 });

@@ -3,9 +3,145 @@
 const { test, describe } = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
 const { EventStore } = require("../src/eventStore");
 
+test("snapshot continuation survives termination of its creator process", async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-snapshot-death-"));
+  const filename = path.join(folder, "replica.sqlite");
+  const script = `
+    const Database = require("better-sqlite3");
+    const { EventStore } = require("./src/eventStore");
+    const db = new Database(process.argv[1]);
+    const store = new EventStore(db);
+    store.ingestBatch({ accountId: "a", events: [1, 2].map(index => ({
+      eventId: "death-" + index, type: "CONVERSATION_UPSERTED",
+      conversationId: "c-" + index, revision: 1, sortKey: index,
+      payload: Buffer.from("cipher-" + index), cryptoVersion: 3,
+    })) });
+    const first = store.beginSnapshot({ accountId: "a", linkedDeviceId: "browser", limit: 1 });
+    process.stdout.write(JSON.stringify({ token: first.token, cursor: first.nextCursor,
+      baseline: first.baselineSequence }) + "\\n", () => setInterval(() => {}, 1000));
+  `;
+  const child = spawn(process.execPath, ["-e", script, filename], {
+    cwd: path.resolve(__dirname, ".."), stdio: ["ignore", "pipe", "pipe"],
+  });
+  let db;
+  try {
+    const first = await new Promise((resolve, reject) => {
+      let output = "";
+      let errors = "";
+      const timeout = setTimeout(() => reject(new Error(`snapshot child timed out: ${errors}`)), 10_000);
+      child.stderr.on("data", chunk => { errors += chunk.toString(); });
+      child.stdout.on("data", chunk => {
+        output += chunk.toString();
+        if (!output.includes("\n")) return;
+        clearTimeout(timeout);
+        try { resolve(JSON.parse(output.split("\n")[0])); } catch (error) { reject(error); }
+      });
+      child.on("error", error => { clearTimeout(timeout); reject(error); });
+      child.on("exit", code => {
+        if (!output.includes("\n")) { clearTimeout(timeout); reject(new Error(`snapshot child exited ${code}: ${errors}`)); }
+      });
+    });
+    const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
+    assert.equal(child.kill("SIGKILL"), true);
+    assert.deepEqual(await exited, { code: null, signal: "SIGKILL" });
+    db = new Database(filename);
+    const store = new EventStore(db);
+    const next = store.snapshotPage({ accountId: "a", linkedDeviceId: "browser",
+      token: first.token, cursor: first.cursor, limit: 1 });
+    assert.equal(next.baselineSequence, first.baseline);
+    assert.deepEqual(next.rows.map(row => row.conversationId), ["c-1"]);
+    assert.equal(next.hasMore, false);
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    db?.close();
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test("V2 snapshot remains immutable across pages, new events, and store restart", () => {
+  const db = new Database(":memory:");
+  let now = 1_000_000;
+  const store = new EventStore(db, { now: () => now });
+  const events = Array.from({ length: 205 }, (_, index) => ({
+    eventId: `snapshot-conv-${index}`, type: "CONVERSATION_UPSERTED",
+    conversationId: `conversation-${index}`, revision: 1, sortKey: index,
+    payload: Buffer.from(`cipher-${index}`), cryptoVersion: 3,
+  }));
+  for (let index = 0; index < events.length; index += 100) {
+    store.ingestBatch({ accountId: "a", events: events.slice(index, index + 100) });
+  }
+  store.ingestBatch({ accountId: "a", events: [{ eventId: "snapshot-message", type: "MESSAGE_CREATED",
+    conversationId: "conversation-0", messageId: "message-0", revision: 1,
+    payload: Buffer.from("message-cipher"), cryptoVersion: 3 }] });
+  const first = store.beginSnapshot({ accountId: "a", linkedDeviceId: "browser-a", limit: 100 });
+  assert.equal(first.baselineSequence, 206);
+  assert.equal(first.rows.length, 100);
+  assert.equal(first.hasMore, true);
+  store.ingestBatch({ accountId: "a", events: [{ eventId: "late", type: "CONVERSATION_UPSERTED",
+    conversationId: "conversation-204", revision: 2, sortKey: 999,
+    payload: Buffer.from("late-cipher"), cryptoVersion: 3 }] });
+  const restarted = new EventStore(db, { now: () => now });
+  const second = restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: first.nextCursor, limit: 100 });
+  const third = restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: second.nextCursor, limit: 100 });
+  assert.equal(second.rows.length, 100);
+  assert.equal(third.rows.length, 6);
+  assert.equal(third.rows.at(-1).kind, "message");
+  assert.equal(third.rows.at(-1).messageId, "message-0");
+  assert.equal(third.hasMore, false);
+  assert.equal(third.baselineSequence, 206);
+  assert.equal([...first.rows, ...second.rows, ...third.rows].some(row => row.envelope === Buffer.from("late-cipher").toString("base64")), false);
+  assert.equal(restarted.after("a", first.baselineSequence).events[0].eventId, "late");
+  assert.throws(() => restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-b",
+    token: first.token, cursor: first.nextCursor, limit: 100 }), error => error.code === "snapshot_forbidden");
+  assert.throws(() => restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: "not-a-cursor", limit: 100 }), error => error.code === "invalid_snapshot_cursor");
+  now = first.expiresAt + 1;
+  assert.throws(() => restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: first.nextCursor, limit: 100 }), error => error.code === "snapshot_expired");
+  now = 1_000_000;
+  db.prepare("UPDATE replica_metadata SET snapshot_version = snapshot_version + 1 WHERE account_id = 'a'").run();
+  assert.throws(() => restarted.snapshotPage({ accountId: "a", linkedDeviceId: "browser-a",
+    token: first.token, cursor: first.nextCursor, limit: 100 }), error => error.code === "snapshot_required");
+});
+
 describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => {
+  test("compaction preserves post-baseline deltas while a snapshot session is active", () => {
+    let now = 50_000;
+    const store = new EventStore(new Database(":memory:"), { now: () => now });
+    const event = (id, index) => ({ eventId: id, type: "MESSAGE_CREATED", conversationId: "thread",
+      messageId: id, revision: 1, sortKey: index, payload: Buffer.from(id), cryptoVersion: 3 });
+    store.ingestBatch({ accountId: "a", events: [event("before", 1)] });
+    const snapshot = store.beginSnapshot({ accountId: "a", linkedDeviceId: "slow-browser", limit: 1 });
+    store.ingestBatch({ accountId: "a", events: [event("after-1", 2), event("after-2", 3)] });
+    const metadata = store.replicaMetadata("a");
+    store.acknowledgeClient("a", "fast-browser", 3, metadata.replicaGeneration, metadata.snapshotVersion);
+    now += 1;
+    store.compact("a", { retainEvents: 0, retainMs: 0, limit: 100 });
+    assert.deepEqual(store.after("a", snapshot.baselineSequence).events.map(row => row.eventId), ["after-1", "after-2"]);
+    now = snapshot.expiresAt + 1;
+    store.compact("a", { retainEvents: 0, retainMs: 0, limit: 100 });
+    assert.deepEqual(store.after("a", snapshot.baselineSequence).events, []);
+  });
+  test("V2 reports accepted, identical replay, and conflicting replay without consuming sequence", () => {
+    const store = new EventStore(new Database(":memory:"));
+    const event = { eventId: "v2-1", type: "DEVICE_STATUS_CHANGED", payload: Buffer.from("x"), cryptoVersion: 1 };
+    const first = store.ingestBatch({ accountId: "a", sourceDeviceId: "phone", events: [event], perItem: true });
+    assert.deepEqual(first.results, [{ eventId: "v2-1", status: "ACCEPTED", serverSequence: 1 }]);
+    const replay = store.ingestBatch({ accountId: "a", sourceDeviceId: "phone", events: [event], perItem: true });
+    assert.deepEqual(replay.results, [{ eventId: "v2-1", status: "DUPLICATE", serverSequence: 1 }]);
+    const conflict = store.ingestBatch({ accountId: "a", sourceDeviceId: "phone", events: [{ ...event, payload: Buffer.from("y") }], perItem: true });
+    assert.deepEqual(conflict.results, [{ eventId: "v2-1", status: "CONFLICTING_DUPLICATE" }]);
+    assert.equal(conflict.highWatermark, 1);
+    assert.equal(store.count("a"), 1);
+  });
   test("sequences are strictly monotonic per account within a batch", () => {
     const store = new EventStore(new Database(":memory:"));
     const res = store.ingestBatch({

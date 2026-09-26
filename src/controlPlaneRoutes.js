@@ -3,6 +3,10 @@
 const {
   policy: eventCryptoPolicy,
   validateWireBatch,
+  validateWireEvent,
+  validateStoredBatch,
+  MAX_BATCH_EVENTS,
+  MAX_DECODED_BATCH_BYTES,
   MAX_HTTP_BODY_BYTES,
 } = require("./eventCryptoPolicy");
 
@@ -12,6 +16,9 @@ const EVENT_TYPES = Object.keys({
   ...eventCryptoPolicy.nonContentControl,
 });
 const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ"]);
+const SAFE_INGEST_ERROR_CODES = new Set(["invalid_event_id", "invalid_metadata", "invalid_payload_encoding",
+  "invalid_encrypted_envelope", "unsupported_schema_version", "unsupported_crypto_version",
+  "encrypted_payload_required", "event_payload_too_large"]);
 
 /**
  * Phase 2 Control Plane routes (TechSpec §51–58, ADR-001/004) as a REGISTERED
@@ -26,8 +33,45 @@ const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ"])
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentAuthService, checkRateLimit }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentAuthService, checkRateLimit, enableCommandLeases = false }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
+  const replicationCapabilities = () => ({
+    preferredProtocolVersion: 1,
+    supportedProtocolVersions: [1],
+    eventIngest: { maxBatchEvents: 100, perItemResults: false },
+    snapshot: { stablePagination: true },
+    keys: { deviceFiltered: true, independentFromEventCursor: true },
+    commands: { durable: true, idempotent: true, leases: enableCommandLeases },
+  });
+  const capabilitiesSchema = {
+    schema: {
+      summary: "Implemented encrypted replication capabilities",
+      description: "Reports active protocol behavior. V2 remains unavailable until its snapshot, ingest and command contracts are implemented.",
+      tags: ["Sync"],
+      response: { 200: { type: "object", additionalProperties: true },
+        429: { type: "object", properties: { error: { type: "string" } } } },
+    },
+  };
+
+  app.get("/api/v1/agent/replication-capabilities", capabilitiesSchema, async (request, reply) => {
+    const rate = checkRateLimit(request, "agent-replication-capabilities", 60, 60_000);
+    if (!rate.allowed) return reply.code(429).header("Retry-After", rate.retryAfterSeconds)
+      .send({ error: "agent_rate_limit" });
+    if (!authorizeAgent(request, request.rawBody || Buffer.alloc(0))) {
+      return reply.code(401).send({ error: "agent_auth_required" });
+    }
+    reply.header("Cache-Control", "no-store");
+    return replicationCapabilities();
+  });
+
+  app.get("/api/v1/linked-device/replication-capabilities", capabilitiesSchema, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    }
+    reply.header("Cache-Control", "no-store");
+    return replicationCapabilities();
+  });
   const applyStatement = statement => trustRegistry.db.transaction(() => {
     const result = trustRegistry.applyStatement({ accountId, statement });
     if (result.applied && statement.operation === "DEVICE_REVOKED") {
@@ -272,7 +316,8 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
           type: "object",
           properties: { commandId: { type: "string" }, state: { type: "string" }, created: { type: "boolean" } }
         },
-        400: { type: "object", properties: { error: { type: "string" } } }
+        400: { type: "object", properties: { error: { type: "string" } } },
+        409: { type: "object", properties: { error: { type: "string" } } }
       }
     }
   }, async (request, reply) => {
@@ -315,15 +360,18 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         schemaVersion: body.schemaVersion,
         cryptoVersion: body.cryptoVersion,
         targetAgentId: body.targetAgentId ?? null,
-        sourceClientId: body.sourceClientId ?? null,
+        sourceClientId: request.linkedDevice?.deviceId ?? body.sourceClientId ?? null,
         clientSignature: body.clientSignature
           ? Buffer.from(String(body.clientSignature), "base64")
           : null,
         expiresAt: body.expiresAt ?? undefined,
       });
+      if (request.linkedDevice && command.sourceClientId !== request.linkedDevice.deviceId) {
+        return reply.code(409).send({ error: "idempotency_owner_mismatch" });
+      }
       reply.code(202).send({ commandId: command.id, state: command.state, created });
     } catch (error) {
-      reply.code(400).send({ error: error.message });
+      reply.code(error.code === "idempotency_key_reused" ? 409 : 400).send({ error: error.message });
     }
   });
 
@@ -336,6 +384,9 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   }, async (request, reply) => {
     const command = commandEngine.get(String(request.params.id));
     if (!command) { reply.code(404).send({ error: "command_not_found" }); return; }
+    if (request.linkedDevice && command.sourceClientId !== request.linkedDevice.deviceId) {
+      return reply.code(404).send({ error: "command_not_found" });
+    }
     return { ...command, ciphertext: b64(command.ciphertext), clientSignature: b64(command.clientSignature) };
   });
 
@@ -373,6 +424,66 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     return { commands };
   });
 
+  // V2 is opt-in and requires a signed, device-bound agent identity. Android
+  // must dedupe commandId locally before this route is enabled in a rollout.
+  app.post("/api/v1/agent/commands/claim-v2", {
+    schema: {
+      summary: "Claim or reclaim a leased command with stable identity",
+      tags: ["Agent"],
+      body: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 100 } } },
+      response: { 200: { type: "object", properties: { commands: { type: "array", items: { type: "object", additionalProperties: true } } } },
+        429: { type: "object", properties: { error: { type: "string" } } } },
+    },
+  }, async (request, reply) => {
+    if (!enableCommandLeases) return reply.code(409).send({ error: "lease_protocol_unavailable" });
+    const rate = checkRateLimit(request, "agent-claim-v2", 60, 60_000);
+    if (!rate.allowed) return reply.code(429).header("Retry-After", rate.retryAfterSeconds)
+      .send({ error: "agent_rate_limit" });
+    const identity = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (!identity || !request.authenticatedAgentId || identity.deviceId !== request.authenticatedAgentId) {
+      return reply.code(403).send({ error: "signed_agent_identity_required" });
+    }
+    const limit = Math.max(1, Math.min(100, Number(request.body?.limit) || 25));
+    const commands = commandEngine.claimForAgentV2(identity.deviceId, { limit }).map((command) => ({
+      ...command, ciphertext: b64(command.ciphertext), clientSignature: b64(command.clientSignature),
+    }));
+    return { commands };
+  });
+
+  app.post("/api/v1/agent/commands/:id/status-v2", {
+    schema: {
+      summary: "Report a leased command status with claim generation",
+      tags: ["Agent"],
+      body: { type: "object", required: ["state", "claimGeneration"], properties: {
+        state: { type: "string", enum: ["ACCEPTED", "EXECUTING", "COMPLETED", "FAILED"] },
+        claimGeneration: { type: "integer", minimum: 1 },
+        result: { type: "string", nullable: true },
+      } },
+      response: { 200: { type: "object", properties: { ok: { type: "boolean" } } },
+        409: { type: "object", properties: { error: { type: "string" } } },
+        429: { type: "object", properties: { error: { type: "string" } } } },
+    },
+  }, async (request, reply) => {
+    if (!enableCommandLeases) return reply.code(409).send({ error: "lease_protocol_unavailable" });
+    const rate = checkRateLimit(request, "agent-status-v2", 120, 60_000);
+    if (!rate.allowed) return reply.code(429).header("Retry-After", rate.retryAfterSeconds)
+      .send({ error: "agent_rate_limit" });
+    const identity = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (!identity || !request.authenticatedAgentId || identity.deviceId !== request.authenticatedAgentId) {
+      return reply.code(403).send({ error: "signed_agent_identity_required" });
+    }
+    const { state, result, claimGeneration } = request.body || {};
+    const from = {
+      ACCEPTED: ["DELIVERED_TO_AGENT"], EXECUTING: ["ACCEPTED_BY_AGENT"],
+      COMPLETED: ["EXECUTING", "ACCEPTED_BY_AGENT"],
+      FAILED: ["EXECUTING", "ACCEPTED_BY_AGENT", "DELIVERED_TO_AGENT"],
+    }[String(state)];
+    if (!from) return reply.code(400).send({ error: "invalid_state" });
+    const ok = commandEngine.transitionClaim(String(request.params.id), state === "ACCEPTED" ? "ACCEPTED_BY_AGENT" : state,
+      { agentId: identity.deviceId, claimGeneration, fromStates: from, result: result ?? null });
+    return ok ? { ok: true } : reply.code(409).send({ error: "stale_or_illegal_claim" });
+  });
+
   app.post("/api/v1/agent/commands/:id/status", {
     schema: {
       summary: "Android Agent reports command lifecycle status (§58)",
@@ -389,6 +500,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     }
   }, async (request, reply) => {
     const id = String(request.params.id);
+    if (commandEngine.get(id)?.claimGeneration > 0) return reply.code(409).send({ error: "lease_protocol_required" });
     const { state, result } = request.body || {};
     const from = {
       ACCEPTED: ["DELIVERED_TO_AGENT"],
@@ -519,6 +631,61 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     });
   });
 
+  app.post("/api/v1/agent/events/batch-v2", {
+    bodyLimit: MAX_HTTP_BODY_BYTES,
+    schema: {
+      summary: "Per-item encrypted event ingest outcomes",
+      tags: ["Agent"],
+      body: { type: "object", required: ["events"], properties: {
+        events: { type: "array", minItems: 1, maxItems: MAX_BATCH_EVENTS, items: { type: "object", additionalProperties: true } }
+      } },
+      response: { 200: { type: "object", properties: {
+        results: { type: "array", items: { type: "object", properties: {
+          index: { type: "integer" }, eventId: { type: "string" }, status: { type: "string" }, serverSequence: { type: "integer" }, error: { type: "string" }, errorClass: { type: "string", enum: ["VALIDATION", "IDENTITY_CONFLICT"] }
+        } } },
+        highWatermark: { type: "integer" }
+      } } }
+    }
+  }, async (request, reply) => {
+    const submitted = request.body.events;
+    const valid = [];
+    const indices = [];
+    const results = new Array(submitted.length);
+    let decodedBytes = 0;
+    for (let index = 0; index < submitted.length; index++) {
+      const event = submitted[index];
+      try {
+        if (typeof event.eventId !== "string" || !event.eventId || event.eventId.length > 128) {
+          throw Object.assign(new Error("invalid_event_id"), { code: "invalid_event_id" });
+        }
+        const { payload } = validateWireEvent(event);
+        if ((event.conversationId != null && typeof event.conversationId !== "string") ||
+            (event.messageId != null && typeof event.messageId !== "string") ||
+            (event.revision != null && (!Number.isInteger(event.revision) || event.revision < 1)) ||
+            (event.sortKey != null && (!Number.isInteger(event.sortKey) || event.sortKey < 0))) {
+          throw Object.assign(new Error("invalid_metadata"), { code: "invalid_metadata" });
+        }
+        validateStoredBatch([{ ...event, payload }]);
+        decodedBytes += payload.length;
+        if (decodedBytes > MAX_DECODED_BATCH_BYTES) {
+          return reply.code(413).send({ error: "batch_payload_too_large" });
+        }
+        valid.push({ ...event, payload });
+        indices.push(index);
+      } catch (error) {
+        results[index] = { index, eventId: String(event.eventId || ""), status: "INVALID_EVENT",
+          error: SAFE_INGEST_ERROR_CODES.has(error.code) ? error.code : "invalid_event", errorClass: "VALIDATION" };
+      }
+    }
+    const stored = valid.length
+      ? eventStore.ingestBatch({ accountId, sourceDeviceId: request.authenticatedAgentId || null, events: valid, perItem: true })
+      : { results: [], highWatermark: eventStore.highWatermark(accountId) };
+    stored.results.forEach((result, offset) => { results[indices[offset]] = { index: indices[offset], ...result,
+      ...(result.status === "CONFLICTING_DUPLICATE" ? { errorClass: "IDENTITY_CONFLICT" }
+        : result.status === "ACCEPTED" || result.status === "DUPLICATE" ? {} : { errorClass: "VALIDATION" }) }; });
+    return { results, highWatermark: stored.highWatermark };
+  });
+
   app.get("/api/v1/sync", {
     schema: {
       summary: "Cursor-based catch-up sync (§54) — events after a per-account cursor",
@@ -549,6 +716,53 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   });
 
   const webSnapshotHeaders = (reply) => reply.header("Cache-Control", "no-store");
+
+  app.post("/api/v1/web/snapshot-v2", {
+    schema: {
+      summary: "Start immutable encrypted replica snapshot",
+      tags: ["Sync"],
+      body: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 200 } } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    webSnapshotHeaders(reply);
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    }
+    if (checkRateLimit) {
+      const limit = checkRateLimit(request, `linked-snapshot:${request.linkedDevice.deviceId}`, 5, 60_000);
+      if (!limit.allowed) return reply.code(429).header("Retry-After", limit.retryAfterSeconds)
+        .send({ error: "rate_limited" });
+    }
+    return eventStore.beginSnapshot({ accountId, linkedDeviceId: request.linkedDevice.deviceId,
+      limit: request.body?.limit || 100 });
+  });
+  app.get("/api/v1/web/snapshot-v2", {
+    schema: {
+      summary: "Continue immutable encrypted replica snapshot",
+      tags: ["Sync"],
+      querystring: { type: "object", required: ["token"], properties: {
+        token: { type: "string", minLength: 32, maxLength: 128 },
+        cursor: { type: "string", maxLength: 64 },
+        limit: { type: "integer", minimum: 1, maximum: 200 },
+      } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    webSnapshotHeaders(reply);
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    }
+    try {
+      return eventStore.snapshotPage({ accountId, linkedDeviceId: request.linkedDevice.deviceId,
+        token: request.query.token, cursor: request.query.cursor, limit: request.query.limit || 100 });
+    } catch (error) {
+      return reply.code(error.code === "snapshot_forbidden" ? 403 : error.code === "invalid_snapshot_cursor" ? 400 : 409)
+        .send({ error: error.code || "snapshot_required" });
+    }
+  });
 
   app.get("/api/v1/web/bootstrap", {
     schema: {
@@ -645,7 +859,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (!request.linkedDevice?.capabilities?.includes("READ_MESSAGES")) {
       return reply.code(403).send({ error: "capability_denied" });
     }
-    return eventStore.syncDiagnostics(accountId);
+    return eventStore.syncDiagnostics(accountId, request.linkedDevice.deviceId);
   });
 
   app.get("/api/v1/linked-device/key-grants", {

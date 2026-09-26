@@ -9,6 +9,21 @@ const { CommandEngine } = require("../src/commandEngine");
 const { EventStore } = require("../src/eventStore");
 const { registerControlPlaneRoutes } = require("../src/controlPlaneRoutes");
 
+test("lease endpoints are closed unless the provider explicitly enables the protocol", async () => {
+  const app = Fastify({ logger: false });
+  const db = new Database(":memory:");
+  try {
+    registerControlPlaneRoutes(app, { trustRegistry: new TrustRegistry(db),
+      commandEngine: new CommandEngine(db), eventStore: new EventStore(db), accountId: "a",
+      authorizeAgent: () => ({ deviceId: "phone", role: "PRIMARY_TRUST_AGENT" }),
+      linkedSessions: require("../src/linkedSessions") });
+    await app.ready();
+    const claim = await app.inject({ method: "POST", url: "/api/v1/agent/commands/claim-v2", payload: {} });
+    assert.equal(claim.statusCode, 409);
+    assert.equal(claim.json().error, "lease_protocol_unavailable");
+  } finally { await app.close(); db.close(); }
+});
+
 function encryptedPayload(event) {
   const b64 = length => Buffer.alloc(length, 7).toString("base64");
   const envelope = {
@@ -52,10 +67,14 @@ describe("Phase 2 control plane HTTP API", () => {
       commandEngine: new CommandEngine(db),
       eventStore: new EventStore(db),
       accountId: "test-account",
+      enableCommandLeases: true,
       // Test auth stub: request header X-Test-Agent-Role simulates the
       // server's real authorizeAgent (signature → {deviceId, role}).
       linkedSessions: require("../src/linkedSessions"),
-      checkRateLimit: (_request, key, max) => {
+      checkRateLimit: (request, key, max) => {
+        if (request.headers["x-test-rate-limit"] === "deny") {
+          return { allowed: false, retryAfterSeconds: 60 };
+        }
         const count = (rateBuckets.get(key) || 0) + 1;
         rateBuckets.set(key, count);
         return { allowed: count <= max, retryAfterSeconds: 60 };
@@ -81,6 +100,81 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.equal(ping.json().protocolVersion, 1);
     const after = await app.inject({ method: "GET", url: "/api/v1/sync?after=0" });
     assert.deepEqual(after.json(), before.json());
+  });
+
+  test("replication capabilities expose only implemented protocol features to authorized clients", async () => {
+    const agent = await app.inject({
+      method: "GET", url: "/api/v1/agent/replication-capabilities",
+      headers: { "x-test-agent-role": "PRIMARY_TRUST_AGENT", "x-test-agent-device": "agent-capabilities" },
+    });
+    assert.equal(agent.statusCode, 200);
+    assert.equal(agent.json().preferredProtocolVersion, 1);
+    assert.equal(agent.json().snapshot.stablePagination, true);
+    assert.equal(agent.json().eventIngest.perItemResults, false);
+    assert.equal(agent.json().commands.leases, true);
+
+    const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/replication-capabilities" });
+    assert.equal(denied.statusCode, 401);
+    const linked = await app.inject({ method: "GET", url: "/api/v1/linked-device/replication-capabilities",
+      headers: { "x-test-linked": "browser-capabilities" } });
+    assert.equal(linked.statusCode, 200);
+    assert.deepEqual(linked.json(), agent.json());
+  });
+
+  test("agent replication routes rate-limit before authorization", async () => {
+    for (const [method, url, payload] of [
+      ["GET", "/api/v1/agent/replication-capabilities", undefined],
+      ["POST", "/api/v1/agent/commands/claim-v2", {}],
+      ["POST", "/api/v1/agent/commands/unknown/status-v2", { state: "ACCEPTED", claimGeneration: 1 }],
+    ]) {
+      const response = await app.inject({ method, url, payload, headers: { "x-test-rate-limit": "deny" } });
+      assert.equal(response.statusCode, 429, url);
+      assert.equal(response.headers["retry-after"], "60");
+    }
+  });
+
+  test("V2 claims require a bound agent and reject stale or foreign status", async () => {
+    const target = "phone-v2-route";
+    const created = await app.inject({ method: "POST", url: "/api/v1/commands", payload: {
+      type: "SEND_SMS", payload: Buffer.from("opaque-command").toString("base64"),
+      idempotencyKey: `route-v2-${Date.now()}`, targetAgentId: target,
+    } });
+    assert.equal(created.statusCode, 202);
+    const id = created.json().commandId;
+    const unsigned = await app.inject({ method: "POST", url: "/api/v1/agent/commands/claim-v2", payload: {} });
+    assert.equal(unsigned.statusCode, 403);
+    const claimed = await app.inject({ method: "POST", url: "/api/v1/agent/commands/claim-v2",
+      headers: { "x-test-agent-role": "PRIMARY_TRUST_AGENT", "x-test-agent-device": target }, payload: {} });
+    assert.equal(claimed.statusCode, 200);
+    const command = claimed.json().commands.find(row => row.id === id);
+    assert.equal(command.claimGeneration, 1);
+    assert.ok(command.leaseExpiresAt > 0);
+    const old = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${id}/status`,
+      payload: { state: "ACCEPTED" } });
+    assert.equal(old.statusCode, 409);
+    const foreign = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${id}/status-v2`,
+      headers: { "x-test-agent-role": "PRIMARY_TRUST_AGENT", "x-test-agent-device": "another-phone" },
+      payload: { state: "ACCEPTED", claimGeneration: 1 } });
+    assert.equal(foreign.statusCode, 409);
+    const accepted = await app.inject({ method: "POST", url: `/api/v1/agent/commands/${id}/status-v2`,
+      headers: { "x-test-agent-role": "PRIMARY_TRUST_AGENT", "x-test-agent-device": target },
+      payload: { state: "ACCEPTED", claimGeneration: 1 } });
+    assert.equal(accepted.statusCode, 200);
+  });
+
+  test("linked command status belongs only to its creating browser", async () => {
+    const created = await app.inject({ method: "POST", url: "/api/v1/commands",
+      headers: { "x-test-linked": "browser-owner" }, payload: {
+        type: "SEND_SMS", payload: Buffer.from("opaque").toString("base64"),
+        encoding: "envelope.v1", cryptoVersion: 1, schemaVersion: 1,
+        idempotencyKey: `owned-${Date.now()}`, targetAgentId: "phone-owner",
+      } });
+    assert.equal(created.statusCode, 202);
+    const url = `/api/v1/commands/${created.json().commandId}`;
+    assert.equal((await app.inject({ method: "GET", url,
+      headers: { "x-test-linked": "browser-owner" } })).statusCode, 200);
+    assert.equal((await app.inject({ method: "GET", url,
+      headers: { "x-test-linked": "browser-other" } })).statusCode, 404);
   });
 
   after(async () => {
@@ -132,12 +226,16 @@ describe("Phase 2 control plane HTTP API", () => {
     });
     const second = await app.inject({
       method: "POST", url: "/api/v1/commands",
-      payload: { type: "SEND_SMS", payload: Buffer.from("y").toString("base64"), idempotencyKey: key },
+      payload: { type: "SEND_SMS", payload: Buffer.from("x").toString("base64"), idempotencyKey: key },
     });
     assert.equal(first.statusCode, 202);
     assert.equal(second.statusCode, 202);
     assert.equal(second.json().created, false);
     assert.equal(second.json().commandId, first.json().commandId);
+    const conflict = await app.inject({ method: "POST", url: "/api/v1/commands",
+      payload: { type: "SEND_SMS", payload: Buffer.from("y").toString("base64"), idempotencyKey: key } });
+    assert.equal(conflict.statusCode, 409);
+    assert.equal(conflict.json().error, "idempotency_key_reused");
   });
 
   test("claim → accept → execute → complete lifecycle over HTTP", async () => {
@@ -246,6 +344,57 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.deepEqual(body.accepted.map((a) => a.serverSequence), [1, 2]);
   });
 
+  test("V2 batch returns indexed per-item outcomes while V1 remains compatible", async () => {
+    const event = { eventId: `v2-${Date.now()}`, type: "MESSAGE_CREATED", conversationId: "v2-conv",
+      encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3 };
+    const valid = { ...event, payload: encryptedPayload(event) };
+    const upload = events => app.inject({ method: "POST", url: "/api/v1/agent/events/batch-v2",
+      headers: { "x-test-agent-device": "v2-phone", "x-test-agent-role": "PRIMARY_TRUST_AGENT" },
+      payload: { sourceDeviceId: "spoofed-device", events } });
+    const first = await upload([valid, { ...valid, eventId: "bad", payload: "not-base64" }, valid]);
+    assert.equal(first.statusCode, 200);
+    assert.deepEqual(first.json().results.map(row => row.status), ["ACCEPTED", "INVALID_EVENT", "DUPLICATE"]);
+    assert.deepEqual(first.json().results.map(row => row.errorClass ?? null), [null, "VALIDATION", null]);
+    assert.equal(first.json().results[0].serverSequence, first.json().results[2].serverSequence);
+    assert.equal(first.json().results[1].error, "invalid_payload_encoding");
+    const sync = await app.inject({ method: "GET", url: "/api/v1/sync?after=0&limit=1000" });
+    assert.equal(sync.json().events.find(row => row.eventId === event.eventId).sourceDeviceId, "v2-phone");
+    const conflict = await upload([{ ...valid, sortKey: 1 }]);
+    assert.equal(conflict.statusCode, 200);
+    assert.equal(conflict.json().results[0].status, "CONFLICTING_DUPLICATE");
+    assert.equal(conflict.json().results[0].errorClass, "IDENTITY_CONFLICT");
+    assert.equal(conflict.json().highWatermark, first.json().highWatermark);
+    const v1 = await app.inject({ method: "POST", url: "/api/v1/agent/events/batch", payload: { events: [valid] } });
+    assert.equal(v1.statusCode, 200);
+    assert.ok(Array.isArray(v1.json().accepted));
+  });
+
+  test("V2 snapshot pages require the owning linked browser", async () => {
+    const events = [1, 2].map(index => {
+      const event = { eventId: `snapshot-http-${index}`, type: "CONVERSATION_UPSERTED",
+        conversationId: `snapshot-http-conv-${index}`, encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3 };
+      return { ...event, payload: encryptedPayload(event) };
+    });
+    const seed = await app.inject({ method: "POST", url: "/api/v1/agent/events/batch", payload: { events } });
+    assert.equal(seed.statusCode, 200);
+    const denied = await app.inject({ method: "POST", url: "/api/v1/web/snapshot-v2", payload: { limit: 1 } });
+    assert.equal(denied.statusCode, 401);
+    const start = await app.inject({ method: "POST", url: "/api/v1/web/snapshot-v2",
+      headers: { "x-test-linked": "snapshot-browser" }, payload: { limit: 1 } });
+    assert.equal(start.statusCode, 200);
+    assert.equal(start.headers["cache-control"], "no-store");
+    const first = start.json();
+    assert.ok(first.token);
+    assert.ok(first.baselineSequence >= 1);
+    assert.equal(first.rows.length, 1);
+    const nextUrl = `/api/v1/web/snapshot-v2?token=${encodeURIComponent(first.token)}&cursor=${encodeURIComponent(first.nextCursor)}&limit=1`;
+    const wrong = await app.inject({ method: "GET", url: nextUrl, headers: { "x-test-linked": "other-browser" } });
+    assert.equal(wrong.statusCode, 403);
+    const next = await app.inject({ method: "GET", url: nextUrl, headers: { "x-test-linked": "snapshot-browser" } });
+    assert.equal(next.statusCode, 200);
+    assert.equal(next.json().baselineSequence, first.baselineSequence);
+  });
+
   test("web sync ACK requires linked authorization and matching replica metadata", async () => {
     const headers = { "x-test-linked": "web-device" };
     const bootstrap = await app.inject({ method: "GET", url: "/api/v1/web/bootstrap", headers });
@@ -267,6 +416,12 @@ describe("Phase 2 control plane HTTP API", () => {
     const accepted = await app.inject({ method: "POST", url: "/api/v1/web/sync/ack", headers, payload });
     assert.equal(accepted.statusCode, 200);
     assert.equal(accepted.json().cursor, snapshot.highWatermark);
+    const own = await app.inject({ method: "GET", url: "/api/v1/linked-device/sync-diagnostics", headers });
+    const other = await app.inject({ method: "GET", url: "/api/v1/linked-device/sync-diagnostics",
+      headers: { "x-test-linked": "unrelated-browser" } });
+    assert.equal(own.json().phases.browserAckCursor, snapshot.highWatermark);
+    assert.equal(other.json().phases.browserAckCursor, 0);
+    assert.equal(JSON.stringify(other.json()).includes("web-device"), false);
   });
 
   test("event ingest rejects plaintext, malformed, unknown, and oversized input", async () => {
@@ -379,6 +534,11 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.ok(body.total > 0);
     assert.ok(body.maxSequence > 0);
     assert.ok(Array.isArray(body.countsByType));
+    assert.ok(body.phases);
+    assert.equal(typeof body.phases.eventCursor, "number");
+    assert.equal(typeof body.phases.snapshotActive, "boolean");
+    assert.equal(typeof body.phases.historyRows, "number");
+    assert.equal(typeof body.phases.browserAckCursor, "number");
     assert.equal("ciphertext" in body, false);
     assert.equal(JSON.stringify(body).includes("eventId"), false);
     assert.equal(JSON.stringify(body).includes("aggregateId"), false);

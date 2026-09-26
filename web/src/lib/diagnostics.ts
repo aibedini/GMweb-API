@@ -1,8 +1,10 @@
 import { fetchKeyGrantsAfter, fetchKeyring, fetchSyncDiagnostics, health, type ServerSyncDiagnostics, type SyncEvent } from "./api.ts";
-import { getBrowserSyncStatus, getCursor, getProjectionCursor, type BrowserSyncStatus } from "./sync.ts";
+import { getBrowserSyncStatus, getCursor, getProjectionCursor, getReplicationProgress, type BrowserSyncStatus } from "./sync.ts";
 import { getStoredDeviceIdentity, loadCryptoRecord } from "./deviceKeys.ts";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "./buildInfo.ts";
 import { decryptMessage, receiveKeyGrants, type Decryption } from "./messageCrypto.ts";
+import { phaseErrorClass, safeSyncError, type PhaseErrorClass } from "./sync/sync-errors.ts";
+export { phaseErrorClass } from "./sync/sync-errors.ts";
 
 const EVENT_TYPES = ["MESSAGE_CREATED", "MESSAGE_UPDATED", "KEY_GRANT", "CONTACTS_KEY_GRANT", "KEYRING_ENTRY", "HISTORY_KEY_GRANT", "CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"];
 
@@ -10,7 +12,8 @@ export interface WebDiagnosticReport {
   collectedAt: number;
   session: { linked: boolean; capabilities: string[]; apiVersion: string; pwaVersion: string; loadedScript: string; serviceWorker: string; online: boolean; buildMismatch: boolean };
   server: ServerSyncDiagnostics | null;
-  browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number };
+  browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number; phaseErrorClass: PhaseErrorClass };
+  replicaProgress?: { snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number };
   indexedDb: { total: number; byType: Record<string, number>; byCryptoVersion: Record<string, number>; nullAggregateCount: number; distinctMessageAggregateCount: number; conversationRows: number; contactRows: number };
   crypto: { browserIdentity: boolean; verifiedPrimary: boolean; primaryMatchesBrowser: boolean; messages: DecryptionCounts; keyGrants: DecryptionCounts };
   projection: { cursor: number; lag: number; rawMessageAggregates: number; rows: number; readyRows: number; lockedRows: number; failure: "PROJECTION_DIVERGENCE" | null };
@@ -158,11 +161,19 @@ async function localCounts() {
   } finally { db.close(); }
 }
 
-function safeError(value: string | null): string | null {
-  if (!value) return null;
-  if (/Invalid sync page/i.test(value)) return "Invalid sync page";
-  const http = value.match(/HTTP\s+\d{3}/i)?.[0];
-  return http || "Sync operation failed";
+async function probeKeyGrants(): Promise<Decryption[]> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.all([
+        fetchKeyring().then(page => page.events),
+        fetchKeyGrantsAfter(0, 20).then(page => page.events),
+      ]).then(pages => receiveKeyGrants(pages.flat())).catch(() => []),
+      new Promise<Decryption[]>(resolve => { timeout = setTimeout(() => resolve([]), 2_000); }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 async function shortHash(value: string): Promise<string> {
@@ -189,12 +200,10 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     localCounts(), getStoredDeviceIdentity(),
     loadCryptoRecord<{ deviceId: string; encryptionPublicKey: string }>("verified-primary").catch(() => null),
     navigator.serviceWorker?.getRegistration().catch(() => undefined),
-    Promise.all([
-      fetchKeyring().then(page => page.events),
-      fetchKeyGrantsAfter(0, 20).then(page => page.events),
-    ]).then(pages => receiveKeyGrants(pages.flat())).catch(() => []),
+    probeKeyGrants(),
   ]);
   const runtime = getBrowserSyncStatus();
+  const replicaProgress = identity ? await getReplicationProgress(identity.deviceId) : undefined;
   const projectionLag = Math.max(0, cursor - projectionCursor);
   const syncLag = server ? Math.max(0, server.maxSequence - cursor) : null;
   const projectionFailure = detectProjectionFailure(local.distinctMessageAggregateCount, local.conversationRows, projectionCursor, cursor);
@@ -213,7 +222,9 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
       online: navigator.onLine, buildMismatch,
     },
     server,
-    browserSync: { ...runtime, lastErrorMessage: safeError(runtime.lastErrorMessage), cursor, projectionCursor, syncLag, projectionLag },
+    browserSync: { ...runtime, lastErrorMessage: safeSyncError(runtime.lastErrorMessage),
+      phaseErrorClass: phaseErrorClass(runtime.lastErrorPhase), cursor, projectionCursor, syncLag, projectionLag },
+    replicaProgress,
     indexedDb: {
       total: local.total, byType: local.byType, byCryptoVersion: local.byCryptoVersion,
       nullAggregateCount: local.nullAggregateCount, distinctMessageAggregateCount: local.distinctMessageAggregateCount,
@@ -243,7 +254,7 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     locked: selected.events.filter(event => event.decryption?.state === "locked").length,
     invalid: selected.events.filter(event => event.decryption?.state === "invalid").length,
     state: selected.state, firstPageDurationMs: selected.firstPageDurationMs,
-    lastPageError: safeError(selected.lastPageError),
+    lastPageError: safeSyncError(selected.lastPageError),
   };
   return report;
 }
@@ -261,8 +272,13 @@ export function formatWebDiagnostics(report: WebDiagnosticReport): string {
     `Browser cursor             ${report.browserSync.cursor}`,
     `Sync lag                   ${report.browserSync.syncLag ?? "unknown"}`,
     `Sync state                 ${report.browserSync.state}`,
+    `Sync error class           ${report.browserSync.phaseErrorClass ?? "none"}`,
     `Projection cursor          ${report.projection.cursor}`,
     `Projection lag             ${report.projection.lag}`,
+    `Snapshot complete          ${report.replicaProgress?.snapshotComplete ?? "unknown"}`,
+    `Snapshot baseline          ${report.replicaProgress?.snapshotBaseline ?? "unknown"}`,
+    `Keyring cursor             ${report.replicaProgress?.keyringCursor ?? "unknown"}`,
+    `Grant cursor               ${report.replicaProgress?.grantCursor ?? "unknown"}`,
     `Raw MESSAGE_CREATED        ${type("MESSAGE_CREATED")}`,
     `Raw KEY_GRANT              ${type("KEY_GRANT")}`,
     `Raw HISTORY_KEY_GRANT      ${type("HISTORY_KEY_GRANT")}`,

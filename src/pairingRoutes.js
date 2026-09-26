@@ -111,7 +111,7 @@ function markPairing(request, stage, status, reason, identifiers = {}) {
   };
 }
 
-function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }) {
+function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, eventStore, accountId }) {
   // BLOCKER 7: production origin is fail-closed. Header-derived origins are
   // only allowed outside production (trustProxy + forwarded headers must not
   // decide the root-trust transcript).
@@ -599,7 +599,8 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }
             authenticated: { type: "boolean" },
             deviceId: { type: ["string", "null"] },
             capabilities: { type: "array", items: { type: "string" } },
-            trustSequence: { type: "integer" }
+            trustSequence: { type: "integer" },
+            historyStage: { type: ["string", "null"] }
           }
         }
       }
@@ -608,13 +609,16 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit }
     const token = request.cookies ? request.cookies[linkedSessions.COOKIE_NAME] : "";
     const session = linkedSessions.resolve(token);
     if (!session) {
-      return { authenticated: false, deviceId: null, capabilities: [], trustSequence: 0 };
+      return { authenticated: false, deviceId: null, capabilities: [], trustSequence: 0, historyStage: null };
     }
     return {
       authenticated: true,
       deviceId: session.deviceId,
       capabilities: session.capabilities,
       trustSequence: session.trustSequence,
+      historyStage: !eventStore || !accountId ? null
+        : eventStore.historyGrantAvailable(accountId, session.deviceId)
+          ? "HISTORY_GRANT_AVAILABLE" : "WAITING_FOR_HISTORY_GRANT",
     };
   });
 }

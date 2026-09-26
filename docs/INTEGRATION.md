@@ -1,5 +1,11 @@
 ## GMweb 0.18.0 / Messages 3.3.0: fail-closed encrypted replication
 
+GMweb 0.19.14 rate-limits signed-agent replication capabilities (60/min/IP),
+V2 command claims (60/min/IP), and V2 command status (120/min/IP) before
+authorization. Exhausted requests return `429 agent_rate_limit` with
+`Retry-After` seconds. Disabled V2 lease routes still return
+`409 lease_protocol_unavailable`; this change does not activate leases.
+
 The `/web` inbox bootstraps revision-aware encrypted conversation/message state instead of replaying the complete event log. Android publishes newest-first bounded history with realtime priority. Full history continues to use one browser-bound v3 History Master Key.
 
 Phone onboarding now uses dashboard `POST /admin/primary-setup` and one-use
@@ -345,6 +351,10 @@ When GMweb changes:
 
 ## 3b. Control Plane API v1 (`/api/v1/*`) — the strategic surface
 
+Linked-session introspection now reports `historyStage: WAITING_FOR_HISTORY_GRANT | HISTORY_GRANT_AVAILABLE` for an authenticated browser (or `null` when unlinked). This is durable *provider* evidence that a browser-addressed history grant exists, not proof that the browser imported or decrypted it. `GET /api/v1/linked-device/sync-diagnostics` adds privacy-safe `phases` with the server event cursor, active snapshot flag, encrypted history-row count and the requesting browser's own ACK cursor. An unauthenticated or non-`READ_MESSAGES` browser cannot read these counts. SSE remains an invalidation hint; after a missed frame, clients resume from their durable `/sync` cursor.
+
+Command lease V2 is staged and disabled by default (`commands.leases: false`; V2 claim/status return `409 lease_protocol_unavailable`). After the Android dedupe contract is verified, the provider may explicitly set `enableCommandLeases: true` and the capability report then advertises support. `POST /api/v1/agent/commands/claim-v2` accepts `{limit?}` and binds claims to the signed agent identity, not a caller-supplied `agentId`. A reclaimed lease retains the original command ID and idempotency key, with a new `claimGeneration` and `leaseExpiresAt`. `POST /api/v1/agent/commands/:id/status-v2` requires `{state, claimGeneration, result?}`; stale generations and foreign agents receive 409. Reusing an idempotency key with different command content, target or owner also returns `409 idempotency_key_reused`. The V1 status route rejects leased commands. Android must durably dedupe by command ID at the modem boundary before lease activation; this API alone does not establish duplicate-SMS safety. Browser-created command status is visible only to its linked-device owner; the PWA targets the phone identified by its primary command key.
+
 Since v0.4.0, GMweb also exposes the **Messaging Platform Control Plane**
 (ADR-004: GMweb = Control Plane; Messages Android = Data Plane; Eve = Business
 Plane client). These endpoints are the **strategic** integration surface —
@@ -361,8 +371,13 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `POST /api/v1/agent/commands/claim` | **Android Agent only** (device key). Atomically claims queued commands. | `X-API-Key` device key |
 | `POST /api/v1/agent/commands/:id/status` | Agent reports `ACCEPTED/EXECUTING/COMPLETED/FAILED`; guarded transitions, illegal jumps → `409`. | device key |
 | `POST /api/v1/agent/events/batch` | Agent uploads opaque event batches; response **partial-ACKs** per `eventId` with the assigned `serverSequence`; missing IDs stay pending on the device and retry. Duplicate IDs are skipped **without consuming a sequence**. | device key |
+| `POST /api/v1/agent/events/batch-v2` | Additive per-item upload: each index returns `ACCEPTED` with new sequence, `DUPLICATE` with original sequence, `CONFLICTING_DUPLICATE` with `errorClass: IDENTITY_CONFLICT`, or `INVALID_EVENT` with a safe code and `errorClass: VALIDATION`. `highWatermark` is the committed account cursor. V1 upload remains unchanged; V2 is not preferred until the full rollout is ready. | Agent signature or compatible device key |
+| `GET /api/v1/agent/replication-capabilities` | Reports implemented replication protocol versions and ingest, snapshot, key and command features. Currently advertises V1 only; Android must not infer V2 availability. | Agent signature or compatible device key |
+| `GET /api/v1/linked-device/replication-capabilities` | Same implemented capability report for a paired browser; requires `READ_MESSAGES`. | Linked session |
 | `GET /api/v1/sync?after=&limit=` | **Cursor catch-up sync**: opaque ciphertext events with monotonic **per-account** sequences, `{events, nextCursor, hasMore}`. Apply transactionally into your local store; the cursor is your only sync state. | Bearer |
-| `GET /api/v1/web/bootstrap?limit=` | Atomic encrypted conversation bootstrap plus `highWatermark`; linked `READ_MESSAGES` cookie only. | Linked session |
+| `POST /api/v1/web/snapshot-v2` | Start a device-bound immutable encrypted snapshot. Optional JSON `limit` (1–200). Response includes `token`, `replicaGeneration`, `snapshotVersion`, `baselineSequence`, `expiresAt`, `contactEvents`, `rows`, `nextCursor`, `hasMore`. Rows are ciphertext conversation and message states. | Linked session with `READ_MESSAGES` |
+| `GET /api/v1/web/snapshot-v2?token=&cursor=&limit=` | Continue the same snapshot by opaque cursor. Tokens are bound to the paired browser; wrong device is denied, expired or changed-generation snapshots require a new start. Current PWA stores every page and cursor in IndexedDB, then begins delta after `baselineSequence` only after the final page commits. | Linked session with `READ_MESSAGES` |
+| `GET /api/v1/web/bootstrap?limit=` | V1 atomic encrypted conversation bootstrap plus `highWatermark`; linked `READ_MESSAGES` cookie only. | Linked session |
 | `GET /api/v1/web/conversations?cursor=&limit=` | Encrypted conversation snapshots using keyset pagination. | Linked session |
 | `GET /api/v1/web/conversations/:id/messages?before=&limit=` | Latest-first encrypted message current state using keyset pagination. | Linked session |
 | `GET /api/v1/sse` | Realtime **invalidation signal only** (`{type:"sync.available"}` — zero content, §44). On signal, re-pull `/api/v1/sync`. The PWA uses its HttpOnly linked-session cookie. Query-token compatibility is disabled by default and requires the temporary `ALLOW_LEGACY_SSE_QUERY_TOKEN=true` flag. | Linked-session cookie |

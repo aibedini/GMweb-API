@@ -56,9 +56,9 @@ test("security canary leaves no plaintext representation in server or browser re
     if (/\/linked-device\/(?:key-grants|keyring)/.test(path)) {
       return Response.json({ events: [], nextCursor: 0, hasMore: false });
     }
-    if (path.includes("/web/bootstrap")) return Response.json({
-      protocolVersion: 3, ...metadata, highWatermark: 0, contactEvents: [],
-      conversations: [], nextCursor: null, hasMore: false,
+    if (path.includes("/web/snapshot-v2")) return Response.json({
+      token: "security-canary-snapshot", ...metadata, baselineSequence: 0, expiresAt: Date.now() + 60_000,
+      contactEvents: [], rows: [], nextCursor: null, hasMore: false,
     });
     if (path.includes("/web/sync/ack") && options?.method === "POST") return Response.json({ ok: true });
     if (path.includes("/sync?after=0")) return Response.json(syncPage);

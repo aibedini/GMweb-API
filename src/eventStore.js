@@ -159,6 +159,36 @@ class EventStore {
     ensureColumn(db, "sync_events", "sort_key", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "encrypted_message_state", "event_type", "TEXT NOT NULL DEFAULT 'MESSAGE_CREATED'");
     ensureColumn(db, "encrypted_conversation_state", "tombstone", "INTEGER NOT NULL DEFAULT 0");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS encrypted_snapshot_sessions (
+        token TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        linked_device_id TEXT NOT NULL,
+        replica_generation TEXT NOT NULL,
+        snapshot_version INTEGER NOT NULL,
+        baseline_sequence INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        contact_events TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS encrypted_snapshot_rows (
+        token TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        message_id TEXT,
+        revision INTEGER NOT NULL,
+        sort_key INTEGER NOT NULL,
+        tombstone INTEGER NOT NULL,
+        event_type TEXT,
+        envelope BLOB NOT NULL,
+        encoding TEXT NOT NULL,
+        schema_version INTEGER NOT NULL,
+        crypto_version INTEGER NOT NULL,
+        last_server_sequence INTEGER NOT NULL,
+        PRIMARY KEY (token, position)
+      );
+      CREATE INDEX IF NOT EXISTS idx_snapshot_expiry ON encrypted_snapshot_sessions(expires_at);
+    `);
     this.counterStmt = db.prepare(
       `INSERT INTO event_counters (account_id, next_sequence) VALUES (?, 1)
        ON CONFLICT(account_id) DO NOTHING`
@@ -243,7 +273,7 @@ class EventStore {
    * per-account sequence; duplicates (event_uuid already stored) are skipped
    * but DO NOT consume a sequence. Returns per-event results for partial ACK.
    */
-  ingestBatch({ accountId, sourceDeviceId, events }) {
+  ingestBatch({ accountId, sourceDeviceId, events, perItem = false }) {
     if (!Array.isArray(events) || events.length === 0) {
       this.log?.(`batch_received sourceDeviceId=${sourceDeviceId || "unknown"} count=0 types=`);
       this.log?.(`SYNC_REPORT sourceDeviceId=${sourceDeviceId || "unknown"} received=0 accepted=0 duplicates=0 types=`);
@@ -256,12 +286,13 @@ class EventStore {
     const accept = this.db.transaction((batch) => {
       this.counterStmt.run(accountId);
       const accepted = [];
+      const results = [];
       let duplicates = 0;
       let inserted = 0;
       for (const event of batch) {
         const uuid = String(event.eventId || "");
         const type = String(event.type || "UNKNOWN");
-        if (!uuid) { duplicates++; continue; }
+        if (!uuid) { duplicates++; results.push({ eventId: uuid, status: "INVALID_EVENT_ID" }); continue; }
         // Opaque-bytes guard: an undecodable/empty payload can never become a
         // durable row (LOCK 13 — no silently-dropped content). The caller's
         // missing-ACK path requeues it; a permanently malformed payload ends
@@ -269,7 +300,7 @@ class EventStore {
         const payloadBuf = Buffer.isBuffer(event.payload)
           ? event.payload
           : Buffer.from(String(event.payload || ""), "base64");
-        if (payloadBuf.length === 0) { duplicates++; continue; }
+        if (payloadBuf.length === 0) { duplicates++; results.push({ eventId: uuid, status: "INVALID_PAYLOAD" }); continue; }
         const seq = this.nextSeqStmt.get(accountId).next_sequence;
         const info = this.insertEventStmt.run(
           accountId, seq, uuid,
@@ -309,6 +340,7 @@ class EventStore {
             );
           }
           accepted.push({ eventId: uuid, serverSequence: seq });
+          results.push({ eventId: uuid, status: "ACCEPTED", serverSequence: seq });
           inserted++;
           this.debug?.(`event_accepted eventId=${uuid} sequence=${seq} type=${type} aggregateId=${event.conversationId ? String(event.conversationId) : ""} cryptoVersion=${Number(event.cryptoVersion) || 0}`);
         } else {
@@ -324,10 +356,13 @@ class EventStore {
               old.encoding === String(event.encoding || "envelope.v1") &&
               old.schema_version === (Number(event.schemaVersion) || 1) && old.crypto_version === (Number(event.cryptoVersion) || 0)) {
             accepted.push({ eventId: uuid, serverSequence: old.sequence });
+            results.push({ eventId: uuid, status: "DUPLICATE", serverSequence: old.sequence });
+          } else {
+            results.push({ eventId: uuid, status: "CONFLICTING_DUPLICATE" });
           }
         }
       }
-      return { accepted, duplicates, inserted };
+      return { accepted, duplicates, inserted, results };
     });
     const result = accept(events);
     this.log?.(`SYNC_REPORT accepted=${result.accepted.length} duplicates=${result.duplicates} inserted=${result.inserted}`);
@@ -336,7 +371,9 @@ class EventStore {
     if (result.inserted > 0 && this.onEventsAccepted) {
       try { this.onEventsAccepted(result.inserted); } catch { /* swallow */ }
     }
-    return { accepted: result.accepted, duplicates: result.duplicates };
+    return perItem
+      ? { results: result.results, highWatermark: this.nextSeqStmt.get(accountId).next_sequence - 1 }
+      : { accepted: result.accepted, duplicates: result.duplicates };
   }
 
   /** Cursor sync (§54): events after a per-account sequence cursor. */
@@ -410,7 +447,15 @@ class EventStore {
     `).get(now - retainMs, accountId);
     if (!ackState.clientCount) return { rowsRemoved: 0, durationMs: this.now() - startedAt };
     const ack = Number.isSafeInteger(ackState.activeSequence) ? ackState.activeSequence : highWatermark;
-    const maxSequence = Math.min(ack, Math.max(0, highWatermark - retainEvents));
+    const metadata = this.replicaMetadata(accountId);
+    const activeSnapshot = this.db.prepare(`
+      SELECT MIN(baseline_sequence) AS baseline
+      FROM encrypted_snapshot_sessions
+      WHERE account_id = ? AND expires_at > ?
+        AND replica_generation = ? AND snapshot_version = ?
+    `).get(accountId, now, metadata.replicaGeneration, metadata.snapshotVersion);
+    const snapshotCeiling = activeSnapshot.baseline == null ? highWatermark : activeSnapshot.baseline;
+    const maxSequence = Math.min(ack, Math.max(0, highWatermark - retainEvents), snapshotCeiling);
     const candidates = this.db.prepare(`
       SELECT sequence FROM sync_events
       WHERE account_id = ? AND sequence <= ? AND created_at < ?
@@ -471,6 +516,82 @@ class EventStore {
   highWatermark(accountId) {
     this.counterStmt.run(accountId);
     return Math.max(0, Number(this.nextSeqStmt.get(accountId)?.next_sequence || 1) - 1);
+  }
+
+  beginSnapshot({ accountId, linkedDeviceId, limit = 100 }) {
+    if (!linkedDeviceId) throw Object.assign(new Error("linked device required"), { code: "snapshot_forbidden" });
+    const token = crypto.randomBytes(32).toString("base64url");
+    const expiresAt = this.now() + 60 * 60 * 1000;
+    this.db.transaction(() => {
+      const expired = this.db.prepare("SELECT token FROM encrypted_snapshot_sessions WHERE expires_at <= ? LIMIT 10")
+        .all(this.now()).map(row => row.token);
+      for (const oldToken of expired) {
+        this.db.prepare("DELETE FROM encrypted_snapshot_rows WHERE token = ?").run(oldToken);
+        this.db.prepare("DELETE FROM encrypted_snapshot_sessions WHERE token = ?").run(oldToken);
+      }
+      const metadata = this.replicaMetadata(accountId);
+      const baseline = this.highWatermark(accountId);
+      this.db.prepare(`INSERT INTO encrypted_snapshot_sessions
+        (token, account_id, linked_device_id, replica_generation, snapshot_version, baseline_sequence, expires_at, contact_events)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(token, accountId, linkedDeviceId,
+        metadata.replicaGeneration, metadata.snapshotVersion, baseline, expiresAt,
+        JSON.stringify(this.contactBootstrapEvents(accountId)));
+      this.db.prepare(`INSERT INTO encrypted_snapshot_rows
+        (token, position, kind, conversation_id, message_id, revision, sort_key, tombstone,
+         event_type, envelope, encoding, schema_version, crypto_version, last_server_sequence)
+        SELECT ?, ROW_NUMBER() OVER (ORDER BY sort_key DESC, conversation_id DESC),
+          'conversation', conversation_id, NULL, revision, sort_key, tombstone,
+          NULL, envelope, encoding, schema_version, crypto_version, last_server_sequence
+        FROM encrypted_conversation_state WHERE account_id = ?`).run(token, accountId);
+      const conversationCount = this.db.prepare("SELECT COUNT(*) AS n FROM encrypted_conversation_state WHERE account_id = ?")
+        .get(accountId).n;
+      this.db.prepare(`INSERT INTO encrypted_snapshot_rows
+        (token, position, kind, conversation_id, message_id, revision, sort_key, tombstone,
+         event_type, envelope, encoding, schema_version, crypto_version, last_server_sequence)
+        SELECT ?, ? + ROW_NUMBER() OVER (ORDER BY conversation_id, sort_key DESC, message_id DESC),
+          'message', conversation_id, message_id, revision, sort_key, tombstone,
+          event_type, envelope, encoding, schema_version, crypto_version, last_server_sequence
+        FROM encrypted_message_state WHERE account_id = ?`).run(token, conversationCount, accountId);
+    })();
+    return this.snapshotPage({ accountId, linkedDeviceId, token, limit });
+  }
+
+  snapshotPage({ accountId, linkedDeviceId, token, cursor, limit = 100 }) {
+    const session = this.db.prepare("SELECT * FROM encrypted_snapshot_sessions WHERE token = ?").get(token);
+    if (!session) throw Object.assign(new Error("snapshot missing"), { code: "snapshot_required" });
+    if (session.account_id !== accountId || session.linked_device_id !== linkedDeviceId) {
+      throw Object.assign(new Error("snapshot forbidden"), { code: "snapshot_forbidden" });
+    }
+    if (this.now() >= session.expires_at) throw Object.assign(new Error("snapshot expired"), { code: "snapshot_expired" });
+    const currentMetadata = this.replicaMetadata(accountId);
+    if (session.replica_generation !== currentMetadata.replicaGeneration ||
+        session.snapshot_version !== currentMetadata.snapshotVersion) {
+      throw Object.assign(new Error("replica changed"), { code: "snapshot_required" });
+    }
+    const decodedCursor = cursor == null ? "0" : Buffer.from(String(cursor), "base64url").toString("utf8");
+    const position = Number(decodedCursor);
+    if (!Number.isSafeInteger(position) || position < 0 || String(position) !== decodedCursor ||
+        (cursor != null && Buffer.from(decodedCursor).toString("base64url") !== cursor)) {
+      throw Object.assign(new Error("invalid snapshot cursor"), { code: "invalid_snapshot_cursor" });
+    }
+    const capped = Math.max(1, Math.min(200, Number(limit) || 100));
+    const rows = this.db.prepare(`SELECT position, kind, conversation_id AS conversationId,
+      message_id AS messageId, revision, sort_key AS sortKey, tombstone, event_type AS type,
+      envelope, encoding, schema_version AS schemaVersion, crypto_version AS cryptoVersion,
+      last_server_sequence AS lastServerSequence
+      FROM encrypted_snapshot_rows WHERE token = ? AND position > ? ORDER BY position LIMIT ?`)
+      .all(token, position, capped + 1);
+    const hasMore = rows.length > capped;
+    const page = hasMore ? rows.slice(0, capped) : rows;
+    return {
+      token, replicaGeneration: session.replica_generation,
+      snapshotVersion: session.snapshot_version, baselineSequence: session.baseline_sequence,
+      expiresAt: session.expires_at,
+      contactEvents: position === 0 ? JSON.parse(session.contact_events) : [],
+      rows: page.map(row => ({ ...row, tombstone: Boolean(row.tombstone), envelope: Buffer.from(row.envelope).toString("base64") })),
+      nextCursor: hasMore ? Buffer.from(String(page.at(-1).position)).toString("base64url") : null,
+      hasMore,
+    };
   }
 
   conversations(accountId, cursor, limit = 100) {
@@ -580,11 +701,23 @@ class EventStore {
   }
 
   /** Privacy-safe server truth for a READ_MESSAGES linked browser. */
-  syncDiagnostics(accountId) {
+  syncDiagnostics(accountId, linkedDeviceId = null) {
     const scalar = (sql) => Number(this.db.prepare(sql).get(accountId)?.value || 0);
+    const scoped = (sql) => linkedDeviceId
+      ? Number(this.db.prepare(sql).get(accountId, linkedDeviceId)?.value || 0) : 0;
+    const eventCursor = scalar("SELECT COALESCE(MAX(sequence), 0) value FROM sync_events WHERE account_id = ?");
     return {
       total: scalar("SELECT COUNT(*) value FROM sync_events WHERE account_id = ?"),
-      maxSequence: scalar("SELECT COALESCE(MAX(sequence), 0) value FROM sync_events WHERE account_id = ?"),
+      maxSequence: eventCursor,
+      phases: {
+        eventCursor,
+        snapshotActive: linkedDeviceId ? this.db.prepare(`SELECT COUNT(*) value FROM encrypted_snapshot_sessions
+          WHERE account_id = ? AND linked_device_id = ? AND expires_at > ?`)
+          .get(accountId, linkedDeviceId, Date.now()).value > 0 : false,
+        historyRows: scalar("SELECT COUNT(*) value FROM encrypted_message_state WHERE account_id = ?"),
+        browserAckCursor: scoped(`SELECT COALESCE(MAX(last_acked_sequence), 0) value
+          FROM linked_client_sync_state WHERE account_id = ? AND linked_device_id = ?`),
+      },
       countsByType: this.db.prepare(
         "SELECT event_type type, COUNT(*) count FROM sync_events WHERE account_id = ? GROUP BY event_type ORDER BY event_type"
       ).all(accountId).map(row => ({ type: String(row.type), count: Number(row.count) })),
@@ -598,6 +731,15 @@ class EventStore {
         "SELECT COUNT(*) value FROM sync_events WHERE account_id = ? AND aggregate_id IS NULL"
       ),
     };
+  }
+
+  /** Durable provider evidence only: the browser may still need to import it. */
+  historyGrantAvailable(accountId, linkedDeviceId) {
+    return Boolean(this.db.prepare(`SELECT 1 FROM sync_events
+      WHERE account_id = ? AND event_type = 'HISTORY_KEY_GRANT'
+        AND json_valid(CAST(ciphertext AS TEXT))
+        AND json_extract(CAST(ciphertext AS TEXT), '$.deviceId') = ?
+      LIMIT 1`).get(accountId, linkedDeviceId));
   }
 }
 

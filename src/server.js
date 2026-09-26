@@ -794,15 +794,17 @@ function requireToken(request, reply, done) {
         (p === "/api/v1/sync" ||
           p === "/api/v1/sse" ||
           p === "/api/v1/web/bootstrap" ||
+          p === "/api/v1/web/snapshot-v2" ||
           p === "/api/v1/web/conversations" ||
           p.startsWith("/api/v1/web/conversations/") ||
           p === "/api/v1/linked-device/sync-diagnostics" ||
           p === "/api/v1/linked-device/key-grants" ||
           p === "/api/v1/linked-device/keyring" ||
+          p === "/api/v1/linked-device/replication-capabilities" ||
           p === "/api/v1/linked-session" ||
           p.startsWith("/api/v1/trust/"))) ||
       (caps.includes("READ_MESSAGES") && request.method === "POST" &&
-        p === "/api/v1/web/sync/ack") ||
+        (p === "/api/v1/web/sync/ack" || p === "/api/v1/web/snapshot-v2")) ||
       (caps.includes("READ_MESSAGES") && request.method === "GET" &&
         p === "/api/v1/linked-device/telemetry") ||
       (caps.includes("SEND_MESSAGES") && request.method === "GET" &&
@@ -3167,6 +3169,8 @@ registerPairingRoutes(app, {
   agentAuthService,
   config,
   checkRateLimit,
+  eventStore,
+  accountId: DEFAULT_ACCOUNT_ID,
 });
 
 registerPwaAuthRoutes(app, {

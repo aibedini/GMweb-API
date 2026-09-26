@@ -4,6 +4,8 @@ import { syncNow, listRecentEvents, listAggregateEventsPage, listContacts, listC
 import { messagesForAggregate, type ConversationProjection } from "../lib/inbox";
 import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchSyncDiagnostics, fetchTrustSnapshot, health, type DeviceTelemetry, type ServerSyncDiagnostics, type TrustSnapshot } from "../lib/api";
 import { encryptCommand } from "../lib/commandCrypto";
+import { getStoredDeviceIdentity } from "../lib/deviceKeys";
+import { clearPendingSend, loadPendingSends, savePendingSend, type PendingEncryptedSend } from "../lib/commandOutbox";
 import { listCredentials, removeCredential, listPushSubscriptions, type CredentialRow } from "../lib/security";
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
@@ -36,6 +38,14 @@ function messageStatus(status: number): string {
 function Avatar({ title }: { title: string }) {
   const initials = title.replace(/^Conversation\s+/, "").slice(0, 2).toUpperCase();
   return <div className="avatar" aria-hidden="true">{initials}</div>;
+}
+
+async function ensurePendingCommandId(pending: PendingEncryptedSend): Promise<string> {
+  if (pending.commandId) return pending.commandId;
+  const command = await createCommand({ type: "SEND_SMS", payload: pending.payload,
+    idempotencyKey: pending.idempotencyKey, targetAgentId: pending.targetAgentId });
+  await savePendingSend({ ...pending, commandId: command.commandId });
+  return command.commandId;
 }
 
 export default function App() {
@@ -79,8 +89,9 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [composeRecipient, setComposeRecipient] = useState("");
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
-  const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; at: number } | null>(null);
+  const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; recipient: string; at: number } | null>(null);
   const markReadSent = useRef(new Set<string>());
+  const recoveringSend = useRef(false);
   const conversationScrollRef = useRef<HTMLDivElement>(null);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const scriptFile = useMemo(() => loadedScriptFile(), []);
@@ -310,7 +321,7 @@ export default function App() {
     const idempotencyKey = crypto.randomUUID();
     const target = await fetchPrimaryCommandKey();
     const encrypted = await encryptCommand(target.encryptionPublicKey, type, idempotencyKey, { type, ...payload });
-    return createCommand({ type, payload: encrypted, idempotencyKey });
+    return createCommand({ type, payload: encrypted, idempotencyKey, targetAgentId: target.deviceId });
   };
 
   useEffect(() => {
@@ -323,29 +334,82 @@ export default function App() {
   const send = async () => {
     const body = draft.trim();
     if (!body || !selectedRecipient || !capabilities.includes("SEND_MESSAGES")) return;
-    const clientMessageId = crypto.randomUUID();
+    if (recoveringSend.current) return;
+    recoveringSend.current = true;
+    const clientMessageId = commandStatus !== "COMPLETED" && pendingMessage?.body === body && pendingMessage.recipient === selectedRecipient
+      ? pendingMessage.clientMessageId : crypto.randomUUID();
     setCommandStatus("queued");
-    setPendingMessage({ clientMessageId, body, at: Date.now() });
+    setPendingMessage({ clientMessageId, body, recipient: selectedRecipient, at: Date.now() });
     try {
-      const command = await submitCommand("SEND_SMS", { phone: selectedRecipient, body, clientMessageId });
-      setDraft("");
+      const identity = await getStoredDeviceIdentity();
+      if (!identity) throw new Error("Browser identity is unavailable");
+      const existing = (await loadPendingSends()).find(row =>
+        row.clientMessageId === clientMessageId && row.browserDeviceId === identity.deviceId);
+      let pending: PendingEncryptedSend | undefined = existing;
+      if (!pending) {
+        const idempotencyKey = crypto.randomUUID();
+        const target = await fetchPrimaryCommandKey();
+        const payload = await encryptCommand(target.encryptionPublicKey, "SEND_SMS", idempotencyKey,
+          { type: "SEND_SMS", phone: selectedRecipient, body, clientMessageId });
+        pending = { browserDeviceId: identity.deviceId, clientMessageId, idempotencyKey, payload,
+          targetAgentId: target.deviceId, createdAt: Date.now() };
+        await savePendingSend(pending); // durable encrypted retry identity before HTTP
+      }
+      if (existing) setPendingMessage(null); // never display a new draft as an older command
+      const commandId = await ensurePendingCommandId(pending);
+      if (!existing) setDraft("");
       for (let attempt = 0; attempt < 20; attempt += 1) {
         await new Promise(resolve => setTimeout(resolve, 1_000));
-        const state = await fetchCommand(command.commandId);
+        const state = await fetchCommand(commandId);
         setCommandStatus(state?.state || "queued");
         if (state && ["FAILED", "EXPIRED"].includes(state.state)) {
-          setDraft(body);
+          if (!existing) setDraft(body);
           setPendingMessage(null);
+          await clearPendingSend(pending.clientMessageId);
           break;
         }
-        if (state?.state === "COMPLETED") break;
+        if (state?.state === "COMPLETED") {
+          await clearPendingSend(pending.clientMessageId);
+          break;
+        }
       }
     } catch (cause) {
-      setDraft(body);
-      setPendingMessage(null);
+      // A lost response may follow a committed command. Retain the encrypted
+      // envelope and identity so the next retry cannot create a second SMS.
       setCommandStatus(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      recoveringSend.current = false;
     }
   };
+
+  useEffect(() => {
+    if (!authed) return;
+    let recovering = false;
+    const recover = () => void Promise.all([loadPendingSends(), getStoredDeviceIdentity()]).then(async ([pendingRows, identity]) => {
+      if (recovering) return;
+      recovering = true;
+      try {
+        for (const pending of pendingRows) {
+          if (recoveringSend.current) return;
+          if (pending.browserDeviceId !== identity?.deviceId) continue;
+          setCommandStatus("Recovering pending send");
+          try {
+            const commandId = await ensurePendingCommandId(pending);
+            const state = await fetchCommand(commandId);
+            setCommandStatus(state?.state ?? "queued");
+            if (state && ["COMPLETED", "FAILED", "EXPIRED"].includes(state.state))
+              await clearPendingSend(pending.clientMessageId);
+          } catch {
+            setCommandStatus("Pending send needs retry");
+            return;
+          }
+        }
+      } finally { recovering = false; }
+    }).catch(() => { recovering = false; setCommandStatus("Pending send needs retry"); });
+    recover();
+    const timer = window.setInterval(recover, 30_000);
+    return () => window.clearInterval(timer);
+  }, [authed]);
 
   const pull = async () => {
     setBusy(true);
@@ -384,7 +448,10 @@ export default function App() {
   let syncBanner = `Syncing message history… ${syncStatus.appliedThisRun} event(s) applied`;
   if (serverStats) syncBanner = `Syncing message history… cursor ${cursor} / ${serverStats.maxSequence}`;
   if (syncStatus.state === "UP_TO_DATE") syncBanner = "Messages are up to date";
-  if (syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED") syncBanner = `Sync paused after sequence ${cursor}`;
+  if (syncStatus.state === "DEGRADED") syncBanner = syncStatus.lastErrorPhase === "KEY_SYNC"
+    ? `Encrypted history saved through sequence ${cursor}; waiting for keys`
+    : `Sync needs attention after sequence ${cursor}`;
+  if (syncStatus.state === "FAILED") syncBanner = `Sync paused after sequence ${cursor}`;
   let emptyInboxMessage = "Browser has not downloaded message history.";
   if (serverStats && serverTypeCount("MESSAGE_CREATED") === 0) emptyInboxMessage = "No message events have reached GMweb yet.";
   else if (cursor > 0 && events.some(event => event.decryption?.state === "locked")) emptyInboxMessage = "Messages downloaded but are waiting for keys.";
@@ -569,7 +636,7 @@ export default function App() {
           </div>
           {webDiagnostics && <div className="status-grid">
             <Card><CardContent className="status-card"><span>Server</span><strong>{webDiagnostics.session.linked && webDiagnostics.server ? "PASS" : "FAIL"}</strong><small>{webDiagnostics.server?.total ?? "Unavailable"} events · max sequence {webDiagnostics.server?.maxSequence ?? "—"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Browser Sync</span><strong>{webDiagnostics.browserSync.state === "UP_TO_DATE" ? "PASS" : webDiagnostics.browserSync.state === "FAILED" ? "FAIL" : webDiagnostics.browserSync.state === "DEGRADED" ? "WARN" : "SYNCING"}</strong><small>cursor {webDiagnostics.browserSync.cursor} · lag {webDiagnostics.browserSync.syncLag ?? "unknown"}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Browser Sync</span><strong>{webDiagnostics.browserSync.state === "UP_TO_DATE" ? "PASS" : webDiagnostics.browserSync.state === "FAILED" ? "FAIL" : webDiagnostics.browserSync.state === "DEGRADED" ? "WARN" : "SYNCING"}</strong><small>cursor {webDiagnostics.browserSync.cursor} · lag {webDiagnostics.browserSync.syncLag ?? "unknown"} · snapshot {webDiagnostics.replicaProgress?.snapshotComplete ? "complete" : "pending"} · keyring {webDiagnostics.replicaProgress?.keyringCursor ?? "unknown"} · grants {webDiagnostics.replicaProgress?.grantCursor ?? "unknown"}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>IndexedDB</span><strong>PASS</strong><small>{webDiagnostics.indexedDb.total} raw events · {webDiagnostics.indexedDb.distinctMessageAggregateCount} message aggregates</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Crypto</span><strong>{webDiagnostics.crypto.messages.invalid || webDiagnostics.crypto.keyGrants.invalid ? "FAIL" : webDiagnostics.crypto.messages.locked ? "WARN" : "PASS"}</strong><small>{webDiagnostics.crypto.messages.decrypted} decrypted · {webDiagnostics.crypto.messages.locked} locked · {webDiagnostics.crypto.messages.invalid} invalid<br />Grant probe: {webDiagnostics.crypto.keyGrants.accepted} accepted · {Object.keys(webDiagnostics.crypto.keyGrants.reasons).join(", ") || "no rejection"}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Projection</span><strong>{webDiagnostics.projection.failure ? "FAIL" : webDiagnostics.projection.lag ? "SYNCING" : "PASS"}</strong><small>{webDiagnostics.projection.failure || `${webDiagnostics.projection.rows} rows`} · cursor {webDiagnostics.projection.cursor} · lag {webDiagnostics.projection.lag}</small></CardContent></Card>

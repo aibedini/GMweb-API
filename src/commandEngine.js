@@ -30,6 +30,7 @@ class CommandEngine {
   constructor(db, opts = {}) {
     this.now = opts.now || (() => Date.now());
     this.defaultExpiryMs = opts.defaultExpiryMs || 24 * 3600 * 1000; // §93 floor
+    this.claimLeaseMs = opts.claimLeaseMs || 60_000;
     this.db = db;
     db.exec(`
       CREATE TABLE IF NOT EXISTS commands (
@@ -63,6 +64,9 @@ class CommandEngine {
       );
       CREATE INDEX IF NOT EXISTS idx_attempts_command ON command_attempts (command_id);
     `);
+    const columns = new Set(db.pragma("table_info(commands)").map((column) => column.name));
+    if (!columns.has("claim_generation")) db.exec("ALTER TABLE commands ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0");
+    if (!columns.has("lease_expires_at")) db.exec("ALTER TABLE commands ADD COLUMN lease_expires_at INTEGER");
     this.insertStmt = db.prepare(
       `INSERT OR IGNORE INTO commands
        (id, account_id, idempotency_key, target_agent_id, source_client_id, type,
@@ -93,9 +97,30 @@ class CommandEngine {
     this.markDeliveredStmt = db.prepare(
       `UPDATE commands SET state = 'DELIVERED_TO_AGENT' WHERE id = ? AND state = 'QUEUED'`
     );
+    this.claimV2Candidates = db.prepare(
+      `SELECT * FROM commands WHERE target_agent_id = ? AND expires_at > ?
+       AND (state = 'QUEUED' OR (state = 'DELIVERED_TO_AGENT' AND claim_generation > 0 AND lease_expires_at <= ?))
+       ORDER BY created_at ASC LIMIT ?`
+    );
+    this.claimV2Update = db.prepare(
+      `UPDATE commands SET state = 'DELIVERED_TO_AGENT',
+         claim_generation = claim_generation + 1, lease_expires_at = ?
+       WHERE id = ? AND target_agent_id = ? AND expires_at > ?
+         AND (state = 'QUEUED' OR (state = 'DELIVERED_TO_AGENT' AND claim_generation > 0 AND lease_expires_at <= ?))`
+    );
+    this.transitionClaimStmt = db.prepare(
+      `UPDATE commands SET state = @state,
+         accepted_at = COALESCE(accepted_at, @accepted_at),
+         completed_at = @completed_at, result = COALESCE(@result, result),
+         lease_expires_at = NULL
+       WHERE id = @id AND target_agent_id = @agentId AND claim_generation = @claimGeneration
+         AND (',' || @fromStates || ',') LIKE ('%,' || state || ',%')
+         AND (state != 'DELIVERED_TO_AGENT' OR lease_expires_at > @now)`
+    );
     this.expireStmt = db.prepare(
       `UPDATE commands SET state = 'EXPIRED', completed_at = ?
-       WHERE state = 'QUEUED' AND expires_at <= ?`
+       WHERE (state = 'QUEUED' OR (state = 'DELIVERED_TO_AGENT' AND claim_generation > 0))
+         AND expires_at <= ?`
     );
     this.insertAttempt = db.prepare(
       `INSERT INTO command_attempts (command_id, state, detail, at) VALUES (?, ?, ?, ?)`
@@ -130,7 +155,11 @@ class CommandEngine {
     }
     const existing = this.byIdempotency.get(accountId, idempotencyKey);
     if (existing) {
-      // Replay of a live idempotency key — surface the original row.
+      if (!sameCommandRequest(existing, { type, ciphertext, targetAgentId, sourceClientId })) {
+        const error = new Error("idempotency_key_reused");
+        error.code = "idempotency_key_reused";
+        throw error;
+      }
       return { created: false, command: this.#public(existing) };
     }
     const id = `cmd_${crypto.randomUUID()}`;
@@ -151,8 +180,13 @@ class CommandEngine {
       expires_at: expiresAt ?? now + this.defaultExpiryMs,
     });
     if (info.changes === 0) {
-      // Lost an insert race → the winner's row is the answer.
-      return { created: false, command: this.#public(this.byIdempotency.get(accountId, idempotencyKey)) };
+      const winner = this.byIdempotency.get(accountId, idempotencyKey);
+      if (!sameCommandRequest(winner, { type, ciphertext, targetAgentId, sourceClientId })) {
+        const error = new Error("idempotency_key_reused");
+        error.code = "idempotency_key_reused";
+        throw error;
+      }
+      return { created: false, command: this.#public(winner) };
     }
     this.insertAttempt.run(id, "QUEUED", "created", now);
     return { created: true, command: this.#public(this.getStmt.get(id)) };
@@ -178,6 +212,35 @@ class CommandEngine {
       }
     }
     return out;
+  }
+
+  /** V2 only: reclaim an unacknowledged lease with the same command ID. */
+  claimForAgentV2(agentId, { limit = 25 } = {}) {
+    this.#expireDue();
+    const claim = this.db.transaction(() => {
+      const now = this.now();
+      const rows = this.claimV2Candidates.all(agentId, now, now, Math.max(1, Math.min(100, limit)));
+      const out = [];
+      for (const row of rows) {
+        if (!this.claimV2Update.run(now + this.claimLeaseMs, row.id, agentId, now, now).changes) continue;
+        this.insertAttempt.run(row.id, "DELIVERED_TO_AGENT", "leased", now);
+        out.push(this.#public(this.getStmt.get(row.id)));
+      }
+      return out;
+    });
+    return claim();
+  }
+
+  transitionClaim(id, state, { agentId, claimGeneration, fromStates, result = null } = {}) {
+    if (!agentId || !Number.isSafeInteger(claimGeneration) || claimGeneration < 1 || !Array.isArray(fromStates)) return false;
+    const now = this.now();
+    const terminal = state === "COMPLETED" || state === "FAILED" || state === "EXPIRED";
+    const info = this.transitionClaimStmt.run({ id, state, agentId, claimGeneration,
+      fromStates: fromStates.join(","), now,
+      accepted_at: state === "ACCEPTED_BY_AGENT" ? now : null,
+      completed_at: terminal ? now : null, result });
+    if (info.changes) this.insertAttempt.run(id, state, result || "", now);
+    return info.changes > 0;
   }
 
   /** Guarded lifecycle transition used by agents/executors. */
@@ -206,7 +269,9 @@ class CommandEngine {
 
   #expireDue() {
     const now = this.now();
-    const due = db_count(this.db, `SELECT COUNT(*) AS n FROM commands WHERE state = 'QUEUED' AND expires_at <= ?`, now);
+    const due = db_count(this.db, `SELECT COUNT(*) AS n FROM commands
+      WHERE (state = 'QUEUED' OR (state = 'DELIVERED_TO_AGENT' AND claim_generation > 0))
+        AND expires_at <= ?`, now);
     if (due > 0) this.expireStmt.run(now, now);
   }
 
@@ -229,8 +294,15 @@ class CommandEngine {
       acceptedAt: row.accepted_at,
       completedAt: row.completed_at,
       result: row.result,
+      claimGeneration: row.claim_generation,
+      leaseExpiresAt: row.lease_expires_at,
     };
   }
+}
+
+function sameCommandRequest(row, { type, ciphertext, targetAgentId, sourceClientId }) {
+  return row.type === type && row.ciphertext.equals(ciphertext) &&
+    row.target_agent_id === targetAgentId && row.source_client_id === sourceClientId;
 }
 
 function db_count(db, sql, ...args) {

@@ -57,6 +57,10 @@ jobs:
         run: |
           cmp shared/pairing-protocol-v1.json android-messages/protocol/pairing-protocol-v1.json
           echo "GMweb shared/pairing-protocol-v1.json == Messages protocol/pairing-protocol-v1.json"
+      - name: Encrypted replication fixture must be byte-identical across repositories
+        run: |
+          cmp shared/messages-web-replication-v3.json android-messages/protocol/messages-web-replication-v3.json
+          echo "GMweb shared/messages-web-replication-v3.json == Messages protocol/messages-web-replication-v3.json"
       - name: Android grants must equal the schema (fail on capability drift)
         run: |
           node -e '

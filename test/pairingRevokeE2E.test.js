@@ -38,6 +38,8 @@ describe("pairingRevokeE2E", () => {
   let db;
   let phone;
   let browser;
+  let commandEngine;
+  let eventStore;
 
   before(async () => {
     app = Fastify({ logger: false });
@@ -68,22 +70,27 @@ describe("pairingRevokeE2E", () => {
     app.addHook("preHandler", (request, reply, done) => {
       const path = String(request.url || "").split("?")[0];
       const isSync = request.method === "GET" && path === "/api/v1/sync";
+      const isCommandStatus = request.method === "GET" && path.startsWith("/api/v1/commands/");
       const isRevoked = request.method === "GET" && path === "/api/v1/trust/revoked-devices";
-      if (!isSync && !isRevoked) return done();
+      if (!isSync && !isRevoked && !isCommandStatus) return done();
       if (request.headers["x-master-token"] === "test-master") return done();
       const token = request.cookies ? request.cookies[linkedSessions.COOKIE_NAME] : "";
-      if (!linkedSessions.resolve(token)) {
+      const session = linkedSessions.resolve(token);
+      if (!session) {
         reply.code(401).send({ error: "unauthorized", reason: "linked_session_required" });
         return;
       }
+      request.linkedDevice = session;
       return done();
     });
 
-    registerPairingRoutes(app, { agentAuthService: svc, config: {} });
+    eventStore = new EventStore(db);
+    registerPairingRoutes(app, { agentAuthService: svc, config: {}, eventStore, accountId: "default" });
+    commandEngine = new CommandEngine(db);
     registerControlPlaneRoutes(app, {
       trustRegistry: new TrustRegistry(db),
-      commandEngine: new CommandEngine(db),
-      eventStore: new EventStore(db),
+      commandEngine,
+      eventStore,
       accountId: "default",
       linkedSessions,
       authorizeAgent: (request) => {
@@ -161,6 +168,17 @@ describe("pairingRevokeE2E", () => {
     const cookie = complete.cookies.find((c) => c.name === linkedSessions.COOKIE_NAME);
     assert.ok(cookie, "linked session cookie must be issued");
     assert.ok(linkedSessions.resolve(cookie.value), "session live before revocation");
+    const linkedBeforeGrant = await app.inject({ method: "GET", url: "/api/v1/linked-session",
+      headers: { cookie: `${cookie.name}=${cookie.value}` } });
+    assert.equal(linkedBeforeGrant.json().historyStage, "WAITING_FOR_HISTORY_GRANT");
+    eventStore.ingestBatch({ accountId: "default", sourceDeviceId: PHONE, events: [{
+      eventId: "history-for-browser", type: "HISTORY_KEY_GRANT",
+      conversationId: "__history_master__", payload: Buffer.from(JSON.stringify({ deviceId: WEB })),
+      encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3,
+    }] });
+    const linkedAfterGrant = await app.inject({ method: "GET", url: "/api/v1/linked-session",
+      headers: { cookie: `${cookie.name}=${cookie.value}` } });
+    assert.equal(linkedAfterGrant.json().historyStage, "HISTORY_GRANT_AVAILABLE");
 
     // Sync is allowed while the session is live.
     const syncBefore = await app.inject({
@@ -168,6 +186,20 @@ describe("pairingRevokeE2E", () => {
       headers: { cookie: `${cookie.name}=${cookie.value}` },
     });
     assert.ok([200, 204].includes(syncBefore.statusCode), `sync before revoke: ${syncBefore.statusCode}`);
+
+    const commandId = commandEngine.createCommand({ accountId: "default", idempotencyKey: "revoke-command",
+      type: "SEND_SMS", ciphertext: Buffer.from("opaque"), targetAgentId: PHONE,
+      sourceClientId: WEB }).command.id;
+    const otherCookie = linkedSessions.issue("other-browser", ["READ_MESSAGES", "SEND_MESSAGES"]);
+    const otherHistory = await app.inject({ method: "GET", url: "/api/v1/linked-session",
+      headers: { cookie: `${linkedSessions.COOKIE_NAME}=${otherCookie}` } });
+    assert.equal(otherHistory.json().historyStage, "WAITING_FOR_HISTORY_GRANT");
+    const ownerStatus = await app.inject({ method: "GET", url: `/api/v1/commands/${commandId}`,
+      headers: { cookie: `${cookie.name}=${cookie.value}` } });
+    assert.equal(ownerStatus.statusCode, 200);
+    const foreignStatus = await app.inject({ method: "GET", url: `/api/v1/commands/${commandId}`,
+      headers: { cookie: `${linkedSessions.COOKIE_NAME}=${otherCookie}` } });
+    assert.equal(foreignStatus.statusCode, 404);
 
     // Phone revokes the browser (DEVICE_REVOKED trust statement, seq 1).
     const statement = {
@@ -220,6 +252,11 @@ describe("pairingRevokeE2E", () => {
       headers: { cookie: `${cookie.name}=${cookie.value}` },
     });
     assert.ok([401, 403].includes(syncAfter.statusCode), `sync after revoke: ${syncAfter.statusCode}`);
+    const commandAfter = await app.inject({ method: "GET", url: `/api/v1/commands/${commandId}`,
+      headers: { cookie: `${cookie.name}=${cookie.value}` } });
+    assert.equal(commandAfter.statusCode, 401);
+    const otherStillLive = await app.inject({ method: "GET", url: "/api/v1/sync",
+      headers: { cookie: `${linkedSessions.COOKIE_NAME}=${otherCookie}` } });
+    assert.ok([200, 204].includes(otherStillLive.statusCode));
   });
 });
-

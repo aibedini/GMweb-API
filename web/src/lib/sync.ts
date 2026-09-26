@@ -8,66 +8,27 @@
  * without touching storage or UI.
  */
 
-import { acknowledgeWebSync, fetchEventsAfter, fetchKeyGrantsAfter, fetchKeyring, fetchWebBootstrap, fetchWebConversationPage, fetchWebMessagePage, SnapshotRequiredError,
-  type EncryptedConversationState, type EncryptedMessageState, type SyncEvent, type SyncPage } from "./api.ts";
-import { receiveKeyGrant, receiveKeyGrants, decryptMessage, type Decryption } from "./messageCrypto.ts";
-import { decodeEventPayload, conversationProjectionFromEvents, type ConversationProjection } from "./inbox.ts";
+import { fetchWebConversationPage, fetchWebMessagePage,
+  type EncryptedConversationState, type EncryptedMessageState, type SyncEvent } from "./api.ts";
+import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypto.ts";
+import { decodeEventPayload, type ConversationProjection } from "./inbox.ts";
 import { getOrCreateDeviceKeys } from "./deviceKeys.ts";
 import { assertSupportedContentEvent, isContentBearingEvent } from "./eventCryptoPolicy.ts";
+import { syncFailure, updateSyncStatus } from "./sync/sync-state.ts";
+import { grantCursorKey, keyringCursorKey, runKeySync, syncKeysSafely } from "./sync/key-sync.ts";
+import { runSnapshotBootstrap } from "./sync/snapshot-sync.ts";
+import { createReplicaEngine } from "./sync/replica-sync.ts";
+import { subscribeSyncAvailable as subscribeLiveInvalidation } from "./sync/live-invalidation.ts";
+import { createProjectionEngine, conversationStateEvent, messageStateEvent } from "./sync/projection-engine.ts";
+export { getBrowserSyncStatus } from "./sync/sync-state.ts";
+export type { BrowserSyncState, BrowserSyncStatus } from "./sync/sync-state.ts";
 
-const DB_NAME = "gmweb-messages";
-const DB_VERSION = 7;
-const STORE_EVENTS = "events";
-const STORE_META = "meta";
-const STORE_CONTACTS = "contacts";
-const CURSOR_KEY = "sync_cursor";
-/** Derived read-model store (PWA projection). Raw events stay the truth. */
-const STORE_CONVERSATIONS = "conversations";
-const STORE_ENCRYPTED_CONVERSATIONS = "encrypted_conversation_state";
-const STORE_ENCRYPTED_MESSAGES = "encrypted_message_state";
-const PROJECTION_VERSION_KEY = "conversation_projection_version";
-export const PROJECTION_CURSOR_KEY = "conversation_projection_cursor";
-const REPLICA_GENERATION_KEY = "replica_generation";
-const SNAPSHOT_VERSION_KEY = "snapshot_version";
-const REPLICA_MIGRATION_VERSION_KEY = "replica_migration_version";
-const RECONSTRUCTABLE_STATE_EVENTS = new Set([
-  "MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED", "MESSAGE_DELETED",
-  "CONVERSATION_UPSERT", "CONVERSATION_UPSERTED", "CONVERSATION_DELETED", "THREAD_READ",
-]);
-const KEY_GRANT_CURSOR_PREFIX = "key_grant_bootstrap_v2_cursor:";
-const KEYRING_CURSOR_PREFIX = "account_keyring_v2_cursor:";
+import { DB_NAME, DB_VERSION, STORE_EVENTS, STORE_META, STORE_CONTACTS, CURSOR_KEY, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, PROJECTION_CURSOR_KEY, SNAPSHOT_TOKEN_KEY, SNAPSHOT_BASELINE_KEY, SNAPSHOT_COMPLETE_KEY, REPLICA_MIGRATION_VERSION_KEY, RECONSTRUCTABLE_STATE_EVENTS } from "./sync/schema.ts";
+export { PROJECTION_CURSOR_KEY } from "./sync/schema.ts";
+const { refreshConversationProjectionsInDb, repairConversationProjectionGap, ensureConversationProjectionRebuilt } = createProjectionEngine({
+  requestToPromise, txDone, metaNumber, contactsFromDb, decryptForDisplay,
+});
 const volatileContacts = new Map<string, StoredContact>();
-
-export type BrowserSyncState = "INITIALIZING" | "FIRST_PAINT_READY" | "SYNCING_HISTORY" |
-  "UP_TO_DATE" | "DEGRADED" | "FAILED";
-export interface BrowserSyncStatus {
-  state: BrowserSyncState;
-  lastSuccessfulSyncAt: number | null;
-  lastPageCount: number;
-  appliedThisRun: number;
-  lastErrorPhase: string | null;
-  lastErrorCode: string | null;
-  lastErrorMessage: string | null;
-}
-let syncStatus: BrowserSyncStatus = {
-  state: "INITIALIZING",
-  lastSuccessfulSyncAt: null,
-  lastPageCount: 0,
-  appliedThisRun: 0,
-  lastErrorPhase: null,
-  lastErrorCode: null,
-  lastErrorMessage: null,
-};
-export function getBrowserSyncStatus(): BrowserSyncStatus { return { ...syncStatus }; }
-function updateSyncStatus(change: Partial<BrowserSyncStatus>) { syncStatus = { ...syncStatus, ...change }; }
-function syncFailure(phase: string, cause: unknown, fatal: boolean) {
-  updateSyncStatus({
-    state: fatal ? "FAILED" : "DEGRADED",
-    lastErrorPhase: phase,
-    lastErrorCode: cause instanceof DOMException ? cause.name : "SYNC_ERROR",
-    lastErrorMessage: cause instanceof Error ? cause.message : String(cause),
-  });
-}
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -172,6 +133,20 @@ export async function getProjectionCursor(): Promise<number> {
   return v ?? 0;
 }
 
+/** Independent durable positions; neither key cursor advances the event cursor. */
+export async function getReplicationProgress(deviceId: string): Promise<{
+  snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number;
+}> {
+  const db = await openDb();
+  const [snapshotComplete, snapshotBaseline, keyringCursor, grantCursor] = await Promise.all([
+    metaValue<boolean>(db, SNAPSHOT_COMPLETE_KEY),
+    metaNumber(db, SNAPSHOT_BASELINE_KEY),
+    metaNumber(db, keyringCursorKey(deviceId)),
+    metaNumber(db, grantCursorKey(deviceId)),
+  ]);
+  return { snapshotComplete: snapshotComplete === true, snapshotBaseline, keyringCursor, grantCursor };
+}
+
 /** §43: apply pages transactionally until the server says hasMore=false. */
 let runningSync: Promise<number> | null = null;
 function serializeSync(run: () => Promise<number>): Promise<number> {
@@ -184,12 +159,16 @@ function serializeSync(run: () => Promise<number>): Promise<number> {
 export function syncNow(onProgress?: (applied: number) => void): Promise<number> {
   updateSyncStatus({ state: "SYNCING_HISTORY", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
   return serializeSync(async () => {
+    let keySyncDegraded = false;
     try {
-      await bootstrapKeyGrants();
+      // Key availability is deliberately independent from replica durability.
+      // A missing/unavailable key must leave ciphertext replication healthy so
+      // the browser can catch up and retry projection after the grant arrives.
+      keySyncDegraded = !(await syncKeysSafely(bootstrapKeyGrants));
       await bootstrapEncryptedState();
       await repairConversationProjection();
       const result = await drainSync(undefined, onProgress);
-      updateSyncStatus({ state: "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
+      updateSyncStatus({ state: keySyncDegraded || result.keyDegraded ? "DEGRADED" : "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
       return result.applied;
     } catch (cause) {
       syncFailure("SYNC", cause, false);
@@ -206,13 +185,18 @@ export function syncNow(onProgress?: (applied: number) => void): Promise<number>
 export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): Promise<number> {
   updateSyncStatus({ state: "INITIALIZING", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
   return serializeSync(async () => {
+    let keySyncDegraded = false;
     try {
-      await bootstrapKeyGrants();
-      await bootstrapEncryptedState();
+      keySyncDegraded = !(await syncKeysSafely(bootstrapKeyGrants));
+      const snapshotComplete = await bootstrapEncryptedState(false, maxPages);
+      if (!snapshotComplete) {
+        updateSyncStatus({ state: keySyncDegraded ? "DEGRADED" : "FIRST_PAINT_READY", lastPageCount: 0, appliedThisRun: 0 });
+        return 0;
+      }
       await repairConversationProjection();
       const result = await drainSync(maxPages, onProgress);
       updateSyncStatus({
-        state: result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY",
+        state: keySyncDegraded || result.keyDegraded ? "DEGRADED" : (result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY"),
         lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied,
       });
       return result.applied;
@@ -223,141 +207,19 @@ export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): 
   });
 }
 
+/**
+ * Run key/bootstrap synchronization without making it a prerequisite for the
+ * encrypted replica. The return value is intentionally boolean so callers can
+ * surface a degraded key state while continuing event ingestion.
+ */
+
 /** Catch-up synonym of syncNow() kept for call-site readability. */
 export function syncUntilCaughtUp(onProgress?: (applied: number) => void): Promise<number> {
   return syncNow(onProgress);
 }
 
-interface DrainResult { applied: number; lastPageCount: number; caughtUp: boolean }
-async function drainSync(maxPages?: number, onProgress?: (applied: number) => void): Promise<DrainResult> {
-  let cursor = await getCursor();
-  const db = await openDb();
-  let replicaGeneration = await metaValue<string>(db, REPLICA_GENERATION_KEY);
-  let snapshotVersion = await metaValue<number>(db, SNAPSHOT_VERSION_KEY);
-  let applied = 0;
-  let pages = 0;
-  let lastPageCount = 0;
-  const pendingAggregates = new Set<string>();
-  let projectionThrough = cursor;
-  const flushProjection = async () => {
-    if (pendingAggregates.size > 0) {
-      await refreshConversationProjections([...pendingAggregates]);
-      pendingAggregates.clear();
-    }
-    await setMetaNumber(PROJECTION_CURSOR_KEY, projectionThrough);
-  };
-  for (;;) {
-    let page: SyncPage;
-    try {
-      page = await fetchEventsAfter(cursor);
-    } catch (cause) {
-      if (!(cause instanceof SnapshotRequiredError)) throw cause;
-      await bootstrapEncryptedState(true);
-      cursor = await getCursor();
-      projectionThrough = cursor;
-      continue;
-    }
-    if (page.replicaGeneration && (page.replicaGeneration !== replicaGeneration ||
-        page.snapshotVersion !== snapshotVersion)) {
-      await bootstrapEncryptedState(true);
-      cursor = await getCursor();
-      projectionThrough = cursor;
-      replicaGeneration = await metaValue<string>(db, REPLICA_GENERATION_KEY);
-      snapshotVersion = await metaValue<number>(db, SNAPSHOT_VERSION_KEY);
-      continue;
-    }
-    for (const event of page.events) assertSupportedContentEvent(event);
-    lastPageCount = page.events.length;
-    // Observability (Phase 2) — browser console trace of each sync page.
-    try {
-      let incoming = 0;
-      let outgoing = 0;
-      for (const ev of page.events) {
-        const payload = decodeEventPayload(ev);
-        if (payload?.direction === "in") incoming += 1;
-        else if (payload?.direction === "out") outgoing += 1;
-      }
-      // eslint-disable-next-line no-console
-      console.info(`sync_fetched cursor=${cursor} events=${page.events.length} incoming=${incoming} outgoing=${outgoing}`);
-    } catch {
-      /* best-effort diagnostics only */
-    }
-    if (page.events.length === 0) return { applied, lastPageCount, caughtUp: true };
-    if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor ||
-        page.events.some(ev => !Number.isSafeInteger(ev.sequence) || ev.sequence <= cursor || ev.sequence > page.nextCursor)) {
-      throw new Error("Invalid sync page: non-advancing cursor or event sequence");
-    }
-    await receiveKeyGrants(page.events.filter(event =>
-      (event.cryptoVersion === 1 && (event.type === "KEY_GRANT" || event.type === "CONTACTS_KEY_GRANT")) ||
-      (event.cryptoVersion === 2 && event.type === "KEYRING_ENTRY") ||
-      (event.cryptoVersion === 3 && event.type === "HISTORY_KEY_GRANT")));
-    for (const event of page.events) {
-      if ((event.cryptoVersion === 1 || event.cryptoVersion === 2) &&
-          (event.type === "CONTACTS_SNAPSHOT" || event.type === "CONTACTS_CHANGED")) {
-        const decoded = await decryptMessage(event);
-        if (decoded.state === "decrypted") await applyContacts(decoded.payload);
-      }
-    }
-    await new Promise<void>((resolve, reject) => {
-      const t = db.transaction([STORE_EVENTS, STORE_META, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES], "readwrite");
-      const store = t.objectStore(STORE_EVENTS);
-      for (const ev of page.events) {
-        store.put(ev); // keyed by server sequence — idempotent replay-safe
-        if (["CONVERSATION_UPSERTED", "CONVERSATION_UPSERT", "CONVERSATION_DELETED"].includes(ev.type) && ev.aggregateId) {
-          const states = t.objectStore(STORE_ENCRYPTED_CONVERSATIONS);
-          const next = { conversationId: ev.aggregateId, tombstone: ev.type === "CONVERSATION_DELETED",
-            revision: ev.revision ?? 1,
-            sortKey: ev.sortKey ?? ev.createdAt, envelope: ev.ciphertext, encoding: ev.encoding,
-            schemaVersion: ev.schemaVersion, cryptoVersion: ev.cryptoVersion,
-            lastServerSequence: ev.sequence };
-          const get = states.get(ev.aggregateId);
-          get.onsuccess = () => {
-            const old = get.result as EncryptedConversationState | undefined;
-            if (!old || next.revision > old.revision ||
-                (next.revision === old.revision && next.lastServerSequence > old.lastServerSequence)) states.put(next);
-          };
-        }
-        if (ev.messageId && ev.aggregateId && ["MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED", "MESSAGE_DELETED"].includes(ev.type)) {
-          const states = t.objectStore(STORE_ENCRYPTED_MESSAGES);
-          const next = { messageId: ev.messageId, conversationId: ev.aggregateId, type: ev.type,
-            tombstone: ev.type === "MESSAGE_DELETED", revision: ev.revision ?? 1,
-            sortKey: ev.sortKey ?? ev.createdAt, envelope: ev.ciphertext, encoding: ev.encoding,
-            schemaVersion: ev.schemaVersion, cryptoVersion: ev.cryptoVersion,
-            lastServerSequence: ev.sequence };
-          const get = states.get(ev.messageId);
-          get.onsuccess = () => {
-            const old = get.result as EncryptedMessageState | undefined;
-            if (!old || next.revision > old.revision ||
-                (next.revision === old.revision && next.lastServerSequence > old.lastServerSequence)) states.put(next);
-          };
-        }
-      }
-      t.objectStore(STORE_META).put(page.nextCursor, CURSOR_KEY);
-      t.oncomplete = () => resolve();
-      t.onerror = () => reject(t.error);
-      t.onabort = () => reject(t.error ?? new Error("Sync transaction aborted"));
-    });
-    if (page.replicaGeneration && Number.isSafeInteger(page.snapshotVersion)) {
-      await acknowledgeWebSync(page.nextCursor, page.replicaGeneration, page.snapshotVersion!);
-    }
-    await compactLocalContentEvents(db, page.nextCursor - 10_000);
-    // PWA projection (P0): after the page commits, refresh ONLY the changed
-    // conversations — never rebuild the whole inbox.
-    const changedAggregates = [...new Set(page.events
-      .map((ev) => ev.aggregateId)
-      .filter((id): id is string => typeof id === "string" && id.length > 0))];
-    for (const id of changedAggregates) pendingAggregates.add(id);
-    projectionThrough = page.nextCursor;
-    applied += page.events.length;
-    cursor = page.nextCursor;
-    onProgress?.(applied);
-    pages += 1;
-    const stopping = !page.hasMore || (maxPages !== undefined && pages >= maxPages);
-    if (pages % 10 === 0 || stopping) await flushProjection();
-    if (!page.hasMore) return { applied, lastPageCount, caughtUp: true };
-    if (maxPages !== undefined && pages >= maxPages) return { applied, lastPageCount, caughtUp: false };
-  }
-}
+const { drainSync } = createReplicaEngine({ getCursor, openDb, metaValue, setMetaNumber,
+  bootstrapEncryptedState, refreshConversationProjections, applyContacts, compactLocalContentEvents });
 
 export interface StoredEvent extends SyncEvent { decryption?: Decryption }
 
@@ -451,11 +313,13 @@ export async function listAggregateEventsPage(
   const limit = Math.max(1, Math.min(500, options.limit ?? 200));
   const db = await openDb();
   const localPage = await cachedMessagePage(db, aggregateId, options.beforeState, limit);
+  const hasV2Snapshot = Boolean(await metaValue<string>(db, SNAPSHOT_TOKEN_KEY));
+  if (hasV2Snapshot && localPage.items.length > 0) return localPage;
   if (localPage.items.length >= limit ||
       (typeof navigator !== "undefined" && !navigator.onLine && localPage.items.length > 0)) {
     return localPage;
   }
-  if (typeof navigator !== "undefined" && navigator.onLine) {
+  if (!hasV2Snapshot && typeof navigator !== "undefined" && navigator.onLine) {
     const remote = await fetchWebMessagePage(aggregateId, options.beforeState, Math.min(100, limit));
     const write = db.transaction(STORE_ENCRYPTED_MESSAGES, "readwrite");
     const states = write.objectStore(STORE_ENCRYPTED_MESSAGES);
@@ -639,108 +503,13 @@ async function contactsFromDb(db: IDBDatabase): Promise<StoredContact[]> {
   return [...volatileContacts.values()];
 }
 
-async function aggregateIdsInSequenceRange(db: IDBDatabase, after: number, through: number): Promise<string[]> {
-  if (through <= after) return [];
-  const ids = new Set<string>();
-  await new Promise<void>((resolve, reject) => {
-    const transaction = db.transaction(STORE_EVENTS, "readonly");
-    const req = transaction.objectStore(STORE_EVENTS).openCursor(IDBKeyRange.bound(after, through, true, false));
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (!cursor) return;
-      const id = (cursor.value as SyncEvent).aggregateId;
-      if (typeof id === "string" && id.length > 0) ids.add(id);
-      cursor.continue();
-    };
-    req.onerror = () => reject(req.error);
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error);
-    transaction.onabort = () => reject(transaction.error ?? new Error("Projection repair scan aborted"));
-  });
-  return [...ids];
-}
 
-async function refreshConversationProjectionsInDb(db: IDBDatabase, aggregateIds: string[]): Promise<void> {
-  const encryptedCount = await requestToPromise(db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readonly")
-    .objectStore(STORE_ENCRYPTED_CONVERSATIONS).count());
-  if (encryptedCount > 0) return;
-  const contactMap = new Map((await contactsFromDb(db)).map(contact => [contact.normalizedPhone, contact.displayName]));
-  for (const aggregateId of aggregateIds) {
-    const rows = await requestToPromise(db.transaction(STORE_EVENTS, "readonly")
-      .objectStore(STORE_EVENTS).index("by_aggregate").getAll(aggregateId)) as SyncEvent[];
-    const row = conversationProjectionFromEvents(await decryptForDisplay(rows), aggregateId, contactMap);
-    const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
-    if (row) transaction.objectStore(STORE_CONVERSATIONS).put(row);
-    else transaction.objectStore(STORE_CONVERSATIONS).delete(aggregateId);
-    await txDone(transaction);
-  }
-}
 
-function conversationStateEvent(row: EncryptedConversationState): SyncEvent {
-  return {
-    sequence: row.lastServerSequence,
-    eventId: `snapshot:${row.conversationId}:${row.revision}`,
-    type: "CONVERSATION_UPSERTED",
-    aggregateId: row.conversationId,
-    sourceDeviceId: null,
-    ciphertext: row.envelope,
-    encoding: row.encoding,
-    schemaVersion: row.schemaVersion,
-    cryptoVersion: row.cryptoVersion,
-    createdAt: row.sortKey,
-    revision: row.revision,
-    sortKey: row.sortKey,
-  };
-}
 
-function messageStateEvent(row: EncryptedMessageState): SyncEvent {
-  return {
-    ...conversationStateEvent(row),
-    eventId: `state:${row.messageId}:${row.revision}`,
-    type: row.type,
-    messageId: row.messageId,
-  };
-}
 
-async function bootstrapEncryptedState(force = false): Promise<void> {
-  const db = await openDb();
-  const storedGeneration = await metaValue<string>(db, REPLICA_GENERATION_KEY);
-  const storedSnapshotVersion = await metaValue<number>(db, SNAPSHOT_VERSION_KEY);
-  if (!force && storedGeneration && Number.isSafeInteger(storedSnapshotVersion)) return;
-  const page = await fetchWebBootstrap(101);
-  if (page.protocolVersion !== 3 || !page.replicaGeneration ||
-      !Number.isSafeInteger(page.snapshotVersion) ||
-      !Number.isSafeInteger(page.minimumAvailableSequence) ||
-      !Number.isSafeInteger(page.highWatermark)) {
-    throw new Error("Unsupported encrypted bootstrap response");
-  }
-  const generationChanged = Boolean(storedGeneration && storedGeneration !== page.replicaGeneration);
-  const transaction = db.transaction(
-    [STORE_EVENTS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, STORE_CONVERSATIONS, STORE_META], "readwrite");
-  const snapshots = transaction.objectStore(STORE_ENCRYPTED_CONVERSATIONS);
-  snapshots.clear();
-  transaction.objectStore(STORE_ENCRYPTED_MESSAGES).clear();
-  transaction.objectStore(STORE_CONVERSATIONS).clear();
-  if (generationChanged) {
-    const oldEvents = transaction.objectStore(STORE_EVENTS).openCursor();
-    oldEvents.onsuccess = () => {
-      const cursor = oldEvents.result;
-      if (!cursor) return;
-      if (RECONSTRUCTABLE_STATE_EVENTS.has((cursor.value as SyncEvent).type) ||
-          ["CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"].includes((cursor.value as SyncEvent).type)) cursor.delete();
-      cursor.continue();
-    };
-  }
-  for (const event of page.contactEvents ?? []) transaction.objectStore(STORE_EVENTS).put(event);
-  for (const row of page.conversations) snapshots.put(row);
-  const meta = transaction.objectStore(STORE_META);
-  meta.put(page.highWatermark, CURSOR_KEY);
-  meta.put(page.highWatermark, PROJECTION_CURSOR_KEY);
-  meta.put(page.replicaGeneration, REPLICA_GENERATION_KEY);
-  meta.put(page.snapshotVersion, SNAPSHOT_VERSION_KEY);
-  meta.put(7, REPLICA_MIGRATION_VERSION_KEY);
-  await txDone(transaction);
-  await repairContactsFromLocalEvents(db);
+
+function bootstrapEncryptedState(force = false, maxPages = Infinity): Promise<boolean> {
+  return runSnapshotBootstrap({ openDb, metaValue, txDone, repairContactsFromLocalEvents }, force, maxPages);
 }
 
 async function eventsByType(db: IDBDatabase, type: string): Promise<SyncEvent[]> {
@@ -768,77 +537,14 @@ async function repairContactsFromLocalEvents(db: IDBDatabase): Promise<void> {
  * addressed to this browser, then retry local projections. The normal sync
  * cursor remains the sole raw-event cursor and is never advanced here.
  */
-async function bootstrapKeyGrants(): Promise<void> {
+async function bootstrapKeyGrants(signal: AbortSignal): Promise<void> {
   const db = await openDb();
   const deviceId = (await getOrCreateDeviceKeys()).deviceId;
-  const keyring = await fetchKeyring();
-  if (keyring.hasMore || keyring.events.some(event =>
-    !((event.type === "KEYRING_ENTRY" && event.cryptoVersion === 2) ||
-      (event.type === "HISTORY_KEY_GRANT" && event.cryptoVersion === 3)))) {
-    throw new Error("Invalid or oversized account keyring");
-  }
-  const keyringCursorKey = `${KEYRING_CURSOR_PREFIX}${deviceId}`;
-  const previousKeyringCursor = await metaNumber(db, keyringCursorKey);
-  if (keyring.nextCursor > previousKeyringCursor) {
-    const keyringResults = await receiveKeyGrants(keyring.events);
-    const rejectedKey = keyringResults.find(result => result.state !== "key-grant" ||
-      (result.reason !== "Authorized account key stored" &&
-       result.reason !== "Authorized history key stored"));
-    if (rejectedKey) throw new Error(`Account keyring failed: ${"reason" in rejectedKey ? rejectedKey.reason : "unexpected result"}`);
-
-    const aggregateIds = (await requestToPromise(db.transaction(STORE_CONVERSATIONS, "readonly")
-      .objectStore(STORE_CONVERSATIONS).getAllKeys())).filter((key): key is string => typeof key === "string");
-    await refreshConversationProjectionsInDb(db, aggregateIds);
-    await repairContactsFromLocalEvents(db);
-    await setMetaNumber(keyringCursorKey, keyring.nextCursor);
-  }
-
-  const cursorKey = `${KEY_GRANT_CURSOR_PREFIX}${deviceId}`;
-  let cursor = await metaNumber(db, cursorKey);
-  const acceptedAggregates = new Set<string>();
-  let contactsGrantAccepted = false;
-  for (;;) {
-    const page = await fetchKeyGrantsAfter(cursor);
-    if (page.events.length === 0) break;
-    if (!Number.isSafeInteger(page.nextCursor) || page.nextCursor <= cursor ||
-        page.events.some(event => !Number.isSafeInteger(event.sequence) || event.sequence <= cursor ||
-          event.sequence > page.nextCursor || (event.type !== "KEY_GRANT" && event.type !== "CONTACTS_KEY_GRANT"))) {
-      throw new Error("Invalid key-grant bootstrap page");
-    }
-    const results = await receiveKeyGrants(page.events);
-    const rejected = results.find(result => result.state !== "key-grant" ||
-      result.reason !== "Authorized epoch key stored");
-    if (rejected) throw new Error(`Key-grant bootstrap failed: ${"reason" in rejected ? rejected.reason : "unexpected result"}`);
-    for (let index = 0; index < page.events.length; index += 1) {
-      const event = page.events[index];
-      const result = results[index];
-      if (result.state !== "key-grant" || result.reason !== "Authorized epoch key stored") continue;
-      if (event.type === "CONTACTS_KEY_GRANT") contactsGrantAccepted = true;
-      else if (event.aggregateId) acceptedAggregates.add(event.aggregateId);
-    }
-    cursor = page.nextCursor;
-    if (!page.hasMore) break;
-  }
-  if (acceptedAggregates.size > 0) {
-    const projected = new Set((await requestToPromise(db.transaction(STORE_CONVERSATIONS, "readonly")
-      .objectStore(STORE_CONVERSATIONS).getAllKeys())).filter((key): key is string => typeof key === "string"));
-    await refreshConversationProjectionsInDb(db, [...acceptedAggregates].filter(id => projected.has(id)));
-  }
-  if (contactsGrantAccepted) await repairContactsFromLocalEvents(db);
-  await setMetaNumber(cursorKey, cursor);
+  await runKeySync(signal, db, deviceId, { conversationStore: STORE_CONVERSATIONS,
+    metaNumber, setMetaNumber, requestToPromise, refreshConversationProjectionsInDb,
+    repairContactsFromLocalEvents });
 }
 
-async function repairConversationProjectionGap(db: IDBDatabase): Promise<void> {
-  const [cursor, projectionCursor] = await Promise.all([
-    metaNumber(db, CURSOR_KEY), metaNumber(db, PROJECTION_CURSOR_KEY),
-  ]);
-  if (projectionCursor >= cursor) return;
-  const ids = await aggregateIdsInSequenceRange(db, projectionCursor, cursor);
-  await refreshConversationProjectionsInDb(db, ids);
-  const transaction = db.transaction(STORE_META, "readwrite");
-  transaction.objectStore(STORE_META).put(cursor, PROJECTION_CURSOR_KEY);
-  await txDone(transaction);
-}
 
 export async function repairConversationProjection(): Promise<void> {
   await repairConversationProjectionGap(await openDb());
@@ -876,7 +582,7 @@ export async function listConversations(
     db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readonly")
       .objectStore(STORE_ENCRYPTED_CONVERSATIONS).count());
   if (encryptedCount > 0) {
-    if (options.before && navigator.onLine) {
+    if (options.before && navigator.onLine && !(await metaValue<string>(db, SNAPSHOT_TOKEN_KEY))) {
       const raw = btoa(JSON.stringify([options.before.lastAt, options.before.aggregateId]))
         .replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
       const remote = await fetchWebConversationPage(raw, Math.min(200, limit + 1));
@@ -967,42 +673,8 @@ export async function listConversations(
 }
 
 /**
- * One-time migration rebuild: after the schema moves to v4, recompute the
- * whole projection from locally stored events. Raw events, the cursor and the
- * browser identity/crypto keys are never touched. Idempotent (meta marker).
+ * List transient contacts reconstructed from encrypted local events.
  */
-async function ensureConversationProjectionRebuilt(db: IDBDatabase): Promise<void> {
-  const versionReq = db.transaction(STORE_META, "readonly")
-    .objectStore(STORE_META).get(PROJECTION_VERSION_KEY) as IDBRequest<number | undefined>;
-  const version = await requestToPromise(versionReq);
-  if (version !== undefined) return;
-
-  const keyReq = db.transaction(STORE_EVENTS, "readonly")
-    .objectStore(STORE_EVENTS).index("by_aggregate").getAllKeys() as IDBRequest<IDBValidKey[]>;
-  const keys = await requestToPromise(keyReq);
-  const ids = [...new Set(keys.filter((k): k is string => typeof k === "string" && k.length > 0))];
-
-  const contactMap = new Map((await contactsFromDb(db)).map((contact) => [contact.normalizedPhone, contact.displayName]));
-
-  for (let offset = 0; offset < ids.length; offset += 50) {
-    for (const aggregateId of ids.slice(offset, offset + 50)) {
-      const getReq = db.transaction(STORE_EVENTS, "readonly")
-        .objectStore(STORE_EVENTS).index("by_aggregate").getAll(aggregateId) as IDBRequest<SyncEvent[]>;
-      const events = await decryptForDisplay(await requestToPromise(getReq));
-      const row = conversationProjectionFromEvents(events, aggregateId, contactMap);
-      const transaction = db.transaction(STORE_CONVERSATIONS, "readwrite");
-      const store = transaction.objectStore(STORE_CONVERSATIONS);
-      if (row) store.put(row);
-      else store.delete(aggregateId);
-      await txDone(transaction);
-    }
-  }
-  const rebuiltThrough = await metaNumber(db, CURSOR_KEY);
-  const metaTx = db.transaction(STORE_META, "readwrite");
-  metaTx.objectStore(STORE_META).put(1, PROJECTION_VERSION_KEY);
-  metaTx.objectStore(STORE_META).put(rebuiltThrough, PROJECTION_CURSOR_KEY);
-  await txDone(metaTx);
-}
 
 
 export async function listContacts(): Promise<StoredContact[]> {
@@ -1042,57 +714,5 @@ export function subscribeSyncAvailable(
   onRevoked: () => void,
   onSyncError?: (cause: unknown) => void,
 ): () => void {
-  let closed = false;
-  let es: EventSource | null = null;
-  let connecting: ReturnType<typeof setTimeout> | null = null;
-
-  const connect = () => {
-    if (closed) return;
-    // EventSource sends cookies for same-origin automatically; withCredentials
-    // additionally keeps the linked-session cookie on cross-origin/proxied setups.
-    es = new EventSource("/api/v1/sse", { withCredentials: true });
-    es.onmessage = (msg) => {
-      try {
-        const evt = JSON.parse(msg.data) as { type?: string; newEvents?: number };
-        if (evt.type === "device.revoked") {
-          closed = true;
-          es?.close();
-          onRevoked();
-          return;
-        }
-        if (evt.type === "sync.available") {
-          void syncNow()
-            .then((applied) => {
-              if (applied > 0) onSynced(applied);
-            })
-            .catch((cause) => {
-              syncFailure("SSE_SYNC", cause, false);
-              onSyncError?.(cause);
-            });
-        }
-      } catch {
-        /* ignore malformed frames — the cursor is the truth */
-      }
-    };
-    // EventSource retries on its own; we only rebuild after a hard close.
-    es.onerror = () => {
-      void fetch("/api/v1/linked-session", { credentials: "include" })
-        .then(r => r.json()).then(s => { if (s.authenticated === false) { closed = true; onRevoked(); } }).catch(() => {});
-      es?.close();
-      es = null;
-      if (!closed && connecting === null) {
-        connecting = setTimeout(() => {
-          connecting = null;
-          connect();
-        }, 5_000);
-      }
-    };
-  };
-
-  connect();
-  return () => {
-    closed = true;
-    if (connecting !== null) clearTimeout(connecting);
-    es?.close();
-  };
+  return subscribeLiveInvalidation(syncNow, onSynced, onRevoked, onSyncError);
 }

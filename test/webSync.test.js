@@ -29,11 +29,12 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
       grantRequests++;
       return Response.json({ events: [], nextCursor: 0, hasMore: false });
     }
-    if (/\/web\/bootstrap/.test(String(url))) {
-      return Response.json({ protocolVersion: 3, snapshotVersion: 1, highWatermark: 0,
-        replicaGeneration: 'test-generation', minimumAvailableSequence: 0,
-        conversations: [], nextCursor: null, hasMore: false });
+    if (/\/web\/snapshot-v2/.test(String(url))) {
+      return Response.json({ token: "sync-test-snapshot", snapshotVersion: 1, baselineSequence: 0,
+        replicaGeneration: 'test-generation', expiresAt: Date.now() + 60_000,
+        contactEvents: [], rows: [], nextCursor: null, hasMore: false });
     }
+    if (String(url).includes("/web/sync/ack")) return Response.json({ ok: true });
     requests++;
     const after = Number(new URL(url, 'https://example.test').searchParams.get('after'));
     const events = rows.filter(row => row.sequence > after).slice(0, 500);
@@ -118,5 +119,39 @@ test('latest N uses a descending cursor; concurrent/repeated sync is idempotent 
     assert.deepEqual(pagedIds.slice(0, 3), ['large-1050', 'large-1049', 'large-1048']);
     assert.deepEqual(pagedIds.slice(-3), ['large-0003', 'large-0002', 'large-0001']);
     db.close();
+  } finally { global.fetch = originalFetch; }
+});
+
+test('lost SSE invalidation is recovered by the durable event cursor', async () => {
+  global.indexedDB = indexedDB;
+  global.IDBKeyRange = IDBKeyRange;
+  const originalFetch = global.fetch;
+  const sync = await import('../web/src/lib/sync.ts');
+  await sync.resetLocal();
+  let available = 1;
+  const event = sequence => ({ sequence, eventId: `missed-${sequence}`, aggregateId: null,
+    sourceDeviceId: 'phone', type: 'DEVICE_STATUS_CHANGED', createdAt: sequence,
+    cryptoVersion: 1, encoding: 'envelope.v1', schemaVersion: 1,
+    ciphertext: Buffer.from('opaque').toString('base64') });
+  global.fetch = async url => {
+    const path = String(url);
+    if (/\/linked-device\/(?:key-grants|keyring)/.test(path))
+      return Response.json({ events: [], nextCursor: 0, hasMore: false });
+    if (path.includes('/web/snapshot-v2')) return Response.json({ token: 'sse-loss',
+      replicaGeneration: 'sse-generation', snapshotVersion: 1, baselineSequence: 0,
+      expiresAt: Date.now() + 60_000, contactEvents: [], rows: [], nextCursor: null, hasMore: false });
+    if (path.includes('/web/sync/ack')) return Response.json({ ok: true });
+    const after = Number(new URL(path, 'https://example.test').searchParams.get('after') || 0);
+    const events = Array.from({ length: available }, (_, index) => event(index + 1))
+      .filter(row => row.sequence > after);
+    return Response.json({ events, nextCursor: events.at(-1)?.sequence ?? after,
+      hasMore: false, replicaGeneration: 'sse-generation', snapshotVersion: 1 });
+  };
+  try {
+    assert.equal(await sync.syncNow(), 1);
+    available = 2; // no SSE frame arrives for this event
+    assert.equal(await sync.syncNow(), 1);
+    assert.equal(await sync.getCursor(), 2);
+    assert.equal(await sync.syncNow(), 0);
   } finally { global.fetch = originalFetch; }
 });

@@ -15,11 +15,12 @@ test("replica generation mismatch reboots message state but preserves browser id
     if (/\/linked-device\/(?:key-grants|keyring)/.test(path)) {
       return Response.json({ events: [], nextCursor: 0, hasMore: false });
     }
-    if (path.includes("/web/bootstrap")) return Response.json({
-      protocolVersion: 3, replicaGeneration: generation, snapshotVersion: 1,
-      minimumAvailableSequence: 1, highWatermark, contactEvents: [],
-      conversations: [], nextCursor: null, hasMore: false,
+    if (path.includes("/web/snapshot-v2")) return Response.json({
+      token: `snapshot-${generation}`, replicaGeneration: generation, snapshotVersion: 1,
+      baselineSequence: highWatermark, expiresAt: Date.now() + 60_000, contactEvents: [],
+      rows: [], nextCursor: null, hasMore: false,
     });
+    if (path.includes("/web/sync/ack")) return Response.json({ ok: true });
     if (path.includes("/sync?")) return Response.json({
       events: [], nextCursor: Number(new URL(path, "https://example.test").searchParams.get("after")),
       hasMore: false, replicaGeneration: generation, snapshotVersion: 1, minimumAvailableSequence: 1,
