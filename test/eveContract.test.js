@@ -100,6 +100,27 @@ test("production Fastify accepts Eve /send and denies unscoped commands", async 
   });
   assert.equal(response.statusCode, 202, response.payload);
   assert.equal(response.json().status, "queued");
+  assert.equal(response.json().requestId, "contract-request");
+  assert.equal(response.json().jobId, "contract-job");
+  assert.equal(response.json().statusUrl, "/send/status/contract-request");
+  assert.equal(response.json().terminal, false);
+  assert.equal(response.json().successful, null);
+
+  const durableRow = {
+    id: 1, key_name: "eve-runtime-contract", job_id: "contract-job",
+    status: "queued", priority: "critical", created_at: Date.now(),
+    queued_at: Date.now(), updated_at: Date.now()
+  };
+  sendStore.byReference = () => durableRow;
+  sendQueue.jobStatus = async () => null;
+  const status = await app.inject({ method: "GET", url: "/send/status/contract-request", headers });
+  assert.equal(status.statusCode, 200, status.payload);
+  assert.equal(status.json().requestId, "contract-request");
+  assert.equal(status.json().jobId, "contract-job");
+  assert.equal(status.json().statusUrl, "/send/status/contract-request");
+  assert.equal(status.json().status, "queued");
+  assert.equal(status.json().terminal, false);
+  assert.equal(status.json().successful, null);
 
   const denied = await app.inject({
     method: "POST",

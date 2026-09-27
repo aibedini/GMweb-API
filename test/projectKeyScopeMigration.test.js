@@ -41,7 +41,11 @@ async function withKeyFile(keys, run) {
   try {
     await run(keysFile, path.join(dir, "logs.jsonl"));
   } finally {
-    await fsp.rm(dir, { recursive: true, force: true });
+    // ApiKeyStore.save() completes its tmp+rename asynchronously. On Windows,
+    // directory removal can briefly race the open handle after assertions
+    // finish; a bounded retry makes cleanup deterministic without changing
+    // what the migration test proves.
+    await fsp.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
 

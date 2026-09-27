@@ -631,3 +631,59 @@ Each row includes the timestamp, category, severity, actor, method/path,
 response status, outcome, duration, request ID, IP, user agent, and safe route
 metadata. Authorization headers and request bodies are never stored. Logs are
 kept as bounded JSONL in `data/activity.jsonl` (up to 10,000 recent events).
+
+---
+
+## 7. Eve signed SMS callbacks (`eve-signed-events-v4`)
+
+GMweb can post a dedicated SMS timeline to Eve when **both**
+`EVE_SMS_EVENTS_URL=https://eve.rooteam.ir/internal/gmweb/sms/events` and
+`EVE_SMS_EVENTS_SECRET` (at least 32 characters, shared with Eve) are set.
+Callbacks are disabled when both are absent. A partial or invalid configuration
+fails startup. Keep `WEBHOOK_URL` away from Eve's SMS events path: that legacy
+webhook is a separate, unsigned feed and may include message content.
+
+Only sends tagged with `meta.source="eve"` produce these callbacks. The SQLite
+send ledger writes an immutable event body into `eve_sms_outbox` in the same
+transaction as the canonical queued, sent, failed, cancelled or superseded
+status transition. The callback worker reads that outbox, sends over HTTPS, and
+stores Eve's acknowledgement. A restart recovers pending, retrying and stale
+`delivering` rows. Network errors, timeouts, HTTP 408/429 and 5xx retry with
+jittered exponential backoff capped at 15 minutes; other non-2xx responses
+remain as `dead_letter` for operator inspection. Event and delivery IDs and the
+raw body stay unchanged across retries. The timestamp and signature are fresh
+for each attempt.
+
+The current event types are `send.queued`, `send.sent`, `send.failed` and
+`send.cancelled` (the latter includes a superseded/invalidated queued send).
+There is no `send.delivered` emission: the current Android/Chrome paths expose
+submission evidence but no genuine carrier DLR. **HTTP acceptance is not
+physical submission, and physical submission is not carrier delivery.** A
+late authenticated Android sent ACK may add `send.sent` after a prior failure or
+cancellation, preserving physical truth.
+
+Each body contains only `event_id`, `trace_id`, `message_id`, `type`,
+`occurred_at`, and, when known, `attempt`. The IDs identify the
+GMweb request (`send_<ledger-id>`); Eve can correlate that ID with the `/send`
+response. The body never includes SMS text, full recipient number, service key,
+raw provider results, credentials or free-form failure text. The legacy
+`WEBHOOK_URL` feed does **not** have these guarantees.
+
+GMweb sets `X-GMweb-Timestamp` (Unix seconds), `X-GMweb-Delivery-Id` (stable
+per event) and `X-GMweb-Signature` (`sha256=` followed by lowercase HMAC-SHA256
+hex). Eve verifies the HMAC of the exact transmitted bytes:
+`<timestamp>.<delivery-id>.<raw JSON body>`.
+
+The Eve project key still needs `sms.send`, `sms.status`, `sms.cancel`,
+`sms.capacity`, `sms.invalidate` and `transport:read`. Existing custom keys are
+not automatically widened. Use `GET /admin/api-keys` and
+`PATCH /admin/api-keys/:id` with an operator's master-token or dashboard
+authorization to check and update the deployed Eve key; Eve itself must only
+hold its project key. The deployed key, shared callback secret and Eve receiver
+are outside this repository and require staging verification.
+
+`POST /send` now declares `terminal` and `successful` on every accepted send
+response, alongside the stable `requestId`, `jobId`, `status` and `statusUrl`.
+Queued and deferred responses report `terminal:false, successful:null`;
+terminal responses report their final outcome. `/send/status/{requestId}`
+remains the authoritative polling view after retries and process restart.

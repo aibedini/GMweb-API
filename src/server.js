@@ -22,6 +22,7 @@ const {
 const { ActivityLogStore, classify: classifyActivity } = require("./activityLog");
 const { SendQueue } = require("./queue");
 const { SendStore } = require("./sendStore");
+const { EveSmsEvents, eveEventsConfig } = require("./eveSmsEvents");
 const {
   NOTIFICATION_TEXT_LIMITS,
   normalizeNotificationMeta,
@@ -360,6 +361,7 @@ const sendQueue = new SendQueue();
 // Durable send ledger — survives crashes, tracks per-message status, powers the
 // 24h de-dupe, and lets us rebuild the queue from disk if Redis is ever wiped.
 const sendStore = new SendStore(path.join(config.rootDir, "data", "sends.db"));
+const eveSmsEvents = new EveSmsEvents(sendStore.db, eveEventsConfig(), { log: app.log });
 const dashboardSessionCookieName = "gmweb_session";
 const dashboardPasswordCookieName = "gmweb_login";
 const dashboardDir = path.join(config.rootDir, "public", "dashboard");
@@ -3752,6 +3754,8 @@ app.post("/send", {
           statusUrl: { type: ["string", "null"] },
           jobId: { type: "string" },
           status: { type: "string", enum: ["queued", "deferred"] },
+          terminal: { type: "boolean" },
+          successful: { type: ["boolean", "null"] },
           priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
           priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           deduped: { type: "boolean", description: "True if this returned an existing job for a repeated Idempotency-Key." },
@@ -3787,7 +3791,7 @@ app.post("/send", {
           state: { type: "string", enum: ["superseded"] },
           superseded: { type: "boolean" },
           terminal: { type: "boolean" },
-          successful: { type: "boolean" },
+          successful: { type: ["boolean", "null"] },
           retryable: { type: "boolean" },
           counted: { type: "boolean" },
           priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
@@ -3819,6 +3823,8 @@ app.post("/send", {
           statusUrl: { type: ["string", "null"] },
           jobId: { type: "string" },
           status: { type: "string", enum: ["failed"] },
+          terminal: { type: "boolean" },
+          successful: { type: "boolean" },
           priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
           priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           error: { type: "string" }
@@ -3954,6 +3960,8 @@ app.post("/send", {
           statusUrl: ledger ? `/send/status/${sendStore.requestId(ledger.id)}` : null,
           jobId: rec.jobId,
           status: duplicateStatus,
+          terminal: duplicateStatus !== "queued",
+          successful: duplicateStatus === "completed" ? true : (duplicateStatus === "queued" ? null : false),
           priority: originalPriority.name,
           priorityLevel: originalPriority.level,
           deduped: true
@@ -4005,6 +4013,8 @@ app.post("/send", {
         statusUrl: `/send/status/${sendStore.requestId(claim.row.id)}`,
         jobId: claim.row.job_id || null,
         status: "duplicate_suppressed",
+          terminal: !["queued", "active"].includes(claim.row.status),
+          successful: claim.row.status === "sent" ? true : (["queued", "active"].includes(claim.row.status) ? null : false),
         reason: claim.action,           // duplicate_suppressed | duplicate_inflight
         deduped: true,
         priority: normalizeSendPriority(claim.row.priority).name,
@@ -4064,6 +4074,7 @@ app.post("/send", {
           statusUrl: `/send/status/${requestId}`,
           jobId: result.deferredJobId,
           status: "deferred",
+            terminal: false, successful: null,
           priority: result.priority,
           priorityLevel: normalizeSendPriority(result.priority).level,
           reason: result.reason,
@@ -4075,7 +4086,8 @@ app.post("/send", {
       if (result?.unverified) {
         return {
           ok: false, requestId, statusUrl: `/send/status/${requestId}`,
-          jobId: job.id, status: "unverified", priority: sendPriority.name, priorityLevel: sendPriority.level, result
+            jobId: job.id, status: "unverified", terminal: true, successful: false,
+            priority: sendPriority.name, priorityLevel: sendPriority.level, result
         };
       }
       if (result?.superseded) {
@@ -4094,19 +4106,25 @@ app.post("/send", {
       if (result?.cancelled) {
         return {
           ok: false, requestId, statusUrl: `/send/status/${requestId}`,
-          jobId: job.id, status: "cancelled", priority: sendPriority.name, priorityLevel: sendPriority.level, result
+            jobId: job.id, status: "cancelled", terminal: true, successful: false,
+            priority: sendPriority.name, priorityLevel: sendPriority.level, result
         };
       }
       if (result?.terminalFailure) {
         reply.code(502);
         return {
           ok: false, requestId, statusUrl: `/send/status/${requestId}`,
-          jobId: job.id, status: "failed", priority: sendPriority.name, priorityLevel: sendPriority.level, error: result.error
+            jobId: job.id, status: "failed", terminal: true, successful: false,
+            priority: sendPriority.name, priorityLevel: sendPriority.level, error: result.error
         };
       }
-      return { ok: true, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "completed", priority: sendPriority.name, priorityLevel: sendPriority.level, result };
+      return { ok: true, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id,
+        status: "completed", terminal: true, successful: true,
+        priority: sendPriority.name, priorityLevel: sendPriority.level, result };
     } catch (error) {
-      reply.code(502).send({ ok: false, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id, status: "failed", priority: sendPriority.name, priorityLevel: sendPriority.level, error: error.message });
+      reply.code(502).send({ ok: false, requestId, statusUrl: `/send/status/${requestId}`, jobId: job.id,
+        status: "failed", terminal: true, successful: false,
+        priority: sendPriority.name, priorityLevel: sendPriority.level, error: error.message });
       return;
     }
   }
@@ -4119,6 +4137,8 @@ app.post("/send", {
     statusUrl: `/send/status/${requestId}`,
     jobId: job.id,
     status: "queued",
+    terminal: false,
+    successful: null,
     priority: sendPriority.name,
     priorityLevel: sendPriority.level,
     queuePosition
@@ -4141,6 +4161,7 @@ app.get("/send/status/:reference", {
         properties: {
           ok: { type: "boolean" },
           requestId: { type: ["string", "null"] },
+          statusUrl: { type: ["string", "null"] },
           jobId: { type: ["string", "null"] },
           id: { type: ["string", "null"], description: "Backwards-compatible alias of jobId" },
           state: { type: "string", enum: ["waiting", "active", "completed", "failed", "delayed", "unverified", "cancelled", "suppressed", "superseded", "revoked"] },
@@ -4217,7 +4238,7 @@ app.get("/send/status/:reference", {
     }[live.state] || "queued";
     const legacyTerminal = ["completed", "failed"].includes(live.state);
     return {
-      ok: true, requestId: null, jobId: live.id, ...live,
+      ok: true, requestId: null, statusUrl: `/send/status/${reference}`, jobId: live.id, ...live,
       status: legacyStatus,
       stage: null,
       terminal: legacyTerminal,
@@ -4261,6 +4282,7 @@ app.get("/send/status/:reference", {
   return {
     ok: true,
     requestId: sendStore.requestId(ledger.id),
+    statusUrl: `/send/status/${sendStore.requestId(ledger.id)}`,
     jobId: ledger.job_id || live?.id || null,
     id: ledger.job_id || live?.id || null,
     state: superseded && !revoked ? "superseded" : (live?.state || fallbackState),
@@ -5685,6 +5707,7 @@ async function main() {
   await backfillPendingLedger().catch((error) => app.log.warn({ error: error.message }, "ledger backfill failed"));
   await reconcilePending().catch((error) => app.log.warn({ error: error.message }, "reconcile failed"));
   await app.listen({ host: config.host, port: config.port });
+  eveSmsEvents.start();
   initializeBrowserAndConversationIndex({ resumeAfterWarm: true });
 }
 
@@ -5701,6 +5724,7 @@ async function shutdown(signal) {
   // recovery terminate a wedged browser action immediately; BullMQ reclaims
   // the interrupted active job after restart instead of blocking StopTimeout.
   await sendQueue.close({ force: true }).catch((error) => app.log.warn({ error }, "queue close failed"));
+  await eveSmsEvents.stop().catch((error) => app.log.warn({ error }, "Eve callback worker close failed"));
   try { sendStore.close(); } catch (error) { app.log.warn({ error }, "ledger close failed"); }
   if (config.browserMode === "connect") client.detachForShutdown();
   else await client.stop().catch((error) => app.log.warn({ error }, "browser stop failed"));
