@@ -31,6 +31,10 @@ const { createSendRevocation, METRICS: REVOCATION_METRICS } = require("./sendRev
 const { registerGatewayRoutes } = require("./gatewayRoutes");
 const { GatewayPresenceTracker } = require("./gatewayPresence");
 const { createTransportHealth, STATE: TRANSPORT_STATE, REASON: TRANSPORT_REASON } = require("./transportHealth");
+const {
+  projectTransportHealth,
+  responseSchemaProperties: eveTransportHealthSchema
+} = require("./eveTransportHealth");
 const { applyStaticCachePolicy } = require("./staticCachePolicy");
 const { buildQueueReport } = require("./queueSnapshot");
 const { SendPacingController } = require("./sendPacing");
@@ -2998,6 +3002,30 @@ app.get("/admin/transport", {
     androidLastAckAt: android.lastAckAt || null,
     androidLastTaskPulledAt: android.lastTaskPulledAt || null
   };
+});
+
+app.get("/eve/v1/transport-health", {
+  schema: {
+    summary: "Delivery transport health for the Eve consumer",
+    description: "Read-only projection of the authoritative transport snapshot (the same object /admin/transport serves), scoped with `transport:read` instead of the master token. Never exposes device keys, credentials, recipients or message content. The response shape is declared in shared/eve-gmweb-contract-v1.json, and the schema below is derived from that file so no declared field can be silently stripped by the response serializer.",
+    tags: ["Eve"],
+    response: {
+      200: {
+        type: "object",
+        properties: eveTransportHealthSchema()
+      }
+    }
+  }
+}, async (request, reply) => {
+  // The same operational budget the other read-only diagnostics use: this is
+  // polled by an operator's settings page, never by a device.
+  const limit = checkRateLimit(request, "eve-transport-health", 120, 60_000);
+  if (!limit.allowed) {
+    reply.header("retry-after", String(limit.retryAfterSeconds));
+    reply.code(429).send({ error: "rate_limited" });
+    return;
+  }
+  return projectTransportHealth(await transportHealth.snapshot());
 });
 
 app.get("/admin/gateway-diagnostics", {

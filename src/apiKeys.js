@@ -3,6 +3,7 @@ const crypto = require("node:crypto");
 const {
   DEFAULT_PROJECT_KEY_SCOPES,
   normalizeProjectKeyScopes,
+  migratedProjectKeyScopes,
 } = require("./projectKeyScopes");
 
 const LOG_KEEP = 5000;
@@ -42,7 +43,11 @@ class ApiKeyStore {
           delete key.token;
           dirty = true;
         }
-        const scopes = normalizeProjectKeyScopes(key.scopes);
+        // A key persisted with EXACTLY the previous default scope set is migrated
+        // forward (it was never an operator's choice); every other explicit set -
+        // restricted or custom - is left untouched.
+        const migrated = migratedProjectKeyScopes(key.scopes);
+        const scopes = migrated || normalizeProjectKeyScopes(key.scopes);
         if (!Array.isArray(key.scopes) || JSON.stringify(scopes) !== JSON.stringify(key.scopes)) {
           key.scopes = scopes;
           dirty = true;

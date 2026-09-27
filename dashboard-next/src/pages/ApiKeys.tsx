@@ -8,9 +8,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 
+// Keep in step with PROJECT_KEY_SCOPES in src/projectKeyScopes.js: a scope
+// missing here is not assignable from the dashboard, so the key silently lacks
+// an authority the API will demand. (sms.invalidate and transport:read were both
+// missing before this list was corrected.)
 const PROJECT_KEY_SCOPES = [
-  "sms.send", "sms.status", "sms.cancel", "sms.capacity",
+  "sms.send", "sms.status", "sms.cancel", "sms.capacity", "sms.invalidate",
   "conversations.read", "events.read", "commands.create", "commands.read",
+  "transport:read",
 ] as const;
 const DEFAULT_PROJECT_KEY_SCOPES = PROJECT_KEY_SCOPES.filter((scope) => !scope.startsWith("commands."));
 
