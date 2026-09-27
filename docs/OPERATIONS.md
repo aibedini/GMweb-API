@@ -295,3 +295,23 @@ If that does not recover, stop the process, run `npm run login`, repair Google M
 - Do not enable `ENABLE_DEBUG_ROUTES` on public servers.
 - Put the service behind HTTPS and a firewall.
 - Prefer `HOST=127.0.0.1` behind Nginx.
+
+## Eve SMS callback operations
+
+When Eve callbacks are enabled, inspect bounded `Eve SMS callback accepted`
+and `Eve SMS callback not accepted` log records for event ID, delivery ID,
+event type, attempt, HTTP status, outbox state and next attempt time. Do not
+log or copy the callback secret, message body or recipient number. For a
+read-only count by state on the GMweb host, query `data/sends.db`:
+
+```sql
+SELECT state, COUNT(*) FROM eve_sms_outbox GROUP BY state;
+```
+
+`pending` and `retry_wait` are scheduled for delivery; `delivering` can be
+recovered after a 30-second stale claim; `delivered` has a persisted 2xx ACK;
+`dead_letter` is a permanent non-2xx rejection that needs operator review.
+Inspect only the bounded status/error columns, not `body`, during routine
+diagnosis. Compare Eve's Delivery Log with `message_id=send_<ledger-id>` and
+the stable `event_id`. Test the staging route with a synthetic notification and
+mock device outcome; never use customer SMS for verification.

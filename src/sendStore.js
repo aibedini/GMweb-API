@@ -129,6 +129,9 @@ class SendStore {
       // must outlive the in-memory outbox, otherwise /gateway/validate cannot
       // answer after a restart.
       "ALTER TABLE sends ADD COLUMN gateway_request_id TEXT",
+      // Distinguish a physical submission from the admin's manual "complete"
+      // operation, which can set status=sent without device evidence.
+      "ALTER TABLE sends ADD COLUMN physical_submitted INTEGER NOT NULL DEFAULT 0",
       // Which notification KINDS the recorded watermark invalidated. A renewal
       // that only revoked "volume_ended" must not silently block an "expired"
       // reminder the consumer still considers valid.
@@ -136,6 +139,78 @@ class SendStore {
     ]) {
       try { this.db.exec(sql); } catch { /* already present */ }
     }
+    // Eve callbacks are separate from the generic webhook. SQLite triggers
+    // append their immutable bodies in the same transaction as the canonical
+    // send status, including late Android ACK reconciliation. Existing rows are
+    // deliberately not backfilled: old state is not a new transition.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS eve_sms_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        delivery_id TEXT NOT NULL UNIQUE,
+        send_id INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        body TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL,
+        last_attempt_at INTEGER,
+        last_http_status INTEGER,
+        last_error TEXT,
+        delivered_at INTEGER,
+        created_at INTEGER NOT NULL,
+        UNIQUE(send_id, event_type)
+      );
+      CREATE INDEX IF NOT EXISTS idx_eve_sms_outbox_due
+        ON eve_sms_outbox(state, next_attempt_at, id);
+      CREATE TRIGGER IF NOT EXISTS eve_sms_body_immutable
+      BEFORE UPDATE OF event_id, delivery_id, body ON eve_sms_outbox
+      BEGIN
+        SELECT RAISE(ABORT, 'immutable_eve_event');
+      END;
+      CREATE TRIGGER IF NOT EXISTS eve_sms_queued_on_tag
+      AFTER UPDATE OF source ON sends
+      WHEN NEW.source='eve' AND OLD.source IS NOT 'eve' AND NEW.status='queued'
+      BEGIN
+        INSERT INTO eve_sms_outbox
+          (event_id, delivery_id, send_id, event_type, body, next_attempt_at, created_at)
+        VALUES (
+          'gmw:send:' || NEW.id || ':queued',
+          'gmw:send:' || NEW.id || ':queued',
+          NEW.id, 'send.queued',
+          json_object(
+            'event_id', 'gmw:send:' || NEW.id || ':queued',
+            'trace_id', 'send_' || NEW.id,
+            'message_id', 'send_' || NEW.id,
+            'type', 'send.queued',
+            'occurred_at', strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at / 1000.0, 'unixepoch')
+          ), NEW.updated_at, NEW.updated_at
+        ) ON CONFLICT(send_id, event_type) DO NOTHING;
+      END;
+      CREATE TRIGGER IF NOT EXISTS eve_sms_on_status
+      AFTER UPDATE OF status ON sends
+      WHEN NEW.source='eve' AND NEW.status IS NOT OLD.status
+        AND NEW.status IN ('sent', 'failed', 'cancelled', 'superseded')
+        AND (NEW.status <> 'sent' OR NEW.physical_submitted=1)
+      BEGIN
+        INSERT INTO eve_sms_outbox
+          (event_id, delivery_id, send_id, event_type, body, next_attempt_at, created_at)
+        VALUES (
+          'gmw:send:' || NEW.id || ':' || CASE WHEN NEW.status='superseded' THEN 'cancelled' ELSE NEW.status END,
+          'gmw:send:' || NEW.id || ':' || CASE WHEN NEW.status='superseded' THEN 'cancelled' ELSE NEW.status END,
+          NEW.id,
+          'send.' || CASE WHEN NEW.status='superseded' THEN 'cancelled' ELSE NEW.status END,
+          json_patch(json_object(
+            'event_id', 'gmw:send:' || NEW.id || ':' || CASE WHEN NEW.status='superseded' THEN 'cancelled' ELSE NEW.status END,
+            'trace_id', 'send_' || NEW.id,
+            'message_id', 'send_' || NEW.id,
+            'type', 'send.' || CASE WHEN NEW.status='superseded' THEN 'cancelled' ELSE NEW.status END,
+            'occurred_at', strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at / 1000.0, 'unixepoch')
+          ), CASE WHEN NEW.attempts > 0 THEN json_object('attempt', NEW.attempts) ELSE '{}' END),
+          NEW.updated_at, NEW.updated_at
+        ) ON CONFLICT(send_id, event_type) DO NOTHING;
+      END;
+    `);
     for (const sql of [
       "CREATE INDEX IF NOT EXISTS idx_sends_service ON sends (source, service_key, status)",
       "CREATE INDEX IF NOT EXISTS idx_sends_notification_generation ON sends (service_key, notification_generation)",
@@ -196,6 +271,7 @@ class SendStore {
     this._byId = this.db.prepare(`SELECT * FROM sends WHERE id=? LIMIT 1`);
     this._setStatusByJob = this.db.prepare(
       `UPDATE sends SET status=@status, attempts=@attempts, error=@error, updated_at=@now,
+         physical_submitted = CASE WHEN @status='sent' THEN 1 ELSE physical_submitted END,
          active_at = CASE WHEN @status='active' THEN @now ELSE active_at END,
          finished_at = CASE WHEN @status IN ('sent','unverified','failed','suppressed','cancelled','superseded') THEN @now ELSE finished_at END,
          sent_at = CASE WHEN @status='sent' THEN @now ELSE sent_at END,
@@ -283,12 +359,14 @@ class SendStore {
     this._lateSent = this.db.prepare(
       `UPDATE sends
           SET status='sent', sent_at=COALESCE(sent_at, @now),
+              physical_submitted=1,
               finished_at=@now, updated_at=@now, error=NULL, result_json=@result_json
         WHERE id=@id AND status NOT IN ('sent','suppressed')`
     );
     this._markSentAfterRevocation = this.db.prepare(
       `UPDATE sends
           SET status='sent', sent_at=COALESCE(sent_at, @now),
+              physical_submitted=1,
               finished_at=@now, updated_at=@now, result_json=@result_json,
               sent_after_revocation_at=@now
         WHERE id=@id
@@ -635,13 +713,15 @@ class SendStore {
   // idempotency reservation happens in Redis first, so retries never call this.
   create({ to, text, keyName, priority = "normal", idempotencyKey = null, notification = null }) {
     const now = Date.now();
-    const info = this._insert.run({
-      dedupe_key: dedupeKey(to, text), to_number: to, text,
-      key_name: keyName || null, priority, idempotency_key: idempotencyKey, now
-    });
-    const id = Number(info.lastInsertRowid);
-    if (notification) this._setNotification.run(this._notificationParams(id, notification, now));
-    return id;
+    return this.db.transaction(() => {
+      const info = this._insert.run({
+        dedupe_key: dedupeKey(to, text), to_number: to, text,
+        key_name: keyName || null, priority, idempotency_key: idempotencyKey, now
+      });
+      const id = Number(info.lastInsertRowid);
+      if (notification) this._setNotification.run(this._notificationParams(id, notification, now));
+      return id;
+    })();
   }
 
   backfillPending(job) {
