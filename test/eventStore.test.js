@@ -370,6 +370,9 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
       ["contacts-snapshot", "contacts-change", "key"]);
     assert.deepEqual(store.bootstrap("a").contactEvents.map(event => event.eventId),
       ["contacts-snapshot", "contacts-change"]);
+    const lazy = store.bootstrap("a", 1, { includeContacts: false });
+    assert.deepEqual(lazy.contactEvents, []);
+    assert.equal(lazy.highWatermark, store.highWatermark("a"));
     assert.deepEqual(store.deviceGrantsAfter("a", "web", 0).events.map(event => event.eventId), ["key"]);
   });
 

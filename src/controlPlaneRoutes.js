@@ -768,12 +768,16 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     schema: {
       summary: "Encrypted linked-browser bootstrap",
       tags: ["Sync"],
-      querystring: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 200, default: 100 } } },
+      querystring: { type: "object", properties: {
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 100 },
+        includeContacts: { type: "boolean", default: true },
+      } },
       response: { 200: { type: "object", additionalProperties: true } },
     },
   }, async (request, reply) => {
     webSnapshotHeaders(reply);
-    return eventStore.bootstrap(accountId, Number(request.query?.limit) || 100);
+    return eventStore.bootstrap(accountId, Number(request.query?.limit) || 100,
+      { includeContacts: request.query?.includeContacts !== false });
   });
 
   app.post("/api/v1/web/sync/ack", {

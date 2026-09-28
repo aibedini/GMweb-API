@@ -22,6 +22,8 @@ export const SNAPSHOT_LAST_PAGE_MS_KEY = "snapshot_last_page_ms_v2";
 export const SNAPSHOT_PAGE_COUNT_KEY = "snapshot_page_count_v2";
 export const SNAPSHOT_POSITION_KEY = "snapshot_position_v2";
 export const REPLICA_MIGRATION_VERSION_KEY = "replica_migration_version";
+/** Current-state pages are fetched on demand; this is not a full replica ACK. */
+export const LAZY_INBOX_KEY = "lazy_inbox_v1";
 export const RECONSTRUCTABLE_STATE_EVENTS = new Set([
   "MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED", "MESSAGE_DELETED",
   "CONVERSATION_UPSERT", "CONVERSATION_UPSERTED", "CONVERSATION_DELETED", "THREAD_READ",
