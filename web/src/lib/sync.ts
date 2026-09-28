@@ -8,7 +8,7 @@
  * without touching storage or UI.
  */
 
-import { fetchWebConversationPage, fetchWebMessagePage,
+import { fetchWebBootstrap, fetchWebConversationPage, fetchWebMessagePage,
   type EncryptedConversationState, type EncryptedMessageState, type SyncEvent } from "./api.ts";
 import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypto.ts";
 import { decodeEventPayload, type ConversationProjection } from "./inbox.ts";
@@ -23,7 +23,7 @@ import { createProjectionEngine, conversationStateEvent, messageStateEvent } fro
 export { getBrowserSyncStatus } from "./sync/sync-state.ts";
 export type { BrowserSyncState, BrowserSyncStatus } from "./sync/sync-state.ts";
 
-import { DB_NAME, DB_VERSION, STORE_EVENTS, STORE_META, STORE_CONTACTS, CURSOR_KEY, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, PROJECTION_CURSOR_KEY, SNAPSHOT_TOKEN_KEY, SNAPSHOT_BASELINE_KEY, SNAPSHOT_COMPLETE_KEY, SNAPSHOT_STARTED_AT_KEY, SNAPSHOT_LAST_PAGE_AT_KEY, SNAPSHOT_LAST_PAGE_MS_KEY, SNAPSHOT_PAGE_COUNT_KEY, SNAPSHOT_POSITION_KEY, REPLICA_MIGRATION_VERSION_KEY, RECONSTRUCTABLE_STATE_EVENTS } from "./sync/schema.ts";
+import { DB_NAME, DB_VERSION, STORE_EVENTS, STORE_META, STORE_CONTACTS, CURSOR_KEY, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES, PROJECTION_CURSOR_KEY, REPLICA_GENERATION_KEY, SNAPSHOT_VERSION_KEY, SNAPSHOT_TOKEN_KEY, SNAPSHOT_CURSOR_KEY, SNAPSHOT_BASELINE_KEY, SNAPSHOT_COMPLETE_KEY, SNAPSHOT_STARTED_AT_KEY, SNAPSHOT_LAST_PAGE_AT_KEY, SNAPSHOT_LAST_PAGE_MS_KEY, SNAPSHOT_PAGE_COUNT_KEY, SNAPSHOT_POSITION_KEY, LAZY_INBOX_KEY, REPLICA_MIGRATION_VERSION_KEY, RECONSTRUCTABLE_STATE_EVENTS } from "./sync/schema.ts";
 export { PROJECTION_CURSOR_KEY } from "./sync/schema.ts";
 const { refreshConversationProjectionsInDb, repairConversationProjectionGap, ensureConversationProjectionRebuilt } = createProjectionEngine({
   requestToPromise, txDone, metaNumber, contactsFromDb, decryptForDisplay,
@@ -135,12 +135,13 @@ export async function getProjectionCursor(): Promise<number> {
 
 /** Independent durable positions; neither key cursor advances the event cursor. */
 export async function getReplicationProgress(deviceId: string): Promise<{
-  snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number;
+  lazyMode: boolean; snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number;
   snapshotPosition: number; snapshotPageCount: number; snapshotStartedAt: number;
   lastSnapshotPageAt: number; lastSnapshotPageMs: number;
 }> {
   const db = await openDb();
-  const [snapshotComplete, snapshotBaseline, keyringCursor, grantCursor, snapshotPosition, snapshotPageCount, snapshotStartedAt, lastSnapshotPageAt, lastSnapshotPageMs] = await Promise.all([
+  const [lazyMode, snapshotComplete, snapshotBaseline, keyringCursor, grantCursor, snapshotPosition, snapshotPageCount, snapshotStartedAt, lastSnapshotPageAt, lastSnapshotPageMs] = await Promise.all([
+    metaValue<boolean>(db, LAZY_INBOX_KEY),
     metaValue<boolean>(db, SNAPSHOT_COMPLETE_KEY),
     metaNumber(db, SNAPSHOT_BASELINE_KEY),
     metaNumber(db, keyringCursorKey(deviceId)),
@@ -151,7 +152,7 @@ export async function getReplicationProgress(deviceId: string): Promise<{
     metaNumber(db, SNAPSHOT_LAST_PAGE_AT_KEY),
     metaNumber(db, SNAPSHOT_LAST_PAGE_MS_KEY),
   ]);
-  return { snapshotComplete: snapshotComplete === true, snapshotBaseline, keyringCursor, grantCursor,
+  return { lazyMode: lazyMode === true, snapshotComplete: snapshotComplete === true, snapshotBaseline, keyringCursor, grantCursor,
     snapshotPosition, snapshotPageCount, snapshotStartedAt, lastSnapshotPageAt, lastSnapshotPageMs };
 }
 
@@ -162,6 +163,85 @@ function serializeSync(run: () => Promise<number>): Promise<number> {
   // overwrite a newer cursor after it completes out of order.
   if (!runningSync) runningSync = run().finally(() => { runningSync = null; });
   return runningSync;
+}
+
+/** Refresh only current conversation summaries; the watermark records observation, not downloaded history. */
+export function syncVisibleInbox(): Promise<number> {
+  updateSyncStatus({ state: "INITIALIZING", lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
+  return serializeSync(async () => {
+    try {
+      const page = await fetchWebBootstrap(100, false);
+      if (!Number.isSafeInteger(page.highWatermark) || page.highWatermark < 0 ||
+          !page.replicaGeneration || !Number.isSafeInteger(page.snapshotVersion) ||
+          page.conversations.length > 100 || page.contactEvents.length !== 0) {
+        throw new Error("Invalid lazy inbox bootstrap");
+      }
+      const db = await openDb();
+      const [lazy, priorGeneration, priorVersion, priorCursor] = await Promise.all([
+        metaValue<boolean>(db, LAZY_INBOX_KEY), metaValue<string>(db, REPLICA_GENERATION_KEY),
+        metaValue<number>(db, SNAPSHOT_VERSION_KEY), metaNumber(db, CURSOR_KEY),
+      ]);
+      const reset = lazy !== true || priorGeneration !== page.replicaGeneration || priorVersion !== page.snapshotVersion;
+      const observed = reset ? page.highWatermark : Math.max(priorCursor, page.highWatermark);
+      const transaction = db.transaction([STORE_EVENTS, STORE_META, STORE_CONTACTS, STORE_CONVERSATIONS,
+        STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES], "readwrite");
+      if (reset) {
+        for (const name of [STORE_EVENTS, STORE_CONTACTS, STORE_CONVERSATIONS,
+          STORE_ENCRYPTED_CONVERSATIONS, STORE_ENCRYPTED_MESSAGES]) transaction.objectStore(name).clear();
+        volatileContacts.clear();
+      }
+      const conversations = transaction.objectStore(STORE_ENCRYPTED_CONVERSATIONS);
+      for (const row of page.conversations) {
+        const get = conversations.get(row.conversationId);
+        get.onsuccess = () => {
+          const old = get.result as EncryptedConversationState | undefined;
+          if (!old || row.revision > old.revision ||
+              (row.revision === old.revision && row.lastServerSequence >= old.lastServerSequence)) conversations.put(row);
+        };
+      }
+      const meta = transaction.objectStore(STORE_META);
+      meta.put(true, LAZY_INBOX_KEY);
+      meta.put(observed, CURSOR_KEY);
+      meta.put(observed, PROJECTION_CURSOR_KEY);
+      meta.put(page.replicaGeneration, REPLICA_GENERATION_KEY);
+      meta.put(page.snapshotVersion, SNAPSHOT_VERSION_KEY);
+      for (const key of [SNAPSHOT_TOKEN_KEY, SNAPSHOT_CURSOR_KEY, SNAPSHOT_BASELINE_KEY,
+        SNAPSHOT_COMPLETE_KEY, SNAPSHOT_STARTED_AT_KEY, SNAPSHOT_LAST_PAGE_AT_KEY,
+        SNAPSHOT_LAST_PAGE_MS_KEY, SNAPSHOT_PAGE_COUNT_KEY, SNAPSHOT_POSITION_KEY]) meta.delete(key);
+      await txDone(transaction);
+      const keyDegraded = !(await syncKeysSafely(bootstrapKeyGrants));
+      updateSyncStatus({ state: keyDegraded ? "DEGRADED" : "UP_TO_DATE",
+        lastSuccessfulSyncAt: Date.now(), appliedThisRun: 0, lastPageCount: page.conversations.length });
+      return reset || observed > priorCursor ? 1 : 0;
+    } catch (cause) {
+      syncFailure("VISIBLE_SYNC", cause, false);
+      throw cause;
+    }
+  });
+}
+
+/** Contacts are a separate encrypted view; loading the Inbox never requests them. */
+export async function loadContactsOnDemand(): Promise<void> {
+  const db = await openDb();
+  if (await metaValue<boolean>(db, LAZY_INBOX_KEY) !== true) await syncVisibleInbox();
+  if (!navigator.onLine) return;
+  const page = await fetchWebBootstrap(1, true);
+  const oldContactKeys: IDBValidKey[] = [];
+  const read = db.transaction(STORE_EVENTS, "readonly");
+  const cursor = read.objectStore(STORE_EVENTS).openCursor();
+  cursor.onsuccess = () => {
+    const row = cursor.result;
+    if (!row) return;
+    if (["CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"].includes((row.value as SyncEvent).type)) oldContactKeys.push(row.primaryKey);
+    row.continue();
+  };
+  await txDone(read);
+  const transaction = db.transaction(STORE_EVENTS, "readwrite");
+  const events = transaction.objectStore(STORE_EVENTS);
+  for (const key of oldContactKeys) events.delete(key);
+  for (const event of page.contactEvents) events.put(event);
+  await txDone(transaction);
+  await repairContactsFromLocalEvents(db);
 }
 
 export function syncNow(onProgress?: (applied: number) => void): Promise<number> {
@@ -309,6 +389,29 @@ async function cachedMessagePage(db: IDBDatabase, aggregateId: string, before: s
   };
 }
 
+async function cacheCurrentStates<T extends EncryptedConversationState | EncryptedMessageState>(
+  db: IDBDatabase, storeName: string, rows: T[], id: (row: T) => string,
+): Promise<T[]> {
+  const transaction = db.transaction(storeName, "readwrite");
+  const store = transaction.objectStore(storeName);
+  const effective: T[] = [];
+  for (const [index, row] of rows.entries()) {
+    const get = store.get(id(row));
+    get.onsuccess = () => {
+      const old = get.result as T | undefined;
+      if (old && (old.revision > row.revision ||
+          (old.revision === row.revision && old.lastServerSequence > row.lastServerSequence))) {
+        effective[index] = old;
+      } else {
+        effective[index] = row;
+        store.put(row);
+      }
+    };
+  }
+  await txDone(transaction);
+  return effective;
+}
+
 /**
  * P1: paged thread reads via the [aggregateId, sequence] index instead of a
  * getAll() of the whole conversation. Newest ~200 first; pass
@@ -320,6 +423,12 @@ export async function listAggregateEventsPage(
 ): Promise<AggregatePage> {
   const limit = Math.max(1, Math.min(500, options.limit ?? 200));
   const db = await openDb();
+  if (await metaValue<boolean>(db, LAZY_INBOX_KEY) === true && navigator.onLine) {
+    const remote = await fetchWebMessagePage(aggregateId, options.beforeState, Math.min(100, limit));
+    const current = await cacheCurrentStates(db, STORE_ENCRYPTED_MESSAGES, remote.messages, row => row.messageId);
+    return { items: await decryptForDisplay(current.map(messageStateEvent)),
+      hasMore: remote.hasMore, next: remote.nextCursor ?? undefined };
+  }
   const localPage = await cachedMessagePage(db, aggregateId, options.beforeState, limit);
   const hasV2Snapshot = Boolean(await metaValue<string>(db, SNAPSHOT_TOKEN_KEY));
   if (hasV2Snapshot && localPage.items.length > 0) return localPage;
@@ -573,7 +682,33 @@ export interface ConversationPage {
   items: ConversationProjection[];
   hasMore: boolean;
   /** Cursor for the next page ("load older"). */
-  next?: { lastAt: number; aggregateId: string };
+  next?: string | { lastAt: number; aggregateId: string };
+}
+
+async function projectEncryptedConversations(encrypted: EncryptedConversationState[]): Promise<ConversationProjection[]> {
+  const items: ConversationProjection[] = [];
+  for (const row of encrypted) {
+    if (row.tombstone) continue;
+    const decrypted = await decryptMessage(conversationStateEvent(row));
+    if (decrypted.state !== "decrypted") {
+      items.push({ aggregateId: row.conversationId, title: "Encrypted message",
+        preview: "Locked — waiting for the history key", lastAt: row.sortKey,
+        read: true, unreadCount: 0, lastMessageId: row.conversationId,
+        lastSequence: row.lastServerSequence, decodeState: "locked" });
+      continue;
+    }
+    const value = decrypted.payload;
+    const address = typeof value.address === "string" ? value.address : "";
+    const displayName = typeof value.displayName === "string" ? value.displayName : address;
+    items.push({ aggregateId: row.conversationId, title: displayName || "Unknown conversation",
+      ...(displayName && address && displayName !== address ? { subtitle: address } : {}),
+      preview: typeof value.lastMessagePreview === "string" ? value.lastMessagePreview : "",
+      lastAt: Number(value.lastMessageAt) || row.sortKey,
+      read: Number(value.unreadCount) === 0,
+      unreadCount: Math.max(0, Number(value.unreadCount) || 0),
+      lastMessageId: row.conversationId, lastSequence: row.lastServerSequence, decodeState: "ready" });
+  }
+  return items;
 }
 
 /**
@@ -582,16 +717,28 @@ export interface ConversationPage {
  * reachable instead of older ones silently disappearing from the Inbox.
  */
 export async function listConversations(
-  options: { limit?: number; before?: { lastAt: number; aggregateId: string } } = {},
+  options: { limit?: number; before?: string | { lastAt: number; aggregateId: string } } = {},
 ): Promise<ConversationPage> {
   const limit = Math.max(1, Math.min(500, options.limit ?? 100));
   const db = await openDb();
+  const lazy = await metaValue<boolean>(db, LAZY_INBOX_KEY) === true;
+  if (lazy && navigator.onLine) {
+    const before = typeof options.before === "string" ? options.before : options.before
+      ? encodeStateCursor(options.before.lastAt, options.before.aggregateId) : undefined;
+    const remote = await fetchWebConversationPage(before, Math.min(200, limit));
+    const current = await cacheCurrentStates(db, STORE_ENCRYPTED_CONVERSATIONS, remote.conversations, row => row.conversationId);
+    return { items: await projectEncryptedConversations(current),
+      hasMore: remote.hasMore, next: remote.nextCursor ?? undefined };
+  }
   const encryptedCount = await requestToPromise(
     db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readonly")
       .objectStore(STORE_ENCRYPTED_CONVERSATIONS).count());
   if (encryptedCount > 0) {
-    if (options.before && navigator.onLine && !(await metaValue<string>(db, SNAPSHOT_TOKEN_KEY))) {
-      const raw = btoa(JSON.stringify([options.before.lastAt, options.before.aggregateId]))
+    if (options.before && !lazy && navigator.onLine && !(await metaValue<string>(db, SNAPSHOT_TOKEN_KEY))) {
+      const marker = typeof options.before === "string" ? decodeStateCursor(options.before) :
+        [options.before.lastAt, options.before.aggregateId];
+      if (!marker) throw new Error("Invalid conversation cursor");
+      const raw = btoa(JSON.stringify(marker))
         .replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
       const remote = await fetchWebConversationPage(raw, Math.min(200, limit + 1));
       const write = db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readwrite");
@@ -603,9 +750,9 @@ export async function listConversations(
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readonly");
       const index = transaction.objectStore(STORE_ENCRYPTED_CONVERSATIONS).index("by_sort");
-      const range = options.before
-        ? IDBKeyRange.upperBound([options.before.lastAt, options.before.aggregateId], true)
-        : null;
+      const before = typeof options.before === "string" ? decodeStateCursor(options.before) : options.before
+        ? [options.before.lastAt, options.before.aggregateId] as [number, string] : null;
+      const range = before ? IDBKeyRange.upperBound(before, true) : null;
       const request = index.openCursor(range, "prev");
       request.onsuccess = () => {
         const cursor = request.result;
@@ -617,46 +764,21 @@ export async function listConversations(
       transaction.oncomplete = () => resolve();
       transaction.onabort = () => reject(transaction.error);
     });
-    const items: ConversationProjection[] = [];
-    for (const row of encrypted) {
-      if (row.tombstone) continue;
-      const event = conversationStateEvent(row);
-      const decrypted = await decryptMessage(event);
-      if (decrypted.state !== "decrypted") {
-        items.push({ aggregateId: row.conversationId, title: "Encrypted message",
-          preview: "Locked — waiting for the history key", lastAt: row.sortKey,
-          read: true, unreadCount: 0, lastMessageId: row.conversationId,
-          lastSequence: row.lastServerSequence, decodeState: "locked" });
-        continue;
-      }
-      const value = decrypted.payload;
-      const address = typeof value.address === "string" ? value.address : "";
-      const displayName = typeof value.displayName === "string" ? value.displayName : address;
-      items.push({
-        aggregateId: row.conversationId,
-        title: displayName || "Unknown conversation",
-        ...(displayName && address && displayName !== address ? { subtitle: address } : {}),
-        preview: typeof value.lastMessagePreview === "string" ? value.lastMessagePreview : "",
-        lastAt: Number(value.lastMessageAt) || row.sortKey,
-        read: Number(value.unreadCount) === 0,
-        unreadCount: Math.max(0, Number(value.unreadCount) || 0),
-        lastMessageId: row.conversationId,
-        lastSequence: row.lastServerSequence,
-        decodeState: "ready",
-      });
-    }
+    const items = await projectEncryptedConversations(encrypted);
     const last = items.at(-1);
+    const lastRaw = encrypted.at(-1);
     return { items, hasMore, next: hasMore && last
-      ? { lastAt: last.lastAt, aggregateId: last.aggregateId } : undefined };
+      ? lazy && lastRaw ? encodeStateCursor(lastRaw.sortKey, lastRaw.conversationId)
+        : { lastAt: last.lastAt, aggregateId: last.aggregateId } : undefined };
   }
   const items: ConversationProjection[] = [];
   let hasMore = false;
   await new Promise<void>((resolve, reject) => {
     const transaction = db.transaction(STORE_CONVERSATIONS, "readonly");
     const index = transaction.objectStore(STORE_CONVERSATIONS).index("by_last_at");
-    const range = options.before
-      ? IDBKeyRange.upperBound([options.before.lastAt, options.before.aggregateId], true)
-      : null;
+    const before = typeof options.before === "string" ? decodeStateCursor(options.before) : options.before
+      ? [options.before.lastAt, options.before.aggregateId] as [number, string] : null;
+    const range = before ? IDBKeyRange.upperBound(before, true) : null;
     const req = index.openCursor(range, "prev");
     req.onsuccess = () => {
       const cursor = req.result;
@@ -721,6 +843,7 @@ export function subscribeSyncAvailable(
   onSynced: (applied: number) => void,
   onRevoked: () => void,
   onSyncError?: (cause: unknown) => void,
+  syncFunction: () => Promise<number> = syncNow,
 ): () => void {
-  return subscribeLiveInvalidation(syncNow, onSynced, onRevoked, onSyncError);
+  return subscribeLiveInvalidation(syncFunction, onSynced, onRevoked, onSyncError);
 }

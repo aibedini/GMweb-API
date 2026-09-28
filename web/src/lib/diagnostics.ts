@@ -1,5 +1,5 @@
 import { fetchKeyGrantsAfter, fetchKeyring, fetchSyncDiagnostics, health, type ServerSyncDiagnostics, type SyncEvent } from "./api.ts";
-import { getBrowserSyncStatus, getCursor, getProjectionCursor, getReplicationProgress, type BrowserSyncStatus } from "./sync.ts";
+import { getBrowserSyncStatus, getCursor, getProjectionCursor, getReplicationProgress, listContacts, type BrowserSyncStatus } from "./sync.ts";
 import { getStoredDeviceIdentity, loadCryptoRecord } from "./deviceKeys.ts";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "./buildInfo.ts";
 import { decryptMessage, receiveKeyGrants, type Decryption } from "./messageCrypto.ts";
@@ -13,7 +13,7 @@ export interface WebDiagnosticReport {
   session: { linked: boolean; capabilities: string[]; apiVersion: string; pwaVersion: string; loadedScript: string; serviceWorker: string; online: boolean; buildMismatch: boolean };
   server: ServerSyncDiagnostics | null;
   browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number; phaseErrorClass: PhaseErrorClass };
-  replicaProgress?: { snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number; snapshotPosition?: number; snapshotPageCount?: number; snapshotStartedAt?: number; lastSnapshotPageAt?: number; lastSnapshotPageMs?: number };
+  replicaProgress?: { lazyMode: boolean; snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number; snapshotPosition?: number; snapshotPageCount?: number; snapshotStartedAt?: number; lastSnapshotPageAt?: number; lastSnapshotPageMs?: number };
   indexedDb: { total: number; byType: Record<string, number>; byCryptoVersion: Record<string, number>; nullAggregateCount: number; distinctMessageAggregateCount: number; conversationRows: number; contactRows: number };
   crypto: { browserIdentity: boolean; verifiedPrimary: boolean; primaryMatchesBrowser: boolean; messages: DecryptionCounts; keyGrants: DecryptionCounts };
   projection: { cursor: number; lag: number; rawMessageAggregates: number; rows: number; readyRows: number; lockedRows: number; failure: "PROJECTION_DIVERGENCE" | null };
@@ -72,10 +72,11 @@ export function detectContactsFailure(eventCounts: Record<string, number>, paylo
   return null;
 }
 
-export function diagnosticOutcome(input: { buildMismatch: boolean; projectionFailure: string | null; syncState: BrowserSyncStatus["state"]; contactsFailure: string | null; syncLag: number | null; projectionLag: number }): WebDiagnosticReport["overall"] {
+export function diagnosticOutcome(input: { buildMismatch: boolean; projectionFailure: string | null; syncState: BrowserSyncStatus["state"]; contactsFailure: string | null; syncLag: number | null; projectionLag: number; lazyMode?: boolean; trustUnavailable?: boolean }): WebDiagnosticReport["overall"] {
   if (input.buildMismatch || input.projectionFailure || input.syncState === "FAILED") return "FAIL";
-  if (input.syncState === "DEGRADED" || input.contactsFailure) return "WARN";
-  if (input.syncLag === null || input.syncLag > 0 || input.projectionLag > 0 || input.syncState !== "UP_TO_DATE") return "SYNCING";
+  if (input.syncState === "DEGRADED" || input.contactsFailure || input.trustUnavailable) return "WARN";
+  if ((!input.lazyMode && (input.syncLag === null || input.syncLag > 0 || input.projectionLag > 0)) ||
+      input.syncState !== "UP_TO_DATE") return "SYNCING";
   return "PASS";
 }
 
@@ -193,27 +194,31 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
   // Opening through sync.ts first guarantees the current schema and performs
   // any pending projection repair before the read-only diagnostic scan.
   const [cursor, projectionCursor] = await Promise.all([getCursor(), getProjectionCursor()]);
-  const [sessionResponse, api, server, local, identity, pinned, registration, grantProbe] = await Promise.all([
+  const [sessionResponse, api, server, local, identity, pinned, registration, grantProbe, visibleContacts] = await Promise.all([
     fetch("/api/v1/linked-session", { credentials: "include" }).then(response => response.json()).catch(() => ({})),
     health().catch(() => ({ ok: false, version: "unreachable" })),
     fetchSyncDiagnostics().catch(() => null),
     localCounts(), getStoredDeviceIdentity(),
     loadCryptoRecord<{ deviceId: string; encryptionPublicKey: string }>("verified-primary").catch(() => null),
     navigator.serviceWorker?.getRegistration().catch(() => undefined),
-    probeKeyGrants(),
+    probeKeyGrants(), listContacts(),
   ]);
   const runtime = getBrowserSyncStatus();
   const replicaProgress = identity ? await getReplicationProgress(identity.deviceId) : undefined;
-  const projectionLag = replicaProgress && !replicaProgress.snapshotComplete
+  local.contactRows = visibleContacts.length;
+  const lazyMode = replicaProgress?.lazyMode === true;
+  const projectionLag = lazyMode ? 0 : replicaProgress && !replicaProgress.snapshotComplete
     ? Math.max(0, local.distinctMessageAggregateCount - local.conversationRows)
     : Math.max(0, cursor - projectionCursor);
-  const syncLag = server ? Math.max(0, server.maxSequence - cursor) : null;
-  const projectionFailure = detectProjectionFailure(local.distinctMessageAggregateCount, local.conversationRows, projectionCursor, cursor);
-  const contactsFailure = detectContactsFailure(local.byType, local.contactPayloadCrypto, local.contactRows);
+  const syncLag = lazyMode ? null : server ? Math.max(0, server.maxSequence - cursor) : null;
+  const projectionFailure = lazyMode ? null : detectProjectionFailure(local.distinctMessageAggregateCount, local.conversationRows, projectionCursor, cursor);
+  const contactsFailure = lazyMode && visibleContacts.length > 0 ? null :
+    detectContactsFailure(local.byType, local.contactPayloadCrypto, local.contactRows);
   const primaryMatchesBrowser = Boolean(identity && pinned && pinned.deviceId === identity.deviceId &&
     pinned.encryptionPublicKey === identity.encryptionPublicKeyB64);
   const buildMismatch = api.version !== PWA_BUILD_VERSION;
-  const overall = diagnosticOutcome({ buildMismatch, projectionFailure, syncState: runtime.state, contactsFailure, syncLag, projectionLag });
+  const overall = diagnosticOutcome({ buildMismatch, projectionFailure, syncState: runtime.state, contactsFailure, syncLag, projectionLag, lazyMode,
+    trustUnavailable: !primaryMatchesBrowser });
   const report: WebDiagnosticReport = {
     collectedAt: Date.now(),
     session: {
@@ -271,13 +276,14 @@ export function formatWebDiagnostics(report: WebDiagnosticReport): string {
     `Linked session             ${report.session.linked ? "PASS" : "FAIL"}`,
     `API / PWA build            ${report.session.apiVersion} / ${report.session.pwaVersion}${report.session.buildMismatch ? " FAIL" : " PASS"}`,
     `Server max sequence        ${report.server?.maxSequence ?? "unavailable"}`,
-    `Browser cursor             ${report.browserSync.cursor}`,
-    `Sync lag                   ${report.browserSync.syncLag ?? "unknown"}`,
+    `${report.replicaProgress?.lazyMode ? "Observed server sequence  " : "Browser cursor             "}${report.browserSync.cursor}`,
+    `Full replica sync lag      ${report.replicaProgress?.lazyMode ? "not applicable (on-demand mode)" : report.browserSync.syncLag ?? "unknown"}`,
     `Sync state                 ${report.browserSync.state}`,
     `Sync error class           ${report.browserSync.phaseErrorClass ?? "none"}`,
     `Projection cursor          ${report.projection.cursor}`,
     `Projection lag             ${report.projection.lag}`,
-    `Snapshot complete          ${report.replicaProgress?.snapshotComplete ?? "unknown"}`,
+    `History loading mode       ${report.replicaProgress?.lazyMode ? "on demand" : "full replica"}`,
+    `Snapshot complete          ${report.replicaProgress?.lazyMode ? "not requested" : report.replicaProgress?.snapshotComplete ?? "unknown"}`,
     `Snapshot position          ${report.replicaProgress?.snapshotPosition ?? "unknown"}`,
     `Snapshot pages             ${report.replicaProgress?.snapshotPageCount ?? "unknown"}`,
     `Snapshot started at        ${report.replicaProgress?.snapshotStartedAt ?? "unknown"}`,

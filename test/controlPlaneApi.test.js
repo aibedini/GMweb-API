@@ -399,6 +399,11 @@ describe("Phase 2 control plane HTTP API", () => {
     const headers = { "x-test-linked": "web-device" };
     const bootstrap = await app.inject({ method: "GET", url: "/api/v1/web/bootstrap", headers });
     assert.equal(bootstrap.statusCode, 200);
+    const lazyBootstrap = await app.inject({ method: "GET",
+      url: "/api/v1/web/bootstrap?limit=1&includeContacts=false", headers });
+    assert.equal(lazyBootstrap.statusCode, 200);
+    assert.deepEqual(lazyBootstrap.json().contactEvents, []);
+    assert.equal(lazyBootstrap.json().highWatermark, bootstrap.json().highWatermark);
     const snapshot = bootstrap.json();
     const payload = {
       cursor: snapshot.highWatermark,

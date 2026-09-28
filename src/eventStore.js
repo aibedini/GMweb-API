@@ -661,12 +661,12 @@ class EventStore {
     return eventPage(rows, 0, rows.length).events;
   }
 
-  bootstrap(accountId, limit = 100) {
+  bootstrap(accountId, limit = 100, { includeContacts = true } = {}) {
     return this.db.transaction(() => ({
       protocolVersion: 3,
       ...this.replicaMetadata(accountId),
       highWatermark: this.highWatermark(accountId),
-      contactEvents: this.contactBootstrapEvents(accountId),
+      contactEvents: includeContacts ? this.contactBootstrapEvents(accountId) : [],
       ...this.conversations(accountId, null, limit),
     }))();
   }

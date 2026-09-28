@@ -68,6 +68,17 @@ export interface WebSnapshotPage {
   hasMore: boolean;
 }
 
+export interface WebBootstrapPage {
+  protocolVersion: number;
+  replicaGeneration: string;
+  snapshotVersion: number;
+  highWatermark: number;
+  contactEvents: SyncEvent[];
+  conversations: EncryptedConversationState[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
 export interface TrustSnapshot {
   accountId: string;
   trustSequence: number;
@@ -130,6 +141,12 @@ export async function continueWebSnapshot(token: string, cursor: string, limit =
     throw new Error(`HTTP ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
   }
   return jsonOrThrow<WebSnapshotPage>(res);
+}
+
+export async function fetchWebBootstrap(limit = 100, includeContacts = false): Promise<WebBootstrapPage> {
+  const query = new URLSearchParams({ limit: String(limit), includeContacts: String(includeContacts) });
+  const res = await fetch(`${API}/web/bootstrap?${query}`, { credentials: "include", cache: "no-store" });
+  return jsonOrThrow<WebBootstrapPage>(res);
 }
 
 export async function fetchWebConversationPage(cursor?: string, limit = 100) {
