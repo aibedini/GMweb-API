@@ -95,10 +95,27 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       body: { type: "object" },
       response: {
         200: { type: "object", properties: { ok: { type: "boolean" }, applied: { type: "boolean" }, trustSequence: { type: "integer" }, reason: { type: "string" } } },
-        400: { type: "object", properties: { error: { type: "string" } } }
+        400: { type: "object", properties: { error: { type: "string" } } },
+        409: { type: "object", additionalProperties: true },
       }
     }
   };
+
+  app.get("/api/v1/agent/trust/position", {
+    schema: { summary: "Primary-agent trust publication position", tags: ["Trust"],
+      response: { 200: { type: "object", properties: { trustSequence: { type: "integer" } } },
+        429: { type: "object", properties: { error: { type: "string" } } } } },
+  }, async (request, reply) => {
+    const rate = checkRateLimit(request, "agent-trust-position", 60, 60_000);
+    if (!rate.allowed) return reply.code(429).header("Retry-After", rate.retryAfterSeconds)
+      .send({ error: "agent_rate_limit" });
+    const agent = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (!agent || agent.role !== "PRIMARY_TRUST_AGENT") {
+      return reply.code(403).send({ error: "primary_agent_required" });
+    }
+    reply.header("Cache-Control", "no-store");
+    return { trustSequence: trustRegistry.currentSequence(accountId) };
+  });
 
   app.post("/api/v1/agent/trust/statements", trustStatementSchema, async (request, reply) => {
     const statement = request.body?.statement || request.body;
@@ -120,6 +137,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       return;
     }
     const result = applyStatement(statement);
+    if (!result.applied && result.reason !== "duplicate") return reply.code(409).send({ ok: false, ...result });
     return { ok: true, ...result };
   });
 
@@ -150,6 +168,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     // agent (checked above). rootSignature provides cryptographic binding;
     // web clients verify it independently before trusting.
     const result = applyStatement(statement);
+    if (!result.applied && result.reason !== "duplicate") return reply.code(409).send({ ok: false, ...result });
     return { ok: true, ...result };
   });
 

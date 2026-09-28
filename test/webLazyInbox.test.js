@@ -14,6 +14,16 @@ const message = (index, revision = 1) => ({ messageId: `message-${index}`,
   schemaVersion: 1, cryptoVersion: 3, lastServerSequence: 1000 + revision });
 const cursor = (sortKey, id) => Buffer.from(JSON.stringify([sortKey, id])).toString("base64url");
 
+test("current-state projections preserve the AEAD-bound event identity", async () => {
+  const { conversationStateEvent, messageStateEvent } = await import("../web/src/lib/sync/projection-engine.ts");
+  const encrypted = (eventId, type) => Buffer.from(JSON.stringify({ v: 3, kind: "message",
+    eventId, type, conversationId: "conversation-0", ciphertext: "opaque" })).toString("base64");
+  assert.equal(conversationStateEvent({ ...conversation(0), envelope: encrypted("original-conversation-event", "CONVERSATION_UPSERTED") }).eventId,
+    "original-conversation-event");
+  assert.equal(messageStateEvent({ ...message(0), envelope: encrypted("original-message-event", "MESSAGE_CREATED") }).eventId,
+    "original-message-event");
+});
+
 test("lazy inbox downloads summaries first and only the opened thread's bounded pages", async () => {
   const originalFetch = global.fetch;
   const originalNavigator = Object.getOwnPropertyDescriptor(global, "navigator");

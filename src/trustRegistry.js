@@ -1,5 +1,7 @@
 "use strict";
 
+const { isDeepStrictEqual } = require("node:util");
+
 /**
  * ADR-001 Signed Trust Registry relay — GMweb NEVER authorizes devices.
  *
@@ -88,6 +90,13 @@ class TrustRegistry {
     }
     const max = this.maxSeqStmt.get(accountId)?.maxSeq || 0;
     if (seq <= max) {
+      const old = this.db.prepare(`SELECT statement_id, root_signature, payload FROM trust_statements
+        WHERE account_id = ? AND trust_sequence = ?`).get(accountId, seq);
+      if (old && old.statement_id === String(statement.statementId || "") &&
+          old.root_signature === String(statement.rootSignature || "") &&
+          isDeepStrictEqual(JSON.parse(old.payload), statement)) {
+        return { applied: false, reason: "duplicate", trustSequence: seq, currentSequence: max };
+      }
       return { applied: false, reason: "stale_sequence", currentSequence: max };
     }
     // Sequence must be exactly max+1 — no gaps (Android assigns them serially).
@@ -105,6 +114,10 @@ class TrustRegistry {
       created_at: Date.now(),
     });
     return { applied: info.changes > 0, trustSequence: seq };
+  }
+
+  currentSequence(accountId) {
+    return this.maxSeqStmt.get(accountId)?.maxSeq || 0;
   }
 
   /** Store/refresh the latest Android-signed snapshot for an account. */
