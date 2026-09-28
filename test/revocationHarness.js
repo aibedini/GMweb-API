@@ -112,12 +112,12 @@ function createHarness(options = {}) {
     serviceKey = "eve:1:uuid-A", source = "eve", kind = "volume_ended",
     generation = 17, to = "+989120000001", text = "your volume ended",
     jobId = null, state = "waiting", requiresValidation = undefined,
-    correlationId = "corr-1", keyName = "eve", priority = "expiring"
+    correlationId = "corr-1", eveNotificationId = undefined, keyName = "eve", priority = "expiring"
   } = {}) {
     const id = store.claim({
       to, text, keyName, priority, windowMs: 0,
       notification: {
-        source, serviceKey, notificationKind: kind, generation, correlationId,
+        source, serviceKey, notificationKind: kind, generation, correlationId, eveNotificationId,
         ...(requiresValidation === undefined ? {} : { requiresValidation })
       }
     });
@@ -150,6 +150,7 @@ function createHarness(options = {}) {
       notificationKind: row.notification_kind, generation: row.notification_generation,
       correlationId: row.correlation_id, requiresValidation: Boolean(row.requires_validation)
     } : null;
+    if (meta && row.eve_notification_id) meta.eveNotificationId = row.eve_notification_id;
 
     try {
       let result;

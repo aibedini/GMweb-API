@@ -132,6 +132,7 @@ class SendStore {
       // Distinguish a physical submission from the admin's manual "complete"
       // operation, which can set status=sent without device evidence.
       "ALTER TABLE sends ADD COLUMN physical_submitted INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE sends ADD COLUMN eve_notification_id TEXT",
       // Which notification KINDS the recorded watermark invalidated. A renewal
       // that only revoked "volume_ended" must not silently block an "expired"
       // reminder the consumer still considers valid.
@@ -158,11 +159,59 @@ class SendStore {
         last_http_status INTEGER,
         last_error TEXT,
         delivered_at INTEGER,
-        created_at INTEGER NOT NULL,
-        UNIQUE(send_id, event_type)
+        created_at INTEGER NOT NULL
       );
+    `);
+    // v5: retain every immutable callback and its retry state while replacing
+    // the legacy per-send/type constraint with one scoped to send.* events.
+    // Carrier reports can have multiple distinct event IDs per message.
+    const outboxSql = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='eve_sms_outbox'").get()?.sql || "";
+    if (/UNIQUE\s*\(\s*send_id\s*,\s*event_type\s*\)/i.test(outboxSql)) {
+      this.db.transaction(() => {
+        this.db.exec(`
+          DROP TRIGGER IF EXISTS eve_sms_body_immutable;
+          DROP TRIGGER IF EXISTS eve_sms_queued_on_tag;
+          DROP TRIGGER IF EXISTS eve_sms_on_status;
+          CREATE TABLE eve_sms_outbox_v5 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE,
+            delivery_id TEXT NOT NULL UNIQUE, send_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL, body TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending', attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL, last_attempt_at INTEGER,
+            last_http_status INTEGER, last_error TEXT, delivered_at INTEGER,
+            created_at INTEGER NOT NULL
+          );
+          INSERT INTO eve_sms_outbox_v5 SELECT * FROM eve_sms_outbox;
+          DROP TABLE eve_sms_outbox;
+          ALTER TABLE eve_sms_outbox_v5 RENAME TO eve_sms_outbox;
+        `);
+      })();
+    }
+    this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_eve_sms_outbox_due
         ON eve_sms_outbox(state, next_attempt_at, id);
+      CREATE INDEX IF NOT EXISTS idx_eve_sms_outbox_state_created
+        ON eve_sms_outbox(state, created_at);
+      CREATE INDEX IF NOT EXISTS idx_eve_sms_outbox_delivered_at
+        ON eve_sms_outbox(delivered_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_eve_sms_outbox_last_attempt
+        ON eve_sms_outbox(last_attempt_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_eve_sms_send_event
+        ON eve_sms_outbox(send_id, event_type) WHERE event_type LIKE 'send.%';
+      CREATE TABLE IF NOT EXISTS carrier_delivery_reports (
+        event_id TEXT PRIMARY KEY, send_id INTEGER NOT NULL,
+        gateway_request_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('delivered','failed')),
+        occurred_at INTEGER NOT NULL, received_at INTEGER NOT NULL,
+        device_id TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_carrier_reports_send
+        ON carrier_delivery_reports(send_id, occurred_at);
+      CREATE INDEX IF NOT EXISTS idx_carrier_reports_status
+        ON carrier_delivery_reports(send_id, status, occurred_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_carrier_reports_received
+        ON carrier_delivery_reports(received_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_carrier_reports_occurred
+        ON carrier_delivery_reports(occurred_at DESC, event_id DESC);
       CREATE TRIGGER IF NOT EXISTS eve_sms_body_immutable
       BEFORE UPDATE OF event_id, delivery_id, body ON eve_sms_outbox
       BEGIN
@@ -185,7 +234,7 @@ class SendStore {
             'type', 'send.queued',
             'occurred_at', strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at / 1000.0, 'unixepoch')
           ), NEW.updated_at, NEW.updated_at
-        ) ON CONFLICT(send_id, event_type) DO NOTHING;
+        ) ON CONFLICT DO NOTHING;
       END;
       CREATE TRIGGER IF NOT EXISTS eve_sms_on_status
       AFTER UPDATE OF status ON sends
@@ -208,9 +257,15 @@ class SendStore {
             'occurred_at', strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at / 1000.0, 'unixepoch')
           ), CASE WHEN NEW.attempts > 0 THEN json_object('attempt', NEW.attempts) ELSE '{}' END),
           NEW.updated_at, NEW.updated_at
-        ) ON CONFLICT(send_id, event_type) DO NOTHING;
+        ) ON CONFLICT DO NOTHING;
       END;
     `);
+    try { this.db.exec("ALTER TABLE carrier_delivery_reports ADD COLUMN device_id TEXT"); } catch { /* already present */ }
+    this._carrierByEvent = this.db.prepare("SELECT * FROM carrier_delivery_reports WHERE event_id=?");
+    this._carrierDelivered = this.db.prepare("SELECT status, occurred_at FROM carrier_delivery_reports WHERE send_id=? AND status='delivered' ORDER BY occurred_at DESC LIMIT 1");
+    this._carrierLatest = this.db.prepare("SELECT status, occurred_at FROM carrier_delivery_reports WHERE send_id=? ORDER BY occurred_at DESC LIMIT 1");
+    this._insertCarrier = this.db.prepare("INSERT INTO carrier_delivery_reports (event_id,send_id,gateway_request_id,status,occurred_at,received_at,device_id) VALUES (@eventId,@sendId,@requestId,@status,@occurredAt,@receivedAt,@deviceId)");
+    this._insertCarrierCallback = this.db.prepare("INSERT INTO eve_sms_outbox (event_id,delivery_id,send_id,event_type,body,next_attempt_at,created_at) VALUES (@eventId,@eventId,@sendId,@eventType,@body,@receivedAt,@receivedAt)");
     for (const sql of [
       "CREATE INDEX IF NOT EXISTS idx_sends_service ON sends (source, service_key, status)",
       "CREATE INDEX IF NOT EXISTS idx_sends_notification_generation ON sends (service_key, notification_generation)",
@@ -295,6 +350,7 @@ class SendStore {
       `UPDATE sends
           SET source=@source, service_key=@service_key,
               notification_kind=@notification_kind, correlation_id=@correlation_id,
+              eve_notification_id=@eve_notification_id,
               notification_generation=@notification_generation,
               requires_validation=@requires_validation, updated_at=@now
         WHERE id=@id`
@@ -445,6 +501,7 @@ class SendStore {
       service_key: clean.serviceKey,
       notification_kind: clean.notificationKind,
       correlation_id: clean.correlationId,
+      eve_notification_id: clean.eveNotificationId,
       notification_generation: clean.generation,
       requires_validation: clean.requiresValidation ? 1 : 0,
       now
@@ -564,6 +621,149 @@ class SendStore {
     const value = String(gatewayRequestId || "").trim();
     if (!value) return null;
     return this._byGatewayRequest.get(value) || null;
+  }
+
+  /** Commit a carrier receipt and its Eve callback in one SQLite transaction. */
+  recordCarrierReport({ eventId, requestId, status, occurredAt, deviceId = null }, { fault = null } = {}) {
+    const receivedAt = Date.now();
+    const safeDeviceId = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(String(deviceId || "")) ? String(deviceId) : null;
+    const commit = this.db.transaction(() => {
+      const previous = this._carrierByEvent.get(eventId);
+      if (previous) {
+        if (previous.gateway_request_id !== requestId || previous.status !== status ||
+            Number(previous.occurred_at) !== occurredAt) {
+          this._bumpCounter.run({ name: "sms_carrier_conflicts_total", delta: 1, now: receivedAt });
+          return { error: "event_id_conflict" };
+        }
+        this._bumpCounter.run({ name: "sms_carrier_duplicates_total", delta: 1, now: receivedAt });
+        return { ok: true, duplicate: true, carrierStatus: this.carrierStatus(previous.send_id) };
+      }
+      const row = this.byGatewayRequest(requestId);
+      if (!row) {
+        this._bumpCounter.run({ name: "sms_carrier_unknown_requests_total", delta: 1, now: receivedAt });
+        return { error: "unknown_request_id" };
+      }
+      const recipientDigits = String(row.to_number).replace(/\D/g, "");
+      if (recipientDigits.length >= 10 && eventId.includes(recipientDigits)) {
+        return { error: "invalid_delivery_report" };
+      }
+      this._insertCarrier.run({ eventId, sendId: row.id, requestId, status, occurredAt, receivedAt, deviceId: safeDeviceId });
+      this._bumpCounter.run({ name: "sms_carrier_reports_total", delta: 1, now: receivedAt });
+      this._bumpCounter.run({ name: status === "delivered" ? "sms_carrier_delivered_total" : "sms_carrier_failed_total", delta: 1, now: receivedAt });
+      if (fault === "afterReportInsert") throw new Error("injected_carrier_report_failure");
+      // A genuine carrier receipt is later than modem submission. If the ACK
+      // was lost, reconcile the submission before reporting carrier evidence.
+      if (!row.physical_submitted && row.status !== "suppressed") {
+        if (row.revoked_at || row.status === "superseded") {
+          if (this.recordSentAfterRevocation(row.id, { reason: "carrier_receipt_before_ack" })) {
+            this._bumpCounter.run({ name: "sms_sent_after_revocation_total", delta: 1, now: receivedAt });
+          }
+        } else if (row.status === "sent") {
+          this.db.prepare("UPDATE sends SET physical_submitted=1, updated_at=? WHERE id=?").run(receivedAt, row.id);
+        } else {
+          this.reconcileLateSent(row.id, { at: receivedAt, reason: "carrier_receipt_before_ack" });
+        }
+      }
+      if (row.source === "eve") {
+        const body = {
+          event_id: eventId,
+          trace_id: `send_${row.id}`,
+          message_id: `send_${row.id}`,
+          type: status === "delivered" ? "sms.delivered" : "sms.delivery_failed",
+          occurred_at: new Date(occurredAt).toISOString()
+        };
+        if (row.eve_notification_id && !row.eve_notification_id.includes(String(row.to_number).replace(/\D/g, "")) &&
+            !/^\+?\d{10,15}$/.test(row.eve_notification_id)) body.eve_notification_id = row.eve_notification_id;
+        if (safeDeviceId && !safeDeviceId.includes(recipientDigits)) body.device_id = safeDeviceId;
+        if (Number(row.attempts) > 0) body.attempt = Number(row.attempts);
+        this._insertCarrierCallback.run({
+          eventId, sendId: row.id, eventType: body.type,
+          body: JSON.stringify(body), receivedAt
+        });
+      }
+      if (fault === "beforeCommit") throw new Error("injected_carrier_report_failure");
+      return { ok: true, duplicate: false, carrierStatus: this.carrierStatus(row.id) };
+    });
+    return commit();
+  }
+
+  carrierStatus(sendId) {
+    const latest = this._carrierDelivered.get(Number(sendId)) || this._carrierLatest.get(Number(sendId));
+    if (!latest) {
+      const row = this.byId(sendId);
+      return { status: row?.physical_submitted && row?.gateway_request_id ? "pending" : "unavailable",
+        occurredAt: null, evidence: null };
+    }
+    return {
+      status: latest.status, occurredAt: new Date(Number(latest.occurred_at)).toISOString(),
+      evidence: "android_delivery_report"
+    };
+  }
+
+  carrierTimeline(sendId, limit = 50) {
+    const rows = this.db.prepare(`SELECT event_id, status, occurred_at, received_at
+      FROM carrier_delivery_reports WHERE send_id=?
+      ORDER BY occurred_at DESC, event_id DESC LIMIT ?`).all(Number(sendId), Math.max(1, Math.min(Number(limit) || 50, 100)));
+    return rows.reverse().map((row) => ({
+      eventId: row.event_id, status: row.status,
+      occurredAt: new Date(Number(row.occurred_at)).toISOString(),
+      receivedAt: new Date(Number(row.received_at)).toISOString(),
+      evidence: "android_delivery_report"
+    }));
+  }
+
+  searchCarrierReports({ keyName = null, from = null, to = null, status = null,
+    requestId = null, eventId = null, callbackState = null, limit = 50 } = {}) {
+    const where = [];
+    const params = [];
+    if (keyName) { where.push("s.key_name=?"); params.push(keyName); }
+    if (from !== null) { where.push("d.occurred_at>=?"); params.push(Number(from)); }
+    if (to !== null) { where.push("d.occurred_at<=?"); params.push(Number(to)); }
+    if (status) { where.push("d.status=?"); params.push(status); }
+    if (requestId) {
+      const match = /^send_(\d+)$/.exec(requestId);
+      where.push(match ? "s.id=?" : "d.gateway_request_id=?");
+      params.push(match ? Number(match[1]) : requestId);
+    }
+    if (eventId) { where.push("d.event_id=?"); params.push(eventId); }
+    if (callbackState) { where.push("o.state=?"); params.push(callbackState); }
+    params.push(Math.max(1, Math.min(Number(limit) || 50, 100)));
+    const sql = `SELECT d.event_id, d.status, d.occurred_at, d.received_at,
+      d.gateway_request_id, d.device_id, s.id AS send_id, s.job_id, s.to_number,
+      s.eve_notification_id, o.state AS callback_state
+      FROM carrier_delivery_reports d
+      JOIN sends s ON s.id=d.send_id
+      LEFT JOIN eve_sms_outbox o ON o.event_id=d.event_id
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY d.occurred_at DESC, d.event_id DESC LIMIT ?`;
+    return this.db.prepare(sql).all(...params).map((row) => ({
+      eventId: row.event_id,
+      traceId: `send_${row.send_id}`,
+      messageId: `send_${row.send_id}`,
+      requestId: `send_${row.send_id}`,
+      gatewayRequestId: row.gateway_request_id,
+      jobId: row.job_id || null,
+      eveNotificationId: row.eve_notification_id && !row.eve_notification_id.includes(String(row.to_number).replace(/\D/g, "")) ? row.eve_notification_id : null,
+      deviceId: row.device_id && !row.device_id.includes(String(row.to_number).replace(/\D/g, "")) ? row.device_id : null,
+      status: row.status,
+      occurredAt: new Date(Number(row.occurred_at)).toISOString(),
+      receivedAt: new Date(Number(row.received_at)).toISOString(),
+      callbackState: row.callback_state || null
+    }));
+  }
+
+  carrierReportStats() {
+    const counts = this.counters();
+    const row = this.db.prepare("SELECT received_at FROM carrier_delivery_reports ORDER BY received_at DESC LIMIT 1").get();
+    return {
+      total: Number(counts.sms_carrier_reports_total || 0),
+      delivered: Number(counts.sms_carrier_delivered_total || 0),
+      failed: Number(counts.sms_carrier_failed_total || 0),
+      duplicates: Number(counts.sms_carrier_duplicates_total || 0),
+      conflicts: Number(counts.sms_carrier_conflicts_total || 0),
+      unknownRequests: Number(counts.sms_carrier_unknown_requests_total || 0),
+      lastReportAt: row?.received_at ? new Date(Number(row.received_at)).toISOString() : null
+    };
   }
 
   /**

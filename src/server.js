@@ -1763,6 +1763,7 @@ function startSendWorker() {
           correlationId: ledgerRow?.correlation_id ?? null,
           requiresValidation: Boolean(ledgerRow?.requires_validation)
         };
+        if (ledgerRow?.eve_notification_id) notificationMeta.eveNotificationId = ledgerRow.eve_notification_id;
         // ONE logical identity for the whole life of this BullMQ job. A retry,
         // a delayed retry or a transport timeout must NOT look like a new task
         // to the phone, or a lost ACK turns into a duplicate SMS.
@@ -3027,7 +3028,45 @@ app.get("/eve/v1/transport-health", {
     reply.code(429).send({ error: "rate_limited" });
     return;
   }
-  return projectTransportHealth(await transportHealth.snapshot());
+  return projectTransportHealth(await transportHealth.snapshot(), { includeActivity: true, carrierReports: sendStore.carrierReportStats(), callbackOutbox: eveSmsEvents.health() });
+});
+
+app.get("/eve/v1/sms-delivery-events", {
+  schema: {
+    summary: "Search bounded carrier receipt and callback evidence",
+    description: "Project keys with sms.status see only their own sends. Returns operational IDs and outcomes without SMS body or recipient.",
+    tags: ["Messaging"],
+    querystring: {
+      type: "object", additionalProperties: false,
+      properties: {
+        from: { type: "integer", minimum: 0 },
+        to: { type: "integer", minimum: 0 },
+        status: { type: "string", enum: ["delivered", "failed"] },
+        requestId: { type: "string", minLength: 1, maxLength: 120 },
+        eventId: { type: "string", minLength: 1, maxLength: 196 },
+        callbackState: { type: "string", enum: ["pending", "retry_wait", "delivering", "delivered", "dead_letter"] },
+        limit: { type: "integer", minimum: 1, maximum: 100 }
+      }
+    },
+    response: { 200: { type: "object", properties: {
+      events: { type: "array", items: { type: "object", additionalProperties: true } },
+      limit: { type: "integer" }
+    } } }
+  }
+}, async (request, reply) => {
+  const limit = checkRateLimit(request, "eve-sms-delivery-events", 120, 60_000);
+  if (!limit.allowed) {
+    reply.header("retry-after", String(limit.retryAfterSeconds));
+    return reply.code(429).send({ error: "rate_limited" });
+  }
+  const query = request.query || {};
+  if (query.from !== undefined && query.to !== undefined && query.from > query.to) {
+    return reply.code(400).send({ error: "invalid_time_range" });
+  }
+  const boundedLimit = Math.max(1, Math.min(Number(query.limit) || 50, 100));
+  return { limit: boundedLimit, events: sendStore.searchCarrierReports({
+    ...query, keyName: request._projectKey?.name || null, limit: boundedLimit
+  }) };
 });
 
 app.get("/admin/gateway-diagnostics", {
@@ -3045,6 +3084,8 @@ app.get("/admin/gateway-diagnostics", {
     transport,
     deviceKey: { configured: deviceKeyStore.configured, source: deviceKeyStore.source },
     pullBridge: bridge,
+    carrierReports: sendStore.carrierReportStats(),
+    eveCallbacks: eveSmsEvents.health(),
     devices: gatewayTelemetry.deviceSnapshot(),
     queue: {
       pending: Number(transport.pending || 0),
@@ -3900,6 +3941,7 @@ app.post("/send", {
       notificationKind: z.string().max(48).optional(),
       generation: z.number().int().min(0).optional(),
       correlationId: z.string().max(64).optional(),
+      eveNotificationId: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,119}$/).optional(),
       requiresValidation: z.boolean().optional()
     }).partial().optional()
   });
@@ -4176,6 +4218,10 @@ app.get("/send/status/:reference", {
           generation: { type: ["integer", "null"] },
           requiresValidation: { type: "boolean" },
           correlationId: { type: ["string", "null"] },
+          eveNotificationId: { type: ["string", "null"] },
+          carrierStatus: { type: "object", additionalProperties: true },
+          carrierEvents: { type: "array", items: { type: "object", additionalProperties: true } },
+          gatewayRequestId: { type: ["string", "null"] },
           priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
           priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           stage: { type: ["string", "null"] },
@@ -4243,6 +4289,9 @@ app.get("/send/status/:reference", {
       stage: null,
       terminal: legacyTerminal,
       successful: live.state === "completed" ? true : (legacyTerminal ? false : null),
+      carrierStatus: { status: "unavailable", occurredAt: null, evidence: null },
+      carrierEvents: [],
+      gatewayRequestId: null,
       currentAt: live.finishedAt || live.processedAt || live.createdAt,
       queuedAt: live.createdAt,
       activeAt: live.processedAt,
@@ -4303,6 +4352,10 @@ app.get("/send/status/:reference", {
     generation: ledger.notification_generation ?? null,
     requiresValidation: Boolean(ledger.requires_validation),
     correlationId: ledger.correlation_id || null,
+    eveNotificationId: ledger.eve_notification_id || null,
+    carrierStatus: sendStore.carrierStatus(ledger.id),
+    carrierEvents: sendStore.carrierTimeline(ledger.id),
+    gatewayRequestId: ledger.gateway_request_id || null,
     to: ledger.to_number,
     requestedTo: result?.requestedTo || ledger.to_number,
     sentTo: result?.sentTo || null,

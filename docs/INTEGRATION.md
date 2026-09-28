@@ -634,7 +634,7 @@ kept as bounded JSONL in `data/activity.jsonl` (up to 10,000 recent events).
 
 ---
 
-## 7. Eve signed SMS callbacks (`eve-signed-events-v4`)
+## 7. Eve signed SMS callbacks (`android-carrier-dlr-v5`)
 
 GMweb can post a dedicated SMS timeline to Eve when **both**
 `EVE_SMS_EVENTS_URL=https://eve.rooteam.ir/internal/gmweb/sms/events` and
@@ -654,16 +654,16 @@ remain as `dead_letter` for operator inspection. Event and delivery IDs and the
 raw body stay unchanged across retries. The timestamp and signature are fresh
 for each attempt.
 
-The current event types are `send.queued`, `send.sent`, `send.failed` and
-`send.cancelled` (the latter includes a superseded/invalidated queued send).
-There is no `send.delivered` emission: the current Android/Chrome paths expose
-submission evidence but no genuine carrier DLR. **HTTP acceptance is not
-physical submission, and physical submission is not carrier delivery.** A
-late authenticated Android sent ACK may add `send.sent` after a prior failure or
-cancellation, preserving physical truth.
+The event types are `send.queued`, `send.sent`, `send.failed`,
+`send.cancelled`, `sms.delivered` and `sms.delivery_failed`. The latter two are
+emitted only when the Android device reports a definitive carrier receipt to
+`POST /gateway/delivery-report`; Chrome has no carrier receipt source. A
+`send.sent` event means recorded modem submission, not delivery. A late
+authenticated Android sent ACK or carrier receipt can reconcile missing
+submission evidence after a prior gateway failure.
 
 Each body contains only `event_id`, `trace_id`, `message_id`, `type`,
-`occurred_at`, and, when known, `attempt`. The IDs identify the
+`occurred_at`, and, when known, `attempt` and `eve_notification_id`. The IDs identify the
 GMweb request (`send_<ledger-id>`); Eve can correlate that ID with the `/send`
 response. The body never includes SMS text, full recipient number, service key,
 raw provider results, credentials or free-form failure text. The legacy
@@ -687,3 +687,57 @@ response, alongside the stable `requestId`, `jobId`, `status` and `statusUrl`.
 Queued and deferred responses report `terminal:false, successful:null`;
 terminal responses report their final outcome. `/send/status/{requestId}`
 remains the authoritative polling view after retries and process restart.
+`carrierStatus` is a separate object on polling responses. Its `status` is
+`unavailable` without Android receipt capability, `pending` after recorded
+Android submission with no receipt, or `delivered`/`failed` with authenticated
+carrier report evidence. `occurredAt` is the device's report timestamp and
+`evidence` is `android_delivery_report` only when a report exists. A gateway
+`sent` status must not be treated as carrier delivery.
+The same response exposes `gatewayRequestId` and up to 50 recent
+`carrierEvents` with stable `eventId`, status and timestamps. Project keys can
+read only their own sends through the existing `sms.status` authorization.
+For a bounded cross-message view, `GET /eve/v1/sms-delivery-events` accepts
+optional `from`/`to` Unix milliseconds, `status`, `requestId`, `eventId`,
+`callbackState` and `limit` (1–100, default 50). A project key with
+`sms.status` sees only its own sends. Each event returns safe IDs, carrier
+outcome/times and the callback state; it omits the SMS body, recipient and
+callback body.
+
+The Android client sends a definitive Telephony receipt as:
+
+```json
+POST /gateway/delivery-report
+X-API-Key: <device key>
+
+{"eventId":"dlr_opaque-stable-id","requestId":"pull_123","status":"delivered","occurredAt":1779000000000}
+```
+
+The same four values replay with `200 duplicate:true`. Reusing an `eventId`
+with different values returns `409 event_id_conflict`; an unknown task returns
+`404 unknown_request_id`. The route shares the operational gateway rate limit.
+The SQLite DLR row and immutable Eve callback are committed together before a
+successful response. Report IDs must be stable across Android retries. GMweb
+does not infer carrier delivery from HTTP 200/202, ACK, or Chrome DOM state.
+The optional `/send` metadata field `eveNotificationId` (ASCII letter followed
+by up to 119 letters, digits, `_` or `-`)
+is persisted, passed through Android pull metadata, and included in signed
+carrier callbacks when supplied. It must be an opaque non-recipient identifier.
+The gateway currently authenticates a shared device key. An optional device
+header is diagnostic and does not establish separate per-phone ownership; a
+multi-device deployment needs a separate authenticated identity/binding design.
+
+For rollout, back up `sends.db` and its WAL, stop GMweb, deploy the new binary,
+and restart. Startup migrates the existing callback table transactionally,
+preserving retry state and IDs. Rollback to a pre-v5 binary requires restoring
+the pre-migration database backup or backporting the new outbox schema: old
+triggers expect the former `(send_id,event_type)` unique constraint. Inspect
+`/admin/gateway-diagnostics` for aggregate `carrierReports` and `eveCallbacks`
+and `/eve/v1/transport-health` for the same bounded diagnostics. No customer
+message or number is included in these counters.
+
+DLR records and Eve callback outbox rows currently have **no automatic age
+deletion**. This preserves deduplication and late receipt evidence. Back up
+the database under the existing operational backup policy; archive and prune
+only under a future migration that first defines Android's maximum retry
+horizon and Eve's audit window. The generic activity JSONL retains up to
+10,000 recent entries; its rotation is separate from the DLR ledger.

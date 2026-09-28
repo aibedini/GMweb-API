@@ -122,6 +122,11 @@ test("production Fastify accepts Eve /send and denies unscoped commands", async 
   assert.equal(status.json().terminal, false);
   assert.equal(status.json().successful, null);
 
+  const deliverySearch = await app.inject({ method: "GET", url: "/eve/v1/sms-delivery-events?limit=5", headers });
+  assert.equal(deliverySearch.statusCode, 200, deliverySearch.payload);
+  assert.equal(deliverySearch.json().limit, 5);
+  assert.ok(Array.isArray(deliverySearch.json().events));
+
   const denied = await app.inject({
     method: "POST",
     url: "/api/v1/commands",
