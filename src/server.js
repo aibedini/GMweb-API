@@ -3074,9 +3074,21 @@ app.get("/admin/gateway-diagnostics", {
     summary: "Privacy-safe Android pull-bridge diagnostics",
     description: "Returns operational gateway telemetry without keys, recipients, message bodies or raw request identifiers. **Master token only.**",
     tags: ["Admin"],
-    response: { 200: { type: "object", additionalProperties: true } }
+    response: {
+      200: { type: "object", additionalProperties: true },
+      429: {
+        type: "object",
+        required: ["error"],
+        properties: { error: { type: "string", enum: ["rate_limited"] } }
+      }
+    }
   }
-}, async () => {
+}, async (request, reply) => {
+  const limit = checkRateLimit(request, "gateway-diagnostics", 120, 60_000);
+  if (!limit.allowed) {
+    reply.header("retry-after", String(limit.retryAfterSeconds));
+    return reply.code(429).send({ error: "rate_limited" });
+  }
   const transport = await transportHealth.android();
   const bridge = gatewayTelemetry.snapshot();
   return {
@@ -5800,5 +5812,5 @@ if (require.main === module) {
 
 module.exports = { app, deviceKeyStore, agentAuthService };
 if (config.appEnv === "test") {
-  module.exports.__testing = { apiKeyStore, sendQueue, sendStore };
+  module.exports.__testing = { apiKeyStore, sendQueue, sendStore, rateBuckets };
 }
