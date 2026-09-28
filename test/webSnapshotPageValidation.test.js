@@ -17,3 +17,16 @@ test("snapshot pages keep token, baseline and positions stable before persistenc
   assert.throws(() => assertValidSnapshotPage({ ...page, nextCursor: btoa("2") },
     expected), /Invalid encrypted snapshot cursor/);
 });
+
+test("snapshot continuation restarts only for a stale device-bound token", async () => {
+  const { continueWebSnapshot, SnapshotRequiredError } = await import("../web/src/lib/api.ts");
+  const originalFetch = global.fetch;
+  try {
+    global.fetch = async () => Response.json({ error: "snapshot_forbidden" }, { status: 403 });
+    await assert.rejects(continueWebSnapshot("old-token", "old-cursor"), SnapshotRequiredError);
+    global.fetch = async () => Response.json({ error: "read_messages_capability_required" }, { status: 403 });
+    await assert.rejects(continueWebSnapshot("old-token", "old-cursor"), /read_messages_capability_required/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});

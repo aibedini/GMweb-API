@@ -124,8 +124,10 @@ export async function startWebSnapshot(limit = 100): Promise<WebSnapshotPage> {
 export async function continueWebSnapshot(token: string, cursor: string, limit = 100): Promise<WebSnapshotPage> {
   const query = new URLSearchParams({ token, cursor, limit: String(limit) });
   const res = await fetch(`${API}/web/snapshot-v2?${query}`, { credentials: "include", cache: "no-store" });
-  if (res.status === 409) {
-    throw new SnapshotRequiredError(await res.json().catch(() => ({ error: "snapshot_required" })));
+  if (res.status === 409 || res.status === 403) {
+    const body = await res.json().catch(() => ({})) as Record<string, unknown>;
+    if (res.status === 409 || body.error === "snapshot_forbidden") throw new SnapshotRequiredError(body);
+    throw new Error(`HTTP ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
   }
   return jsonOrThrow<WebSnapshotPage>(res);
 }
