@@ -302,12 +302,23 @@ describe("Phase 2 control plane HTTP API", () => {
     const ok1 = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(1), headers: H });
     assert.equal(ok1.json().applied, true);
 
+    const positionDenied = await app.inject({ method: "GET", url: "/api/v1/agent/trust/position" });
+    assert.equal(positionDenied.statusCode, 403);
+    const position = await app.inject({ method: "GET", url: "/api/v1/agent/trust/position", headers: H });
+    assert.equal(position.statusCode, 200);
+    assert.deepEqual(position.json(), { trustSequence: 1 });
+
     const gap = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(3), headers: H });
+    assert.equal(gap.statusCode, 409);
     assert.equal(gap.json().applied, false);
     assert.equal(gap.json().reason, "sequence_gap");
 
     const ok2 = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(2), headers: H });
     assert.equal(ok2.json().applied, true);
+
+    const duplicate = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(2), headers: H });
+    assert.equal(duplicate.statusCode, 200);
+    assert.equal(duplicate.json().reason, "duplicate");
 
     const list = await app.inject({ method: "GET", url: "/api/v1/trust/statements?after=0" });
     assert.deepEqual(list.json().statements.map((s) => s.trustSequence), [1, 2]);

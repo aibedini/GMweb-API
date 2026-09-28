@@ -453,4 +453,22 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     assert.equal(JSON.stringify(linked).includes("secret"), false);
     assert.equal(JSON.stringify(linked).includes("thread-a"), false);
   });
+
+  test("diagnostic stats keep account and source totals distinct in one grouped scan", () => {
+    const store = new EventStore(new Database(":memory:"));
+    store.ingestBatch({ accountId: "account", sourceDeviceId: "phone-a", events: [
+      { eventId: "a1", type: "MESSAGE_CREATED", conversationId: "thread-a", payload: Buffer.from("a"), cryptoVersion: 1 },
+    ] });
+    store.ingestBatch({ accountId: "account", sourceDeviceId: "phone-b", events: [
+      { eventId: "b1", type: "MESSAGE_UPDATED", conversationId: "thread-b", payload: Buffer.from("b"), cryptoVersion: 2 },
+      { eventId: "b2", type: "KEY_GRANT", payload: Buffer.from("c"), cryptoVersion: 1 },
+    ] });
+    const stats = store.diagnosticStats("account", "phone-b");
+    assert.deepEqual(stats.account, { total: 3, messageCreated: 1, messageUpdated: 1, keyGrant: 1,
+      byCryptoVersion: [{ value: 1, count: 2 }, { value: 2, count: 1 }], maxSequence: 3 });
+    assert.deepEqual(stats.sourceDevice, { total: 2, messageCreated: 0, messageUpdated: 1, keyGrant: 1,
+      byCryptoVersion: [{ value: 1, count: 1 }, { value: 2, count: 1 }], maxSequence: 3 });
+    assert.deepEqual(store.diagnosticStats("empty", "phone-b").account,
+      { total: 0, messageCreated: 0, messageUpdated: 0, keyGrant: 0, byCryptoVersion: [], maxSequence: 0 });
+  });
 });

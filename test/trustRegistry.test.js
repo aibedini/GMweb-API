@@ -41,10 +41,11 @@ describe("TrustRegistry relay", () => {
 
   test("redelivery of the same sequence is an idempotent no-op", () => {
     const reg = new TrustRegistry(new Database(":memory:"));
-    reg.applyStatement({ accountId: "acc1", statement: stmt(1, "DEVICE_APPROVED") });
-    const r = reg.applyStatement({ accountId: "acc1", statement: stmt(1, "DEVICE_APPROVED") });
+    const statement = stmt(1, "DEVICE_APPROVED");
+    reg.applyStatement({ accountId: "acc1", statement });
+    const r = reg.applyStatement({ accountId: "acc1", statement: Object.fromEntries(Object.entries(statement).reverse()) });
     assert.equal(r.applied, false);
-    assert.equal(r.reason, "stale_sequence");
+    assert.equal(r.reason, "duplicate");
     assert.equal(reg.statementsAfter("acc1", 0).length, 1);
   });
 

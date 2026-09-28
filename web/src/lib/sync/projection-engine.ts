@@ -2,10 +2,22 @@ import type { EncryptedConversationState, EncryptedMessageState, SyncEvent } fro
 import { conversationProjectionFromEvents } from "../inbox.ts";
 import { STORE_EVENTS, STORE_META, STORE_CONVERSATIONS, STORE_ENCRYPTED_CONVERSATIONS, CURSOR_KEY, PROJECTION_VERSION_KEY, PROJECTION_CURSOR_KEY } from "./schema.ts";
 
+/** Current-state rows retain the original encrypted envelope, whose event ID is AEAD-bound. */
+function envelopeEventId(base64: string, fallback: string): string {
+  try {
+    const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0));
+    const value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    if (typeof value.eventId === "string" && value.eventId.length > 0 && value.eventId.length <= 128) {
+      return value.eventId;
+    }
+  } catch { /* The crypto layer reports a malformed envelope as invalid. */ }
+  return fallback;
+}
+
 export function conversationStateEvent(row: EncryptedConversationState): SyncEvent {
   return {
     sequence: row.lastServerSequence,
-    eventId: `snapshot:${row.conversationId}:${row.revision}`,
+    eventId: envelopeEventId(row.envelope, `snapshot:${row.conversationId}:${row.revision}`),
     type: "CONVERSATION_UPSERTED",
     aggregateId: row.conversationId,
     sourceDeviceId: null,
@@ -22,7 +34,7 @@ export function conversationStateEvent(row: EncryptedConversationState): SyncEve
 export function messageStateEvent(row: EncryptedMessageState): SyncEvent {
   return {
     ...conversationStateEvent(row),
-    eventId: `state:${row.messageId}:${row.revision}`,
+    eventId: envelopeEventId(row.envelope, `state:${row.messageId}:${row.revision}`),
     type: row.type,
     messageId: row.messageId,
   };

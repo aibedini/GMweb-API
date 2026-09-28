@@ -687,25 +687,42 @@ class EventStore {
   }
 
   diagnosticStats(accountId, sourceDeviceId) {
-    const counts = (deviceId = null) => {
-      const sourceFilter = deviceId ? " AND source_device_id = ?" : "";
-      const args = deviceId ? [accountId, deviceId] : [accountId];
-      const scalar = (sql) => Number(this.db.prepare(sql).get(...args)?.value || 0);
-      return {
-        total: scalar(`SELECT COUNT(*) value FROM sync_events WHERE account_id = ?${sourceFilter}`),
-        messageCreated: scalar(`SELECT COUNT(*) value FROM sync_events WHERE account_id = ?${sourceFilter} AND event_type = 'MESSAGE_CREATED'`),
-        messageUpdated: scalar(`SELECT COUNT(*) value FROM sync_events WHERE account_id = ?${sourceFilter} AND event_type = 'MESSAGE_UPDATED'`),
-        keyGrant: scalar(`SELECT COUNT(*) value FROM sync_events WHERE account_id = ?${sourceFilter} AND event_type = 'KEY_GRANT'`),
-        byCryptoVersion: this.db.prepare(
-          `SELECT crypto_version value, COUNT(*) count FROM sync_events WHERE account_id = ?${sourceFilter} GROUP BY crypto_version ORDER BY crypto_version`
-        ).all(...args).map(row => ({ value: Number(row.value), count: Number(row.count) })),
-        maxSequence: scalar(`SELECT COALESCE(MAX(sequence), 0) value FROM sync_events WHERE account_id = ?${sourceFilter}`),
-      };
-    };
-    return {
-      account: counts(),
-      sourceDevice: counts(sourceDeviceId),
-    };
+    // The Android full test has a 15-second read timeout. Twelve scans over a
+    // million-row event store exceeded it; collect both scopes in one scan.
+    const rows = this.db.prepare(`
+      SELECT crypto_version AS cryptoVersion,
+        COUNT(*) AS total,
+        SUM(CASE WHEN event_type = 'MESSAGE_CREATED' THEN 1 ELSE 0 END) AS messageCreated,
+        SUM(CASE WHEN event_type = 'MESSAGE_UPDATED' THEN 1 ELSE 0 END) AS messageUpdated,
+        SUM(CASE WHEN event_type = 'KEY_GRANT' THEN 1 ELSE 0 END) AS keyGrant,
+        MAX(sequence) AS maxSequence,
+        SUM(CASE WHEN source_device_id = ? THEN 1 ELSE 0 END) AS sourceTotal,
+        SUM(CASE WHEN source_device_id = ? AND event_type = 'MESSAGE_CREATED' THEN 1 ELSE 0 END) AS sourceMessageCreated,
+        SUM(CASE WHEN source_device_id = ? AND event_type = 'MESSAGE_UPDATED' THEN 1 ELSE 0 END) AS sourceMessageUpdated,
+        SUM(CASE WHEN source_device_id = ? AND event_type = 'KEY_GRANT' THEN 1 ELSE 0 END) AS sourceKeyGrant,
+        MAX(CASE WHEN source_device_id = ? THEN sequence ELSE 0 END) AS sourceMaxSequence
+      FROM sync_events WHERE account_id = ?
+      GROUP BY crypto_version ORDER BY crypto_version
+    `).all(sourceDeviceId, sourceDeviceId, sourceDeviceId, sourceDeviceId, sourceDeviceId, accountId);
+    const empty = () => ({ total: 0, messageCreated: 0, messageUpdated: 0, keyGrant: 0,
+      byCryptoVersion: [], maxSequence: 0 });
+    const account = empty();
+    const sourceDevice = empty();
+    for (const row of rows) {
+      account.total += Number(row.total);
+      account.messageCreated += Number(row.messageCreated);
+      account.messageUpdated += Number(row.messageUpdated);
+      account.keyGrant += Number(row.keyGrant);
+      account.maxSequence = Math.max(account.maxSequence, Number(row.maxSequence));
+      account.byCryptoVersion.push({ value: Number(row.cryptoVersion), count: Number(row.total) });
+      sourceDevice.total += Number(row.sourceTotal);
+      sourceDevice.messageCreated += Number(row.sourceMessageCreated);
+      sourceDevice.messageUpdated += Number(row.sourceMessageUpdated);
+      sourceDevice.keyGrant += Number(row.sourceKeyGrant);
+      sourceDevice.maxSequence = Math.max(sourceDevice.maxSequence, Number(row.sourceMaxSequence));
+      if (row.sourceTotal) sourceDevice.byCryptoVersion.push({ value: Number(row.cryptoVersion), count: Number(row.sourceTotal) });
+    }
+    return { account, sourceDevice };
   }
 
   /** Privacy-safe server truth for a READ_MESSAGES linked browser. */
