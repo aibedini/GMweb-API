@@ -112,6 +112,31 @@ test("V2 snapshot remains immutable across pages, new events, and store restart"
     token: first.token, cursor: first.nextCursor, limit: 100 }), error => error.code === "snapshot_required");
 });
 
+test("active snapshot pages renew expiry while an idle snapshot still expires", () => {
+  const db = new Database(":memory:");
+  let now = 1_000_000;
+  const store = new EventStore(db, { now: () => now });
+  store.ingestBatch({ accountId: "a", events: [0, 1, 2].map(index => ({
+    eventId: `lease-${index}`, type: "CONVERSATION_UPSERTED",
+    conversationId: `c-${index}`, revision: 1, sortKey: index,
+    payload: Buffer.from(`cipher-${index}`), cryptoVersion: 3,
+  })) });
+  const first = store.beginSnapshot({ accountId: "a", linkedDeviceId: "browser", limit: 1 });
+  now += 40 * 60 * 1000;
+  const second = store.snapshotPage({ accountId: "a", linkedDeviceId: "browser",
+    token: first.token, cursor: first.nextCursor, limit: 1 });
+  assert.equal(second.expiresAt, now + 60 * 60 * 1000);
+  now += 40 * 60 * 1000;
+  const third = store.snapshotPage({ accountId: "a", linkedDeviceId: "browser",
+    token: first.token, cursor: second.nextCursor, limit: 1 });
+  assert.equal(third.hasMore, false);
+  assert.equal(third.expiresAt, now + 60 * 60 * 1000);
+  now = third.expiresAt;
+  assert.throws(() => store.snapshotPage({ accountId: "a", linkedDeviceId: "browser",
+    token: first.token, cursor: second.nextCursor, limit: 1 }), error => error.code === "snapshot_expired");
+  db.close();
+});
+
 describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => {
   test("compaction preserves post-baseline deltas while a snapshot session is active", () => {
     let now = 50_000;

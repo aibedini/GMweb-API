@@ -562,7 +562,8 @@ class EventStore {
     if (session.account_id !== accountId || session.linked_device_id !== linkedDeviceId) {
       throw Object.assign(new Error("snapshot forbidden"), { code: "snapshot_forbidden" });
     }
-    if (this.now() >= session.expires_at) throw Object.assign(new Error("snapshot expired"), { code: "snapshot_expired" });
+    const now = this.now();
+    if (now >= session.expires_at) throw Object.assign(new Error("snapshot expired"), { code: "snapshot_expired" });
     const currentMetadata = this.replicaMetadata(accountId);
     if (session.replica_generation !== currentMetadata.replicaGeneration ||
         session.snapshot_version !== currentMetadata.snapshotVersion) {
@@ -583,10 +584,17 @@ class EventStore {
       .all(token, position, capped + 1);
     const hasMore = rows.length > capped;
     const page = hasMore ? rows.slice(0, capped) : rows;
+    // Keep a progressing bootstrap alive without retaining abandoned snapshots forever.
+    const expiresAt = session.expires_at - now <= 30 * 60 * 1000
+      ? now + 60 * 60 * 1000 : session.expires_at;
+    if (expiresAt !== session.expires_at) {
+      this.db.prepare("UPDATE encrypted_snapshot_sessions SET expires_at = ? WHERE token = ?")
+        .run(expiresAt, token);
+    }
     return {
       token, replicaGeneration: session.replica_generation,
       snapshotVersion: session.snapshot_version, baselineSequence: session.baseline_sequence,
-      expiresAt: session.expires_at,
+      expiresAt,
       contactEvents: position === 0 ? JSON.parse(session.contact_events) : [],
       rows: page.map(row => ({ ...row, tombstone: Boolean(row.tombstone), envelope: Buffer.from(row.envelope).toString("base64") })),
       nextCursor: hasMore ? Buffer.from(String(page.at(-1).position)).toString("base64url") : null,
