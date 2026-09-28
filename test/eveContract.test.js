@@ -60,7 +60,7 @@ test("production Fastify accepts Eve /send and denies unscoped commands", async 
 
   const { app, __testing } = require("../src/server");
   assert.equal(require("../src/config").apiToken, "contract-master-token");
-  const { apiKeyStore, sendQueue, sendStore } = __testing;
+  const { apiKeyStore, sendQueue, sendStore, rateBuckets } = __testing;
   apiKeyStore.save = () => Promise.resolve();
   const key = apiKeyStore.create({
     name: "eve-runtime-contract",
@@ -121,6 +121,25 @@ test("production Fastify accepts Eve /send and denies unscoped commands", async 
   assert.equal(status.json().status, "queued");
   assert.equal(status.json().terminal, false);
   assert.equal(status.json().successful, null);
+
+  const deliverySearch = await app.inject({ method: "GET", url: "/eve/v1/sms-delivery-events?limit=5", headers });
+  assert.equal(deliverySearch.statusCode, 200, deliverySearch.payload);
+  assert.equal(deliverySearch.json().limit, 5);
+  assert.ok(Array.isArray(deliverySearch.json().events));
+
+  rateBuckets.set("gateway-diagnostics:127.0.0.1", {
+    count: 120,
+    resetAt: Date.now() + 60_000,
+  });
+  const diagnosticsLimited = await app.inject({
+    method: "GET",
+    url: "/admin/gateway-diagnostics",
+    headers: { authorization: "Bearer contract-master-token" },
+  });
+  assert.equal(diagnosticsLimited.statusCode, 429, diagnosticsLimited.payload);
+  assert.equal(diagnosticsLimited.json().error, "rate_limited");
+  assert.match(diagnosticsLimited.headers["retry-after"], /^\d+$/);
+  rateBuckets.delete("gateway-diagnostics:127.0.0.1");
 
   const denied = await app.inject({
     method: "POST",

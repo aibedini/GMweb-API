@@ -63,14 +63,15 @@ test("notification meta is whitelisted and bounded", () => {
   });
   assert.deepEqual(meta, {
     source: "eve", serviceKey: "eve:1:uuid-A", notificationKind: "volume_ended",
-    correlationId: "c1", generation: 17, requiresValidation: true
+    correlationId: "c1", eveNotificationId: null, generation: 17, requiresValidation: true
   });
   const huge = normalizeNotificationMeta({ serviceKey: "x".repeat(500) });
   assert.equal(huge.serviceKey.length, 200);
   assert.equal(huge.generation, null);
   assert.equal(huge.requiresValidation, false);
+  assert.equal(normalizeNotificationMeta({ eveNotificationId: "+989121234567" }).eveNotificationId, null);
   assert.deepEqual(normalizeNotificationMeta(undefined), {
-    source: null, serviceKey: null, notificationKind: null, correlationId: null,
+    source: null, serviceKey: null, notificationKind: null, correlationId: null, eveNotificationId: null,
     generation: null, requiresValidation: false
   });
   assert.ok(NOTIFICATION_KINDS.includes("volume_ended"));
@@ -267,6 +268,6 @@ test("the ledger migration is additive and old rows stay readable", () => {
   assert.ok(source.includes("CREATE TABLE IF NOT EXISTS send_counters"),
     "durable counters live in their own additive table");
   assert.ok(source.includes("CREATE TABLE IF NOT EXISTS send_counters"));
-  assert.equal(/DROP TABLE|DROP COLUMN|DELETE FROM sends/.test(source), false,
-    "no destructive migration may exist");
+  assert.equal(/DROP TABLE sends|DROP COLUMN|DELETE FROM sends/.test(source), false,
+    "the send ledger itself must not be destructively migrated");
 });

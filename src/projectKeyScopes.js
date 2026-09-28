@@ -76,6 +76,7 @@ function requiredProjectKeyScope(method, requestUrl) {
   // it reports the state of the active delivery transport and never accepts
   // input, so it can never change a delivery decision.
   if (verb === "GET" && pathname === "/eve/v1/transport-health") return "transport:read";
+  if (verb === "GET" && pathname === "/eve/v1/sms-delivery-events") return "sms.status";
   return null;
 }
 

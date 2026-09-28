@@ -128,7 +128,16 @@ function projectTransportHealth(snapshot, options = {}) {
       outcome: source.lastAckOutcome || null
     },
     diagnostics: {
-      androidPull: androidActive ? null : androidPullDiagnostics(alternatives.android)
+      androidPull: androidActive ? null : androidPullDiagnostics(alternatives.android),
+      ...(androidActive && options.includeActivity ? { androidActivity: {
+        authoritative: true,
+        lastSuccessfulPullAt: instantOrNull(source.lastSuccessfulPullAt),
+        lastTaskPulledAt: instantOrNull(source.lastTaskPulledAt),
+        lastValidateAt: instantOrNull(source.lastValidateAt),
+        lastValidateResult: source.lastValidateResult || null
+      } } : {}),
+      ...(options.carrierReports ? { carrierReports: options.carrierReports } : {}),
+      ...(options.callbackOutbox ? { callbackOutbox: options.callbackOutbox } : {})
     }
   };
 }
@@ -174,7 +183,10 @@ function diagnosticsSchema() {
   return {
     type: "object",
     properties: {
-      androidPull: { type: ["object", "null"], additionalProperties: true }
+      androidPull: { type: ["object", "null"], additionalProperties: true },
+      androidActivity: { type: ["object", "null"], additionalProperties: true },
+      carrierReports: { type: ["object", "null"], additionalProperties: true },
+      callbackOutbox: { type: ["object", "null"], additionalProperties: true }
     },
     additionalProperties: true
   };

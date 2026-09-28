@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.17",
+    "version": "0.19.19",
     "contact": {
       "name": "GMweb API"
     }
@@ -1150,9 +1150,140 @@
                             "object"
                           ],
                           "additionalProperties": true
+                        },
+                        "androidActivity": {
+                          "type": [
+                            "null",
+                            "object"
+                          ],
+                          "additionalProperties": true
+                        },
+                        "carrierReports": {
+                          "type": [
+                            "null",
+                            "object"
+                          ],
+                          "additionalProperties": true
+                        },
+                        "callbackOutbox": {
+                          "type": [
+                            "null",
+                            "object"
+                          ],
+                          "additionalProperties": true
                         }
                       },
                       "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/eve/v1/sms-delivery-events": {
+      "get": {
+        "summary": "Search bounded carrier receipt and callback evidence",
+        "tags": [
+          "Messaging"
+        ],
+        "description": "Project keys with sms.status see only their own sends. Returns operational IDs and outcomes without SMS body or recipient.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "in": "query",
+            "name": "from",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "in": "query",
+            "name": "to",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "delivered",
+                "failed"
+              ]
+            },
+            "in": "query",
+            "name": "status",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120
+            },
+            "in": "query",
+            "name": "requestId",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 196
+            },
+            "in": "query",
+            "name": "eventId",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "retry_wait",
+                "delivering",
+                "delivered",
+                "dead_letter"
+              ]
+            },
+            "in": "query",
+            "name": "callbackState",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "events": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "limit": {
+                      "type": "integer"
                     }
                   }
                 }
@@ -1177,6 +1308,27 @@
                 "schema": {
                   "type": "object",
                   "additionalProperties": true
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "rate_limited"
+                      ]
+                    }
+                  }
                 }
               }
             }
@@ -1541,6 +1693,10 @@
                                 "string"
                               ]
                             },
+                            "eveNotificationId": {
+                              "type": "string",
+                              "maxLength": 120
+                            },
                             "requiresValidation": {
                               "type": "boolean"
                             }
@@ -1677,6 +1833,160 @@
             }
           },
           "401": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/gateway/delivery-report": {
+      "post": {
+        "summary": "Record an Android carrier delivery receipt",
+        "tags": [
+          "Gateway"
+        ],
+        "description": "Device-authenticated carrier receipt. This is separate from modem submission ACK. A successful response means the report and Eve callback were committed to the durable ledger.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "eventId",
+                  "requestId",
+                  "status",
+                  "occurredAt"
+                ],
+                "properties": {
+                  "eventId": {
+                    "type": "string",
+                    "pattern": "^dlr_[A-Za-z0-9_-]{1,192}$",
+                    "maxLength": 196
+                  },
+                  "requestId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 120
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "delivered",
+                      "failed"
+                    ]
+                  },
+                  "occurredAt": {
+                    "type": "integer",
+                    "minimum": 1577836800000
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "duplicate": {
+                      "type": "boolean"
+                    },
+                    "eventId": {
+                      "type": "string"
+                    },
+                    "requestId": {
+                      "type": "string"
+                    },
+                    "carrierStatus": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
             "description": "Default Response",
             "content": {
               "application/json": {
@@ -5581,6 +5891,29 @@
                       "type": "boolean"
                     },
                     "correlationId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "eveNotificationId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "carrierStatus": {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    "carrierEvents": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    },
+                    "gatewayRequestId": {
                       "type": [
                         "null",
                         "string"

@@ -278,7 +278,7 @@ describe("the production server wires the route to this contract", () => {
       "the production server must register the consumer transport-health route");
     assert.ok(source.includes("eveTransportHealthSchema()"),
       "the route response schema must be derived from the shared contract, not hand-written");
-    assert.ok(source.includes("projectTransportHealth(await transportHealth.snapshot())"),
+    assert.ok(source.includes("projectTransportHealth(await transportHealth.snapshot(),"),
       "the route must project the ONE authoritative snapshot rather than re-deriving health");
   });
 

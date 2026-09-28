@@ -45,6 +45,19 @@ test("pull hands the phone the notification metadata so it can validate before s
   });
 });
 
+test("optional Eve notification ID survives the queued Android pull task", async () => {
+  await withHarness(async (h) => {
+    const { jobId } = h.queueNotification({ text: "tagged notification", eveNotificationId: "eve_notif_test42" });
+    const worker = h.runWorker(jobId);
+    const app = await h.buildGatewayApp();
+    const pull = await app.inject({ method: "GET", url: "/gateway/pull", headers: { "x-api-key": h.deviceKey } });
+    assert.equal(pull.json().task.meta.eveNotificationId, "eve_notif_test42");
+    await app.close();
+    h.outbox.acknowledge(pull.json().task.requestId, false, { outcome: "superseded" });
+    await worker;
+  });
+});
+
 test("pull keeps the legacy shape for a send without meta", async () => {
   await withHarness(async (h) => {
     const id = h.store.claim({ to: "+989120000021", text: "legacy pull", keyName: "eve", windowMs: 0 });

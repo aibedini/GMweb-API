@@ -44,6 +44,7 @@ const NOTIFICATION_TEXT_LIMITS = Object.freeze({
   serviceKey: 200,
   notificationKind: 48,
   correlationId: 64,
+  eveNotificationId: 120,
   reason: 64,
   eventId: 200
 });
@@ -53,6 +54,7 @@ const NOTIFICATION_TEXT_LIMITS = Object.freeze({
 const MAX_GENERATION = 2147483647;
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/g;
+const EVE_NOTIFICATION_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,119}$/;
 
 function boundedText(value, limit) {
   if (value === null || value === undefined) return null;
@@ -91,6 +93,8 @@ function normalizeNotificationMeta(raw) {
     serviceKey: boundedText(source.serviceKey, NOTIFICATION_TEXT_LIMITS.serviceKey),
     notificationKind: kind,
     correlationId: boundedText(source.correlationId, NOTIFICATION_TEXT_LIMITS.correlationId),
+    eveNotificationId: EVE_NOTIFICATION_ID_PATTERN.test(String(source.eveNotificationId || ""))
+      ? String(source.eveNotificationId) : null,
     generation: boundedGeneration(source.generation),
     requiresValidation: requiresValidationForKind(kind)
   };
@@ -111,10 +115,13 @@ function validateNotificationMeta(raw) {
     return { ok: false, error: "meta_must_be_an_object" };
   }
   const meta = normalizeNotificationMeta(raw);
-  const present = [raw.source, raw.serviceKey, raw.notificationKind, raw.generation]
+  const present = [raw.source, raw.serviceKey, raw.notificationKind, raw.generation, raw.eveNotificationId]
     .some((value) => value !== undefined && value !== null && value !== "");
   if (!present) return { ok: true, meta: null };
   if (!meta.source) return { ok: false, error: "meta_source_required" };
+  if (raw.eveNotificationId !== undefined && !meta.eveNotificationId) {
+    return { ok: false, error: "meta_eve_notification_id_invalid" };
+  }
   if (!meta.serviceKey || meta.serviceKey.length < 3) {
     return { ok: false, error: "meta_service_key_required" };
   }

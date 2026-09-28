@@ -164,6 +164,20 @@ class EveSmsEvents {
   stats() {
     return this.db.prepare(`SELECT state, COUNT(*) AS count FROM eve_sms_outbox GROUP BY state`).all();
   }
+
+  health(now = Date.now()) {
+    const counts = { pending: 0, retry_wait: 0, delivering: 0, delivered: 0, dead_letter: 0 };
+    for (const row of this.stats()) if (row.state in counts) counts[row.state] = Number(row.count);
+    const oldest = this.db.prepare(`SELECT MIN(created_at) AS at FROM eve_sms_outbox WHERE state IN ('pending','retry_wait','delivering')`).get()?.at;
+    const lastSuccess = this.db.prepare(`SELECT MAX(delivered_at) AS at FROM eve_sms_outbox`).get()?.at;
+    const lastFailure = this.db.prepare(`SELECT MAX(last_attempt_at) AS at FROM eve_sms_outbox WHERE last_http_status IS NOT NULL AND last_http_status NOT BETWEEN 200 AND 299`).get()?.at;
+    return {
+      ...counts,
+      last_success_at: lastSuccess ? new Date(Number(lastSuccess)).toISOString() : null,
+      last_failure_at: lastFailure ? new Date(Number(lastFailure)).toISOString() : null,
+      oldest_pending_age_ms: oldest ? Math.max(0, now - Number(oldest)) : null
+    };
+  }
 }
 
 module.exports = { EveSmsEvents, eveEventsConfig, signature, retryDelay, retryableStatus };

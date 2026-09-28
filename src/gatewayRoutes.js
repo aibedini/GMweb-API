@@ -195,6 +195,7 @@ function registerGatewayRoutes(app, deps = {}) {
                     notificationKind: { type: ["string", "null"] },
                     generation: { type: ["integer", "null"] },
                     correlationId: { type: ["string", "null"] },
+                    eveNotificationId: { type: "string", maxLength: 120 },
                     requiresValidation: { type: "boolean" }
                   }
                 }
@@ -333,6 +334,53 @@ function registerGatewayRoutes(app, deps = {}) {
   }
 
   // ── ack ──────────────────────────────────────────────────────────────────
+  app.post("/gateway/delivery-report", {
+    bodyLimit: 1024,
+    schema: {
+      summary: "Record an Android carrier delivery receipt",
+      description: "Device-authenticated carrier receipt. This is separate from modem submission ACK. A successful response means the report and Eve callback were committed to the durable ledger.",
+      tags: ["Gateway"],
+      body: {
+        type: "object", additionalProperties: false,
+        required: ["eventId", "requestId", "status", "occurredAt"],
+        properties: {
+          eventId: { type: "string", pattern: "^dlr_[A-Za-z0-9_-]{1,192}$", maxLength: 196 },
+          requestId: { type: "string", minLength: 1, maxLength: MAX_REQUEST_ID },
+          status: { type: "string", enum: ["delivered", "failed"] },
+          occurredAt: { type: "integer", minimum: 1577836800000 }
+        }
+      },
+      response: {
+        200: { type: "object", properties: {
+          ok: { type: "boolean" }, duplicate: { type: "boolean" },
+          eventId: { type: "string" }, requestId: { type: "string" },
+          carrierStatus: { type: "object", additionalProperties: true }
+        } },
+        400: { type: "object", properties: { error: { type: "string" } } },
+        401: { type: "object", properties: { error: { type: "string" } } },
+        404: { type: "object", properties: { error: { type: "string" } } },
+        409: { type: "object", properties: { error: { type: "string" } } },
+        429: { type: "object", properties: { error: { type: "string" } } }
+      }
+    }
+  }, async (request, reply) => {
+    if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-delivery-report", operationalLimit)) return;
+    const { eventId, requestId, status, occurredAt } = request.body || {};
+    if (!/^dlr_[A-Za-z0-9_-]{1,192}$/.test(eventId || "") ||
+        !/^[\x21-\x7e]{1,120}$/.test(requestId || "") ||
+        !["delivered", "failed"].includes(status) ||
+        !Number.isSafeInteger(occurredAt) || occurredAt > Date.now() + 86_400_000) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    const result = sendStore.recordCarrierReport({ eventId, requestId, status, occurredAt,
+      deviceId: request.headers["x-gateway-device-id"] || null });
+    if (result.error) return reply.code(result.error === "unknown_request_id" ? 404 : result.error === "invalid_delivery_report" ? 400 : 409).send({ error: result.error });
+    log?.info?.({ event: result.duplicate ? "carrier_dlr_duplicate" : status === "delivered" ? "carrier_delivered" : "carrier_failed",
+      gatewayRequestId: requestId, status, duplicate: result.duplicate }, "carrier report recorded");
+    return { ...result, eventId, requestId };
+  });
+
   app.post("/gateway/ack", {
     schema: {
       summary: "Android device reports a delivery outcome",
