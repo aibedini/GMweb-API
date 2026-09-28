@@ -147,6 +147,10 @@ class EventStore {
         ON encrypted_conversation_state(account_id, sort_key DESC, conversation_id DESC);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_events_uuid ON sync_events (account_id, event_uuid);
       CREATE INDEX IF NOT EXISTS idx_events_time ON sync_events (account_id, created_at);
+      -- Android diagnostics aggregates metadata across the account. Covering
+      -- this query avoids one table lookup (and ciphertext page read) per event.
+      CREATE INDEX IF NOT EXISTS idx_events_diagnostics_cover
+        ON sync_events (account_id, crypto_version, event_type, source_device_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_events_grant_target
         ON sync_events(account_id, json_extract(CAST(ciphertext AS TEXT), '$.deviceId'), sequence)
         WHERE event_type IN ('KEY_GRANT', 'CONTACTS_KEY_GRANT') AND json_valid(CAST(ciphertext AS TEXT));
