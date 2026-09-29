@@ -195,6 +195,12 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
     assert.equal(res.accepted.length, 2);
     assert.deepEqual(res.accepted.map(row => row.serverSequence), [1, 2]); // lost ACK is safely replayed
     assert.equal(res.duplicates, 1);
+    assert.deepEqual(res.results.map(row => row.status), ["DUPLICATE", "ACCEPTED"]);
+    const conflict = store.ingestBatch({ accountId: "a", events: [
+      { eventId: "e1", type: "DEVICE_STATUS_CHANGED", payload: Buffer.from("changed"), cryptoVersion: 1 },
+    ] });
+    assert.deepEqual(conflict.accepted, []);
+    assert.deepEqual(conflict.results.map(row => row.status), ["CONFLICTING_DUPLICATE"]);
     assert.equal(store.count("a"), 2);
   });
 

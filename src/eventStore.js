@@ -378,9 +378,12 @@ class EventStore {
     if (result.inserted > 0 && this.onEventsAccepted) {
       try { this.onEventsAccepted(result.inserted); } catch { /* swallow */ }
     }
+    // V1's aggregate duplicate count includes identity conflicts. Returning
+    // the already computed item outcomes lets current phones stop retrying a
+    // permanent conflict while old clients keep using accepted[].
     return perItem
       ? { results: result.results, highWatermark: this.nextSeqStmt.get(accountId).next_sequence - 1 }
-      : { accepted: result.accepted, duplicates: result.duplicates };
+      : { accepted: result.accepted, duplicates: result.duplicates, results: result.results };
   }
 
   /** Cursor sync (§54): events after a per-account sequence cursor. */

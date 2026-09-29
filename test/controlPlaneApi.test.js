@@ -113,7 +113,7 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.equal(agent.statusCode, 200);
     assert.equal(agent.json().preferredProtocolVersion, 1);
     assert.equal(agent.json().snapshot.stablePagination, true);
-    assert.equal(agent.json().eventIngest.perItemResults, false);
+    assert.equal(agent.json().eventIngest.perItemResults, true);
     assert.equal(agent.json().commands.leases, true);
 
     const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/replication-capabilities" });
@@ -412,6 +412,8 @@ describe("Phase 2 control plane HTTP API", () => {
     const v1 = await app.inject({ method: "POST", url: "/api/v1/agent/events/batch", payload: { events: [valid] } });
     assert.equal(v1.statusCode, 200);
     assert.ok(Array.isArray(v1.json().accepted));
+    assert.deepEqual(v1.json().results.map(row => row.status), ["CONFLICTING_DUPLICATE"]);
+    assert.equal(v1.json().accepted.length, 0);
   });
 
   test("V2 snapshot pages require the owning linked browser", async () => {
