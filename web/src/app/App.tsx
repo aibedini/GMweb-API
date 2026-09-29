@@ -81,6 +81,7 @@ export default function App() {
   const [contactSearch, setContactSearch] = useState("");
   const [contactsBusy, setContactsBusy] = useState(false);
   const [contactsProgress, setContactsProgress] = useState(0);
+  const [contactsCheckedAt, setContactsCheckedAt] = useState<number | null>(null);
   const [contactsError, setContactsError] = useState<string | null>(null);
   const [visibleContactCount, setVisibleContactCount] = useState(100);
   // PWA projection: paginated conversation read-model (replaces the old
@@ -164,6 +165,7 @@ export default function App() {
     try {
       await loadContactsOnDemand(setContactsProgress);
       setContacts(await listContacts());
+      setContactsCheckedAt(Date.now());
     } catch (cause) {
       setContactsError(cause instanceof Error ? cause.message : String(cause));
     } finally { setContactsBusy(false); }
@@ -659,7 +661,7 @@ export default function App() {
           <div className="page-title"><p className="eyebrow">Phone book</p><h1>Contacts</h1><p>End-to-end encrypted contacts synced from the Primary Android device.</p></div>
           <div className="contact-sync-status" role="status">
             <span>{contactsBusy ? `Syncing encrypted contacts… ${contactsProgress} event(s) checked`
-              : contactsError ? contactsError : `${contacts.length} contacts ready`}</span>
+              : contactsError ? contactsError : `${contacts.length} contacts ready${contactsCheckedAt ? ` · checked ${formatTime(contactsCheckedAt)}` : ""}`}</span>
             <Button size="sm" variant="ghost" onPress={() => void refreshContacts()} isDisabled={contactsBusy}>
               {contactsBusy ? <Spinner size="sm" /> : "Sync contacts"}
             </Button>

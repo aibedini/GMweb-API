@@ -112,6 +112,7 @@ button, input { font: inherit; }
 .notice.danger { border-color: color-mix(in srgb, var(--danger) 25%, var(--border)); color: var(--danger); }
 .security-list { display: grid; gap: 10px; }
 .contact-sync-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -8px 0 16px; color: var(--muted-fg); font-size: 12px; }
+.contact-sync-status button { flex: 0 0 auto; color: var(--accent) !important; border: 1px solid var(--border); background: var(--surface); }
 .security-row { min-height: 78px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 17px !important; }
 .security-row strong { font-size: 13px; }
 .security-row p { margin: 5px 0 0; color: var(--muted-fg); font-size: 11px; }
