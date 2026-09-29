@@ -456,6 +456,11 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
 
   test("diagnostic stats keep account and source totals distinct in one grouped scan", () => {
     const store = new EventStore(new Database(":memory:"));
+    const plan = store.db.prepare(`EXPLAIN QUERY PLAN SELECT crypto_version,
+      COUNT(*), SUM(CASE WHEN event_type = 'MESSAGE_CREATED' THEN 1 ELSE 0 END),
+      SUM(CASE WHEN source_device_id = ? THEN 1 ELSE 0 END), MAX(sequence)
+      FROM sync_events WHERE account_id = ? GROUP BY crypto_version`).all("phone-b", "account");
+    assert.ok(plan.some(row => row.detail.includes("COVERING INDEX idx_events_diagnostics_cover")));
     store.ingestBatch({ accountId: "account", sourceDeviceId: "phone-a", events: [
       { eventId: "a1", type: "MESSAGE_CREATED", conversationId: "thread-a", payload: Buffer.from("a"), cryptoVersion: 1 },
     ] });
