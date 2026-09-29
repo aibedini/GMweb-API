@@ -113,4 +113,40 @@ test("v3 FULL_HISTORY needs one origin-bound browser history key", async () => {
   assert.deepEqual(await messageCrypto.receiveKeyGrant(
     event("HISTORY_KEY_GRANT", "grant-2", "__history_master__", { ...grant, origin: "https://evil.example" })
   ), { state: "invalid", reason: "History grant pairing binding mismatch" });
+
+  await keysModule.saveCryptoRecord("verified-primary", {
+    deviceId: "browser-v3", root: rootPublicSpki,
+    encryptionPublicKey: recipientPublicRaw,
+    certificate: { ...certificate, trustSequence: 56, pairingTranscriptHash: "transcript-56" },
+  });
+  assert.deepEqual(await messageCrypto.receiveKeyGrant(
+    event("HISTORY_KEY_GRANT", "grant-old", "__history_master__", grant)
+  ), { state: "key-grant", reason: "Prior pairing history grant ignored" });
+  assert.equal(await keysModule.loadCryptoRecord(`history-key:browser-v3:${rootPublicSpki}:history-1`), null);
+  assert.deepEqual(await messageCrypto.receiveKeyGrant(
+    event("HISTORY_KEY_GRANT", "grant-invalid-current", "__history_master__", { ...grant, trustSequence: 56 })
+  ), { state: "invalid", reason: "History grant pairing binding mismatch" });
+  const currentFields = ["history-1", "browser-v3", certificate.webOrigin,
+    "56", "transcript-56", recipientPublicRaw];
+  const currentSender = await suite.createSenderContext({
+    recipientPublicKey: recipient.publicKey,
+    info: messageCrypto.binding("GMweb-history-key-v3", ...currentFields),
+  });
+  const currentWrappedKey = Buffer.concat([
+    Buffer.from(currentSender.enc), Buffer.from(await currentSender.seal(historyKey)),
+  ]).toString("base64");
+  const currentSignature = new Uint8Array(await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" }, root.privateKey,
+    messageCrypto.binding("GMweb-history-key-signature-v3", ...currentFields, currentWrappedKey)
+  ));
+  const currentGrant = { ...grant, trustSequence: 56, pairingTranscriptHash: "transcript-56",
+    wrappedKey: currentWrappedKey, rootSignature: rawEcdsaToDer(currentSignature).toString("base64") };
+  assert.deepEqual(await messageCrypto.receiveKeyGrants([
+    event("HISTORY_KEY_GRANT", "grant-old-page", "__history_master__", grant),
+    event("HISTORY_KEY_GRANT", "grant-current", "__history_master__", currentGrant),
+  ]), [
+    { state: "key-grant", reason: "Prior pairing history grant ignored" },
+    { state: "key-grant", reason: "Authorized history key stored" },
+  ]);
+  assert.ok(await keysModule.loadCryptoRecord(`history-key:browser-v3:${rootPublicSpki}:history-1`));
 });

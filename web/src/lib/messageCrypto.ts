@@ -67,6 +67,14 @@ async function receiveKeyGrantPage(events: SyncEvent[]): Promise<Decryption[]> {
       }
       if (historyGrant) {
         if (!Number.isSafeInteger(o.trustSequence) || Number(o.trustSequence) < 1) throw new Error("Invalid trust sequence");
+        // The server keeps earlier grants for the same stable browser device ID.
+        // A fresh pairing pins a newer certificate, so those grants cannot be
+        // installed in this session. Ignore them without blocking the current
+        // signed grant in the same keyring page.
+        if (Number(o.trustSequence) < Number(pinned.certificate?.trustSequence)) {
+          results.push({ state: "key-grant", reason: "Prior pairing history grant ignored" });
+          continue;
+        }
         const fields = [string(o, "keyId"), string(o, "deviceId"), string(o, "origin"),
           String(o.trustSequence), string(o, "pairingTranscriptHash"), string(o, "encryptionPublicKey")];
         if (fields[2] !== pinned.certificate?.webOrigin ||
