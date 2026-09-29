@@ -48,7 +48,8 @@ export async function runKeySync(signal: AbortSignal, db: IDBDatabase, deviceId:
     signal.throwIfAborted();
     const rejectedKey = keyringResults.find(result => result.state !== "key-grant" ||
       (result.reason !== "Authorized account key stored" &&
-       result.reason !== "Authorized history key stored"));
+       result.reason !== "Authorized history key stored" &&
+       result.reason !== "Prior pairing history grant ignored"));
     if (rejectedKey) throw new Error(`Account keyring failed: ${"reason" in rejectedKey ? rejectedKey.reason : "unexpected result"}`);
 
     const aggregateIds = (await requestToPromise(db.transaction(conversationStore, "readonly")
