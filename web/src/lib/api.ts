@@ -149,6 +149,14 @@ export async function fetchWebBootstrap(limit = 100, includeContacts = false): P
   return jsonOrThrow<WebBootstrapPage>(res);
 }
 
+export async function fetchContactEventPage(beforeSequence?: number, limit = 50) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (beforeSequence) query.set("beforeSequence", String(beforeSequence));
+  const res = await fetch(`${API}/linked-device/contacts/events?${query}`,
+    { credentials: "include", cache: "no-store" });
+  return jsonOrThrow<{ events: SyncEvent[]; nextBeforeSequence: number | null; hasMore: boolean }>(res);
+}
+
 export async function fetchWebConversationPage(cursor?: string, limit = 100) {
   const query = new URLSearchParams({ limit: String(limit) });
   if (cursor) query.set("cursor", cursor);

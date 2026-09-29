@@ -263,6 +263,25 @@ describe("EventStore — per-account sequencing (LOCK 10) + partial ACK", () => 
       ["CONTACTS_KEY_GRANT"]);
   });
 
+  test("contact pages walk backwards across snapshot chunks without fetching messages", () => {
+    const store = new EventStore(new Database(":memory:"));
+    const event = (eventId, type) => ({ eventId, type, conversationId: "contacts",
+      payload: Buffer.from(eventId), cryptoVersion: 1 });
+    store.ingestBatch({ accountId: "contacts", events: [
+      event("chunk-0", "CONTACTS_SNAPSHOT"),
+      { ...event("message", "MESSAGE_CREATED"), messageId: "m1" },
+      event("chunk-1", "CONTACTS_SNAPSHOT"),
+      event("change", "CONTACTS_CHANGED"),
+    ] });
+    const first = store.contactEventsBefore("contacts", undefined, 2);
+    assert.deepEqual(first.events.map(row => row.eventId), ["change", "chunk-1"]);
+    assert.equal(first.hasMore, true);
+    const second = store.contactEventsBefore("contacts", first.nextBeforeSequence, 2);
+    assert.deepEqual(second.events.map(row => row.eventId), ["chunk-0"]);
+    assert.equal(second.hasMore, false);
+    assert.deepEqual(store.contactEventsBefore("another-account", undefined, 2).events, []);
+  });
+
   test("grant bootstrap pages skip message traffic without advancing the raw sync cursor", () => {
     const store = new EventStore(new Database(":memory:"));
     store.ingestBatch({ accountId: "grants", sourceDeviceId: "phone", events: [

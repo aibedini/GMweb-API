@@ -813,6 +813,8 @@ function requireToken(request, reply, done) {
         (p === "/api/v1/web/sync/ack" || p === "/api/v1/web/snapshot-v2")) ||
       (caps.includes("READ_MESSAGES") && request.method === "GET" &&
         p === "/api/v1/linked-device/telemetry") ||
+      (caps.includes("CONTACTS_READ") && request.method === "GET" &&
+        p === "/api/v1/linked-device/contacts/events") ||
       (caps.includes("SEND_MESSAGES") && request.method === "GET" &&
         p === "/api/v1/linked-device/command-key") ||
       ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ")) &&

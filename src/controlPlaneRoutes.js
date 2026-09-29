@@ -103,7 +103,13 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
 
   app.get("/api/v1/agent/trust/position", {
     schema: { summary: "Primary-agent trust publication position", tags: ["Trust"],
-      response: { 200: { type: "object", properties: { trustSequence: { type: "integer" } } },
+      response: { 200: { type: "object", properties: {
+        trustSequence: { type: "integer" },
+        confirmedApprovals: { type: "array", items: { type: "object", properties: {
+          trustSequence: { type: "integer" }, deviceId: { type: "string" },
+        } } },
+        pendingPairingSessionIds: { type: "array", items: { type: "string" } },
+      } },
         429: { type: "object", properties: { error: { type: "string" } } } } },
   }, async (request, reply) => {
     const rate = checkRateLimit(request, "agent-trust-position", 60, 60_000);
@@ -114,7 +120,40 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       return reply.code(403).send({ error: "primary_agent_required" });
     }
     reply.header("Cache-Control", "no-store");
-    return { trustSequence: trustRegistry.currentSequence(accountId) };
+    // These are server-side pairing receipts, not authorization by themselves.
+    // The primary phone decides whether to publish its already signed statement.
+    const db = trustRegistry.db;
+    const now = Date.now();
+    const confirmed = new Map();
+    const pendingPairingSessionIds = [];
+    const certificateApproval = (certificate, deviceId) => {
+      try {
+        const parsed = JSON.parse(certificate);
+        const sequence = Number(parsed.trustSequence);
+        if (parsed.accountId === accountId && parsed.deviceId === deviceId &&
+            Number.isSafeInteger(sequence) && sequence > 0) {
+          confirmed.set(`${sequence}:${deviceId}`, { trustSequence: sequence, deviceId });
+        }
+      } catch { /* expired or malformed evidence is never confirmation */ }
+    };
+    for (const row of db.prepare("SELECT id, payload FROM pairing_sessions WHERE expires_at > ? LIMIT 128").all(now)) {
+      const session = JSON.parse(row.payload);
+      if (session.state === "PENDING") pendingPairingSessionIds.push(row.id);
+      if (session.state === "APPROVED" && session.approved)
+        certificateApproval(session.approved.certificate, session.approved.deviceId);
+    }
+    for (const row of db.prepare("SELECT device_id, payload FROM pairing_challenges WHERE expires_at > ? LIMIT 128").all(now)) {
+      const challenge = JSON.parse(row.payload);
+      certificateApproval(challenge.certificate, row.device_id);
+    }
+    for (const row of db.prepare("SELECT device_id, payload FROM linked_sessions WHERE expires_at > ? LIMIT 128").all(now)) {
+      const session = JSON.parse(row.payload);
+      const sequence = Number(session.trustSequence);
+      if (session.deviceId === row.device_id && Number.isSafeInteger(sequence) && sequence > 0)
+        confirmed.set(`${sequence}:${row.device_id}`, { trustSequence: sequence, deviceId: row.device_id });
+    }
+    return { trustSequence: trustRegistry.currentSequence(accountId),
+      confirmedApprovals: [...confirmed.values()], pendingPairingSessionIds };
   });
 
   app.post("/api/v1/agent/trust/statements", trustStatementSchema, async (request, reply) => {
@@ -797,6 +836,25 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     webSnapshotHeaders(reply);
     return eventStore.bootstrap(accountId, Number(request.query?.limit) || 100,
       { includeContacts: request.query?.includeContacts !== false });
+  });
+
+  app.get("/api/v1/linked-device/contacts/events", {
+    schema: {
+      summary: "Bounded encrypted contact-event page for an authorized linked browser",
+      tags: ["Sync"],
+      querystring: { type: "object", properties: {
+        beforeSequence: { type: "integer", minimum: 1 },
+        limit: { type: "integer", minimum: 1, maximum: 100, default: 50 },
+      } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    webSnapshotHeaders(reply);
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("CONTACTS_READ"))
+      return reply.code(403).send({ error: "contacts_read_capability_required" });
+    return eventStore.contactEventsBefore(accountId, request.query?.beforeSequence,
+      request.query?.limit);
   });
 
   app.post("/api/v1/web/sync/ack", {

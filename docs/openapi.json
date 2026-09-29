@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.22",
+    "version": "0.19.23",
     "contact": {
       "name": "GMweb API"
     }
@@ -2276,6 +2276,26 @@
                   "properties": {
                     "trustSequence": {
                       "type": "integer"
+                    },
+                    "confirmedApprovals": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "trustSequence": {
+                            "type": "integer"
+                          },
+                          "deviceId": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "pendingPairingSessionIds": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
                     }
                   }
                 }
@@ -3553,6 +3573,49 @@
             },
             "in": "query",
             "name": "includeContacts",
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/linked-device/contacts/events": {
+      "get": {
+        "summary": "Bounded encrypted contact-event page for an authorized linked browser",
+        "tags": [
+          "Sync"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "in": "query",
+            "name": "beforeSequence",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            },
+            "in": "query",
+            "name": "limit",
             "required": false
           }
         ],

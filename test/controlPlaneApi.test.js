@@ -48,7 +48,7 @@ function encryptedPayload(event) {
 // control plane is testable in isolation (ADR-004 "independent CI").
 
 describe("Phase 2 control plane HTTP API", () => {
-  let app;
+  let app, db;
 
   before(async () => {
     app = Fastify({ logger: false });
@@ -56,11 +56,14 @@ describe("Phase 2 control plane HTTP API", () => {
       if (request.headers["x-test-agent-device"]) request.authenticatedAgentId = String(request.headers["x-test-agent-device"]);
       if (request.headers["x-test-linked"]) request.linkedDevice = {
         deviceId: String(request.headers["x-test-linked"]),
-        capabilities: ["READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "CONTACTS_READ"],
+        capabilities: request.headers["x-test-without-contacts"]
+          ? ["READ_MESSAGES", "SEND_MESSAGES", "MARK_READ"]
+          : ["READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "CONTACTS_READ"],
       };
       done();
     });
-    const db = new Database(":memory:");
+    db = new Database(":memory:");
+    require("../src/pairingDb").configure(db);
     const rateBuckets = new Map();
     registerControlPlaneRoutes(app, {
       trustRegistry: new TrustRegistry(db),
@@ -306,7 +309,7 @@ describe("Phase 2 control plane HTTP API", () => {
     assert.equal(positionDenied.statusCode, 403);
     const position = await app.inject({ method: "GET", url: "/api/v1/agent/trust/position", headers: H });
     assert.equal(position.statusCode, 200);
-    assert.deepEqual(position.json(), { trustSequence: 1 });
+    assert.deepEqual(position.json(), { trustSequence: 1, confirmedApprovals: [], pendingPairingSessionIds: [] });
 
     const gap = await app.inject({ method: "POST", url: "/api/v1/trust/statements", payload: mk(3), headers: H });
     assert.equal(gap.statusCode, 409);
@@ -322,6 +325,37 @@ describe("Phase 2 control plane HTTP API", () => {
 
     const list = await app.inject({ method: "GET", url: "/api/v1/trust/statements?after=0" });
     assert.deepEqual(list.json().statements.map((s) => s.trustSequence), [1, 2]);
+  });
+
+  test("primary trust position reports pairing evidence without exposing certificates", async () => {
+    const now = Date.now();
+    db.prepare("INSERT INTO pairing_sessions VALUES (?, ?, ?, ?)").run(
+      "pending-session", "test", now + 60000,
+      JSON.stringify({ state: "PENDING" }));
+    db.prepare("INSERT INTO linked_sessions VALUES (?, ?, ?, ?, ?)").run(
+      "token-hash", "browser-54", now + 60000, now,
+      JSON.stringify({ deviceId: "browser-54", trustSequence: 54 }));
+    const response = await app.inject({ method: "GET", url: "/api/v1/agent/trust/position",
+      headers: { "x-test-agent-role": "PRIMARY_TRUST_AGENT" } });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().confirmedApprovals, [{ trustSequence: 54, deviceId: "browser-54" }]);
+    assert.deepEqual(response.json().pendingPairingSessionIds, ["pending-session"]);
+    assert.equal(response.body.includes("token-hash"), false);
+    db.prepare("DELETE FROM pairing_sessions WHERE id = ?").run("pending-session");
+    db.prepare("DELETE FROM linked_sessions WHERE token_hash = ?").run("token-hash");
+  });
+
+  test("encrypted contact pages require CONTACTS_READ on a linked session", async () => {
+    const anonymous = await app.inject({ method: "GET", url: "/api/v1/linked-device/contacts/events" });
+    assert.equal(anonymous.statusCode, 401);
+    const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/contacts/events",
+      headers: { "x-test-linked": "browser", "x-test-without-contacts": "1" } });
+    assert.equal(denied.statusCode, 403);
+    const linked = await app.inject({ method: "GET", url: "/api/v1/linked-device/contacts/events?limit=2",
+      headers: { "x-test-linked": "browser" } });
+    assert.equal(linked.statusCode, 200);
+    assert.deepEqual(linked.json().events, []);
+    assert.equal(linked.headers["cache-control"], "no-store");
   });
 
   test("trust snapshot 404 before any snapshot exists", async () => {
