@@ -147,6 +147,9 @@ class EventStore {
         ON encrypted_conversation_state(account_id, sort_key DESC, conversation_id DESC);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_events_uuid ON sync_events (account_id, event_uuid);
       CREATE INDEX IF NOT EXISTS idx_events_time ON sync_events (account_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_events_contact_page
+        ON sync_events (account_id, event_type, sequence DESC)
+        WHERE event_type IN ('CONTACTS_SNAPSHOT', 'CONTACTS_CHANGED');
       -- Android diagnostics aggregates metadata across the account. Covering
       -- this query avoids one table lookup (and ciphertext page read) per event.
       CREATE INDEX IF NOT EXISTS idx_events_diagnostics_cover
@@ -663,6 +666,26 @@ class EventStore {
       ORDER BY sequence ASC
     `).all(accountId, accountId);
     return eventPage(rows, 0, rows.length).events;
+  }
+
+  /** Bounded reverse scan of opaque contact events for on-demand browser reconstruction. */
+  contactEventsBefore(accountId, beforeSequence, limit = 50) {
+    const capped = Math.max(1, Math.min(100, Number(limit) || 50));
+    const before = Number.isSafeInteger(Number(beforeSequence)) && Number(beforeSequence) > 0
+      ? Number(beforeSequence) : Number.MAX_SAFE_INTEGER;
+    const rows = this.db.prepare(`
+      SELECT sequence, event_uuid AS eventId, event_type AS type, aggregate_id AS aggregateId,
+             source_device_id AS sourceDeviceId, ciphertext, encoding,
+             schema_version AS schemaVersion, crypto_version AS cryptoVersion, created_at AS createdAt
+      FROM sync_events
+      WHERE account_id = ? AND event_type IN ('CONTACTS_SNAPSHOT', 'CONTACTS_CHANGED')
+        AND sequence < ?
+      ORDER BY sequence DESC LIMIT ?
+    `).all(accountId, before, capped + 1);
+    const hasMore = rows.length > capped;
+    const page = hasMore ? rows.slice(0, capped) : rows;
+    return { events: page.map(row => ({ ...row, ciphertext: Buffer.from(row.ciphertext).toString('base64') })),
+      nextBeforeSequence: page.length ? page.at(-1).sequence : null, hasMore };
   }
 
   bootstrap(accountId, limit = 100, { includeContacts = true } = {}) {

@@ -39,6 +39,10 @@ test("lazy inbox downloads summaries first and only the opened thread's bounded 
     if (path.includes("/linked-device/keyring") || path.includes("/linked-device/key-grants")) {
       return Response.json({ events: [], nextCursor: 0, hasMore: false });
     }
+    if (path.includes("/linked-device/contacts/events")) {
+      assert.equal(new URL(path, "https://example.test").searchParams.get("limit"), "50");
+      return Response.json({ events: [], nextBeforeSequence: null, hasMore: false });
+    }
     if (path.includes("/web/bootstrap")) {
       const query = new URL(path, "https://example.test").searchParams;
       if (query.get("includeContacts") === "true") {
@@ -104,7 +108,7 @@ test("lazy inbox downloads summaries first and only the opened thread's bounded 
     assert.equal((await sync.listConversations({ limit: 100, before: inbox.next })).items.length, 30);
     assert.equal(calls.some(path => path.includes("includeContacts=true")), false);
     await sync.loadContactsOnDemand();
-    assert.equal(calls.some(path => path.includes("includeContacts=true")), true);
+    assert.equal(calls.some(path => path.includes("/linked-device/contacts/events")), true);
     const first = await sync.listAggregateEventsPage("conversation-0", { limit: 10 });
     assert.equal(first.items.length, 10);
     assert.equal(await count(), 10);

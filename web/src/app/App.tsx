@@ -78,6 +78,10 @@ export default function App() {
   const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
   const [contacts, setContacts] = useState<StoredContact[]>([]);
   const [contactSearch, setContactSearch] = useState("");
+  const [contactsBusy, setContactsBusy] = useState(false);
+  const [contactsProgress, setContactsProgress] = useState(0);
+  const [contactsError, setContactsError] = useState<string | null>(null);
+  const [visibleContactCount, setVisibleContactCount] = useState(100);
   // PWA projection: paginated conversation read-model (replaces the old
   // listInboxEvents(100) inbox scan).
   const [conversationPage, setConversationPage] = useState<ConversationProjection[]>([]);
@@ -94,6 +98,8 @@ export default function App() {
   const lastThreadSelection = useRef<string | null>(null);
   const recoveringSend = useRef(false);
   const conversationScrollRef = useRef<HTMLDivElement>(null);
+  const loadingOlderRef = useRef(false);
+  const hasLoadedOlderConversations = useRef(false);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const scriptFile = useMemo(() => loadedScriptFile(), []);
 
@@ -106,9 +112,12 @@ export default function App() {
     setTrust(nextTrust);
     setSyncStatus(getBrowserSyncStatus());
     const page = await listConversations({ limit: 100 });
-    setConversationPage(page.items);
-    setConversationHasMore(page.hasMore);
-    setConversationNext(page.next);
+    setConversationPage(prev => prev.length > 100
+      ? [...new Map([...prev, ...page.items].map(item => [item.aggregateId, item])).values()]
+        .sort((a, b) => b.lastAt - a.lastAt || a.aggregateId.localeCompare(b.aggregateId))
+      : page.items);
+    setConversationHasMore(prev => hasLoadedOlderConversations.current ? prev : page.hasMore);
+    setConversationNext(prev => hasLoadedOlderConversations.current ? prev : page.next);
     setContacts(nextContacts);
   };
 
@@ -119,16 +128,21 @@ export default function App() {
     setCursor(nextCursor);
     setEvents(nextEvents);
     setContacts(nextContacts);
-    setConversationPage(page.items);
-    setConversationHasMore(page.hasMore);
-    setConversationNext(page.next);
+    setConversationPage(prev => prev.length > 100
+      ? [...new Map([...prev, ...page.items].map(item => [item.aggregateId, item])).values()]
+        .sort((a, b) => b.lastAt - a.lastAt || a.aggregateId.localeCompare(b.aggregateId))
+      : page.items);
+    setConversationHasMore(prev => hasLoadedOlderConversations.current ? prev : page.hasMore);
+    setConversationNext(prev => hasLoadedOlderConversations.current ? prev : page.next);
   };
 
   const loadOlderConversations = async () => {
-    if (!conversationNext || loadingOlder) return;
+    if (!conversationNext || loadingOlderRef.current) return;
+    loadingOlderRef.current = true;
     setLoadingOlder(true);
     try {
       const page = await listConversations({ limit: 100, before: conversationNext });
+      hasLoadedOlderConversations.current = true;
       setConversationPage(prev => {
         const merged = new Map([...prev, ...page.items].map(item => [item.aggregateId, item]));
         return [...merged.values()].sort((a, b) => b.lastAt - a.lastAt || a.aggregateId.localeCompare(b.aggregateId));
@@ -136,8 +150,22 @@ export default function App() {
       setConversationHasMore(page.hasMore);
       setConversationNext(page.next);
     } finally {
+      loadingOlderRef.current = false;
       setLoadingOlder(false);
     }
+  };
+
+  const refreshContacts = async () => {
+    if (contactsBusy) return;
+    setContactsBusy(true);
+    setContactsError(null);
+    setContactsProgress(0);
+    try {
+      await loadContactsOnDemand(setContactsProgress);
+      setContacts(await listContacts());
+    } catch (cause) {
+      setContactsError(cause instanceof Error ? cause.message : String(cause));
+    } finally { setContactsBusy(false); }
   };
 
   const refreshSecurity = async () => {
@@ -209,9 +237,7 @@ export default function App() {
 
   useEffect(() => {
     if (!authed || tab !== "contacts") return;
-    void loadContactsOnDemand()
-      .then(() => listContacts()).then(setContacts)
-      .catch(cause => setError(cause instanceof Error ? cause.message : String(cause)));
+    void refreshContacts();
   }, [authed, tab]);
 
   const contactNames = useMemo(() => new Map(contacts.map(contact => [contact.normalizedPhone, contact.displayName])), [contacts]);
@@ -227,8 +253,8 @@ export default function App() {
   }, [conversations, search]);
 
   useEffect(() => {
-    if (!selected && conversations[0]) setSelected(conversations[0].aggregateId);
-  }, [conversations, selected]);
+    if (!selected && !composeRecipient && conversations[0]) setSelected(conversations[0].aggregateId);
+  }, [conversations, selected, composeRecipient]);
 
   const selectedConversation = conversations.find((item) => item.aggregateId === selected) ||
     (selectedConversationCache?.aggregateId === selected ? selectedConversationCache : null);
@@ -437,7 +463,7 @@ export default function App() {
       const count = await syncVisibleInbox();
       setApplied(count);
       setThreadReload(value => value + 1);
-      if (tab === "contacts") setContacts(await loadContactsOnDemand().then(listContacts));
+      if (tab === "contacts") await refreshContacts();
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -540,7 +566,7 @@ export default function App() {
                     const item = filteredConversations[virtualRow.index];
                     return <button key={item.aggregateId} ref={conversationVirtualizer.measureElement} data-index={virtualRow.index}
                       style={{ position: "absolute", width: "100%", transform: "translateY(" + virtualRow.start + "px)" }}
-                      className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => { setSelected(item.aggregateId); setSelectedConversationCache(item); }}>
+                      className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => { setComposeRecipient(""); setSelected(item.aggregateId); setSelectedConversationCache(item); }}>
                         <Avatar title={item.title} />
                         <span className="conversation-copy"><span className="conversation-title">{item.title}{item.subtitle ? ` · ${item.subtitle}` : ""}</span><span className="conversation-preview">{item.preview}</span></span>
                         <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time>{item.unreadCount > 0 && <Chip size="sm">{item.unreadCount}</Chip>}</span>
@@ -603,13 +629,33 @@ export default function App() {
           </div>
         </TabPanel>
 
-        <TabPanel id="contacts" className="content-panel">
+        <TabPanel id="contacts" className="content-panel" onScroll={(event) => {
+          const element = event.currentTarget;
+          if (element.scrollHeight - element.scrollTop - element.clientHeight < 240)
+            setVisibleContactCount(count => Math.min(count + 100, filteredContacts.length));
+        }}>
           <div className="page-title"><p className="eyebrow">Phone book</p><h1>Contacts</h1><p>End-to-end encrypted contacts synced from the Primary Android device.</p></div>
+          <div className="contact-sync-status" role="status">
+            <span>{contactsBusy ? `Syncing encrypted contacts… ${contactsProgress} event(s) checked`
+              : contactsError ? contactsError : `${contacts.length} contacts ready`}</span>
+            <Button size="sm" variant="ghost" onPress={() => void refreshContacts()} isDisabled={contactsBusy}>
+              {contactsBusy ? <Spinner size="sm" /> : "Sync contacts"}
+            </Button>
+          </div>
           <label className="search-box"><span aria-hidden="true">⌕</span><input value={contactSearch} onChange={(event) => setContactSearch(event.target.value)} placeholder="Search names or numbers" aria-label="Search contacts" /></label>
           <div className="security-list">
-            {filteredContacts.map(contact => (
-              <button key={contact.normalizedPhone} type="button" onClick={() => { setComposeRecipient(contact.normalizedPhone); setSelected(null); setTab("inbox"); }}><Card><CardContent className="security-row"><div><strong>{contact.displayName}</strong><p>{contact.normalizedPhone}</p></div>{contact.starred && <Chip size="sm" variant="soft">Starred</Chip>}</CardContent></Card></button>
+            {filteredContacts.slice(0, visibleContactCount).map(contact => (
+              <button key={contact.normalizedPhone} type="button" onClick={() => {
+                setComposeRecipient(contact.normalizedPhone);
+                const matching = conversations.find(item =>
+                  `${item.title} ${item.subtitle || ""}`.includes(contact.normalizedPhone));
+                setSelected(matching?.aggregateId ?? null);
+                if (matching) setSelectedConversationCache(matching);
+                setTab("inbox");
+              }}><Card><CardContent className="security-row"><div><strong>{contact.displayName}</strong><p>{contact.normalizedPhone}</p></div>{contact.starred && <Chip size="sm" variant="soft">Starred</Chip>}</CardContent></Card></button>
             ))}
+            {filteredContacts.length > visibleContactCount && <Button size="sm" variant="ghost"
+              onPress={() => setVisibleContactCount(count => count + 100)}>Load more contacts</Button>}
             {filteredContacts.length === 0 && <div className="empty-list"><span>✦</span><p>{contacts.length
               ? "No matching contacts"
               : !capabilities.includes("CONTACTS_READ")

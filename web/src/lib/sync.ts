@@ -8,7 +8,7 @@
  * without touching storage or UI.
  */
 
-import { fetchWebBootstrap, fetchWebConversationPage, fetchWebMessagePage,
+import { fetchWebBootstrap, fetchWebConversationPage, fetchWebMessagePage, fetchContactEventPage,
   type EncryptedConversationState, type EncryptedMessageState, type SyncEvent } from "./api.ts";
 import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypto.ts";
 import { decodeEventPayload, type ConversationProjection } from "./inbox.ts";
@@ -220,12 +220,54 @@ export function syncVisibleInbox(): Promise<number> {
   });
 }
 
-/** Contacts are a separate encrypted view; loading the Inbox never requests them. */
-export async function loadContactsOnDemand(): Promise<void> {
+/** Reconstruct only the latest complete encrypted snapshot, in bounded pages. */
+export async function loadContactsOnDemand(onProgress?: (events: number) => void): Promise<void> {
   const db = await openDb();
   if (await metaValue<boolean>(db, LAZY_INBOX_KEY) !== true) await syncVisibleInbox();
   if (!navigator.onLine) return;
-  const page = await fetchWebBootstrap(1, true);
+  type Decoded = { event: SyncEvent; payload: Record<string, unknown> };
+  const decoded: Decoded[] = [];
+  let fetchedCount = 0;
+  const snapshots = new Map<string, { count: number; chunks: Map<number, Decoded>; latest: number }>();
+  let before: number | undefined;
+  let selected: { count: number; chunks: Map<number, Decoded>; latest: number } | undefined;
+  for (let pageNumber = 0; pageNumber < 20 && !selected; pageNumber++) {
+    const page = await fetchContactEventPage(before, 50);
+    fetchedCount += page.events.length;
+    for (const event of page.events) {
+      const payload = event.cryptoVersion > 0
+        ? await decryptMessage(event).then(result => result.state === "decrypted" ? result.payload : null)
+        : decodeEventPayload(event);
+      if (!payload) continue;
+      const item = { event, payload };
+      decoded.push(item);
+      if (event.type !== "CONTACTS_SNAPSHOT") continue;
+      const id = payload.snapshotId;
+      const index = Number(payload.chunkIndex);
+      const count = Number(payload.chunkCount);
+      if (typeof id !== "string" || !Number.isSafeInteger(index) || !Number.isSafeInteger(count) ||
+          index < 0 || count < 1 || index >= count) continue;
+      const group = snapshots.get(id) || { count, chunks: new Map<number, Decoded>(), latest: event.sequence };
+      if (group.count !== count) continue;
+      group.chunks.set(index, item);
+      group.latest = Math.max(group.latest, event.sequence);
+      snapshots.set(id, group);
+    }
+    onProgress?.(decoded.length);
+    // Prefer the newest complete snapshot; never apply an incomplete newer
+    // generation, which would silently drop most of the phone book.
+    selected = [...snapshots.values()].filter(group => group.chunks.size === group.count)
+      .sort((a, b) => b.latest - a.latest)[0];
+    if (selected || !page.hasMore || !page.nextBeforeSequence) break;
+    before = page.nextBeforeSequence;
+  }
+  if (!selected && fetchedCount === 0) { volatileContacts.clear(); return; }
+  if (!selected) throw new Error("A complete contact snapshot or its decryption key is still pending");
+  const canonical = [
+    ...[...selected.chunks.entries()].sort((a, b) => a[0] - b[0]).map(([, value]) => value),
+    ...decoded.filter(item => item.event.type === "CONTACTS_CHANGED" &&
+      item.event.sequence > selected!.latest).sort((a, b) => a.event.sequence - b.event.sequence),
+  ];
   const oldContactKeys: IDBValidKey[] = [];
   const read = db.transaction(STORE_EVENTS, "readonly");
   const cursor = read.objectStore(STORE_EVENTS).openCursor();
@@ -239,9 +281,10 @@ export async function loadContactsOnDemand(): Promise<void> {
   const transaction = db.transaction(STORE_EVENTS, "readwrite");
   const events = transaction.objectStore(STORE_EVENTS);
   for (const key of oldContactKeys) events.delete(key);
-  for (const event of page.contactEvents) events.put(event);
+  for (const item of canonical) events.put(item.event);
   await txDone(transaction);
-  await repairContactsFromLocalEvents(db);
+  volatileContacts.clear();
+  for (const item of canonical) await applyContacts(item.payload);
 }
 
 export function syncNow(onProgress?: (applied: number) => void): Promise<number> {
