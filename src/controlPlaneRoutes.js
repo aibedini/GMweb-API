@@ -38,7 +38,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   const replicationCapabilities = () => ({
     preferredProtocolVersion: 1,
     supportedProtocolVersions: [1],
-    eventIngest: { maxBatchEvents: 100, perItemResults: false },
+    eventIngest: { maxBatchEvents: 100, perItemResults: true },
     snapshot: { stablePagination: true },
     keys: { deviceFiltered: true, independentFromEventCursor: true },
     commands: { durable: true, idempotent: true, leases: enableCommandLeases },
@@ -664,7 +664,11 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
                 properties: { eventId: { type: "string" }, serverSequence: { type: "integer" } }
               }
             },
-            duplicates: { type: "integer" }
+            duplicates: { type: "integer" },
+            results: { type: "array", items: { type: "object", properties: {
+              eventId: { type: "string" }, status: { type: "string" },
+              serverSequence: { type: "integer" }
+            } } }
           }
         }
       }
