@@ -248,6 +248,21 @@ export async function fetchPrimaryTelemetry(): Promise<DeviceTelemetry | null> {
   return (await jsonOrThrow<{ telemetry: DeviceTelemetry | null }>(res)).telemetry;
 }
 
+export interface LinkedBrowserSession {
+  deviceId: string;
+  ip: string | null;
+  userAgent: string | null;
+  lastSeenAt: number;
+  lastDataAt: number | null;
+  lastSyncAt: number | null;
+  onlineNow: boolean;
+}
+
+export async function fetchLinkedSessions(): Promise<LinkedBrowserSession[]> {
+  const res = await fetch(`${API}/linked-device/sessions`, { credentials: "include" });
+  return (await jsonOrThrow<{ sessions: LinkedBrowserSession[] }>(res)).sessions;
+}
+
 export interface ServerSyncDiagnostics {
   total: number;
   maxSequence: number;

@@ -804,6 +804,7 @@ function requireToken(request, reply, done) {
           p === "/api/v1/web/conversations" ||
           p.startsWith("/api/v1/web/conversations/") ||
           p === "/api/v1/linked-device/sync-diagnostics" ||
+          p === "/api/v1/linked-device/sessions" ||
           p === "/api/v1/linked-device/key-grants" ||
           p === "/api/v1/linked-device/keyring" ||
           p === "/api/v1/linked-device/replication-capabilities" ||
@@ -824,6 +825,11 @@ function requireToken(request, reply, done) {
       p === "/api/v1/linked-session"; // introspection always allowed
     if (allowed) {
       request.linkedDevice = linkedSession;
+      linkedSessions.observe(linkedCookie, request.ip, request.headers["user-agent"],
+        p === "/api/v1/sync" || p === "/api/v1/web/bootstrap" ||
+        p === "/api/v1/web/snapshot-v2" || p === "/api/v1/web/conversations" ||
+        p.startsWith("/api/v1/web/conversations/") ||
+        p === "/api/v1/linked-device/contacts/events");
       return done();
     }
     // A linked browser must not silently fall through to bearer auth with

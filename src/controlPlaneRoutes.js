@@ -312,6 +312,23 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     return { telemetry: deviceTelemetryStore?.getPrimary() || null };
   });
 
+  app.get("/api/v1/linked-device/sessions", {
+    schema: { summary: "Presence of linked browser sessions", tags: ["Trust"],
+      response: { 200: { type: "object", additionalProperties: true } } },
+  }, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("READ_MESSAGES"))
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    const ack = eventStore?.db?.prepare(`SELECT updated_at AS lastSyncAt, last_acked_sequence AS lastAckedSequence
+      FROM linked_client_sync_state WHERE account_id = ? AND linked_device_id = ?`);
+    return { sessions: (linkedSessions?.presence() || []).map(row => ({
+      deviceId: row.deviceId, ip: row.ip || null, userAgent: row.userAgent || null,
+      lastSeenAt: row.lastSeenAt, lastDataAt: row.lastDataAt || null,
+      lastSyncAt: ack?.get(accountId, row.deviceId)?.lastSyncAt || null,
+      onlineNow: row.onlineNow,
+    })) };
+  });
+
   app.get("/api/v1/linked-device/command-key", {
     schema: { summary: "Primary Android command encryption public key", tags: ["Commands"] },
   }, async (request, reply) => {
@@ -679,6 +696,9 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     try {
       events = validateWireBatch(body.events);
     } catch (error) {
+      request.log.warn({ validationCode: error.code || "invalid_event_batch",
+        eventCount: Array.isArray(body.events) ? body.events.length : null },
+      "agent event batch rejected before ingestion");
       return reply.code(400).send({ error: error.code || "invalid_event_batch" });
     }
     // P0: sourceDeviceId is NEVER taken from the request body. The per-device
