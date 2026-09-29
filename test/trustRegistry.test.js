@@ -92,6 +92,20 @@ describe("TrustRegistry relay", () => {
     assert.equal(snap.snapshot.devices.length, 0);
   });
 
+  test("a signed void advances the ledger without authorizing a device", () => {
+    const reg = new TrustRegistry(new Database(":memory:"));
+    const voided = stmt(1, "TRUST_SEQUENCE_VOIDED", {
+      deviceId: "void:1", capabilities: [], historyGrant: "",
+    });
+    assert.equal(reg.applyStatement({ accountId: "acc1", statement: voided }).applied, true);
+    assert.equal(reg.currentSequence("acc1"), 1);
+    const snap = reg.getStatementSnapshot("acc1", "ROOTPUB");
+    assert.equal(snap.trustSequence, 1);
+    assert.deepEqual(snap.snapshot.devices, []);
+    assert.equal(reg.statementsAfter("acc1", 0)[0].operation, "TRUST_SEQUENCE_VOIDED");
+    assert.equal(reg.applyStatement({ accountId: "acc1", statement: stmt(2, "DEVICE_APPROVED") }).applied, true);
+  });
+
   test("cursor pagination returns only statements after the cursor", () => {
     const reg = new TrustRegistry(new Database(":memory:"));
     for (let i = 1; i <= 5; i++) {
