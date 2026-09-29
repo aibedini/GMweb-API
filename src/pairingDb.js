@@ -18,6 +18,10 @@ function configure(db) {
       last_seen INTEGER NOT NULL, payload TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS linked_sessions_device ON linked_sessions(device_id);
+    CREATE TABLE IF NOT EXISTS linked_session_presence (
+      token_hash TEXT PRIMARY KEY, ip TEXT, user_agent TEXT,
+      last_data_at INTEGER
+    );
     CREATE TABLE IF NOT EXISTS primary_setup_claims (
       token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, api_origin TEXT NOT NULL
     );

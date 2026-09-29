@@ -2,11 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Card, CardContent, Chip, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
 import { syncVisibleInbox, loadContactsOnDemand, listRecentEvents, listAggregateEventsPage, listContacts, listConversations, getCursor, getBrowserSyncStatus, resetLocal, subscribeSyncAvailable, type BrowserSyncStatus, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, type ConversationProjection } from "../lib/inbox";
-import { createCommand, fetchCommand, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type TrustSnapshot } from "../lib/api";
+import { createCommand, fetchCommand, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type LinkedBrowserSession, type TrustSnapshot } from "../lib/api";
 import { encryptCommand } from "../lib/commandCrypto";
 import { getStoredDeviceIdentity } from "../lib/deviceKeys";
 import { clearPendingSend, loadPendingSends, savePendingSend, type PendingEncryptedSend } from "../lib/commandOutbox";
-import { listCredentials, removeCredential, listPushSubscriptions, type CredentialRow } from "../lib/security";
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
@@ -73,9 +72,11 @@ export default function App() {
   const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
-  const [credentials, setCredentials] = useState<CredentialRow[] | null>(null);
-  const [pushCount, setPushCount] = useState<number | null>(null);
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [recipientSearch, setRecipientSearch] = useState("");
   const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
+  const [linkedBrowsers, setLinkedBrowsers] = useState<LinkedBrowserSession[]>([]);
+  const [showLinkedBrowsers, setShowLinkedBrowsers] = useState(false);
   const [contacts, setContacts] = useState<StoredContact[]>([]);
   const [contactSearch, setContactSearch] = useState("");
   const [contactsBusy, setContactsBusy] = useState(false);
@@ -168,15 +169,6 @@ export default function App() {
     } finally { setContactsBusy(false); }
   };
 
-  const refreshSecurity = async () => {
-    const [nextCredentials, pushes] = await Promise.all([
-      listCredentials().catch(() => null),
-      listPushSubscriptions().catch(() => null),
-    ]);
-    setCredentials(nextCredentials);
-    setPushCount(pushes?.count ?? null);
-  };
-
   useEffect(() => {
     void health().then((value) => setVersion(value.version)).catch(() => setVersion("unreachable"));
     void fetch("/api/v1/linked-session", { credentials: "include" })
@@ -206,10 +198,12 @@ export default function App() {
         setSyncStatus(getBrowserSyncStatus());
         setError(cause instanceof Error ? cause.message : String(cause));
       });
-    void refreshSecurity();
     const refreshTelemetry = () => void fetchPrimaryTelemetry().then(setTelemetry).catch(() => setTelemetry(null));
     refreshTelemetry();
     const telemetryTimer = window.setInterval(refreshTelemetry, 60_000);
+    const refreshLinkedBrowsers = () => void fetchLinkedSessions().then(setLinkedBrowsers).catch(() => setLinkedBrowsers([]));
+    refreshLinkedBrowsers();
+    const linkedBrowsersTimer = window.setInterval(refreshLinkedBrowsers, 60_000);
     const refreshVisible = () => void syncVisibleInbox().then(changed => {
       setSyncStatus(getBrowserSyncStatus());
       if (changed) { setApplied(changed); setThreadReload(value => value + 1); void refresh(); }
@@ -232,7 +226,7 @@ export default function App() {
       setSyncStatus(getBrowserSyncStatus());
       setError(cause instanceof Error ? cause.message : String(cause));
     }, syncVisibleInbox);
-    return () => { window.clearInterval(telemetryTimer); window.clearInterval(visibleTimer); unsubscribe(); };
+    return () => { window.clearInterval(telemetryTimer); window.clearInterval(linkedBrowsersTimer); window.clearInterval(visibleTimer); unsubscribe(); };
   }, [authed]);
 
   useEffect(() => {
@@ -246,6 +240,20 @@ export default function App() {
     const query = contactSearch.trim().toLocaleLowerCase();
     return query ? contacts.filter(contact => `${contact.displayName}\n${contact.normalizedPhone}`.toLocaleLowerCase().includes(query)) : contacts;
   }, [contacts, contactSearch]);
+  const recipientMatches = useMemo(() => {
+    const query = recipientSearch.trim().toLocaleLowerCase();
+    if (!query) return contacts.slice(0, 30);
+    return contacts.filter(contact => `${contact.displayName}\n${contact.normalizedPhone}`.toLocaleLowerCase().includes(query)).slice(0, 30);
+  }, [contacts, recipientSearch]);
+  const selectRecipient = (phone: string) => {
+    setComposeRecipient(phone);
+    const matching = conversations.find(item => item.subtitle === phone || item.title === phone);
+    setSelected(matching?.aggregateId ?? null);
+    if (matching) setSelectedConversationCache(matching);
+    setComposeOpen(false);
+    setRecipientSearch("");
+    setTab("inbox");
+  };
   const filteredConversations = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     if (!query) return conversations;
@@ -253,8 +261,8 @@ export default function App() {
   }, [conversations, search]);
 
   useEffect(() => {
-    if (!selected && !composeRecipient && conversations[0]) setSelected(conversations[0].aggregateId);
-  }, [conversations, selected, composeRecipient]);
+    if (window.innerWidth > 720 && !selected && !composeRecipient && !composeOpen && conversations[0]) setSelected(conversations[0].aggregateId);
+  }, [conversations, selected, composeRecipient, composeOpen]);
 
   const selectedConversation = conversations.find((item) => item.aggregateId === selected) ||
     (selectedConversationCache?.aggregateId === selected ? selectedConversationCache : null);
@@ -353,7 +361,7 @@ export default function App() {
     overscan: 12,
     getItemKey: index => messages[index]?.payload.messageId ?? messages[index]?.event.eventId ?? index,
   });
-  const selectedRecipient = messages.map(item => item.payload.address).find(Boolean) || composeRecipient;
+  const selectedRecipient = composeRecipient || messages.map(item => item.payload.address).find(Boolean);
 
   useEffect(() => {
     if (pendingMessage && messages.some(item =>
@@ -493,7 +501,7 @@ export default function App() {
   let syncBanner = "Refreshing recent conversations…";
   if (syncStatus.state === "UP_TO_DATE") syncBanner = "Recent conversations are up to date";
   if (syncStatus.state === "DEGRADED") syncBanner = syncStatus.lastErrorPhase === "KEY_SYNC"
-    ? "Conversation keys are still pending from the primary phone"
+    ? `Some encryption keys could not be refreshed${syncStatus.lastErrorMessage ? `: ${syncStatus.lastErrorMessage}` : ""}`
     : "Recent conversations need attention";
   if (syncStatus.state === "FAILED") syncBanner = "Conversation refresh paused";
   const emptyInboxMessage = "No recent conversations are available yet.";
@@ -532,10 +540,16 @@ export default function App() {
           <span className="version-pill" title={`${scriptFile} · cursor ${cursor}`}>v{version || "…"}</span>
           <span className={`connection-dot ${!online || version === "unreachable" ? "offline" : ""}`} />
           <span className="connection-label">{!online || version === "unreachable" ? "Offline" : version ? "Connected" : "Checking"}</span>
+          <Button className="topbar-button" size="sm" variant="ghost" aria-label="Linked browsers" onPress={() => setShowLinkedBrowsers(value => !value)}>👁 {linkedBrowsers.filter(row => row.onlineNow).length}</Button>
           <Button className="topbar-button" size="sm" variant="ghost" onPress={() => void pull()} isDisabled={busy}>{busy ? <Spinner size="sm" /> : "Sync"}</Button>
           <Button className="topbar-button" size="sm" variant="ghost" onPress={() => setAuthed(false)}>Lock</Button>
         </div>
       </header>
+      {showLinkedBrowsers && <section className="linked-browser-panel" aria-label="Linked browser sessions">
+        <div className="linked-browser-title"><strong>Linked browsers</strong><Button size="sm" variant="ghost" onPress={() => setShowLinkedBrowsers(false)}>Close</Button></div>
+        {linkedBrowsers.length === 0 && <p>No linked browsers are currently visible.</p>}
+        {linkedBrowsers.map((row, index) => <div className="linked-browser-row" key={`${row.deviceId}-${index}`}><strong>{row.onlineNow ? "● Online" : "○ Inactive"} · {shortId(row.deviceId)}</strong><span>{row.ip || "IP unavailable"}</span><small>{row.userAgent || "Browser unknown"}</small><small>Last seen: {new Date(row.lastSeenAt).toLocaleString()}</small><small>Last data request: {row.lastDataAt ? new Date(row.lastDataAt).toLocaleString() : "No data request observed"}</small><small>Last durable sync: {row.lastSyncAt ? new Date(row.lastSyncAt).toLocaleString() : "No sync acknowledgement"}</small></div>)}
+      </section>}
 
       <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(key as TabKey)} className="app-tabs">
         <TabList className="tab-list" aria-label="Messages navigation">
@@ -552,9 +566,10 @@ export default function App() {
             {(syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED") &&
               <Button size="sm" variant="ghost" onPress={() => void pull()}>Retry</Button>}
           </div>
-          <div className="inbox-layout">
+          <div className={`inbox-layout ${selected || composeRecipient || composeOpen ? "mobile-thread" : "mobile-list"}`}>
             <aside className="conversation-pane">
               <div className="pane-heading"><div><p className="eyebrow">Inbox</p><h1>Conversations</h1></div><Chip size="sm" variant="soft">{conversations.length} loaded</Chip></div>
+              <Button className="compose-button" size="sm" onPress={() => { setComposeOpen(true); setSelected(null); setComposeRecipient(""); setRecipientSearch(""); }}>＋ Compose</Button>
               <label className="search-box"><span aria-hidden="true">⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search messages" aria-label="Search messages" /></label>
               <div ref={conversationScrollRef} className="conversation-list" onScroll={(event) => {
                 const element = event.currentTarget;
@@ -566,7 +581,7 @@ export default function App() {
                     const item = filteredConversations[virtualRow.index];
                     return <button key={item.aggregateId} ref={conversationVirtualizer.measureElement} data-index={virtualRow.index}
                       style={{ position: "absolute", width: "100%", transform: "translateY(" + virtualRow.start + "px)" }}
-                      className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => { setComposeRecipient(""); setSelected(item.aggregateId); setSelectedConversationCache(item); }}>
+                      className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => { setComposeOpen(false); setComposeRecipient(""); setSelected(item.aggregateId); setSelectedConversationCache(item); }}>
                         <Avatar title={item.title} />
                         <span className="conversation-copy"><span className="conversation-title">{item.title}{item.subtitle ? ` · ${item.subtitle}` : ""}</span><span className="conversation-preview">{item.preview}</span></span>
                         <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time>{item.unreadCount > 0 && <Chip size="sm">{item.unreadCount}</Chip>}</span>
@@ -583,9 +598,16 @@ export default function App() {
             </aside>
 
             <main className="message-pane">
-              {selectedConversation ? (
+              {composeOpen ? (
+                <><div className="message-header"><button className="mobile-back" onClick={() => { setComposeOpen(false); setSelected(null); }}>←</button><div><h2>New message</h2><p>Choose a contact or enter a phone number</p></div></div>
+                  <div className="recipient-picker">
+                    <label className="search-box"><span aria-hidden="true">⌕</span><input autoFocus value={recipientSearch} onChange={event => setRecipientSearch(event.target.value)} placeholder="Search contacts or type a number" aria-label="Recipient" /></label>
+                    {/^\+?[0-9\s()-]{3,}$/.test(recipientSearch.trim()) && <button className="recipient-row" onClick={() => selectRecipient(recipientSearch.replace(/[^+0-9]/g, ""))}>Send to {recipientSearch.trim()}</button>}
+                    <div className="recipient-results">{recipientMatches.map(contact => <button key={contact.normalizedPhone} className="recipient-row" onClick={() => selectRecipient(contact.normalizedPhone)}><Avatar title={contact.displayName} /><span><strong>{contact.displayName}</strong><small>{contact.normalizedPhone}</small></span><span aria-hidden="true">✉</span></button>)}</div>
+                  </div></>
+              ) : selectedConversation ? (
                 <>
-                  <div className="message-header"><Avatar title={selectedConversation.title} /><div><h2>{selectedConversation.title}</h2><p>{selectedConversation.subtitle ? `${selectedConversation.subtitle} · ` : ""}Synced from Android · {shortId(selectedConversation.aggregateId)}</p></div></div>
+                  <div className="message-header"><button className="mobile-back" onClick={() => { setSelected(null); setComposeRecipient(""); }}>←</button><Avatar title={selectedConversation.title} /><div><h2>{selectedConversation.title}</h2><p>{selectedConversation.subtitle ? `${selectedConversation.subtitle} · ` : ""}Synced from Android · {shortId(selectedConversation.aggregateId)}</p></div></div>
                   {threadHasMore && (
                     <Button size="sm" variant="ghost" className="load-older-thread" onPress={() => void loadOlderThread()} isDisabled={loadingOlderThread}>
                       {loadingOlderThread ? "Loading…" : "Load older messages"}
@@ -623,7 +645,7 @@ export default function App() {
                   </div>
                 </>
               ) : (
-                <div className="empty-conversation"><div className="empty-icon">✦</div><h3>{composeRecipient ? contactNames.get(composeRecipient) || composeRecipient : "New message"}</h3><p>{composeRecipient || "Choose a conversation or contact."}</p>{composeRecipient && <div className="composer-disabled"><input value={draft} onChange={event => setDraft(event.target.value)} placeholder="Text message" /><span>{draft.length} chars · {draft.length <= 160 ? "SMS" : draft.length <= 480 ? `${Math.ceil(draft.length / 153)} parts` : "MMS"}</span><Button size="sm" onPress={() => void send()} isDisabled={!draft.trim() || !capabilities.includes("SEND_MESSAGES")}>Send</Button>{commandStatus && <Chip size="sm" variant="soft">{commandStatus}</Chip>}</div>}</div>
+                <><div className="message-header"><button className="mobile-back" onClick={() => { setComposeRecipient(""); setSelected(null); }}>←</button><div><h2>{composeRecipient ? contactNames.get(composeRecipient) || composeRecipient : "New message"}</h2><p>{composeRecipient || "Choose a conversation or contact."}</p></div></div><div className="empty-conversation"><div className="empty-icon">✦</div><h3>{composeRecipient ? "Start a conversation" : "Choose a conversation or compose a message"}</h3></div>{composeRecipient && <div className="composer-disabled"><input value={draft} onChange={event => setDraft(event.target.value)} placeholder="Text message" /><span>{draft.length} chars · {draft.length <= 160 ? "SMS" : draft.length <= 480 ? `${Math.ceil(draft.length / 153)} parts` : "MMS"}</span><Button size="sm" onPress={() => void send()} isDisabled={!draft.trim() || !capabilities.includes("SEND_MESSAGES")}>Send</Button>{commandStatus && <Chip size="sm" variant="soft">{commandStatus}</Chip>}</div>}</>
               )}
             </main>
           </div>
@@ -643,16 +665,9 @@ export default function App() {
             </Button>
           </div>
           <label className="search-box"><span aria-hidden="true">⌕</span><input value={contactSearch} onChange={(event) => setContactSearch(event.target.value)} placeholder="Search names or numbers" aria-label="Search contacts" /></label>
-          <div className="security-list">
+          <div className="contact-list">
             {filteredContacts.slice(0, visibleContactCount).map(contact => (
-              <button key={contact.normalizedPhone} type="button" onClick={() => {
-                setComposeRecipient(contact.normalizedPhone);
-                const matching = conversations.find(item =>
-                  `${item.title} ${item.subtitle || ""}`.includes(contact.normalizedPhone));
-                setSelected(matching?.aggregateId ?? null);
-                if (matching) setSelectedConversationCache(matching);
-                setTab("inbox");
-              }}><Card><CardContent className="security-row"><div><strong>{contact.displayName}</strong><p>{contact.normalizedPhone}</p></div>{contact.starred && <Chip size="sm" variant="soft">Starred</Chip>}</CardContent></Card></button>
+              <button className="contact-row" key={contact.normalizedPhone} type="button" onClick={() => selectRecipient(contact.normalizedPhone)}><Avatar title={contact.displayName} /><span className="contact-copy"><strong>{contact.displayName}</strong><small>{contact.normalizedPhone}</small></span>{contact.starred && <span title="Starred">★</span>}<span className="contact-sms" aria-label="Send SMS" title="Send SMS">✉</span></button>
             ))}
             {filteredContacts.length > visibleContactCount && <Button size="sm" variant="ghost"
               onPress={() => setVisibleContactCount(count => count + 100)}>Load more contacts</Button>}
@@ -686,9 +701,9 @@ export default function App() {
           <div className="page-title"><p className="eyebrow">Protection</p><h1>Security</h1><p>Credentials and identities visible to this linked browser.</p></div>
           <div className="security-list">
             <Card><CardContent className="security-row"><div><strong>Message encryption</strong><p>{threadEvents.filter(event => event.decryption?.state === "decrypted").length} open-thread decrypted · {threadEvents.filter(event => event.decryption?.state === "locked").length} open-thread locked · {threadEvents.filter(event => event.decryption?.state === "invalid").length} open-thread invalid</p><p>Messages load when a conversation is opened. Key grants come from your primary phone.</p></div></CardContent></Card>
-            <Card><CardContent className="security-row"><div><strong>Passkeys</strong><p>{credentials === null ? "Dashboard authentication required" : `${credentials.length} enrolled credential(s)`}</p></div>{credentials?.map((credential) => <Button key={credential.credentialId} size="sm" variant="ghost" onPress={() => void removeCredential(credential.credentialId).then(refreshSecurity)}>Remove {credential.label || shortId(credential.credentialId)}</Button>)}</CardContent></Card>
+            <Card><CardContent className="security-row"><div><strong>Passkeys</strong><p>Manage dashboard passkeys in the GMweb dashboard.</p></div></CardContent></Card>
             <Card><CardContent className="security-row"><div><strong>Android trust registry</strong><p>{trust ? `Verified root published at sequence ${trust.trustSequence}` : "Waiting for the primary phone's first signed trust statement"}</p></div><Chip size="sm" variant="soft">{trust ? "Ready" : "Pending"}</Chip></CardContent></Card>
-            <Card><CardContent className="security-row"><div><strong>Private push</strong><p>Notifications contain no sender or message text.</p></div><Chip size="sm" variant="soft">{pushCount ?? 0} subscription(s)</Chip></CardContent></Card>
+            <Card><CardContent className="security-row"><div><strong>Private push</strong><p>Notifications contain no sender or message text.</p></div></CardContent></Card>
           </div>
         </TabPanel>
 
