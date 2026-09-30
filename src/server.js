@@ -3054,6 +3054,7 @@ app.get("/eve/v1/sms-delivery-events", {
         status: { type: "string", enum: ["delivered", "failed"] },
         requestId: { type: "string", minLength: 1, maxLength: 120 },
         eventId: { type: "string", minLength: 1, maxLength: 196 },
+        eveNotificationId: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_-]{0,119}$", maxLength: 120 },
         callbackState: { type: "string", enum: ["pending", "retry_wait", "delivering", "delivered", "dead_letter"] },
         limit: { type: "integer", minimum: 1, maximum: 100 }
       }
@@ -3077,6 +3078,28 @@ app.get("/eve/v1/sms-delivery-events", {
   return { limit: boundedLimit, events: sendStore.searchCarrierReports({
     ...query, keyName: request._projectKey?.name || null, limit: boundedLimit
   }) };
+});
+
+app.post("/admin/eve-callbacks/requeue", {
+  schema: {
+    summary: "Requeue bounded immutable Eve callback dead letters",
+    description: "Master or dashboard admin only. The signed callback body and delivery identity remain unchanged.",
+    tags: ["Admin"],
+    body: { type: "object", additionalProperties: false, properties: {
+      eventIds: { type: "array", maxItems: 100, items: { type: "string", minLength: 1, maxLength: 196 } },
+      limit: { type: "integer", minimum: 1, maximum: 100 }
+    } },
+    response: { 200: { type: "object", additionalProperties: true } }
+  }
+}, async (request, reply) => {
+  const limit = checkRateLimit(request, "eve-callback-requeue", 6, 60_000);
+  if (!limit.allowed) {
+    reply.header("retry-after", String(limit.retryAfterSeconds));
+    return reply.code(429).send({ error: "rate_limited" });
+  }
+  const result = eveSmsEvents.requeueDeadLetters(request.body || {});
+  if (result.error) return reply.code(result.error === "callback_not_configured" ? 409 : 400).send(result);
+  return result;
 });
 
 app.get("/admin/gateway-diagnostics", {

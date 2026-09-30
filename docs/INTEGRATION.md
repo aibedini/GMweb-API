@@ -640,6 +640,12 @@ kept as bounded JSONL in `data/activity.jsonl` (up to 10,000 recent events).
 
 ## 7. Eve signed SMS callbacks (`android-carrier-dlr-v5`)
 
+The `send.*` callback body includes the safe `eve_notification_id` when the Eve send supplied one. Existing queued callback bodies are immutable and are not rewritten by this upgrade. `GET /eve/v1/transport-health` exposes `diagnostics.callbackOutbox` with configuration and worker state, counts, last HTTP outcome, bounded error code and retry timing. Disabled integration reports `integration: "disabled"` and `configured: false`.
+
+After fixing a callback endpoint or shared secret, an operator can call `POST /admin/eve-callbacks/requeue` with master/dashboard authorization and JSON `{ "eventIds": ["gmw:send:1:sent"], "limit": 100 }`. Omit `eventIds` to select up to 100 oldest dead letters. The operation requeues only `dead_letter` rows and returns `matched`, `requeued`, `alreadyPending`, `alreadyDelivered`, and `stillIneligible`. It preserves the original callback body, event ID, delivery ID and attempt history. The route is rate limited to six calls per minute and does not grant project or linked-browser access.
+
+`GET /eve/v1/sms-delivery-events` also accepts optional `eveNotificationId` alongside the existing filters. It remains project scoped and returns carrier reports only; no report means no carrier evidence.
+
 GMweb can post a dedicated SMS timeline to Eve when **both**
 `EVE_SMS_EVENTS_URL=https://eve.rooteam.ir/internal/gmweb/sms/events` and
 `EVE_SMS_EVENTS_SECRET` (at least 32 characters, shared with Eve) are set.

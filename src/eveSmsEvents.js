@@ -165,17 +165,58 @@ class EveSmsEvents {
     return this.db.prepare(`SELECT state, COUNT(*) AS count FROM eve_sms_outbox GROUP BY state`).all();
   }
 
+  requeueDeadLetters({ eventIds = null, limit = 100 } = {}) {
+    if (!this.config) return { error: "callback_not_configured" };
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+        (eventIds !== null && (!Array.isArray(eventIds) || eventIds.length > 100 ||
+          eventIds.some(id => typeof id !== "string" || !/^[A-Za-z0-9:_-]{1,196}$/.test(id))))) {
+      return { error: "invalid_requeue_filter" };
+    }
+    const now = this.now();
+    const select = this.db.prepare("SELECT event_id, state FROM eve_sms_outbox WHERE event_id=?");
+    const update = this.db.prepare(`UPDATE eve_sms_outbox SET state='pending', next_attempt_at=?
+      WHERE event_id=? AND state='dead_letter'`);
+    const run = this.db.transaction(() => {
+      const ids = eventIds ?? this.db.prepare(`SELECT event_id FROM eve_sms_outbox
+        WHERE state='dead_letter' ORDER BY id LIMIT ?`).all(limit).map(row => row.event_id);
+      const result = { matched: 0, requeued: 0, alreadyPending: 0, alreadyDelivered: 0, stillIneligible: 0 };
+      for (const eventId of [...new Set(ids)].slice(0, limit)) {
+        const row = select.get(eventId);
+        if (!row) { result.stillIneligible++; continue; }
+        result.matched++;
+        if (row.state === "dead_letter") result.requeued += update.run(now, eventId).changes;
+        else if (["pending", "retry_wait", "delivering"].includes(row.state)) result.alreadyPending++;
+        else if (row.state === "delivered") result.alreadyDelivered++;
+        else result.stillIneligible++;
+      }
+      return result;
+    });
+    return run();
+  }
+
   health(now = Date.now()) {
     const counts = { pending: 0, retry_wait: 0, delivering: 0, delivered: 0, dead_letter: 0 };
     for (const row of this.stats()) if (row.state in counts) counts[row.state] = Number(row.count);
     const oldest = this.db.prepare(`SELECT MIN(created_at) AS at FROM eve_sms_outbox WHERE state IN ('pending','retry_wait','delivering')`).get()?.at;
     const lastSuccess = this.db.prepare(`SELECT MAX(delivered_at) AS at FROM eve_sms_outbox`).get()?.at;
     const lastFailure = this.db.prepare(`SELECT MAX(last_attempt_at) AS at FROM eve_sms_outbox WHERE last_http_status IS NOT NULL AND last_http_status NOT BETWEEN 200 AND 299`).get()?.at;
+    const latest = this.db.prepare(`SELECT last_http_status, last_error FROM eve_sms_outbox
+      WHERE last_attempt_at IS NOT NULL ORDER BY last_attempt_at DESC, id DESC LIMIT 1`).get();
+    const nextRetry = this.db.prepare(`SELECT MIN(next_attempt_at) AS at FROM eve_sms_outbox WHERE state='retry_wait'`).get()?.at;
     return {
+      configured: Boolean(this.config),
+      validConfig: Boolean(this.config),
+      worker_running: Boolean(this.config && !this.stopped),
+      callbackUrlConfigured: Boolean(this.config?.url),
+      secretConfigured: Boolean(this.config?.secret),
+      integration: this.config ? "configured" : "disabled",
       ...counts,
       last_success_at: lastSuccess ? new Date(Number(lastSuccess)).toISOString() : null,
       last_failure_at: lastFailure ? new Date(Number(lastFailure)).toISOString() : null,
-      oldest_pending_age_ms: oldest ? Math.max(0, now - Number(oldest)) : null
+      oldest_pending_age_ms: oldest ? Math.max(0, now - Number(oldest)) : null,
+      last_http_status: latest?.last_http_status ?? null,
+      last_error_code: latest?.last_error ?? null,
+      next_retry_at: nextRetry ? new Date(Number(nextRetry)).toISOString() : null
     };
   }
 }

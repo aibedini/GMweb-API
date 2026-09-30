@@ -126,6 +126,14 @@ test("production Fastify accepts Eve /send and denies unscoped commands", async 
   assert.equal(deliverySearch.statusCode, 200, deliverySearch.payload);
   assert.equal(deliverySearch.json().limit, 5);
   assert.ok(Array.isArray(deliverySearch.json().events));
+  const requeuePath = "/admin/eve-callbacks/requeue";
+  assert.equal((await app.inject({ method: "POST", url: requeuePath, payload: {} })).statusCode, 401);
+  assert.equal((await app.inject({ method: "POST", url: requeuePath, headers,
+    payload: {} })).statusCode, 401, "Eve project key cannot requeue callbacks");
+  const adminRequeue = await app.inject({ method: "POST", url: requeuePath,
+    headers: { authorization: "Bearer contract-master-token" }, payload: {} });
+  assert.equal(adminRequeue.statusCode, 409, adminRequeue.payload);
+  assert.equal(adminRequeue.json().error, "callback_not_configured");
 
   rateBuckets.set("gateway-diagnostics:127.0.0.1", {
     count: 120,

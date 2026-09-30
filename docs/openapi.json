@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.28",
+    "version": "0.19.29",
     "contact": {
       "name": "GMweb API"
     }
@@ -1244,6 +1244,16 @@
           {
             "schema": {
               "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,119}$",
+              "maxLength": 120
+            },
+            "in": "query",
+            "name": "eveNotificationId",
+            "required": false
+          },
+          {
+            "schema": {
+              "type": "string",
               "enum": [
                 "pending",
                 "retry_wait",
@@ -1286,6 +1296,55 @@
                       "type": "integer"
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/eve-callbacks/requeue": {
+      "post": {
+        "summary": "Requeue bounded immutable Eve callback dead letters",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Master or dashboard admin only. The signed callback body and delivery identity remain unchanged.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "eventIds": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 196
+                    }
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }

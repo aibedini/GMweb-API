@@ -217,7 +217,8 @@ class SendStore {
       BEGIN
         SELECT RAISE(ABORT, 'immutable_eve_event');
       END;
-      CREATE TRIGGER IF NOT EXISTS eve_sms_queued_on_tag
+      DROP TRIGGER IF EXISTS eve_sms_queued_on_tag;
+      CREATE TRIGGER eve_sms_queued_on_tag
       AFTER UPDATE OF source ON sends
       WHEN NEW.source='eve' AND OLD.source IS NOT 'eve' AND NEW.status='queued'
       BEGIN
@@ -227,16 +228,19 @@ class SendStore {
           'gmw:send:' || NEW.id || ':queued',
           'gmw:send:' || NEW.id || ':queued',
           NEW.id, 'send.queued',
-          json_object(
+          json_patch(json_object(
             'event_id', 'gmw:send:' || NEW.id || ':queued',
             'trace_id', 'send_' || NEW.id,
             'message_id', 'send_' || NEW.id,
             'type', 'send.queued',
             'occurred_at', strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at / 1000.0, 'unixepoch')
-          ), NEW.updated_at, NEW.updated_at
+          ), CASE WHEN NEW.eve_notification_id IS NOT NULL
+            AND instr(NEW.eve_notification_id, replace(replace(NEW.to_number, '+', ''), '-', ''))=0
+            THEN json_object('eve_notification_id', NEW.eve_notification_id) ELSE '{}' END), NEW.updated_at, NEW.updated_at
         ) ON CONFLICT DO NOTHING;
       END;
-      CREATE TRIGGER IF NOT EXISTS eve_sms_on_status
+      DROP TRIGGER IF EXISTS eve_sms_on_status;
+      CREATE TRIGGER eve_sms_on_status
       AFTER UPDATE OF status ON sends
       WHEN NEW.source='eve' AND NEW.status IS NOT OLD.status
         AND NEW.status IN ('sent', 'failed', 'cancelled', 'superseded')
@@ -249,13 +253,16 @@ class SendStore {
           'gmw:send:' || NEW.id || ':' || CASE WHEN NEW.status='superseded' THEN 'cancelled' ELSE NEW.status END,
           NEW.id,
           'send.' || CASE WHEN NEW.status='superseded' THEN 'cancelled' ELSE NEW.status END,
-          json_patch(json_object(
+          json_patch(json_patch(json_object(
             'event_id', 'gmw:send:' || NEW.id || ':' || CASE WHEN NEW.status='superseded' THEN 'cancelled' ELSE NEW.status END,
             'trace_id', 'send_' || NEW.id,
             'message_id', 'send_' || NEW.id,
             'type', 'send.' || CASE WHEN NEW.status='superseded' THEN 'cancelled' ELSE NEW.status END,
             'occurred_at', strftime('%Y-%m-%dT%H:%M:%fZ', NEW.updated_at / 1000.0, 'unixepoch')
-          ), CASE WHEN NEW.attempts > 0 THEN json_object('attempt', NEW.attempts) ELSE '{}' END),
+          ), CASE WHEN NEW.eve_notification_id IS NOT NULL
+            AND instr(NEW.eve_notification_id, replace(replace(NEW.to_number, '+', ''), '-', ''))=0
+            THEN json_object('eve_notification_id', NEW.eve_notification_id) ELSE '{}' END),
+            CASE WHEN NEW.attempts > 0 THEN json_object('attempt', NEW.attempts) ELSE '{}' END),
           NEW.updated_at, NEW.updated_at
         ) ON CONFLICT DO NOTHING;
       END;
@@ -713,7 +720,7 @@ class SendStore {
   }
 
   searchCarrierReports({ keyName = null, from = null, to = null, status = null,
-    requestId = null, eventId = null, callbackState = null, limit = 50 } = {}) {
+    requestId = null, eventId = null, eveNotificationId = null, callbackState = null, limit = 50 } = {}) {
     const where = [];
     const params = [];
     if (keyName) { where.push("s.key_name=?"); params.push(keyName); }
@@ -726,6 +733,7 @@ class SendStore {
       params.push(match ? Number(match[1]) : requestId);
     }
     if (eventId) { where.push("d.event_id=?"); params.push(eventId); }
+    if (eveNotificationId) { where.push("s.eve_notification_id=?"); params.push(eveNotificationId); }
     if (callbackState) { where.push("o.state=?"); params.push(callbackState); }
     params.push(Math.max(1, Math.min(Number(limit) || 50, 100)));
     const sql = `SELECT d.event_id, d.status, d.occurred_at, d.received_at,
