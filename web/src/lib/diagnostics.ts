@@ -11,7 +11,7 @@ const EVENT_TYPES = ["MESSAGE_CREATED", "MESSAGE_UPDATED", "KEY_GRANT", "CONTACT
 
 export interface WebDiagnosticReport {
   collectedAt: number;
-  session: { linked: boolean; capabilities: string[]; apiVersion: string; pwaVersion: string; loadedScript: string; serviceWorker: string; online: boolean; buildMismatch: boolean };
+  session: { linked: boolean; capabilities: string[]; apiVersion: string; pwaVersion: string; loadedScript: string; servedScript: string | null; buildRevision: string | null; serviceWorker: string; online: boolean; buildMismatch: boolean };
   server: ServerSyncDiagnostics | null;
   browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number; phaseErrorClass: PhaseErrorClass };
   liveSync: LiveSyncMetrics;
@@ -196,7 +196,7 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
   // Opening through sync.ts first guarantees the current schema and performs
   // any pending projection repair before the read-only diagnostic scan.
   const [cursor, projectionCursor] = await Promise.all([getCursor(), getProjectionCursor()]);
-  const [sessionResponse, api, server, local, identity, pinned, registration, grantProbe, visibleContacts] = await Promise.all([
+  const [sessionResponse, api, server, local, identity, pinned, registration, grantProbe, visibleContacts, servedHtml, buildInfo] = await Promise.all([
     fetch("/api/v1/linked-session", { credentials: "include" }).then(response => response.json()).catch(() => ({})),
     health().catch(() => ({ ok: false, version: "unreachable" })),
     fetchSyncDiagnostics().catch(() => null),
@@ -204,6 +204,8 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     loadCryptoRecord<{ deviceId: string; encryptionPublicKey: string }>("verified-primary").catch(() => null),
     navigator.serviceWorker?.getRegistration().catch(() => undefined),
     probeKeyGrants(), listContacts(),
+    fetch("/web/index.html", { cache: "no-store" }).then(response => response.ok ? response.text() : "").catch(() => ""),
+    fetch("/web/build-info.json", { cache: "no-store" }).then(response => response.ok ? response.json() : null).catch(() => null),
   ]);
   const runtime = getBrowserSyncStatus();
   const replicaProgress = identity ? await getReplicationProgress(identity.deviceId) : undefined;
@@ -218,7 +220,9 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     detectContactsFailure(local.byType, local.contactPayloadCrypto, local.contactRows);
   const primaryMatchesBrowser = Boolean(identity && pinned && pinned.deviceId === identity.deviceId &&
     pinned.encryptionPublicKey === identity.encryptionPublicKeyB64);
-  const buildMismatch = api.version !== PWA_BUILD_VERSION;
+  const servedScript = /\/web\/assets\/(index-[A-Za-z0-9_-]+\.js)/.exec(servedHtml)?.[1] || null;
+  const loadedScript = loadedScriptFile();
+  const buildMismatch = api.version !== PWA_BUILD_VERSION || Boolean(servedScript && servedScript !== loadedScript);
   const overall = diagnosticOutcome({ buildMismatch, projectionFailure, syncState: runtime.state, contactsFailure, syncLag, projectionLag, lazyMode,
     trustUnavailable: !primaryMatchesBrowser });
   const report: WebDiagnosticReport = {
@@ -226,7 +230,8 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     session: {
       linked: sessionResponse.authenticated === true,
       capabilities: Array.isArray(sessionResponse.capabilities) ? sessionResponse.capabilities.map(String) : [],
-      apiVersion: api.version, pwaVersion: PWA_BUILD_VERSION, loadedScript: loadedScriptFile(),
+      apiVersion: api.version, pwaVersion: PWA_BUILD_VERSION, loadedScript,
+      servedScript, buildRevision: typeof buildInfo?.revision === "string" ? buildInfo.revision : null,
       serviceWorker: registration?.active ? "ACTIVE" : registration ? "INSTALLING" : "NONE",
       online: navigator.onLine, buildMismatch,
     },
@@ -279,6 +284,8 @@ export function formatWebDiagnostics(report: WebDiagnosticReport): string {
     "WEB MESSAGE DIAGNOSTICS",
     `Linked session             ${report.session.linked ? "PASS" : "FAIL"}`,
     `API / PWA build            ${report.session.apiVersion} / ${report.session.pwaVersion}${report.session.buildMismatch ? " FAIL" : " PASS"}`,
+    `Loaded / served JS         ${report.session.loadedScript} / ${report.session.servedScript ?? "unavailable"}`,
+    `PWA build revision         ${report.session.buildRevision ?? "unavailable"}`,
     `Server max sequence        ${report.server?.maxSequence ?? "unavailable"}`,
     `${report.replicaProgress?.lazyMode ? "Observed server sequence  " : "Browser cursor             "}${report.browserSync.cursor}`,
     `Full replica sync lag      ${report.replicaProgress?.lazyMode ? "not applicable (on-demand mode)" : report.browserSync.syncLag ?? "unknown"}`,

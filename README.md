@@ -2,258 +2,181 @@
 
 # 📲 GMweb API
 
-**Control Google Messages for Web over a clean REST API.**
-Send & read SMS/RCS from any app — with a queue, a self‑healing browser, and two dashboards.
+**A messaging control plane for Android, the web, and business automation.**
+
+Connect your phone. Manage conversations. Track sends with evidence you can inspect.
+
+[API reference](docs/API.md) · [Integration guide](docs/INTEGRATION.md) · [Deployment](docs/DEPLOYMENT.md) · [Operations](docs/OPERATIONS.md)
 
 </div>
 
----
+## ✨ What GMweb does
 
-GMweb keeps a persistent Chrome session signed into **[messages.google.com/web](https://messages.google.com/web)**
-and puts a small, well‑documented HTTP API in front of it. Other projects (a CRM,
-a billing system, a bot…) can then **send messages, read conversations, and react
-to events** without touching the browser.
+GMweb connects the **Messages Android agent**, a linked **web/PWA inbox**, and service clients such as **EVE**. It owns authentication, pairing, command coordination, sync, and the durable send ledger. Android owns device data and modem submission; EVE owns business decisions and notification workflows.
 
-> ⚠️ This is **browser automation** over Google Messages for Web — not an official
-> Google API. Treat the server like your phone: whoever controls it can read/send your SMS.
+The Chrome/Playwright adapter for Google Messages for Web remains available for legacy integrations. It is browser automation, not an official Google API. Transport selection and device readiness are separate from delivery confirmation.
 
----
+| Capability | What you can expect |
+| --- | --- |
+| 💬 Web inbox | Conversations, contacts, bounded history loading, visible errors, and Retry controls |
+| 📱 Android connection | Primary-device enrollment, signed identity, linked-browser approval, and device telemetry |
+| 📤 Web sending | Encrypted commands carrying the selected active SIM's `subscriptionId`; visible prerequisite and command states |
+| 🧾 Send tracking | SQLite ledger, queued execution, status polling, idempotency, cancellation, and revocation contracts |
+| 🔔 EVE integration | Signed SMS lifecycle callbacks, notification correlation, carrier-report search, and bounded dead-letter recovery |
+| 🔎 Diagnostics | Transport health, sync state, API/PWA versions, loaded versus served JavaScript, and recorded build revision |
+| 🔑 Access control | Operator credentials, scoped project keys, signed agents, and capability-based linked sessions |
 
-## ✨ What it does
+## 🧭 Choose the right interface
 
-- 📤 **Send SMS/RCS** over HTTP — queued, retried, and rate‑limited.
-- 📥 **Read conversations & messages** — list chats, open threads, fetch history.
-- 🚦 **Durable send queue** (BullMQ + Redis) — one message at a time, `high` priority can **jump the line**.
-- 🧯 **Auto de‑dupe** — the same `{to, text}` sent twice within ~120s is suppressed (no double‑texting customers).
-- 🔁 **Idempotency‑Key** support — safe retries from your side.
-- 📡 **Real‑time events** — Server‑Sent Events (`/events`) or an outbound **webhook**.
-- 🩺 **Self‑healing** — a watchdog + in‑app guard recover the browser when Google’s
-  cookie‑rotation wedges the page (no more “stuck/spinning” sessions).
-- 🖥️ **Two UIs** — a modern **React console** (`/app`) and the classic **dashboard** (`/dashboard`).
-- 🔑 **Project API keys** (`gmw_…`) — give consumers messaging access without admin powers.
-- 📜 **OpenAPI** — machine‑readable contract at `/docs` for easy integration.
+| Path | Audience | Purpose |
+| --- | --- | --- |
+| `/web` | Linked browser users | PWA inbox, contacts, sending, connection, security, and diagnostics |
+| `/app` | Operators | React management console for queues, keys, controls, and operational status |
+| `/dashboard` | Operators | Classic management dashboard |
+| `/docs` | Integrators | Live OpenAPI reference |
 
----
+The PWA lives in `web/`. The operator console lives in `dashboard-next/`; they are separate applications with separate build outputs.
 
-## 🚀 One‑command install (Ubuntu 22.04)
+## 🚀 Run locally
 
-The fastest path installs Chrome, Redis, VNC, Node, the API services, both web
-interfaces, and generates the required credentials. It also creates an automatic
-`gmweb.<SERVER_IP>.nip.io` address, configures Nginx and obtains a Let's Encrypt
-certificate, so the React console is available at `https://.../app`.
+Use **Node.js 22.13.0 or newer** and a running Redis instance. Start with the supplied configuration, then replace the example credentials before exposing the service.
+
+```bash
+cp .env.example .env
+npm ci
+npm run token
+npm start
+```
+
+On PowerShell, use `Copy-Item .env.example .env` for the first step. Copy the generated token into `API_TOKEN`. Review host binding, dashboard credentials, transport settings, and public origins in `.env`.
+
+For the legacy Chrome transport, configure Chrome or install Playwright's browser, then pair Google Messages:
+
+```bash
+npx playwright install chromium
+npm run login
+```
+
+For Android enrollment and linked-browser pairing, follow [the integration guide](docs/INTEGRATION.md) and [pairing protocol](docs/PAIRING-PROTOCOL-V1.md). Configure `PUBLIC_API_ORIGIN` and `PUBLIC_WEB_ORIGIN` explicitly for production. A normal browser pairing QR cannot enroll a Primary phone.
+
+### Build the interfaces
+
+```bash
+npm run build:frontends
+npm run verify:artifacts
+```
+
+For PWA development:
+
+```bash
+npm --prefix web ci
+npm --prefix web run dev
+```
+
+For the operator console:
+
+```bash
+npm --prefix dashboard-next ci
+npm --prefix dashboard-next run dev
+```
+
+### Ubuntu installation
+
+The Ubuntu 22.04 installer provisions the API, Chrome, Redis, operator interfaces, and supporting services. Review the script and [VPS guide](docs/VPS.md) before running it with administrator privileges.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | sudo bash
 ```
 
-Run the same command again to repair/reinstall. It updates the app, rebuilds the
-React console, rotates the exposed API token and dashboard password, and
-restarts all core services.
+Re-running the installer may rotate credentials and restart services. For release promotion, backups, and rollback, use [the deployment runbook](docs/DEPLOYMENT.md).
 
-Open TCP ports **80** and **443** in the VPS/provider firewall before running it.
-To use your own domain or skip public HTTPS:
+## 🔌 Integrate a service
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | \
-  sudo env PUBLIC_DOMAIN=gmweb.example.com LETSENCRYPT_EMAIL=admin@example.com bash
-
-curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | \
-  sudo env PUBLIC_DASHBOARD=0 bash
-```
-
-What the installer sets up for you:
-
-| Component | Purpose |
-|---|---|
-| `gmweb-chrome` | Google Chrome on a virtual display (Xvfb), exposed over CDP `:9222` |
-| `gmweb-api` | REST API plus React `/app` and classic `/dashboard`, securely proxied by Nginx |
-| `gmweb-vnc` / `gmweb-novnc` | on‑demand VNC console for scanning the pairing QR |
-
----
-
-## 🔗 Pairing (first run)
-
-Pairing links the server’s Chrome to Google Messages on your phone — exactly like
-“Messages for web” on a laptop. The installer’s **Pairing wizard** does it step by step:
-
-1. Turns the **VNC console** on.
-2. Shows you the SSH‑tunnel + browser URL to view the server’s Chrome.
-3. On your **phone**: Google Messages → ⋮ → **Device pairing** → **scan the QR**.
-4. Polls `/ready` until **paired**, then turns VNC back off for safety.
-
----
-
-## 🧪 Local development (Windows/macOS/Linux)
-
-```bash
-cp .env.example .env        # (Windows: copy .env.example .env)
-npm install
-npx playwright install chromium   # if Playwright must download a browser
-npm start
-```
-
-Needs **Redis** running locally (BullMQ). Generate a strong token with `npm run token`.
-First run requires pairing — use `npm run login` to sign into the profile, scan the QR,
-then `npm start`.
-
-The React console source lives in `dashboard-next/` (Vite + React + Tailwind):
-
-```bash
-cd dashboard-next && npm run dev      # hot‑reload UI, proxies the API on :3030
-npm --prefix dashboard-next run build # outputs to public/dashboard-next (served at /app)
-```
-
----
-
-## 🔐 Auth model
-
-| Token | Access |
-|---|---|
-| **Master token** (`API_TOKEN` env) | everything, incl. `/admin/*`, `/browser/*`, `/session/*` |
-| **Project key** (`gmw_…`) | messaging + conversations only — admin paths return 401 |
-
-Send it as `Authorization: Bearer <token>` on every request (except public `/health`).
-Give external consumers a **project key** (create one in the dashboard or via `POST /admin/api-keys`).
-Project keys carry explicit least-privilege scopes. Existing keys receive only the
-documented legacy messaging/conversation/event scopes; command-engine access must
-be granted explicitly.
-
----
-
-## 📮 Sending a message
+Use a scoped **project key** (`gmw_...`) for service clients. Keep the master `API_TOKEN` for operator actions. Grant only the scopes the consumer needs; deliberately restricted keys are not automatically widened.
 
 ```bash
 curl -X POST http://127.0.0.1:3030/send \
-  -H "Authorization: Bearer gmw_..." \
+  -H "Authorization: Bearer $GMWEB_PROJECT_KEY" \
   -H "Content-Type: application/json" \
-  -d '{ "to": "+989121234567", "text": "Hello from GMweb!" }'
-# -> 202 { "ok": true, "jobId": "123", "status": "queued" }
+  -H "Idempotency-Key: example-request-001" \
+  -d '{"to":"<recipient-in-international-format>","text":"Your requested update is ready."}'
 ```
 
-- ⚡ Jump the queue: add `"priority": "high"`.
-- ⏳ Block for the result: add `"wait": true` (up to 90s).
-- 🧯 Re‑sending the same `{to,text}` within ~120s returns `status:"duplicate_suppressed"` instead of texting twice.
-- 🔁 Pass an `Idempotency-Key` header to make your own retries safe.
+Replace the recipient placeholder before running the example. Acceptance into the queue is not proof of modem submission or carrier delivery. Retain the returned request ID and poll its status URL.
 
-Track delivery via `GET /send/status/:jobId` or the live `GET /events` stream.
-Completed status/history records include both the requested number and the
-recipient number verified in Google Messages before submission.
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` | Public version and basic health |
+| `GET /ready` | Readiness of the active delivery transport |
+| `POST /send` | Submit a send request |
+| `GET /send/status/:id` | Read the authoritative send outcome and separate carrier status |
+| `GET /events` | Service event stream |
+| `GET /eve/v1/transport-health` | Scoped, content-free delivery-transport diagnostics |
+| `GET /eve/v1/sms-delivery-events` | Project-scoped carrier evidence, including `eveNotificationId` filtering |
+| `POST /admin/eve-callbacks/requeue` | Operator-only recovery of bounded callback dead letters |
 
----
+This is a navigation aid, not the complete contract. See [OpenAPI](docs/openapi.json) and [INTEGRATION.md](docs/INTEGRATION.md) for schemas, scopes, rate limits, and error handling. Gateway and linked-browser endpoints use their own documented authentication protocols.
 
-## 🧰 Core endpoints
+## 📡 Understand send outcomes
 
-| Method & path | What |
-|---|---|
-| `GET /health` | public health + version (used for contract‑sync detection) |
-| `GET /ready` | 200 when paired & ready, 503 otherwise |
-| `POST /send` · `GET /send/status/:id` | queue a message · poll a job |
-| `GET /conversations?limit=` | list recent conversations |
-| `GET /messages/active` · `POST /conversations/messages` | read the open / a specific thread |
-| `GET /events` | SSE stream (send lifecycle, conversation changes, browser recovery) |
-| `GET /admin/queue` · `GET /admin/queue/jobs` · `POST .../promote` · `DELETE .../:id` | queue stats, list, bump, cancel |
-| `GET/POST/PATCH/DELETE /admin/api-keys…` | manage project keys |
+- **Queued / accepted:** GMweb has accepted work; physical submission has not been established.
+- **`send.sent`:** recorded submission evidence; this does not establish carrier delivery.
+- **`sms.delivered`:** an authenticated Android carrier report supplies delivery evidence.
+- **No carrier report:** delivery remains unconfirmed. Chrome does not provide Android carrier receipts.
 
-📖 Full reference: **[docs/API.md](docs/API.md)** · machine‑readable **[docs/openapi.json](docs/openapi.json)** · live Swagger UI at **`/docs`**.
-Integrating another project? See **[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
+EVE callbacks require `EVE_SMS_EVENTS_URL` and a shared `EVE_SMS_EVENTS_SECRET` of at least 32 characters. Partial or invalid configuration fails startup. With both absent, the integration is disabled.
 
----
+Eligible `send.*` callbacks carry the safe `eve_notification_id` supplied by EVE. Existing queued callback bodies are not rewritten. After correcting the receiver or secret, operators can requeue dead letters while retaining their original body, event ID, delivery ID, and attempt history. See [the callback contract](docs/INTEGRATION.md#7-eve-signed-sms-callbacks-android-carrier-dlr-v5).
 
-## 🖥️ The two UIs
+## 🔐 Security and data boundaries
 
-| URL | Notes |
-|---|---|
-| `…/app` | **React console** — overview, send, queue (promote/cancel), Google‑Messages‑style conversations, API keys, controls, VNC, logs |
-| `…/dashboard` | **classic** built‑in dashboard (zero‑build) |
+Protect GMweb as you would the connected phone: authorized users may read or send messages. Use HTTPS, strong credentials, limited network exposure, and least-privilege project keys. Keep debug routes disabled in production and protect database backups, browser profiles, and device credentials.
 
-Both use the same 2-step login (dashboard **password → API token**). After install:
+Pairing protocol v1 authenticates participants; it does not itself encrypt message content. Legacy `cryptoVersion=0` envelopes contain Base64-wrapped plaintext. Eligible newer events use the [CKE/DEK v1 format](docs/MESSAGE-CRYPTO-V1.md); unsupported encrypted versions remain locked. Do not infer end-to-end encryption for historical legacy data.
 
-```text
-http://SERVER_IP:3030/app
-http://SERVER_IP:3030/dashboard
-```
+## 🏗️ Project structure
 
-Allow TCP `3030` in the VPS provider firewall. For HTTPS with a domain:
+| Location | Responsibility |
+| --- | --- |
+| `src/server.js` | API routes, authentication integration, and service orchestration |
+| `src/sendStore.js` | Durable send ledger, carrier evidence, and callback outbox |
+| `src/eveSmsEvents.js` | Signed callback delivery, retries, recovery, and health |
+| `src/queue.js` | Redis/BullMQ execution infrastructure |
+| `src/googleMessagesClient.js` | Legacy Chrome adapter |
+| `web/` → `public/web-app/` | Linked-browser PWA source and built artifacts |
+| `dashboard-next/` | React operator console |
+| `shared/` | Versioned integration contracts |
+| `test/` | Automated behavioral and contract checks |
+| `specs/`, `.specify/` | Engineering specifications, constitution, and verification artifacts |
+
+See [ADR-004](docs/adr/ADR-004-repository-and-product-boundaries.md) for the GMweb / Messages / EVE ownership model.
+
+## 🧪 Verification and release status
+
+The current change set targets **0.19.29**: history retry and cursor-progress checks, visible send prerequisites, active SIM selection, EVE notification correlation, callback recovery, and build diagnostics.
+
+Run the repository checks before handing off changes:
 
 ```bash
-gmweb public-dashboard install dashboard.example.com admin@example.com
+npm run check
+npm test
+npm run generate:openapi
+npm run verify:artifacts
 ```
 
-This sets up Nginx + Let’s Encrypt, proxies the local API, supports the noVNC
-WebSocket, and switches dashboard cookies to `Secure`.
+`npm run check` checks syntax. Automated tests cover local behavior and contracts; they do not establish physical-device or production acceptance.
 
----
+**Production acceptance remains NOT VERIFIED for this change set:** interactive browser acceptance, two-SIM telemetry and execution on a real device, modem submission, carrier reporting, and actual callback receipt in EVE still require evidence. No Messages Android changes are included here. Use synthetic test messages, never customer SMS.
 
-## 🩺 Reliability & self‑healing
+Debug reports compare the loaded and served JavaScript files and show the recorded build revision. That revision identifies HEAD at build time; it does not identify uncommitted changes or prove which release production serves.
 
-Google periodically opens an `accounts.google.com/RotateCookiesPage` tab to rotate
-session cookies. When that rotation stalls it **wedges** the Messages session —
-the page spins, sends hang, the queue backs up. GMweb fights this on three levels:
+Non-trivial changes follow the repository's Spec Kit workflow and [constitution](.specify/memory/constitution.md). The inherited implementation was produced without available Spec Kit and graph MCP tools; that process gap remains disclosed rather than treated as completed verification.
 
-1. 🧹 **Rotation guard** — closes the RotateCookiesPage tab every few seconds (in‑app).
-2. ⏱️ **Lock watchdog** — no single browser action can hold the lock forever.
-3. 🤖 **System watchdog** (`gmweb-monitor.timer`) — checks `/health` + `/ready` every
-   2 min and restarts Chrome + API if the session stays unpaired.
+## 📚 Continue from here
 
-Sends are paced by default (minimum 15 seconds apart, maximum 4 starts per minute).
-At startup GMweb also expands the Google Messages sidebar with its real
-`Load more conversations` control, indexes conversations until it reaches a
-previous-year timestamp, and prefers those existing threads over Start chat.
-If Start chat selects a recipient but does not open the composer, GMweb retries
-the UI three times without reloading the whole app. A normal-priority miss goes
-to the queue tail; a high-priority miss is retried after ten successful sends.
-If Google displays "Please wait before creating more conversations", the queue
-auto-pauses instead of retrying into the restriction. Resume it only after the
-session has rested, using `POST /admin/queue/resume`. You can also pause it with
-`POST /admin/queue/pause`. Live pacing is configurable in Dashboard → Settings;
-`SEND_MAX_PER_MINUTE` supplies its initial default. `SEND_MIN_INTERVAL_MS` separately
-paces new-conversation navigation. Other tunables: `SEND_DEDUPE_SECONDS`, `SEND_TIMEOUT_MS`,
-`SEND_FAIL_RESTART_THRESHOLD`, `CONVERSATION_HISTORY_MAX_BATCHES`,
-`POLL_INTERVAL_MS`.
-
----
-
-## ⚙️ Manager command
-
-```bash
-gmweb            # interactive menu
-gmweb status     gmweb restart        gmweb restart-chrome
-gmweb vnc-on     gmweb vnc-off        gmweb token
-gmweb smoke      gmweb credentials    gmweb uninstall
-```
-
----
-
-## 🧨 Uninstall
-
-From `gmweb-install → Uninstall`, choose either:
-
-- **Remove GMweb** — services, app, user (keeps shared Chrome/VNC/Redis packages), or
-- **Nuke everything** — also purges packages, logs, and deletes the installer itself.
-
-A typed `DELETE GMWEB` confirmation is required.
-
----
-
-## 🏗️ Architecture
-
-| File | Role |
-|---|---|
-| [src/server.js](src/server.js) | Fastify app — routes, auth, OpenAPI, dedupe, SSE |
-| [src/googleMessagesClient.js](src/googleMessagesClient.js) | Playwright automation + rotation guard + recovery |
-| [src/queue.js](src/queue.js) | BullMQ send queue, idempotency, dedupe helpers |
-| [src/apiKeys.js](src/apiKeys.js) | project keys (hashed), rate limits, IP allowlist |
-| [public/dashboard/](public/dashboard/) · [dashboard-next/](dashboard-next/) | classic UI · React console |
-| [install/quick-install.sh](install/quick-install.sh) · [scripts/gmweb-monitor.sh](scripts/gmweb-monitor.sh) | installer · watchdog |
-
-More docs: [VPS](docs/VPS.md) · [No‑GUI VPS](docs/VPS_NO_GUI.md) · [Operations](docs/OPERATIONS.md) · [Simple setup](docs/SIMPLE_SETUP.md)
-
----
-
-## 🛡️ Production notes
-
-- ✅ `NODE_ENV=production` and a strong `API_TOKEN`.
-- ✅ Direct setup binds to `0.0.0.0:3030`; protect the port with the generated credentials and a firewall. Prefer HTTPS for internet-facing production use.
-- ✅ `ENABLE_DEBUG_ROUTES=false`.
-- ✅ Keep `data/browser-profile` private and backed up (it holds the Google session).
-- ✅ Give consumers a **project key**, not the master token.
+- [Integration guide](docs/INTEGRATION.md): connect a consumer and interpret outcomes.
+- [API reference](docs/API.md): endpoint behavior and permissions.
+- [Deployment](docs/DEPLOYMENT.md): promote artifacts and plan rollback.
+- [Operations](docs/OPERATIONS.md): diagnose and recover the service.
+- [Physical pairing gate](docs/PAIRING-E2E.md): collect device acceptance evidence.
+- [Messages web physical gate](docs/MESSAGES-WEB-PHYSICAL-GATE.md): verify the complete device/browser path.

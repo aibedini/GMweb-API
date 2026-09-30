@@ -13,6 +13,8 @@ import { collectWebDiagnostics, formatWebDiagnostics, type WebDiagnosticReport }
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { calculateSmsSegments } from "../lib/smsSegments";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
+import { mergeThreadEvents, assertHistoryProgress } from "../lib/threadHistory";
+import { selectSmsSim } from "../lib/simSelection";
 
 type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug";
 type ThreadState = "IDLE" | "LOADING" | "READY" | "LOCKED" | "EMPTY" | "FAILED";
@@ -56,6 +58,8 @@ export default function App() {
   const [threadNext, setThreadNext] = useState<number | string | undefined>();
   const [threadHasMore, setThreadHasMore] = useState(false);
   const [loadingOlderThread, setLoadingOlderThread] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const historyLoadingRef = useRef(false);
   const [cursor, setCursor] = useState(0);
   const [busy, setBusy] = useState(false);
   const [applied, setApplied] = useState<number | null>(null);
@@ -110,6 +114,9 @@ export default function App() {
   const hasLoadedOlderConversations = useRef(false);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const scriptFile = useMemo(() => loadedScriptFile(), []);
+  const refreshTelemetry = () => void fetchPrimaryTelemetry().then(value => {
+    setTelemetry(value);
+  }).catch(() => setTelemetry(null));
 
   const refresh = async () => {
     const [nextCursor, nextEvents, nextTrust, nextContacts] = await Promise.all([
@@ -222,7 +229,6 @@ export default function App() {
         setSyncStatus(getBrowserSyncStatus());
         setError(cause instanceof Error ? cause.message : String(cause));
       });
-    const refreshTelemetry = () => void fetchPrimaryTelemetry().then(setTelemetry).catch(() => setTelemetry(null));
     refreshTelemetry();
     const telemetryTimer = window.setInterval(refreshTelemetry, 60_000);
     const refreshLinkedBrowsers = () => void fetchLinkedSessions().then(setLinkedBrowsers).catch(() => setLinkedBrowsers([]));
@@ -310,6 +316,7 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     setThreadError(null);
+    if (lastThreadSelection.current !== selected) setHistoryError(null);
     if (!selected || !authed) {
       lastThreadSelection.current = null;
       setThreadEvents([]);
@@ -325,13 +332,16 @@ export default function App() {
     const startedAt = performance.now();
     void listAggregateEventsPage(selected, { limit: 10 }).then(page => {
       if (cancelled) return;
+      if (page.hasMore && page.next === undefined) {
+        setHistoryError("PAGINATION_STALLED");
+        setThreadHasMore(false);
+      }
       setThreadFirstPageMs(Math.round(performance.now() - startedAt));
       if (sameThread && !stickToBottom) {
-        setThreadEvents(previous => [...new Map([...previous, ...page.items]
-          .map(event => [event.messageId || event.eventId, event])).values()]);
+        setThreadEvents(previous => mergeThreadEvents(previous, page.items));
       } else {
         setThreadEvents(page.items);
-        setThreadHasMore(page.hasMore);
+        setThreadHasMore(page.hasMore && page.next !== undefined);
         setThreadNext(page.next);
         requestAnimationFrame(() => {
           const pane = messageScrollRef.current;
@@ -355,27 +365,29 @@ export default function App() {
     return () => { cancelled = true; };
   }, [selected, events, authed, threadReload]);
   const loadOlderThread = async () => {
-    if (!selected || threadNext === undefined || loadingOlderThread) return;
+    if (!selected || threadNext === undefined || historyLoadingRef.current) return;
+    historyLoadingRef.current = true;
     setLoadingOlderThread(true);
+    setHistoryError(null);
     try {
+      const requestedCursor = threadNext;
       const page = await listAggregateEventsPage(selected, {
         limit: 20,
-        ...(typeof threadNext === "string" ? { beforeState: threadNext } : { beforeSequence: threadNext }),
+        ...(typeof requestedCursor === "string" ? { beforeState: requestedCursor } : { beforeSequence: requestedCursor }),
       });
+      if (page.items.some(event => event.decryption?.state === "invalid")) throw new Error("DECRYPTION_FAILED");
+      assertHistoryProgress(requestedCursor, page);
       const scroll = messageScrollRef.current;
       const previousHeight = scroll?.scrollHeight ?? 0;
-      setThreadEvents(prev => {
-        const merged = new Map([...page.items, ...prev].map(event => [event.messageId || event.eventId, event]));
-        return [...merged.values()];
-      });
+      setThreadEvents(prev => mergeThreadEvents(prev, page.items));
       requestAnimationFrame(() => {
         if (scroll) scroll.scrollTop += scroll.scrollHeight - previousHeight;
       });
       setThreadHasMore(page.hasMore);
       setThreadNext(page.next);
     } catch (cause) {
-      setThreadError(cause instanceof Error ? cause.message : String(cause));
-    } finally { setLoadingOlderThread(false); }
+      setHistoryError(cause instanceof Error ? cause.message : "HISTORY_PAGE_FAILED");
+    } finally { historyLoadingRef.current = false; setLoadingOlderThread(false); }
   };
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
   const conversationVirtualizer = useVirtualizer({
@@ -395,10 +407,8 @@ export default function App() {
   const selectedRecipient = composeRecipient || messages.map(item => item.payload.address).find(Boolean);
   const smsSegments = useMemo(() => calculateSmsSegments(draft), [draft]);
   const activeSims = telemetry?.smsSubscriptions?.items.filter(sim => sim.isActive) ?? [];
-  const chosenSim = activeSims.find(sim => sim.subscriptionId === selectedSubscriptionId)
-    ?? (selectedSubscriptionId === null ? activeSims.find(sim => sim.isDefaultSms) ?? activeSims[0] : undefined);
-  const simAvailable = selectedSubscriptionId === null && !telemetry?.smsSubscriptions ||
-    Boolean(telemetry?.smsSubscriptions?.available && chosenSim);
+  const chosenSim = selectSmsSim(activeSims, selectedSubscriptionId);
+  const simAvailable = Boolean(telemetry?.smsSubscriptions?.available && chosenSim);
   const showSimSelector = activeSims.length > 1 ||
     (selectedSubscriptionId !== null && !chosenSim && activeSims.length > 0);
   const chooseSim = (id: number) => {
@@ -429,36 +439,56 @@ export default function App() {
 
   const send = async () => {
     const body = draft.trim();
-    if (!body || !selectedRecipient || !capabilities.includes("SEND_MESSAGES") || !simAvailable) return;
+    if (!body) { setCommandStatus("EMPTY_BODY"); return; }
+    if (!selectedRecipient) { setCommandStatus("NO_RECIPIENT"); return; }
+    if (!capabilities.includes("SEND_MESSAGES")) { setCommandStatus("SEND_CAPABILITY_MISSING"); return; }
+    if (!simAvailable) { setCommandStatus(!telemetry?.smsSubscriptions ? "SIM_STATE_UNAVAILABLE" : "SELECTED_SIM_UNAVAILABLE"); return; }
     if (recoveringSend.current) return;
     recoveringSend.current = true;
-    const clientMessageId = commandStatus !== "COMPLETED" && pendingMessage?.body === body && pendingMessage.recipient === selectedRecipient
+    const clientMessageId = commandStatus !== "COMPLETED" && !commandStatus?.startsWith("Command completed") &&
+      pendingMessage?.body === body && pendingMessage.recipient === selectedRecipient
       ? pendingMessage.clientMessageId : crypto.randomUUID();
-    setCommandStatus("queued");
+    setCommandStatus("Preparing send…");
     setPendingMessage({ clientMessageId, body, recipient: selectedRecipient, at: Date.now() });
+    let failureCode = "COMMAND_CREATE_FAILED";
     try {
       const identity = await getStoredDeviceIdentity();
-      if (!identity) throw new Error("Browser identity is unavailable");
-      const existing = (await loadPendingSends()).find(row =>
+      if (!identity) { failureCode = "BROWSER_IDENTITY_UNAVAILABLE"; throw new Error(failureCode); }
+      const pendingRows = (await loadPendingSends()).filter(row => row.browserDeviceId === identity.deviceId);
+      const existing = pendingRows.find(row =>
         row.clientMessageId === clientMessageId && row.browserDeviceId === identity.deviceId);
+      if (!existing && pendingRows.length > 0) {
+        setPendingMessage(null);
+        setCommandStatus("Previous send pending; waiting for phone");
+        return;
+      }
       let pending: PendingEncryptedSend | undefined = existing;
       if (!pending) {
         const idempotencyKey = crypto.randomUUID();
+        failureCode = "DEVICE_COMMAND_KEY_UNAVAILABLE";
         const target = await fetchPrimaryCommandKey();
+        setCommandStatus("Encrypting…");
+        failureCode = "ENCRYPTION_FAILED";
         const payload = await encryptCommand(target.encryptionPublicKey, "SEND_SMS", idempotencyKey,
           { type: "SEND_SMS", phone: selectedRecipient, body, clientMessageId,
             ...(chosenSim ? { subscriptionId: chosenSim.subscriptionId } : {}) });
         pending = { browserDeviceId: identity.deviceId, clientMessageId, idempotencyKey, payload,
           targetAgentId: target.deviceId, createdAt: Date.now() };
+        failureCode = "LOCAL_OUTBOX_FAILED";
         await savePendingSend(pending); // durable encrypted retry identity before HTTP
+        setCommandStatus("Queued locally");
       }
-      if (existing) setPendingMessage(null); // never display a new draft as an older command
+      failureCode = "COMMAND_CREATE_FAILED";
       const commandId = await ensurePendingCommandId(pending);
+      setCommandStatus("Accepted by GMweb; waiting for phone");
       if (!existing) setDraft("");
       for (let attempt = 0; attempt < 20; attempt += 1) {
         await new Promise(resolve => setTimeout(resolve, 1_000));
+        failureCode = "COMMAND_POLL_FAILED";
         const state = await fetchCommand(commandId);
-        setCommandStatus(state?.state || "queued");
+        setCommandStatus(state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
+          state?.state === "FAILED" ? "COMMAND_FAILED" : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
+          "Waiting for phone");
         if (state && ["FAILED", "EXPIRED"].includes(state.state)) {
           if (!existing) setDraft(body);
           setPendingMessage(null);
@@ -470,10 +500,10 @@ export default function App() {
           break;
         }
       }
-    } catch (cause) {
+    } catch {
       // A lost response may follow a committed command. Retain the encrypted
       // envelope and identity so the next retry cannot create a second SMS.
-      setCommandStatus(cause instanceof Error ? cause.message : String(cause));
+      setCommandStatus(failureCode);
     } finally {
       recoveringSend.current = false;
     }
@@ -493,7 +523,9 @@ export default function App() {
           try {
             const commandId = await ensurePendingCommandId(pending);
             const state = await fetchCommand(commandId);
-            setCommandStatus(state?.state ?? "queued");
+          setCommandStatus(state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
+            state?.state === "FAILED" ? "COMMAND_FAILED" : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
+            "Waiting for phone");
             if (state && ["COMPLETED", "FAILED", "EXPIRED"].includes(state.state))
               await clearPendingSend(pending.clientMessageId);
           } catch {
@@ -533,7 +565,7 @@ export default function App() {
         events: threadEvents,
         state: threadState,
         firstPageDurationMs: threadFirstPageMs,
-        lastPageError: threadError,
+        lastPageError: historyError || threadError,
       } : undefined));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -656,6 +688,7 @@ export default function App() {
                       {loadingOlderThread ? "Loading…" : "Load older messages"}
                     </Button>
                   )}
+                  {historyError && <div role="alert" className="history-error">{historyError} <Button size="sm" onPress={() => void loadOlderThread()}>Retry</Button></div>}
                   <div ref={messageScrollRef} className="message-scroll" onScroll={(event) => {
                     if (threadHasMore && !loadingOlderThread && event.currentTarget.scrollTop < 80) void loadOlderThread();
                   }}>
@@ -681,15 +714,15 @@ export default function App() {
                     {threadState === "FAILED" && <div className="empty-conversation"><div className="empty-icon">!</div><h3>Unable to load messages</h3><p>{threadError || "Thread page read failed"}</p><Button size="sm" onPress={() => setThreadReload(value => value + 1)}>Retry</Button></div>}
                   </div>
                   <div className="composer-disabled">
-                    <input dir="auto" value={draft} onChange={event => setDraft(event.target.value)} placeholder={selectedRecipient ? "Text message" : "Choose a contact"} disabled={!selectedRecipient || !capabilities.includes("SEND_MESSAGES")} />
+                    <input dir="auto" value={draft} onChange={event => setDraft(event.target.value)} placeholder={selectedRecipient ? "Text message" : "Choose a contact"} />
                     <span className="sms-segments">{smsSegments.encoding} · {smsSegments.units} units · {smsSegments.segments} SMS · {smsSegments.remaining} left</span>
-                    {showSimSelector ? <select className="sim-select" aria-label="Send using SIM" value={chosenSim?.subscriptionId ?? ""} onChange={event => chooseSim(Number(event.target.value))}><option value="" disabled>Choose SIM</option>{activeSims.map(sim => <option key={sim.subscriptionId} value={sim.subscriptionId}>SIM {sim.slotIndex + 1} · {sim.displayName || sim.carrierName}</option>)}</select> : activeSims.length === 1 ? <span className="sim-label">SIM {activeSims[0].slotIndex + 1}</span> : telemetry?.smsSubscriptions ? <span className="sim-label">SIM unavailable</span> : null}
-                    <Button size="sm" onPress={() => void send()} isDisabled={!draft.trim() || !selectedRecipient || !capabilities.includes("SEND_MESSAGES") || !simAvailable}>Send</Button>
+                    {showSimSelector ? <select className="sim-select" aria-label="Send using SIM" value={chosenSim?.subscriptionId ?? ""} onChange={event => chooseSim(Number(event.target.value))}><option value="" disabled>Choose SIM</option>{activeSims.map(sim => <option key={sim.subscriptionId} value={sim.subscriptionId}>SIM {sim.slotIndex + 1} · {sim.displayName || sim.carrierName}</option>)}</select> : activeSims.length === 1 ? <span className="sim-label">SIM {activeSims[0].slotIndex + 1} · {activeSims[0].displayName || activeSims[0].carrierName}</span> : <span className="sim-label">{telemetry?.smsSubscriptions ? "No active SMS SIM available" : "SIM information unavailable"} <button onClick={refreshTelemetry}>Retry</button></span>}
+                    <Button size="sm" onPress={() => void send()} isDisabled={recoveringSend.current}>Send</Button>
                     {commandStatus && <Chip size="sm" variant="soft">{commandStatus}</Chip>}
                   </div>
                 </>
               ) : (
-                <><div className="message-header"><button className="mobile-back" onClick={() => { setComposeRecipient(""); setSelected(null); }}>←</button><div><h2>{composeRecipient ? contactNames.get(composeRecipient) || composeRecipient : "New message"}</h2><p>{composeRecipient || "Choose a conversation or contact."}</p></div></div><div className="empty-conversation"><div className="empty-icon">✦</div><h3>{composeRecipient ? "Start a conversation" : "Choose a conversation or compose a message"}</h3></div>{composeRecipient && <div className="composer-disabled"><input dir="auto" value={draft} onChange={event => setDraft(event.target.value)} placeholder="Text message" /><span className="sms-segments">{smsSegments.encoding} · {smsSegments.units} units · {smsSegments.segments} SMS · {smsSegments.remaining} left</span>{showSimSelector ? <select className="sim-select" aria-label="Send using SIM" value={chosenSim?.subscriptionId ?? ""} onChange={event => chooseSim(Number(event.target.value))}><option value="" disabled>Choose SIM</option>{activeSims.map(sim => <option key={sim.subscriptionId} value={sim.subscriptionId}>SIM {sim.slotIndex + 1} · {sim.displayName || sim.carrierName}</option>)}</select> : activeSims.length === 1 ? <span className="sim-label">SIM {activeSims[0].slotIndex + 1}</span> : telemetry?.smsSubscriptions ? <span className="sim-label">SIM unavailable</span> : null}<Button size="sm" onPress={() => void send()} isDisabled={!draft.trim() || !capabilities.includes("SEND_MESSAGES") || !simAvailable}>Send</Button>{commandStatus && <Chip size="sm" variant="soft">{commandStatus}</Chip>}</div>}</>
+                <><div className="message-header"><button className="mobile-back" onClick={() => { setComposeRecipient(""); setSelected(null); }}>←</button><div><h2>{composeRecipient ? contactNames.get(composeRecipient) || composeRecipient : "New message"}</h2><p>{composeRecipient || "Choose a conversation or contact."}</p></div></div><div className="empty-conversation"><div className="empty-icon">✦</div><h3>{composeRecipient ? "Start a conversation" : "Choose a conversation or compose a message"}</h3></div>{composeRecipient && <div className="composer-disabled"><input dir="auto" value={draft} onChange={event => setDraft(event.target.value)} placeholder="Text message" /><span className="sms-segments">{smsSegments.encoding} · {smsSegments.units} units · {smsSegments.segments} SMS · {smsSegments.remaining} left</span>{showSimSelector ? <select className="sim-select" aria-label="Send using SIM" value={chosenSim?.subscriptionId ?? ""} onChange={event => chooseSim(Number(event.target.value))}><option value="" disabled>Choose SIM</option>{activeSims.map(sim => <option key={sim.subscriptionId} value={sim.subscriptionId}>SIM {sim.slotIndex + 1} · {sim.displayName || sim.carrierName}</option>)}</select> : activeSims.length === 1 ? <span className="sim-label">SIM {activeSims[0].slotIndex + 1} · {activeSims[0].displayName || activeSims[0].carrierName}</span> : <span className="sim-label">{telemetry?.smsSubscriptions ? "No active SMS SIM available" : "SIM information unavailable"} <button onClick={refreshTelemetry}>Retry</button></span>}<Button size="sm" onPress={() => void send()} isDisabled={recoveringSend.current}>Send</Button>{commandStatus && <Chip size="sm" variant="soft">{commandStatus}</Chip>}</div>}</>
               )}
             </main>
           </div>
@@ -768,7 +801,7 @@ export default function App() {
             <Card><CardContent className="status-card"><span>Projection</span><strong>{webDiagnostics.projection.failure ? "FAIL" : webDiagnostics.projection.lag ? "SYNCING" : "PASS"}</strong><small>{webDiagnostics.projection.failure || `${webDiagnostics.projection.rows} rows`} · cursor {webDiagnostics.projection.cursor} · lag {webDiagnostics.projection.lag}</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Contacts</span><strong>{webDiagnostics.contacts.failure ? "WARN" : "PASS"}</strong><small>{webDiagnostics.contacts.failure || `${webDiagnostics.contacts.stored} rows`} · {webDiagnostics.contacts.grants} grants · {webDiagnostics.contacts.snapshots} snapshots</small></CardContent></Card>
             <Card><CardContent className="status-card"><span>Selected Thread</span><strong>{!webDiagnostics.selectedThread ? "PASS" : webDiagnostics.selectedThread.state === "FAILED" ? "FAIL" : webDiagnostics.selectedThread.state === "LOADING" ? "SYNCING" : webDiagnostics.selectedThread.state === "LOCKED" ? "WARN" : "PASS"}</strong><small>{webDiagnostics.selectedThread ? `${webDiagnostics.selectedThread.state} · ${webDiagnostics.selectedThread.decrypted} decrypted · ${webDiagnostics.selectedThread.locked} locked` : "Select a conversation"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Build / Service Worker</span><strong>{webDiagnostics.session.buildMismatch ? "BUILD_MISMATCH" : "PASS"}</strong><small>{webDiagnostics.session.pwaVersion} · {webDiagnostics.session.loadedScript} · {webDiagnostics.session.serviceWorker}</small></CardContent></Card>
+            <Card><CardContent className="status-card"><span>Build / Service Worker</span><strong>{webDiagnostics.session.buildMismatch ? "BUILD_MISMATCH" : "PASS"}</strong><small>{webDiagnostics.session.pwaVersion} · loaded {webDiagnostics.session.loadedScript} · served {webDiagnostics.session.servedScript ?? "unknown"} · revision {webDiagnostics.session.buildRevision ?? "unknown"} · {webDiagnostics.session.serviceWorker}</small></CardContent></Card>
           </div>}
           {webDiagnostics && <div className={`notice ${webDiagnostics.overall === "FAIL" ? "danger" : ""}`}>Overall: {webDiagnostics.overall}</div>}
         </TabPanel>

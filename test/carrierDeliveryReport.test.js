@@ -53,6 +53,8 @@ test("carrier report commits a physical send and PII-free signed Eve event befor
     const found = f.store.searchCarrierReports({ keyName: "eve", eventId: "dlr_one",
       status: "delivered", requestId: `send_${f.id}`, from: at - 1, to: at + 1 });
     assert.equal(found.length, 1);
+    assert.equal(f.store.searchCarrierReports({ keyName: "eve", eveNotificationId: "eve-notification-42" }).length, 1);
+    assert.equal(f.store.searchCarrierReports({ keyName: "eve", eveNotificationId: "other" }).length, 0);
     assert.equal(found[0].callbackState, "pending");
     assert.equal(JSON.stringify(found).includes("sensitive-sms-content"), false);
     assert.equal(JSON.stringify(found).includes("+989121234567"), false);

@@ -176,3 +176,53 @@ test("late physical ACK after failure records sent but never fabricates delivere
   assert.deepEqual(rows(store).map((row) => row.event_type), ["send.queued", "send.failed", "send.sent"]);
   assert.equal(rows(store).some((row) => row.event_type === "send.delivered"), false);
 }));
+
+test("Eve notification ID correlates queued, physical submission and failure callbacks", async () => fixture((store) => {
+  const id = store.create({ to: TO, text: TEXT, keyName: "eve", notification: {
+    source: "eve", serviceKey: "eve:1:uuid", notificationKind: "near_expiry",
+    eveNotificationId: "eve_notification_test_1", generation: 14, requiresValidation: true
+  } });
+  store.attachJob(id, "job-correlation");
+  store.markStatus("job-correlation", "sent", { attempts: 1 });
+  for (const row of rows(store)) {
+    const body = JSON.parse(row.body);
+    assert.equal(body.eve_notification_id, "eve_notification_test_1");
+    assert.equal(row.body.includes(TO), false);
+    assert.equal(row.body.includes(TEXT), false);
+  }
+}));
+
+test("recipient digits embedded in a notification ID never enter signed callbacks", async () => fixture((store) => {
+  store.create({ to: TO, text: TEXT, keyName: "eve", notification: {
+    source: "eve", serviceKey: "eve:1:uuid", notificationKind: "created",
+    eveNotificationId: "eve_989121234567", generation: 1
+  } });
+  assert.equal(JSON.parse(rows(store)[0].body).eve_notification_id, undefined);
+}));
+
+test("dead-letter replay preserves immutable identity and body", async () => fixture(async (store) => {
+  eveSend(store);
+  let status = 403;
+  const sender = new EveSmsEvents(store.db, CONFIG, { fetch: async () => ({ status }) });
+  await sender.tick();
+  const dead = rows(store)[0];
+  assert.equal(dead.state, "dead_letter");
+  const health = sender.health();
+  assert.equal(health.configured, true);
+  assert.equal(health.dead_letter, 1);
+  assert.equal(health.last_http_status, 403);
+  assert.deepEqual(sender.requeueDeadLetters({ eventIds: [dead.event_id] }), {
+    matched: 1, requeued: 1, alreadyPending: 0, alreadyDelivered: 0, stillIneligible: 0
+  });
+  assert.equal(sender.requeueDeadLetters({ eventIds: [dead.event_id] }).alreadyPending, 1);
+  status = 204;
+  await sender.tick();
+  const delivered = rows(store)[0];
+  assert.equal(delivered.state, "delivered");
+  assert.equal(delivered.event_id, dead.event_id);
+  assert.equal(delivered.delivery_id, dead.delivery_id);
+  assert.equal(delivered.body, dead.body);
+  assert.equal(rows(store).length, 1);
+  assert.equal(sender.requeueDeadLetters({ eventIds: [dead.event_id] }).alreadyDelivered, 1);
+  assert.equal(new EveSmsEvents(store.db, null).requeueDeadLetters().error, "callback_not_configured");
+}));
