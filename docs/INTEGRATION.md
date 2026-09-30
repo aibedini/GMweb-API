@@ -745,3 +745,26 @@ the database under the existing operational backup policy; archive and prune
 only under a future migration that first defines Android's maximum retry
 horizon and Eve's audit window. The generic activity JSONL retains up to
 10,000 recent entries; its rotation is separate from the DLR ledger.
+# Linked SMS realtime extension (`linked-sms-realtime-v1`)
+
+An authenticated linked browser with `READ_MESSAGES` may receive a content-free
+`sync.available` SSE frame containing up to 20 opaque `conversationIds`. After
+the event-store transaction commits, the browser can call
+`POST /api/v1/web/conversations/changed` with `{ "conversationIds": [...] }`.
+The response contains encrypted current-state envelopes plus replica generation,
+snapshot version, and high watermark. An absent or oversized ID list means the
+client must use the existing bounded bootstrap. The endpoint requires the linked
+session and message-read capability and returns no message text or contact data.
+
+Android event batches may include `sourceOrder`, the positive Room outbox
+insertion ID. GMweb persists it with encrypted message and conversation current
+state and prefers higher source order over arrival time, hash revision, and
+message timestamp. This lets deletion move a conversation head to an older
+surviving message while delayed history uploads cannot restore stale heads.
+Older agents omit it; their rows retain the legacy sort/revision fallback.
+
+Signed Primary Android device telemetry may include `smsSubscriptions` with only
+active subscription IDs, slots, bounded labels, and default-SMS status. Linked
+browser send commands carry the chosen `subscriptionId` inside the encrypted
+`SEND_SMS` payload. Android refuses an unavailable explicitly chosen SIM with
+`SIM_NOT_AVAILABLE` and does not substitute another line.

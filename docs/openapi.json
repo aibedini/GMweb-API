@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.27",
+    "version": "0.19.28",
     "contact": {
       "name": "GMweb API"
     }
@@ -3291,6 +3291,12 @@
                           "nullable": true,
                           "description": "Minimal non-content ordering metadata"
                         },
+                        "sourceOrder": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "nullable": true,
+                          "description": "Durable device outbox insertion order"
+                        },
                         "payload": {
                           "type": "string",
                           "minLength": 4,
@@ -3751,6 +3757,53 @@
             "required": false
           }
         ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/web/conversations/changed": {
+      "post": {
+        "summary": "Bounded encrypted conversation states after a content-free SSE invalidation",
+        "tags": [
+          "Sync"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "conversationIds"
+                ],
+                "properties": {
+                  "conversationIds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Default Response",

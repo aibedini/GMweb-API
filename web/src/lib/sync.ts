@@ -8,7 +8,7 @@
  * without touching storage or UI.
  */
 
-import { fetchWebBootstrap, fetchWebConversationPage, fetchWebMessagePage, fetchContactEventPage,
+import { fetchWebBootstrap, fetchWebConversationPage, fetchWebMessagePage, fetchChangedConversationStates, fetchContactEventPage,
   type EncryptedConversationState, type EncryptedMessageState, type SyncEvent } from "./api.ts";
 import { receiveKeyGrant, decryptMessage, type Decryption } from "./messageCrypto.ts";
 import { decodeEventPayload, type ConversationProjection } from "./inbox.ts";
@@ -158,6 +158,21 @@ export async function getReplicationProgress(deviceId: string): Promise<{
 
 /** §43: apply pages transactionally until the server says hasMore=false. */
 let runningSync: Promise<number> | null = null;
+let keyMaintenance: Promise<void> | null = null;
+const keyListeners = new Set<() => void>();
+
+export function subscribeKeyMaintenance(listener: () => void): () => void {
+  keyListeners.add(listener);
+  return () => { keyListeners.delete(listener); };
+}
+
+function scheduleKeyMaintenance(): void {
+  if (keyMaintenance) return;
+  keyMaintenance = (async () => {
+    await syncKeysSafely(bootstrapKeyGrants);
+    for (const listener of keyListeners) listener();
+  })().finally(() => { keyMaintenance = null; });
+}
 function serializeSync(run: () => Promise<number>): Promise<number> {
   // Serialize manual pulls and SSE invalidations: an older request must never
   // overwrite a newer cursor after it completes out of order.
@@ -166,10 +181,37 @@ function serializeSync(run: () => Promise<number>): Promise<number> {
 }
 
 /** Refresh only current conversation summaries; the watermark records observation, not downloaded history. */
-export function syncVisibleInbox(): Promise<number> {
+export function syncVisibleInbox(changedConversationIds?: string[]): Promise<number> {
   updateSyncStatus({ state: "INITIALIZING", lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
   return serializeSync(async () => {
     try {
+      if (changedConversationIds?.length && changedConversationIds.length <= 20) {
+        const targetDb = await openDb();
+        if (await metaValue<boolean>(targetDb, LAZY_INBOX_KEY) === true) {
+          const changed = await fetchChangedConversationStates([...new Set(changedConversationIds)]);
+          const [generation, version, previousCursor] = await Promise.all([
+            metaValue<string>(targetDb, REPLICA_GENERATION_KEY),
+            metaValue<number>(targetDb, SNAPSHOT_VERSION_KEY), metaNumber(targetDb, CURSOR_KEY),
+          ]);
+          if (changed.replicaGeneration === generation && changed.snapshotVersion === version &&
+              Number.isSafeInteger(changed.highWatermark) && changed.conversations.length <= 20) {
+            const tx = targetDb.transaction([STORE_ENCRYPTED_CONVERSATIONS, STORE_META], "readwrite");
+            const states = tx.objectStore(STORE_ENCRYPTED_CONVERSATIONS);
+            for (const row of changed.conversations) {
+              const get = states.get(row.conversationId);
+              get.onsuccess = () => {
+                const old = get.result as EncryptedConversationState | undefined;
+                if (!old || newerReplicaRow(row, old, true)) states.put(row);
+              };
+            }
+            tx.objectStore(STORE_META).put(Math.max(previousCursor, changed.highWatermark), CURSOR_KEY);
+            await txDone(tx);
+            updateSyncStatus({ state: "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(),
+              appliedThisRun: changed.conversations.length, lastPageCount: changed.conversations.length });
+            return 1;
+          }
+        }
+      }
       const page = await fetchWebBootstrap(100, false);
       if (!Number.isSafeInteger(page.highWatermark) || page.highWatermark < 0 ||
           !page.replicaGeneration || !Number.isSafeInteger(page.snapshotVersion) ||
@@ -195,8 +237,7 @@ export function syncVisibleInbox(): Promise<number> {
         const get = conversations.get(row.conversationId);
         get.onsuccess = () => {
           const old = get.result as EncryptedConversationState | undefined;
-          if (!old || row.revision > old.revision ||
-              (row.revision === old.revision && row.lastServerSequence >= old.lastServerSequence)) conversations.put(row);
+          if (!old || newerReplicaRow(row, old, true)) conversations.put(row);
         };
       }
       const meta = transaction.objectStore(STORE_META);
@@ -209,9 +250,9 @@ export function syncVisibleInbox(): Promise<number> {
         SNAPSHOT_COMPLETE_KEY, SNAPSHOT_STARTED_AT_KEY, SNAPSHOT_LAST_PAGE_AT_KEY,
         SNAPSHOT_LAST_PAGE_MS_KEY, SNAPSHOT_PAGE_COUNT_KEY, SNAPSHOT_POSITION_KEY]) meta.delete(key);
       await txDone(transaction);
-      const keyDegraded = !(await syncKeysSafely(bootstrapKeyGrants));
-      updateSyncStatus({ state: keyDegraded ? "DEGRADED" : "UP_TO_DATE",
+      updateSyncStatus({ state: "UP_TO_DATE",
         lastSuccessfulSyncAt: Date.now(), appliedThisRun: 0, lastPageCount: page.conversations.length });
+      scheduleKeyMaintenance();
       return reset || observed > priorCursor ? 1 : 0;
     } catch (cause) {
       syncFailure("VISIBLE_SYNC", cause, false);
@@ -290,16 +331,15 @@ export async function loadContactsOnDemand(onProgress?: (events: number) => void
 export function syncNow(onProgress?: (applied: number) => void): Promise<number> {
   updateSyncStatus({ state: "SYNCING_HISTORY", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
   return serializeSync(async () => {
-    let keySyncDegraded = false;
     try {
       // Key availability is deliberately independent from replica durability.
       // A missing/unavailable key must leave ciphertext replication healthy so
       // the browser can catch up and retry projection after the grant arrives.
-      keySyncDegraded = !(await syncKeysSafely(bootstrapKeyGrants));
+      scheduleKeyMaintenance();
       await bootstrapEncryptedState();
       await repairConversationProjection();
       const result = await drainSync(undefined, onProgress);
-      updateSyncStatus({ state: keySyncDegraded || result.keyDegraded ? "DEGRADED" : "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
+      updateSyncStatus({ state: result.keyDegraded ? "DEGRADED" : "UP_TO_DATE", lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied });
       return result.applied;
     } catch (cause) {
       syncFailure("SYNC", cause, false);
@@ -316,18 +356,17 @@ export function syncNow(onProgress?: (applied: number) => void): Promise<number>
 export function syncStep(maxPages = 2, onProgress?: (applied: number) => void): Promise<number> {
   updateSyncStatus({ state: "INITIALIZING", appliedThisRun: 0, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null });
   return serializeSync(async () => {
-    let keySyncDegraded = false;
     try {
-      keySyncDegraded = !(await syncKeysSafely(bootstrapKeyGrants));
+      scheduleKeyMaintenance();
       const snapshotComplete = await bootstrapEncryptedState(false, maxPages);
       if (!snapshotComplete) {
-        updateSyncStatus({ state: keySyncDegraded ? "DEGRADED" : "FIRST_PAINT_READY", lastPageCount: 0, appliedThisRun: 0 });
+        updateSyncStatus({ state: "FIRST_PAINT_READY", lastPageCount: 0, appliedThisRun: 0 });
         return 0;
       }
       await repairConversationProjection();
       const result = await drainSync(maxPages, onProgress);
       updateSyncStatus({
-        state: keySyncDegraded || result.keyDegraded ? "DEGRADED" : (result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY"),
+        state: result.keyDegraded ? "DEGRADED" : (result.caughtUp ? "UP_TO_DATE" : "FIRST_PAINT_READY"),
         lastSuccessfulSyncAt: Date.now(), lastPageCount: result.lastPageCount, appliedThisRun: result.applied,
       });
       return result.applied;
@@ -432,6 +471,18 @@ async function cachedMessagePage(db: IDBDatabase, aggregateId: string, before: s
   };
 }
 
+function newerReplicaRow(
+  row: EncryptedConversationState, old: EncryptedConversationState, conversation: boolean,
+): boolean {
+  const nextOrder = Number(row.sourceOrder) || 0;
+  const oldOrder = Number(old.sourceOrder) || 0;
+  if (nextOrder > 0 || oldOrder > 0) return nextOrder > oldOrder;
+  if (conversation) return row.sortKey > old.sortKey ||
+    (row.sortKey === old.sortKey && row.lastServerSequence >= old.lastServerSequence);
+  return row.revision > old.revision ||
+    (row.revision === old.revision && row.lastServerSequence >= old.lastServerSequence);
+}
+
 async function cacheCurrentStates<T extends EncryptedConversationState | EncryptedMessageState>(
   db: IDBDatabase, storeName: string, rows: T[], id: (row: T) => string,
 ): Promise<T[]> {
@@ -442,8 +493,9 @@ async function cacheCurrentStates<T extends EncryptedConversationState | Encrypt
     const get = store.get(id(row));
     get.onsuccess = () => {
       const old = get.result as T | undefined;
-      if (old && (old.revision > row.revision ||
-          (old.revision === row.revision && old.lastServerSequence > row.lastServerSequence))) {
+      const conversation = storeName === STORE_ENCRYPTED_CONVERSATIONS;
+      const stale = old && !newerReplicaRow(row, old, conversation);
+      if (stale && old) {
         effective[index] = old;
       } else {
         effective[index] = row;
@@ -754,6 +806,20 @@ async function projectEncryptedConversations(encrypted: EncryptedConversationSta
   return items;
 }
 
+/** Read only SSE-invalidated encrypted heads from local IndexedDB. */
+export async function listChangedConversationHeads(ids: string[]): Promise<{
+  items: ConversationProjection[]; removed: string[];
+}> {
+  const db = await openDb();
+  const states = db.transaction(STORE_ENCRYPTED_CONVERSATIONS, "readonly")
+    .objectStore(STORE_ENCRYPTED_CONVERSATIONS);
+  const rows = (await Promise.all([...new Set(ids)].slice(0, 20)
+    .map(id => requestToPromise(states.get(id))))).filter(
+      (row): row is EncryptedConversationState => Boolean(row));
+  return { items: await projectEncryptedConversations(rows),
+    removed: rows.filter(row => row.tombstone).map(row => row.conversationId) };
+}
+
 /**
  * Paginated conversation read from the projection store. Replaces the old
  * `listInboxEvents(limit=100)` candidate scan, so 1000+ conversations stay
@@ -883,10 +949,10 @@ export async function resetLocal(): Promise<void> {
  * Returns a disposer (for React effects / StrictMode double-mount).
  */
 export function subscribeSyncAvailable(
-  onSynced: (applied: number) => void,
+  onSynced: (applied: number, conversationIds?: string[]) => void,
   onRevoked: () => void,
   onSyncError?: (cause: unknown) => void,
-  syncFunction: () => Promise<number> = syncNow,
+  syncFunction: (conversationIds?: string[]) => Promise<number> = () => syncNow(),
 ): () => void {
   return subscribeLiveInvalidation(syncFunction, onSynced, onRevoked, onSyncError);
 }

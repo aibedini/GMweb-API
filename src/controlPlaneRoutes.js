@@ -661,6 +661,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
                 messageId: { type: "string", maxLength: 128, nullable: true, description: "Opaque stable message identifier" },
                 revision: { type: "integer", minimum: 1, nullable: true },
                 sortKey: { type: "integer", minimum: 0, nullable: true, description: "Minimal non-content ordering metadata" },
+                sourceOrder: { type: "integer", minimum: 0, nullable: true, description: "Durable device outbox insertion order" },
                 payload: { type: "string", minLength: 4, maxLength: 174764, description: "canonical base64 opaque envelope bytes" },
                 encoding: { type: "string", enum: ["envelope.v1", "envelope.v2", "envelope.v3"] },
                 schemaVersion: { type: "integer", enum: [1] },
@@ -744,7 +745,8 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         if ((event.conversationId != null && typeof event.conversationId !== "string") ||
             (event.messageId != null && typeof event.messageId !== "string") ||
             (event.revision != null && (!Number.isInteger(event.revision) || event.revision < 1)) ||
-            (event.sortKey != null && (!Number.isInteger(event.sortKey) || event.sortKey < 0))) {
+            (event.sortKey != null && (!Number.isInteger(event.sortKey) || event.sortKey < 0)) ||
+            (event.sourceOrder != null && (!Number.isSafeInteger(event.sourceOrder) || event.sourceOrder < 0))) {
           throw Object.assign(new Error("invalid_metadata"), { code: "invalid_metadata" });
         }
         validateStoredBatch([{ ...event, payload }]);
@@ -935,6 +937,22 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   }, async (request, reply) => {
     webSnapshotHeaders(reply);
     return eventStore.conversations(accountId, request.query?.cursor, Number(request.query?.limit) || 100);
+  });
+
+  app.post("/api/v1/web/conversations/changed", {
+    schema: {
+      summary: "Bounded encrypted conversation states after a content-free SSE invalidation",
+      tags: ["Sync"],
+      body: { type: "object", additionalProperties: false, required: ["conversationIds"],
+        properties: { conversationIds: { type: "array", minItems: 1, maxItems: 20,
+          items: { type: "string", minLength: 1, maxLength: 128 } } } },
+      response: { 200: { type: "object", additionalProperties: true } },
+    },
+  }, async (request, reply) => {
+    webSnapshotHeaders(reply);
+    if (!request.linkedDevice?.capabilities?.includes("READ_MESSAGES"))
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    return eventStore.conversationsByIds(accountId, request.body.conversationIds);
   });
 
   app.get("/api/v1/web/conversations/:conversationId/messages", {

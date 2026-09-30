@@ -102,6 +102,7 @@ class EventStore {
         message_id      TEXT,
         revision        INTEGER NOT NULL DEFAULT 1,
         sort_key        INTEGER NOT NULL DEFAULT 0,
+        source_order    INTEGER NOT NULL DEFAULT 0,
         source_device_id TEXT,
         ciphertext      BLOB NOT NULL,
         encoding        TEXT NOT NULL,
@@ -116,6 +117,7 @@ class EventStore {
         conversation_id TEXT NOT NULL,
         revision INTEGER NOT NULL,
         sort_key INTEGER NOT NULL,
+        source_order INTEGER NOT NULL DEFAULT 0,
         tombstone INTEGER NOT NULL DEFAULT 0,
         event_type TEXT NOT NULL,
         envelope BLOB NOT NULL,
@@ -134,6 +136,7 @@ class EventStore {
         conversation_id TEXT NOT NULL,
         revision INTEGER NOT NULL,
         sort_key INTEGER NOT NULL,
+        source_order INTEGER NOT NULL DEFAULT 0,
         tombstone INTEGER NOT NULL DEFAULT 0,
         envelope BLOB NOT NULL,
         encoding TEXT NOT NULL,
@@ -164,6 +167,9 @@ class EventStore {
     ensureColumn(db, "sync_events", "message_id", "TEXT");
     ensureColumn(db, "sync_events", "revision", "INTEGER NOT NULL DEFAULT 1");
     ensureColumn(db, "sync_events", "sort_key", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, "sync_events", "source_order", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, "encrypted_message_state", "source_order", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, "encrypted_conversation_state", "source_order", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, "encrypted_message_state", "event_type", "TEXT NOT NULL DEFAULT 'MESSAGE_CREATED'");
     ensureColumn(db, "encrypted_conversation_state", "tombstone", "INTEGER NOT NULL DEFAULT 0");
     db.exec(`
@@ -185,6 +191,7 @@ class EventStore {
         message_id TEXT,
         revision INTEGER NOT NULL,
         sort_key INTEGER NOT NULL,
+        source_order INTEGER NOT NULL DEFAULT 0,
         tombstone INTEGER NOT NULL,
         event_type TEXT,
         envelope BLOB NOT NULL,
@@ -196,6 +203,7 @@ class EventStore {
       );
       CREATE INDEX IF NOT EXISTS idx_snapshot_expiry ON encrypted_snapshot_sessions(expires_at);
     `);
+    ensureColumn(db, "encrypted_snapshot_rows", "source_order", "INTEGER NOT NULL DEFAULT 0");
     this.counterStmt = db.prepare(
       `INSERT INTO event_counters (account_id, next_sequence) VALUES (?, 1)
        ON CONFLICT(account_id) DO NOTHING`
@@ -208,42 +216,51 @@ class EventStore {
     );
     this.insertEventStmt = db.prepare(
       `INSERT OR IGNORE INTO sync_events
-       (account_id, sequence, event_uuid, event_type, aggregate_id, message_id, revision, sort_key, source_device_id,
+       (account_id, sequence, event_uuid, event_type, aggregate_id, message_id, revision, sort_key, source_order, source_device_id,
         ciphertext, encoding, schema_version, crypto_version, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     this.upsertMessageStateStmt = db.prepare(`
       INSERT INTO encrypted_message_state
-        (account_id, message_id, conversation_id, revision, sort_key, tombstone, event_type,
+        (account_id, message_id, conversation_id, revision, sort_key, source_order, tombstone, event_type,
          envelope, encoding, schema_version, crypto_version, last_server_sequence, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(account_id, message_id) DO UPDATE SET
         conversation_id=excluded.conversation_id, revision=excluded.revision,
-        sort_key=excluded.sort_key, tombstone=excluded.tombstone, event_type=excluded.event_type,
+        sort_key=excluded.sort_key, source_order=excluded.source_order,
+        tombstone=excluded.tombstone, event_type=excluded.event_type,
         envelope=excluded.envelope, encoding=excluded.encoding,
         schema_version=excluded.schema_version, crypto_version=excluded.crypto_version,
         last_server_sequence=excluded.last_server_sequence, updated_at=excluded.updated_at
-      WHERE excluded.revision > encrypted_message_state.revision
+      WHERE (excluded.source_order > 0 AND excluded.source_order > encrypted_message_state.source_order)
+         OR (excluded.source_order = 0 AND encrypted_message_state.source_order = 0 AND
+             (excluded.revision > encrypted_message_state.revision
          OR (excluded.revision = encrypted_message_state.revision
-             AND excluded.last_server_sequence > encrypted_message_state.last_server_sequence)
+             AND excluded.last_server_sequence > encrypted_message_state.last_server_sequence)))
     `);
     this.upsertConversationStateStmt = db.prepare(`
       INSERT INTO encrypted_conversation_state
-        (account_id, conversation_id, revision, sort_key, tombstone, envelope, encoding,
+        (account_id, conversation_id, revision, sort_key, source_order, tombstone, envelope, encoding,
          schema_version, crypto_version, last_server_sequence, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(account_id, conversation_id) DO UPDATE SET
-        revision=excluded.revision, sort_key=excluded.sort_key, tombstone=excluded.tombstone, envelope=excluded.envelope,
+        revision=excluded.revision, sort_key=excluded.sort_key, source_order=excluded.source_order,
+        tombstone=excluded.tombstone, envelope=excluded.envelope,
         encoding=excluded.encoding, schema_version=excluded.schema_version,
         crypto_version=excluded.crypto_version,
         last_server_sequence=excluded.last_server_sequence, updated_at=excluded.updated_at
-      WHERE excluded.revision > encrypted_conversation_state.revision
-         OR (excluded.revision = encrypted_conversation_state.revision
-             AND excluded.last_server_sequence > encrypted_conversation_state.last_server_sequence)
+      -- Android's historical revision is a stable identity hash, not a
+      -- monotonic version. The message timestamp orders conversation heads;
+      -- server sequence resolves read/status updates at the same timestamp.
+      WHERE (excluded.source_order > 0 AND excluded.source_order > encrypted_conversation_state.source_order)
+         OR (excluded.source_order = 0 AND encrypted_conversation_state.source_order = 0 AND
+             (excluded.sort_key > encrypted_conversation_state.sort_key
+         OR (excluded.sort_key = encrypted_conversation_state.sort_key
+             AND excluded.last_server_sequence > encrypted_conversation_state.last_server_sequence)))
     `);
     this.afterStmt = db.prepare(
       `SELECT sequence, event_uuid AS eventId, event_type AS type, aggregate_id AS aggregateId,
-              message_id AS messageId, revision, sort_key AS sortKey,
+              message_id AS messageId, revision, sort_key AS sortKey, source_order AS sourceOrder,
               source_device_id AS sourceDeviceId, ciphertext, encoding, schema_version AS schemaVersion,
               crypto_version AS cryptoVersion, created_at AS createdAt
        FROM sync_events WHERE account_id = ? AND sequence > ?
@@ -296,6 +313,8 @@ class EventStore {
       const results = [];
       let duplicates = 0;
       let inserted = 0;
+      const changedConversationIds = new Set();
+      let requiresFullInvalidation = false;
       for (const event of batch) {
         const uuid = String(event.eventId || "");
         const type = String(event.type || "UNKNOWN");
@@ -316,6 +335,7 @@ class EventStore {
           event.messageId ? String(event.messageId) : null,
           Math.max(1, Number(event.revision) || 1),
           Math.max(0, Number(event.sortKey) || 0),
+          Math.max(0, Number(event.sourceOrder) || 0),
           sourceDeviceId ? String(sourceDeviceId) : null,
           payloadBuf,
           String(event.encoding || "envelope.v1"),
@@ -334,6 +354,7 @@ class EventStore {
           if (messageId && conversationId && ["MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED", "MESSAGE_DELETED"].includes(eventType)) {
             this.upsertMessageStateStmt.run(
               accountId, messageId, conversationId, revision, sortKey,
+              Math.max(0, Number(event.sourceOrder) || 0),
               eventType === "MESSAGE_DELETED" ? 1 : 0, eventType, payloadBuf,
               String(event.encoding || "envelope.v1"), Number(event.schemaVersion) || 1,
               Number(event.cryptoVersion) || 0, seq, now, now
@@ -341,11 +362,19 @@ class EventStore {
           }
           if (conversationId && ["CONVERSATION_UPSERT", "CONVERSATION_UPSERTED", "CONVERSATION_DELETED"].includes(eventType)) {
             this.upsertConversationStateStmt.run(
-              accountId, conversationId, revision, sortKey, eventType === "CONVERSATION_DELETED" ? 1 : 0, payloadBuf,
+              accountId, conversationId, revision, sortKey,
+              Math.max(0, Number(event.sourceOrder) || 0),
+              eventType === "CONVERSATION_DELETED" ? 1 : 0, payloadBuf,
               String(event.encoding || "envelope.v1"), Number(event.schemaVersion) || 1,
               Number(event.cryptoVersion) || 0, seq, now
             );
           }
+          if (conversationId && ["MESSAGE_CREATED", "MESSAGE_UPDATED", "MESSAGE_STATUS_CHANGED",
+            "MESSAGE_DELETED", "CONVERSATION_UPSERT", "CONVERSATION_UPSERTED", "CONVERSATION_DELETED"].includes(eventType)) {
+            changedConversationIds.add(conversationId);
+          }
+          if (["KEY_GRANT", "CONTACTS_KEY_GRANT", "KEYRING_ENTRY", "HISTORY_KEY_GRANT",
+            "CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"].includes(eventType)) requiresFullInvalidation = true;
           accepted.push({ eventId: uuid, serverSequence: seq });
           results.push({ eventId: uuid, status: "ACCEPTED", serverSequence: seq });
           inserted++;
@@ -359,6 +388,7 @@ class EventStore {
               old.message_id === (event.messageId ? String(event.messageId) : null) &&
               old.revision === Math.max(1, Number(event.revision) || 1) &&
               old.sort_key === Math.max(0, Number(event.sortKey) || 0) &&
+              old.source_order === Math.max(0, Number(event.sourceOrder) || 0) &&
               old.source_device_id === (sourceDeviceId ? String(sourceDeviceId) : null) &&
               old.encoding === String(event.encoding || "envelope.v1") &&
               old.schema_version === (Number(event.schemaVersion) || 1) && old.crypto_version === (Number(event.cryptoVersion) || 0)) {
@@ -369,14 +399,16 @@ class EventStore {
           }
         }
       }
-      return { accepted, duplicates, inserted, results };
+      return { accepted, duplicates, inserted, results,
+        changedConversationIds: !requiresFullInvalidation && changedConversationIds.size > 0 &&
+          changedConversationIds.size <= 20 ? [...changedConversationIds] : null };
     });
     const result = accept(events);
     this.log?.(`SYNC_REPORT accepted=${result.accepted.length} duplicates=${result.duplicates} inserted=${result.inserted}`);
     // §44 invalidation hook — AFTER the transaction committed (durable first,
     // realtime second). Never throws into the HTTP path.
     if (result.inserted > 0 && this.onEventsAccepted) {
-      try { this.onEventsAccepted(result.inserted); } catch { /* swallow */ }
+      try { this.onEventsAccepted(result.inserted, result.changedConversationIds); } catch { /* swallow */ }
     }
     // V1's aggregate duplicate count includes identity conflicts. Returning
     // the already computed item outcomes lets current phones stop retrying a
@@ -547,19 +579,19 @@ class EventStore {
         metadata.replicaGeneration, metadata.snapshotVersion, baseline, expiresAt,
         JSON.stringify(this.contactBootstrapEvents(accountId)));
       this.db.prepare(`INSERT INTO encrypted_snapshot_rows
-        (token, position, kind, conversation_id, message_id, revision, sort_key, tombstone,
+        (token, position, kind, conversation_id, message_id, revision, sort_key, source_order, tombstone,
          event_type, envelope, encoding, schema_version, crypto_version, last_server_sequence)
         SELECT ?, ROW_NUMBER() OVER (ORDER BY sort_key DESC, conversation_id DESC),
-          'conversation', conversation_id, NULL, revision, sort_key, tombstone,
+          'conversation', conversation_id, NULL, revision, sort_key, source_order, tombstone,
           NULL, envelope, encoding, schema_version, crypto_version, last_server_sequence
         FROM encrypted_conversation_state WHERE account_id = ?`).run(token, accountId);
       const conversationCount = this.db.prepare("SELECT COUNT(*) AS n FROM encrypted_conversation_state WHERE account_id = ?")
         .get(accountId).n;
       this.db.prepare(`INSERT INTO encrypted_snapshot_rows
-        (token, position, kind, conversation_id, message_id, revision, sort_key, tombstone,
+        (token, position, kind, conversation_id, message_id, revision, sort_key, source_order, tombstone,
          event_type, envelope, encoding, schema_version, crypto_version, last_server_sequence)
         SELECT ?, ? + ROW_NUMBER() OVER (ORDER BY conversation_id, sort_key DESC, message_id DESC),
-          'message', conversation_id, message_id, revision, sort_key, tombstone,
+          'message', conversation_id, message_id, revision, sort_key, source_order, tombstone,
           event_type, envelope, encoding, schema_version, crypto_version, last_server_sequence
         FROM encrypted_message_state WHERE account_id = ?`).run(token, conversationCount, accountId);
     })();
@@ -587,7 +619,8 @@ class EventStore {
     }
     const capped = Math.max(1, Math.min(200, Number(limit) || 100));
     const rows = this.db.prepare(`SELECT position, kind, conversation_id AS conversationId,
-      message_id AS messageId, revision, sort_key AS sortKey, tombstone, event_type AS type,
+      message_id AS messageId, revision, sort_key AS sortKey, source_order AS sourceOrder,
+      tombstone, event_type AS type,
       envelope, encoding, schema_version AS schemaVersion, crypto_version AS cryptoVersion,
       last_server_sequence AS lastServerSequence
       FROM encrypted_snapshot_rows WHERE token = ? AND position > ? ORDER BY position LIMIT ?`)
@@ -616,7 +649,8 @@ class EventStore {
     const capped = Math.max(1, Math.min(200, Number(limit) || 100));
     const [sortKey, conversationId] = decodeCursor(cursor, [Number.MAX_SAFE_INTEGER, "\uffff"]);
     const rows = this.db.prepare(`
-      SELECT conversation_id AS conversationId, revision, sort_key AS sortKey, tombstone,
+      SELECT conversation_id AS conversationId, revision, sort_key AS sortKey,
+             source_order AS sourceOrder, tombstone,
              envelope, encoding, schema_version AS schemaVersion,
              crypto_version AS cryptoVersion, last_server_sequence AS lastServerSequence
       FROM encrypted_conversation_state
@@ -632,12 +666,32 @@ class EventStore {
     };
   }
 
+  conversationsByIds(accountId, ids) {
+    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 20 ||
+        ids.some(id => typeof id !== "string" || id.length < 1 || id.length > 128)) {
+      throw new Error("invalid_conversation_ids");
+    }
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = this.db.prepare(`
+      SELECT conversation_id AS conversationId, revision, sort_key AS sortKey,
+             source_order AS sourceOrder, tombstone,
+             envelope, encoding, schema_version AS schemaVersion,
+             crypto_version AS cryptoVersion, last_server_sequence AS lastServerSequence
+      FROM encrypted_conversation_state
+      WHERE account_id = ? AND conversation_id IN (${placeholders})
+    `).all(accountId, ...ids);
+    return { ...this.replicaMetadata(accountId), highWatermark: this.highWatermark(accountId),
+      conversations: rows.map(row => ({ ...row, tombstone: Boolean(row.tombstone),
+        envelope: Buffer.from(row.envelope).toString("base64") })) };
+  }
+
   messages(accountId, conversationId, cursor, limit = 50) {
     const capped = Math.max(1, Math.min(100, Number(limit) || 50));
     const [sortKey, messageId] = decodeCursor(cursor, [Number.MAX_SAFE_INTEGER, "\uffff"]);
     const rows = this.db.prepare(`
       SELECT message_id AS messageId, conversation_id AS conversationId, revision,
-             sort_key AS sortKey, tombstone, event_type AS type, envelope, encoding,
+             sort_key AS sortKey, source_order AS sourceOrder, tombstone,
+             event_type AS type, envelope, encoding,
              schema_version AS schemaVersion, crypto_version AS cryptoVersion,
              last_server_sequence AS lastServerSequence
       FROM encrypted_message_state

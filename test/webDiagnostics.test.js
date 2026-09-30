@@ -54,6 +54,8 @@ test("diagnostic report is privacy-safe and exposes an old PWA build", async () 
     session: { linked: true, capabilities: ["READ_MESSAGES"], apiVersion: "0.16.2", pwaVersion: "0.16.1", loadedScript: "index-old.js", serviceWorker: "ACTIVE", online: true, buildMismatch: true },
     server: { total: 2, maxSequence: 2, countsByType: [], countsByCryptoVersion: [], distinctAggregateCount: 1, nullAggregateCount: 0 },
     browserSync: { state: "UP_TO_DATE", lastSuccessfulSyncAt: 1, lastPageCount: 0, appliedThisRun: 2, lastErrorPhase: null, lastErrorCode: null, lastErrorMessage: null, cursor: 2, projectionCursor: 2, syncLag: 0, projectionLag: 0 },
+    liveSync: { connection: "CONNECTED", reconnectCount: 0, lastFrameAt: 1,
+      serverPublishedAt: 1, browserPullCompletedAt: 2, browserProjectedAt: 3, browserRenderedAt: 4 },
     replicaProgress: { snapshotComplete: true, snapshotBaseline: 1, keyringCursor: 2, grantCursor: 3 },
     indexedDb: { total: 2, byType: { MESSAGE_CREATED: 1 }, byCryptoVersion: { 1: 2 }, nullAggregateCount: 0, distinctMessageAggregateCount: 1, conversationRows: 1, contactRows: 0 },
     crypto: { browserIdentity: true, verifiedPrimary: true, primaryMatchesBrowser: true, messages: { ...emptyCrypto, decrypted: 1 }, keyGrants: { ...emptyCrypto, accepted: 1 } },

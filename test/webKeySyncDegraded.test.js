@@ -57,8 +57,10 @@ test("key sync failure does not block durable ciphertext replica catch-up", asyn
     assert.equal(await sync.syncNow(), 1);
     assert.equal(await sync.getCursor(), 1);
     assert.equal(eventRequests, 1);
-    assert.equal(sync.getBrowserSyncStatus().state, "DEGRADED");
-    assert.equal(sync.getBrowserSyncStatus().lastErrorPhase, "KEY_SYNC");
+    for (let attempt = 0; attempt < 50 && sync.getBrowserSyncStatus().keyState !== "FAILED"; attempt++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(sync.getBrowserSyncStatus().state, "UP_TO_DATE");
+    assert.equal(sync.getBrowserSyncStatus().keyState, "FAILED");
     const keys = await (await import("../web/src/lib/deviceKeys.ts")).getOrCreateDeviceKeys();
     const progress = await sync.getReplicationProgress(keys.deviceId);
     assert.equal(progress.snapshotComplete, true);
@@ -70,7 +72,7 @@ test("key sync failure does not block durable ciphertext replica catch-up", asyn
   }
 });
 
-test("a stalled key endpoint cannot indefinitely block ciphertext catch-up", async () => {
+test("a stalled key endpoint times out independently after inbox catch-up", async () => {
   global.indexedDB = indexedDB;
   global.IDBKeyRange = IDBKeyRange;
   const originalFetch = global.fetch;
@@ -99,16 +101,57 @@ test("a stalled key endpoint cannot indefinitely block ciphertext catch-up", asy
   let timer;
   try {
     const bounded = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("key timeout did not release sync")), 5_000);
+      timer = setTimeout(() => reject(new Error("key timeout blocked visible sync")), 2_000);
     });
     assert.equal(await Promise.race([sync.syncNow(), bounded]), 1);
     assert.equal(await sync.getCursor(), 1);
-    assert.equal(sync.getBrowserSyncStatus().state, "DEGRADED");
-    assert.equal(sync.getBrowserSyncStatus().lastErrorPhase, "KEY_SYNC");
+    assert.equal(sync.getBrowserSyncStatus().state, "UP_TO_DATE");
+    assert.equal(sync.getBrowserSyncStatus().keyState, "REFRESHING");
+    for (let attempt = 0; attempt < 65 && sync.getBrowserSyncStatus().keyState !== "FAILED"; attempt++)
+      await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(sync.getBrowserSyncStatus().keyState, "FAILED");
     assert.equal(keyRequestAborted, true);
   } finally {
     clearTimeout(timer);
     global.fetch = originalFetch;
+  }
+});
+
+test("a three-second keyring request does not delay visible inbox paint", async () => {
+  global.indexedDB = indexedDB;
+  global.IDBKeyRange = IDBKeyRange;
+  const oldNavigator = Object.getOwnPropertyDescriptor(global, "navigator");
+  Object.defineProperty(global, "navigator", { configurable: true, value: { onLine: true } });
+  const originalFetch = global.fetch;
+  const sync = await import("../web/src/lib/sync.ts");
+  await sync.resetLocal();
+  global.fetch = async url => {
+    const path = String(url);
+    if (path.includes("/linked-device/keyring")) {
+      await new Promise(resolve => setTimeout(resolve, 3_000));
+      return Response.json({ events: [], nextCursor: 0, hasMore: false });
+    }
+    if (path.includes("/linked-device/key-grants"))
+      return Response.json({ events: [], nextCursor: 0, hasMore: false });
+    if (path.includes("/web/bootstrap")) return Response.json({
+      highWatermark: 5, replicaGeneration: "slow-key-generation", snapshotVersion: 1,
+      conversations: [], contactEvents: [], hasMore: false, nextCursor: null,
+    });
+    throw new Error(`unexpected fetch ${path}`);
+  };
+  try {
+    const startedAt = performance.now();
+    assert.equal(await sync.syncVisibleInbox(), 1);
+    assert.ok(performance.now() - startedAt < 2_000, "visible sync waited for slow keyring");
+    assert.equal(sync.getBrowserSyncStatus().state, "UP_TO_DATE");
+    assert.equal(sync.getBrowserSyncStatus().keyState, "REFRESHING");
+    for (let attempt = 0; attempt < 40 && sync.getBrowserSyncStatus().keyState !== "UP_TO_DATE"; attempt++)
+      await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(sync.getBrowserSyncStatus().keyState, "UP_TO_DATE");
+  } finally {
+    global.fetch = originalFetch;
+    if (oldNavigator) Object.defineProperty(global, "navigator", oldNavigator);
+    else delete global.navigator;
   }
 });
 

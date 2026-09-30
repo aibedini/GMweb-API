@@ -133,6 +133,10 @@ button, input { font: inherit; }
 .recipient-row small { color: var(--muted-fg); }
 .composer-disabled { gap: 8px; min-width: 0; }
 .composer-disabled input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--fg); }
+.composer-disabled .sms-segments { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.sim-select { max-width: 170px; min-width: 88px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--fg); padding: 6px; }
+.sim-label { white-space: nowrap; }
+.key-sync-note { padding: 5px 16px; color: var(--muted-fg); font-size: 12px; }
 .composer-disabled > span { flex: 0 0 auto; }
 .debug-actions { display: flex; gap: 8px; margin-bottom: 12px; }
 .debug-list { padding: 7px 14px !important; }

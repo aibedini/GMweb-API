@@ -217,8 +217,9 @@ const eventStore = new EventStore(controlDb, {
   debug: (line) => console.log(`[eventStore] ${line}`),
   // §44+§45: durability first, then two best-effort realtime hints —
   // (a) in-process SSE fan-out, (b) content-less Web Push wake-ups.
-  onEventsAccepted: (count) => {
-    emitControlEvent({ type: "sync.available", newEvents: count, at: new Date().toISOString() });
+  onEventsAccepted: (count, conversationIds) => {
+    emitControlEvent({ type: "sync.available", newEvents: count,
+      conversationIds, at: new Date().toISOString() });
     void webPushService.notifySyncAvailable(count).catch(() => {});
   },
 });
@@ -811,7 +812,8 @@ function requireToken(request, reply, done) {
           p === "/api/v1/linked-session" ||
           p.startsWith("/api/v1/trust/"))) ||
       (caps.includes("READ_MESSAGES") && request.method === "POST" &&
-        (p === "/api/v1/web/sync/ack" || p === "/api/v1/web/snapshot-v2")) ||
+        (p === "/api/v1/web/sync/ack" || p === "/api/v1/web/snapshot-v2" ||
+          p === "/api/v1/web/conversations/changed")) ||
       (caps.includes("READ_MESSAGES") && request.method === "GET" &&
         p === "/api/v1/linked-device/telemetry") ||
       (caps.includes("CONTACTS_READ") && request.method === "GET" &&

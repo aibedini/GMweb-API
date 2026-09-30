@@ -40,6 +40,22 @@ export interface ConversationProjection extends ConversationSummary {
   decodeState: "ready" | "locked";
 }
 
+/** The opened thread may arrive before its encrypted conversation summary. */
+export function reconcileConversationHead(
+  rows: ConversationProjection[], aggregateId: string | null, latest: TimelineItem | undefined,
+): ConversationProjection[] {
+  if (!aggregateId || !latest) return rows;
+  const current = rows.find(row => row.aggregateId === aggregateId);
+  if (!current || latest.payload.dateMs < current.lastAt) return rows;
+  return rows.map(row => row.aggregateId === aggregateId ? {
+    ...row,
+    preview: latest.payload.body || "Empty message",
+    lastAt: latest.payload.dateMs,
+    lastMessageId: latest.payload.messageId,
+    lastSequence: Math.max(row.lastSequence, latest.event.sequence),
+  } : row).sort((a, b) => b.lastAt - a.lastAt || a.aggregateId.localeCompare(b.aggregateId));
+}
+
 
 
 export interface TimelineItem {
