@@ -309,7 +309,20 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     schema: { summary: "Latest Primary Android telemetry", tags: ["Trust"] },
   }, async (request, reply) => {
     if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
-    return { telemetry: deviceTelemetryStore?.getPrimary() || null };
+    const primary = agentAuthService?.getPrimaryIdentity();
+    return { telemetry: primary ? deviceTelemetryStore?.get(primary.device_id) || null
+      : deviceTelemetryStore?.getPrimary() || null };
+  });
+
+  app.delete("/api/v1/linked-session", {
+    schema: { summary: "Sign out and unlink this browser's server sessions", tags: ["Pairing"],
+      response: { 200: { type: "object", properties: { ok: { type: "boolean" } } } } },
+  }, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    linkedSessions.revokeDevice(request.linkedDevice.deviceId);
+    reply.clearCookie(linkedSessions.COOKIE_NAME, { path: "/" });
+    reply.header("Cache-Control", "no-store");
+    return { ok: true };
   });
 
   app.get("/api/v1/linked-device/sessions", {
@@ -332,8 +345,8 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   app.get("/api/v1/linked-device/command-key", {
     schema: { summary: "Primary Android command encryption public key", tags: ["Commands"] },
   }, async (request, reply) => {
-    if (!request.linkedDevice?.capabilities?.includes("SEND_MESSAGES")) {
-      return reply.code(403).send({ error: "send_messages_capability_required" });
+    if (!request.linkedDevice?.capabilities?.some(cap => ["SEND_MESSAGES", "MARK_READ"].includes(cap))) {
+      return reply.code(403).send({ error: "command_capability_required" });
     }
     const identity = agentAuthService?.getPrimaryIdentity();
     if (!identity?.encryption_public_key) return reply.code(404).send({ error: "primary_command_key_unavailable" });
@@ -444,6 +457,10 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       if (request.linkedDevice && command.sourceClientId !== request.linkedDevice.deviceId) {
         return reply.code(409).send({ error: "idempotency_owner_mismatch" });
       }
+      if (command.type === "MARK_THREAD_READ") request._readAudit = {
+        action: "read_requested", commandId: command.id, readerDeviceId: command.sourceClientId,
+        targetAgentId: command.targetAgentId, state: command.state, created,
+      };
       reply.code(202).send({ commandId: command.id, state: command.state, created });
     } catch (error) {
       reply.code(error.code === "idempotency_key_reused" ? 409 : 400).send({ error: error.message });
@@ -556,6 +573,12 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (!from) return reply.code(400).send({ error: "invalid_state" });
     const ok = commandEngine.transitionClaim(String(request.params.id), state === "ACCEPTED" ? "ACCEPTED_BY_AGENT" : state,
       { agentId: identity.deviceId, claimGeneration, fromStates: from, result: result ?? null });
+    const command = commandEngine.get(String(request.params.id));
+    if (ok && command?.type === "MARK_THREAD_READ") request._readAudit = {
+      action: state === "COMPLETED" ? "read_completed" : "read_status",
+      commandId: command.id, readerDeviceId: command.sourceClientId,
+      targetAgentId: command.targetAgentId, state,
+    };
     return ok ? { ok: true } : reply.code(409).send({ error: "stale_or_illegal_claim" });
   });
 
@@ -589,6 +612,12 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       result: result ?? null,
     });
     if (!ok) { reply.code(409).send({ error: "illegal_transition" }); return; }
+    const command = commandEngine.get(id);
+    if (command?.type === "MARK_THREAD_READ") request._readAudit = {
+      action: state === "COMPLETED" ? "read_completed" : "read_status",
+      commandId: id, readerDeviceId: command.sourceClientId,
+      targetAgentId: command.targetAgentId, state,
+    };
     return { ok: true };
   });
 

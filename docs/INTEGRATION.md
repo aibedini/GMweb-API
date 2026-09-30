@@ -1,5 +1,13 @@
 ## GMweb 0.18.0 / Messages 3.3.0: fail-closed encrypted replication
 
+### GMweb 0.19.30: linked inbox actions (`linked-inbox-actions-v1`)
+
+`DELETE /api/v1/linked-session` requires the linked browser cookie and removes all server sessions and pending pairing challenges for that browser identity. The response clears the cookie. The PWA then clears its replica, pending commands and local identity keys. Other browsers remain linked; Android Primary remains the authority for revoking another device's trust. A new approval is required to link this cleared browser again.
+
+Browsers with either `MARK_READ` or `SEND_MESSAGES` can retrieve the Primary command key. Opening a ready, visible unread thread submits encrypted `MARK_THREAD_READ`; its source browser is recorded in the durable command row. After durable acceptance the browser clears its own viewed badge, while phone confirmation stays pending until executor completion. Newer message sequences are not hidden by an older completion. Operator activity records include content-free `read_requested`, `read_status` and `read_completed` references with command ID, reader device ID and target agent ID. No message text or recipient is logged in these read details.
+
+Inbox contacts reconstruct in the background without requiring a Contacts-tab visit. National and international Iranian phone formats match the same contact. The composer requires current SIM telemetry and a selected active subscription; older Android telemetry or missing Phone permission needs correction on the Primary phone. GMweb never substitutes an unknown SIM or infers physical SMS success. Linked telemetry now selects the currently enrolled Primary identity rather than a former Primary's latest snapshot.
+
 GMweb 0.19.14 rate-limits signed-agent replication capabilities (60/min/IP),
 V2 command claims (60/min/IP), and V2 command status (120/min/IP) before
 authorization. Exhausted requests return `429 agent_rate_limit` with
