@@ -37,6 +37,7 @@ export interface EncryptedConversationState {
   tombstone?: boolean;
   revision: number;
   sortKey: number;
+  sourceOrder?: number;
   envelope: string;
   encoding: string;
   schemaVersion: number;
@@ -165,6 +166,16 @@ export async function fetchWebConversationPage(cursor?: string, limit = 100) {
   return jsonOrThrow<{ conversations: EncryptedConversationState[]; nextCursor: string | null; hasMore: boolean }>(res);
 }
 
+export async function fetchChangedConversationStates(conversationIds: string[]) {
+  const res = await fetch(`${API}/web/conversations/changed`, {
+    method: "POST", credentials: "include", cache: "no-store",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ conversationIds }),
+  });
+  return jsonOrThrow<{ conversations: EncryptedConversationState[]; highWatermark: number;
+    replicaGeneration: string; snapshotVersion: number }>(res);
+}
+
 export async function fetchWebMessagePage(conversationId: string, before?: string, limit = 50) {
   const query = new URLSearchParams({ limit: String(limit) });
   if (before) query.set("before", before);
@@ -241,6 +252,10 @@ export interface DeviceTelemetry {
   trust?: { approvedDevicesCount?: number; trustSequence?: number };
   app?: { versionName?: string; versionCode?: number; uptimeMs?: number };
   device?: { manufacturer?: string; model?: string; androidVersion?: string };
+  smsSubscriptions?: { available: boolean; items: Array<{
+    subscriptionId: number; slotIndex: number; displayName: string; carrierName: string;
+    isDefaultSms: boolean; isActive: boolean;
+  }> };
 }
 
 export async function fetchPrimaryTelemetry(): Promise<DeviceTelemetry | null> {

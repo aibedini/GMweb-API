@@ -9,6 +9,58 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { EventStore } = require("../src/eventStore");
 
+test("newer conversation head wins even when Android's hash revision is smaller", () => {
+  const store = new EventStore(new Database(":memory:"));
+  const old = { eventId: "old-head", type: "CONVERSATION_UPSERTED", conversationId: "c",
+    revision: 900, sortKey: 100, payload: Buffer.from("old-preview"), cryptoVersion: 3 };
+  const newest = { ...old, eventId: "new-head", revision: 12, sortKey: 200,
+    payload: Buffer.from("new-preview") };
+  store.ingestBatch({ accountId: "a", events: [old, newest] });
+  assert.equal(store.conversations("a", null, 10).conversations[0].envelope,
+    Buffer.from("new-preview").toString("base64"));
+  store.ingestBatch({ accountId: "a", events: [{ ...old, eventId: "delayed-old", revision: 999 }] });
+  assert.equal(store.conversations("a", null, 10).conversations[0].sortKey, 200);
+  store.ingestBatch({ accountId: "a", events: [{ ...newest, eventId: "read-update",
+    revision: 1, payload: Buffer.from("read-preview") }] });
+  assert.equal(store.conversations("a", null, 10).conversations[0].envelope,
+    Buffer.from("read-preview").toString("base64"));
+});
+
+test("durable device order permits last-message deletion rollback and rejects late uploads", () => {
+  const store = new EventStore(new Database(":memory:"));
+  const head = (eventId, sourceOrder, sortKey, payload) => ({
+    eventId, type: "CONVERSATION_UPSERTED", conversationId: "c",
+    revision: 900 - sourceOrder, sourceOrder, sortKey,
+    payload: Buffer.from(payload), cryptoVersion: 3,
+  });
+  store.ingestBatch({ accountId: "a", events: [
+    head("newest", 100, 300, "newest"), head("fallback", 101, 200, "fallback"),
+    head("late-history", 50, 400, "history"),
+  ] });
+  const row = store.conversations("a", null, 10).conversations[0];
+  assert.equal(row.sourceOrder, 101);
+  assert.equal(row.sortKey, 200);
+  assert.equal(Buffer.from(row.envelope, "base64").toString(), "fallback");
+  const snapshot = store.beginSnapshot({ accountId: "a", linkedDeviceId: "web" });
+  assert.equal(store.snapshotPage({ accountId: "a", linkedDeviceId: "web", token: snapshot.token }).rows[0].sourceOrder, 101);
+});
+
+test("post-commit invalidation names changed opaque threads and falls back for key batches", () => {
+  const db = new Database(":memory:");
+  const signals = [];
+  const store = new EventStore(db, { onEventsAccepted: (count, ids) => {
+    assert.equal(store.conversations("a", null, 10).conversations.length, 1);
+    signals.push({ count, ids });
+  } });
+  const head = { eventId: "head", type: "CONVERSATION_UPSERTED", conversationId: "opaque-thread",
+    revision: 1, sortKey: 1, payload: Buffer.from("cipher"), cryptoVersion: 3 };
+  store.ingestBatch({ accountId: "a", events: [head] });
+  store.ingestBatch({ accountId: "a", events: [head] });
+  store.ingestBatch({ accountId: "a", events: [{ eventId: "grant", type: "KEY_GRANT",
+    conversationId: "opaque-thread", payload: Buffer.from("opaque-grant"), cryptoVersion: 1 }] });
+  assert.deepEqual(signals, [{ count: 1, ids: ["opaque-thread"] }, { count: 1, ids: null }]);
+});
+
 test("snapshot continuation survives termination of its creator process", async () => {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-snapshot-death-"));
   const filename = path.join(folder, "replica.sqlite");

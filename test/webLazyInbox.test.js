@@ -39,6 +39,10 @@ test("lazy inbox downloads summaries first and only the opened thread's bounded 
     if (path.includes("/linked-device/keyring") || path.includes("/linked-device/key-grants")) {
       return Response.json({ events: [], nextCursor: 0, hasMore: false });
     }
+    if (path.includes("/web/conversations/changed")) {
+      return Response.json({ conversations: [conversation(0)], highWatermark,
+        replicaGeneration: "lazy-test-generation", snapshotVersion: 1 });
+    }
     if (path.includes("/linked-device/contacts/events")) {
       assert.equal(new URL(path, "https://example.test").searchParams.get("limit"), "50");
       return Response.json({ events: [], nextBeforeSequence: null, hasMore: false });
@@ -88,6 +92,10 @@ test("lazy inbox downloads summaries first and only the opened thread's bounded 
     await sync.resetLocal();
     assert.equal(await sync.syncVisibleInbox(), 1);
     assert.equal(await sync.getCursor(), 1126);
+    const bootstrapCalls = calls.filter(path => path.includes("/web/bootstrap")).length;
+    assert.equal(await sync.syncVisibleInbox(["conversation-0"]), 1);
+    assert.equal(calls.filter(path => path.includes("/web/bootstrap")).length, bootstrapCalls);
+    assert.equal((await sync.listChangedConversationHeads(["conversation-0"])).items.length, 1);
     assert.equal(calls.some(path => path.includes("/snapshot-v2")), false);
     assert.equal(calls.some(path => path.includes("/web/sync/ack")), false);
     assert.equal(calls.some(path => path.includes("/messages")), false);

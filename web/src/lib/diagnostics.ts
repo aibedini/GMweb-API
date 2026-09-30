@@ -4,6 +4,7 @@ import { getStoredDeviceIdentity, loadCryptoRecord } from "./deviceKeys.ts";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "./buildInfo.ts";
 import { decryptMessage, receiveKeyGrants, type Decryption } from "./messageCrypto.ts";
 import { phaseErrorClass, safeSyncError, type PhaseErrorClass } from "./sync/sync-errors.ts";
+import { getLiveSyncMetrics, type LiveSyncMetrics } from "./sync/live-invalidation.ts";
 export { phaseErrorClass } from "./sync/sync-errors.ts";
 
 const EVENT_TYPES = ["MESSAGE_CREATED", "MESSAGE_UPDATED", "KEY_GRANT", "CONTACTS_KEY_GRANT", "KEYRING_ENTRY", "HISTORY_KEY_GRANT", "CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"];
@@ -13,6 +14,7 @@ export interface WebDiagnosticReport {
   session: { linked: boolean; capabilities: string[]; apiVersion: string; pwaVersion: string; loadedScript: string; serviceWorker: string; online: boolean; buildMismatch: boolean };
   server: ServerSyncDiagnostics | null;
   browserSync: BrowserSyncStatus & { cursor: number; projectionCursor: number; syncLag: number | null; projectionLag: number; phaseErrorClass: PhaseErrorClass };
+  liveSync: LiveSyncMetrics;
   replicaProgress?: { lazyMode: boolean; snapshotComplete: boolean; snapshotBaseline: number; keyringCursor: number; grantCursor: number; snapshotPosition?: number; snapshotPageCount?: number; snapshotStartedAt?: number; lastSnapshotPageAt?: number; lastSnapshotPageMs?: number };
   indexedDb: { total: number; byType: Record<string, number>; byCryptoVersion: Record<string, number>; nullAggregateCount: number; distinctMessageAggregateCount: number; conversationRows: number; contactRows: number };
   crypto: { browserIdentity: boolean; verifiedPrimary: boolean; primaryMatchesBrowser: boolean; messages: DecryptionCounts; keyGrants: DecryptionCounts };
@@ -230,7 +232,9 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     },
     server,
     browserSync: { ...runtime, lastErrorMessage: safeSyncError(runtime.lastErrorMessage),
+      keyError: safeSyncError(runtime.keyError),
       phaseErrorClass: phaseErrorClass(runtime.lastErrorPhase), cursor, projectionCursor, syncLag, projectionLag },
+    liveSync: getLiveSyncMetrics(),
     replicaProgress,
     indexedDb: {
       total: local.total, byType: local.byType, byCryptoVersion: local.byCryptoVersion,
@@ -280,6 +284,19 @@ export function formatWebDiagnostics(report: WebDiagnosticReport): string {
     `Full replica sync lag      ${report.replicaProgress?.lazyMode ? "not applicable (on-demand mode)" : report.browserSync.syncLag ?? "unknown"}`,
     `Sync state                 ${report.browserSync.state}`,
     `Sync error class           ${report.browserSync.phaseErrorClass ?? "none"}`,
+    `Encryption key state       ${report.browserSync.keyState}`,
+    `Encryption key phase       ${report.browserSync.keyPhase}`,
+    `Encryption key duration ms ${report.browserSync.keyDurationMs ?? "none"}`,
+    `Key grants processed       ${report.browserSync.keyGrantsProcessed}`,
+    `Conversations reprojected  ${report.browserSync.keyConversationsReprojected}`,
+    `Last key sync at           ${report.browserSync.lastKeySyncAt ?? "none"}`,
+    `SSE connection             ${report.liveSync.connection}`,
+    `SSE reconnects             ${report.liveSync.reconnectCount}`,
+    `Last SSE frame at          ${report.liveSync.lastFrameAt ?? "none"}`,
+    `Server published at        ${report.liveSync.serverPublishedAt ?? "none"}`,
+    `Browser pull completed at  ${report.liveSync.browserPullCompletedAt ?? "none"}`,
+    `Browser projected at       ${report.liveSync.browserProjectedAt ?? "none"}`,
+    `Browser rendered at        ${report.liveSync.browserRenderedAt ?? "none"}`,
     `Projection cursor          ${report.projection.cursor}`,
     `Projection lag             ${report.projection.lag}`,
     `History loading mode       ${report.replicaProgress?.lazyMode ? "on demand" : "full replica"}`,

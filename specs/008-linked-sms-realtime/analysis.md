@@ -1,0 +1,3 @@
+# Analysis: linked-sms-realtime-v1
+
+The feature ID is shared with the Android change. Requirements and plan preserve encrypted payload boundaries, durable server sequencing, command idempotency, and physical send truth. No new plaintext server route is introduced. Browser-selected SIM is authenticated through existing linked telemetry and sent inside the encrypted command; Android validates again at execution. Conversation revision is a hash and message timestamp can move backward after deletion. Android's durable outbox insertion ID is the coherent device order; server sequence is only an arrival order. Result: coherent enough to implement. Physical latency and SIM acceptance remain separate verification gates.

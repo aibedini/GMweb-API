@@ -24,6 +24,38 @@ test("lease endpoints are closed unless the provider explicitly enables the prot
   } finally { await app.close(); db.close(); }
 });
 
+test("targeted encrypted conversation read requires linked message capability", async () => {
+  const app = Fastify({ logger: false });
+  const db = new Database(":memory:");
+  const store = new EventStore(db);
+  app.addHook("preHandler", (request, _reply, done) => {
+    if (request.headers["x-test-linked"]) request.linkedDevice = {
+      deviceId: "browser", capabilities: request.headers["x-test-denied"] ? [] : ["READ_MESSAGES"],
+    };
+    done();
+  });
+  try {
+    registerControlPlaneRoutes(app, { trustRegistry: new TrustRegistry(db),
+      commandEngine: new CommandEngine(db), eventStore: store, accountId: "a",
+      authorizeAgent: () => null, linkedSessions: require("../src/linkedSessions") });
+    store.ingestBatch({ accountId: "a", events: [{ eventId: "head", type: "CONVERSATION_UPSERTED",
+      conversationId: "opaque-id", revision: 1, sortKey: 10,
+      payload: Buffer.from("opaque-ciphertext"), cryptoVersion: 3 }] });
+    const url = "/api/v1/web/conversations/changed";
+    const payload = { conversationIds: ["opaque-id"] };
+    assert.equal((await app.inject({ method: "POST", url, payload })).statusCode, 403);
+    assert.equal((await app.inject({ method: "POST", url, payload,
+      headers: { "x-test-linked": "yes", "x-test-denied": "yes" } })).statusCode, 403);
+    const allowed = await app.inject({ method: "POST", url, payload,
+      headers: { "x-test-linked": "yes" } });
+    assert.equal(allowed.statusCode, 200);
+    assert.equal(allowed.headers["cache-control"], "no-store");
+    assert.equal(allowed.json().conversations[0].envelope,
+      Buffer.from("opaque-ciphertext").toString("base64"));
+    assert.equal(JSON.stringify(allowed.json()).includes("phone"), false);
+  } finally { await app.close(); db.close(); }
+});
+
 function encryptedPayload(event) {
   const b64 = length => Buffer.alloc(length, 7).toString("base64");
   const envelope = {
