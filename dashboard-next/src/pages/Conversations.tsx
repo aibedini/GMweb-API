@@ -109,10 +109,15 @@ export function ConversationsPage() {
 
   async function send(e: React.FormEvent) {
     e.preventDefault();
-    if (!number || !draft.trim()) return;
+    // Keep the body exactly as the user composed it. Only normalise CRLF/CR to
+    // LF so the same message reaches GMweb and Android on every browser/OS.
+    // trim() is used only to reject an all-whitespace message; it must never be
+    // used as the body because that would mutate intentional line breaks.
+    const body = draft.replace(/\r\n?/g, "\n");
+    if (!number || !body.trim()) return;
     setSending(true);
     try {
-      await api("/send", { method: "POST", body: { to: number, text: draft.trim() } });
+      await api("/send", { method: "POST", body: { to: number, text: body } });
       setDraft("");
       // optimistic — refetch shortly after the worker sends
       setTimeout(() => open && loadThread(open, true), 2500);
@@ -238,16 +243,36 @@ export function ConversationsPage() {
             </div>
 
             {/* composer */}
-            <form onSubmit={send} className="flex items-center gap-2 border-t border-border p-3">
-              <input
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                placeholder={number ? "Text message" : "Can only reply to numeric conversations"}
-                disabled={!number || sending}
-                dir="auto"
-                className="h-10 flex-1 rounded-full border border-input bg-background/60 px-4 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
-              />
-              <Button type="submit" size="icon" className="rounded-full" disabled={!number || !draft.trim() || sending}>
+            <form onSubmit={send} className="flex items-end gap-2 border-t border-border p-3">
+              <div className="min-w-0 flex-1">
+                <textarea
+                  rows={1}
+                  value={draft}
+                  onChange={(e) => {
+                    setDraft(e.target.value);
+                    e.currentTarget.style.height = "auto";
+                    e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 128)}px`;
+                  }}
+                  onKeyDown={(e) => {
+                    // Enter is a real newline, like a chat composer. Use
+                    // Ctrl+Enter / Cmd+Enter as the keyboard send shortcut.
+                    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                      e.preventDefault();
+                      e.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                  placeholder={number ? "Text message" : "Can only reply to numeric conversations"}
+                  disabled={!number || sending}
+                  dir="auto"
+                  className="block min-h-10 max-h-32 w-full resize-none overflow-y-auto rounded-2xl border border-input bg-background/60 px-4 py-2.5 text-sm leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                />
+                {number && (
+                  <div className="mt-1 px-2 text-[10px] text-muted-foreground">
+                    Enter = new line · Ctrl/⌘ + Enter = send
+                  </div>
+                )}
+              </div>
+              <Button type="submit" size="icon" className="mb-5 shrink-0 rounded-full" disabled={!number || !draft.trim() || sending}>
                 {sending ? <Loader2 className="size-4 animate-spin" /> : <SendIcon className="size-4" />}
               </Button>
             </form>
