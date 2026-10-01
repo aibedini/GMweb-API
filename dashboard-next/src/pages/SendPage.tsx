@@ -18,12 +18,15 @@ export function SendPage() {
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
+    const body = text.replace(/\r\n?/g, "\n");
+    if (!to.trim() || !body.trim()) return;
+
     setBusy(true);
     setResult(null);
     try {
       const r = await api<{ jobId: string; status: string; priority?: string }>("/send", {
         method: "POST",
-        body: { to: to.trim(), text, priority: critical ? "critical" : "expiring" },
+        body: { to: to.trim(), text: body, priority: critical ? "critical" : "expiring" },
       });
       setResult({ ok: true, msg: `Queued · job ${r.jobId} · ${r.priority ?? "expiring"}` });
       setText("");
@@ -48,7 +51,14 @@ export function SendPage() {
           </div>
           <div className="space-y-1">
             <Label>Text</Label>
-            <Textarea rows={5} value={text} onChange={(e) => setText(e.target.value)} placeholder="Message text" />
+            <Textarea
+              rows={5}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder="Message text"
+              className="whitespace-pre-wrap"
+            />
+            <p className="text-[11px] text-muted-foreground">Enter creates a new line. Line breaks are preserved in the SMS body.</p>
           </div>
           <button
             type="button"
@@ -68,7 +78,7 @@ export function SendPage() {
 
           {result && <p className={cn("text-xs", result.ok ? "text-emerald-400" : "text-red-400")}>{result.msg}</p>}
 
-          <Button type="submit" className="w-full" disabled={busy || !to || !text}>
+          <Button type="submit" className="w-full" disabled={busy || !to.trim() || !text.trim()}>
             {busy ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
             Send
           </Button>
