@@ -782,3 +782,17 @@ active subscription IDs, slots, bounded labels, and default-SMS status. Linked
 browser send commands carry the chosen `subscriptionId` inside the encrypted
 `SEND_SMS` payload. Android refuses an unavailable explicitly chosen SIM with
 `SIM_NOT_AVAILABLE` and does not substitute another line.
+
+## Composer, SIM and browser send identity (0.19.31)
+
+All browser composers preserve exact message text, including leading/trailing whitespace and newlines. Empty-draft validation may trim; transmission does not. Enter inserts a newline. Ctrl+Enter or Cmd+Enter sends outside IME composition. Segment counts include newlines, GSM extension septets and UTF-16 surrogate pairs.
+
+`POST /send` accepts optional `subscriptionId` (non-negative integer) and `clientMessageId` (1-128 ASCII letters, digits, underscore or hyphen). A browser keeps the same message identity when retrying an uncertain request. Changing recipient, exact body or SIM for the same identity returns 409. The identity has a per-project unique SQLite index and is retained with the selected SIM during queue reconstruction. Explicit SIM selection requires Android transport and fresh enrolled-Primary SIM telemetry; absent legacy fields remain compatible. Both `/gateway/pull` task serialization and Android push `/send` forward these fields. Push also forwards the durable request ID as Idempotency-Key; consumption by older Android versions remains NOT VERIFIED.
+
+`GET /admin/sms-capabilities` uses existing admin authentication and the enrolled Primary identity. It reports availability, freshness, SIM subscription/slot/carrier/active/default state and send capability. Unreported send capability, SEND_SMS permission and default-app status are null, never assumed true.
+
+`GET /send/status/:reference` returns durable clientMessageId and subscriptionId. Dashboard SSE send-stage and carrier events carry the request/message identity; clients requery durable status on reconnect. Sent requires a send outcome, Delivered requires a carrier report. Command COMPLETED alone is not delivery evidence. Android errors are displayed with their actual reason. The encrypted PWA uses its existing cursor/SSE replica for incoming/outgoing/read/reorder changes and exact clientMessageId reconciliation. Mark as read remains a linked-browser encrypted command with reader/target device audit.
+
+The dashboard Android conversation archive now exposes correlated outbound ledger rows and uses SSE invalidation instead of six-second thread polling. It is still an outbound archive, not the encrypted Android inbox; phone unread/incoming/read authority belongs to the linked PWA. Browser/phone/carrier production acceptance is NOT RUN for this change.
+
+Android pull clients may POST `/gateway/progress` with `{requestId, stage:"submitting", clientMessageId?}` using the gateway device key. GMweb validates the durable task/correlation and rejects revoked or terminal tasks, persists the stage and emits SSE. This endpoint cannot assert Sent or Delivered. Older clients that do not publish progress skip the Submitting transition; GMweb never invents it. Real Android progress publication is NOT VERIFIED in this repository-only change.

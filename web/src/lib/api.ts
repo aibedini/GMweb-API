@@ -254,7 +254,7 @@ export interface DeviceTelemetry {
   device?: { manufacturer?: string; model?: string; androidVersion?: string };
   smsSubscriptions?: { available: boolean; items: Array<{
     subscriptionId: number; slotIndex: number; displayName: string; carrierName: string;
-    isDefaultSms: boolean; isActive: boolean;
+    isDefaultSms: boolean; isActive: boolean; sendCapable?: boolean;
   }> };
 }
 

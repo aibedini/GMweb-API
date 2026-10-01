@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.30",
+    "version": "0.19.31",
     "contact": {
       "name": "GMweb API"
     }
@@ -162,6 +162,37 @@
           },
           "aria": {
             "type": "string"
+          },
+          "clientMessageId": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "requestId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "stage": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "failedReason": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "submittedOnce": {
+            "type": "boolean"
+          },
+          "carrierStatus": {
+            "type": "object",
+            "additionalProperties": true
           }
         },
         "title": "Message"
@@ -1712,6 +1743,14 @@
                         "text": {
                           "type": "string"
                         },
+                        "subscriptionId": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "clientMessageId": {
+                          "type": "string",
+                          "maxLength": 128
+                        },
                         "priority": {
                           "type": "string"
                         },
@@ -2074,6 +2113,50 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/gateway/progress": {
+      "post": {
+        "summary": "Android reports modem submission in progress",
+        "tags": [
+          "Gateway"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "requestId",
+                  "stage"
+                ],
+                "properties": {
+                  "requestId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 120
+                  },
+                  "stage": {
+                    "type": "string",
+                    "enum": [
+                      "submitting"
+                    ]
+                  },
+                  "clientMessageId": {
+                    "type": "string",
+                    "maxLength": 128
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response"
           }
         }
       }
@@ -2656,6 +2739,19 @@
     "/admin/device-telemetry": {
       "get": {
         "summary": "Latest Android fleet telemetry",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/admin/sms-capabilities": {
+      "get": {
+        "summary": "Current Primary SIM capabilities; unknown permissions remain null",
         "tags": [
           "Admin"
         ],
@@ -5640,6 +5736,18 @@
                     "maxLength": 4000,
                     "description": "Message content. Plain text only."
                   },
+                  "subscriptionId": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Explicit Android SMS subscription; preserved across queue recovery."
+                  },
+                  "clientMessageId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9_-]+$",
+                    "description": "Stable browser message identity. Reuse only for the same exact payload and SIM."
+                  },
                   "wait": {
                     "type": "boolean",
                     "default": false,
@@ -6213,6 +6321,18 @@
                       "type": [
                         "null",
                         "string"
+                      ]
+                    },
+                    "clientMessageId": {
+                      "type": [
+                        "null",
+                        "string"
+                      ]
+                    },
+                    "subscriptionId": {
+                      "type": [
+                        "null",
+                        "integer"
                       ]
                     },
                     "priority": {

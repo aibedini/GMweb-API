@@ -13,8 +13,8 @@ const path = require("node:path");
 //
 // WAL mode + synchronous=NORMAL gives crash-safe durability with good throughput.
 
-function dedupeKey(to, text) {
-  return crypto.createHash("sha256").update(`${to}\n${text}`).digest("hex");
+function dedupeKey(to, text, subscriptionId = null) {
+  return crypto.createHash("sha256").update(subscriptionId == null ? `${to}\n${text}` : JSON.stringify([to, text, subscriptionId])).digest("hex");
 }
 
 // Consumer notification identity (lifecycle invalidation). The allowlist,
@@ -133,6 +133,8 @@ class SendStore {
       // operation, which can set status=sent without device evidence.
       "ALTER TABLE sends ADD COLUMN physical_submitted INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE sends ADD COLUMN eve_notification_id TEXT",
+      "ALTER TABLE sends ADD COLUMN subscription_id INTEGER",
+      "ALTER TABLE sends ADD COLUMN client_message_id TEXT",
       // Which notification KINDS the recorded watermark invalidated. A renewal
       // that only revoked "volume_ended" must not silently block an "expired"
       // reminder the consumer still considers valid.
@@ -293,12 +295,13 @@ class SendStore {
 
     this._insert = this.db.prepare(
       `INSERT INTO sends
-         (dedupe_key, to_number, text, key_name, priority, idempotency_key,
+         (dedupe_key, to_number, text, key_name, priority, idempotency_key, subscription_id, client_message_id,
           status, created_at, updated_at, queued_at)
        VALUES
-         (@dedupe_key, @to_number, @text, @key_name, @priority, @idempotency_key,
+         (@dedupe_key, @to_number, @text, @key_name, @priority, @idempotency_key, @subscription_id, @client_message_id,
           'queued', @now, @now, @now)`
     );
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sends_client_message ON sends(key_name, client_message_id) WHERE client_message_id IS NOT NULL");
     this._lastSent = this.db.prepare(
       `SELECT * FROM sends
        WHERE dedupe_key=? AND status IN ('sent','unverified')
@@ -472,15 +475,15 @@ class SendStore {
 
     // Claim runs in a transaction so two concurrent identical requests can't both
     // pass the de-dupe check and double-send.
-    this._claimTxn = this.db.transaction((to, text, keyName, priority, windowMs, now, notification) => {
-      const key = dedupeKey(to, text);
+    this._claimTxn = this.db.transaction((to, text, keyName, priority, windowMs, now, notification, subscriptionId) => {
+      const key = dedupeKey(to, text, subscriptionId);
       const sent = this._lastSent.get(key, now - windowMs);
       if (sent) return { action: "duplicate_suppressed", row: sent };
       const inflight = this._inflight.get(key);
       if (inflight) return { action: "duplicate_inflight", row: inflight };
       const info = this._insert.run({
         dedupe_key: key, to_number: to, text, key_name: keyName || null,
-        priority: priority || "normal", idempotency_key: null, now
+        priority: priority || "normal", idempotency_key: null, subscription_id: subscriptionId, client_message_id: null, now
       });
       const id = Number(info.lastInsertRowid);
       // Same transaction as the insert: there is no instant where a
@@ -495,9 +498,9 @@ class SendStore {
   //   { action:"new", id }                       -> caller should enqueue
   //   { action:"duplicate_suppressed", row }      -> identical sent within window
   //   { action:"duplicate_inflight", row }        -> identical already queued/active
-  claim({ to, text, keyName, priority = "normal", windowMs, notification = null }) {
+  claim({ to, text, keyName, priority = "normal", windowMs, notification = null, subscriptionId = null }) {
     return this._claimTxn(to, text, keyName, priority, windowMs, Date.now(),
-      notification ? normalizeNotificationMeta(notification) : null);
+      notification ? normalizeNotificationMeta(notification) : null, subscriptionId);
   }
 
   _notificationParams(id, meta, now) {
@@ -919,17 +922,32 @@ class SendStore {
 
   // Explicit-idempotency sends still need a durable observability row. The
   // idempotency reservation happens in Redis first, so retries never call this.
-  create({ to, text, keyName, priority = "normal", idempotencyKey = null, notification = null }) {
+  create({ to, text, keyName, priority = "normal", idempotencyKey = null, notification = null, subscriptionId = null, clientMessageId = null }) {
     const now = Date.now();
     return this.db.transaction(() => {
+      if (clientMessageId) {
+        const existing = this.byClientMessageId(clientMessageId, keyName || "master");
+        if (existing) {
+          if (existing.to_number !== to || existing.text !== text || existing.subscription_id !== subscriptionId)
+            throw new Error("client_message_id_reused");
+          const conflict = new Error("client_message_already_exists");
+          conflict.row = existing;
+          throw conflict;
+        }
+      }
       const info = this._insert.run({
-        dedupe_key: dedupeKey(to, text), to_number: to, text,
-        key_name: keyName || null, priority, idempotency_key: idempotencyKey, now
+        dedupe_key: dedupeKey(to, text, subscriptionId), to_number: to, text,
+        key_name: keyName || (clientMessageId ? "master" : null), priority, idempotency_key: idempotencyKey,
+        subscription_id: subscriptionId, client_message_id: clientMessageId, now
       });
       const id = Number(info.lastInsertRowid);
       if (notification) this._setNotification.run(this._notificationParams(id, notification, now));
       return id;
     })();
+  }
+
+  byClientMessageId(clientMessageId, keyName) {
+    return this.db.prepare("SELECT * FROM sends WHERE client_message_id=? AND key_name=? ORDER BY id DESC LIMIT 1").get(clientMessageId, keyName);
   }
 
   backfillPending(job) {

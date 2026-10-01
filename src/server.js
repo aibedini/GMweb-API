@@ -222,6 +222,12 @@ const eventStore = new EventStore(controlDb, {
       conversationIds, at: new Date().toISOString() });
     void webPushService.notifySyncAvailable(count).catch(() => {});
   },
+  onPull: (gatewayRequestId, entry) => {
+    if (!entry?.jobId) return;
+    sendStore.markStage(entry.jobId, "phone_pulled");
+    emitSse({ type: "send_stage", requestId: gatewayRequestId, jobId: entry.jobId,
+      stage: "phone_pulled", at: new Date().toISOString() });
+  },
 });
 const pwaAccessTokens = new PwaAccessTokenStore(controlDb);
 const webPushService = new WebPushService(controlDb, {
@@ -344,7 +350,9 @@ function androidThreadFromLedger(number, limit) {
       messages.push({ index: messages.length, type: "timestamp", text: day });
       lastDay = day;
     }
-    messages.push({ index: messages.length, type: "message", direction: "out", text: String(r.text || ""), status: r.status });
+    messages.push({ index: messages.length, type: "message", direction: "out", text: String(r.text || ""),
+      status: r.status, stage: r.stage, failedReason: r.error, clientMessageId: r.client_message_id,
+      requestId: sendStore.requestId(r.id), submittedOnce: Boolean(r.physical_submitted), carrierStatus: sendStore.carrierStatus(r.id) });
   }
   return {
     conversation: { id: `sms:${wanted}`, href: wanted, title: wanted, snippet: "", timestamp: "", origin: "ledger" },
@@ -1067,6 +1075,10 @@ function recordActivity(request, reply, done) {
 }
 
 function emitSse(event) {
+  if (event.requestId || event.jobId) {
+    const row = sendStore.byReference(event.requestId || event.jobId);
+    if (row) event = { ...event, requestId: sendStore.requestId(row.id), clientMessageId: row.client_message_id || undefined };
+  }
   const payload = `data: ${JSON.stringify(event)}\n\n`;
   for (const [reply, scope] of sseClients) {
     // Project API keys may only receive events for their own sends. /send/status
@@ -1783,6 +1795,8 @@ function startSendWorker() {
           client.sendMessage({
             to: job.data.to,
             text: job.data.text,
+            subscriptionId: ledgerRow?.subscription_id ?? job.data.subscriptionId,
+            clientMessageId: ledgerRow?.client_message_id ?? job.data.clientMessageId,
             ledgerId: ledgerRow?.id ?? null,
             jobId: job.id,
             requestId: gatewayRequestId,
@@ -2091,7 +2105,14 @@ app.addSchema({
     type: { type: "string", enum: ["message", "timestamp"] },
     direction: { type: "string", enum: ["in", "out"] },
     text: { type: "string" },
-    aria: { type: "string" }
+    aria: { type: "string" },
+    clientMessageId: { type: ["string", "null"] },
+    requestId: { type: "string" },
+    status: { type: "string" },
+    stage: { type: ["string", "null"] },
+    failedReason: { type: ["string", "null"] },
+    submittedOnce: { type: "boolean" },
+    carrierStatus: { type: "object", additionalProperties: true }
   }
 });
 
@@ -3251,7 +3272,9 @@ registerGatewayRoutes(app, {
   checkRateLimit,
   isPullModeActive: () => Boolean(client.pullMode && client.name === "android" && client.outbox),
   log: app.log,
-  telemetry: gatewayTelemetry
+  telemetry: gatewayTelemetry,
+  onCarrierReport: emitSse,
+  onSendProgress: emitSse
 });
 
 // ── Phase 2 Control Plane (ADR-001/004, TechSpec §51–58) ────────────────────
@@ -3811,6 +3834,8 @@ app.post("/send", {
       properties: {
         to: { type: "string", minLength: 3, maxLength: 32, description: "Recipient phone number with country code, e.g. `+989121234567`" },
         text: { type: "string", minLength: 1, maxLength: 4000, description: "Message content. Plain text only." },
+        subscriptionId: { type: "integer", minimum: 0, description: "Explicit Android SMS subscription; preserved across queue recovery." },
+        clientMessageId: { type: "string", minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$", description: "Stable browser message identity. Reuse only for the same exact payload and SIM." },
         wait: { type: "boolean", default: false, description: "If true, block until the send completes (max 90s) and return the result." },
         priority: {
           oneOf: [
@@ -3971,7 +3996,9 @@ app.post("/send", {
 
   const schema = z.object({
     to: z.string().min(3).max(32),
-    text: z.string().min(1).max(4000),
+    text: z.string().min(1).max(4000).refine(value => value.trim().length > 0),
+    subscriptionId: z.number().int().nonnegative().optional(),
+    clientMessageId: z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/).optional(),
     wait: z.boolean().optional(),
     priority: z.union([
       z.enum([...PRIORITY_NAMES, "high", "normal"]),
@@ -3996,7 +4023,29 @@ app.post("/send", {
     reply.code(400).send({ error: "invalid_body", details: parsed.error.flatten() });
     return;
   }
-  const { to, text, wait, priority, meta } = parsed.data;
+  const { to, text, wait, priority, meta, subscriptionId, clientMessageId } = parsed.data;
+  if (subscriptionId !== undefined && client.name !== "android") {
+    return reply.code(409).send({ error: "sim_selection_requires_android", message: "SIM selection requires the Android transport." });
+  }
+  if (clientMessageId) {
+    const original = sendStore.byClientMessageId(clientMessageId, projectKey?.name || "master");
+    if (original) {
+      if (original.to_number !== to || original.text !== text || original.subscription_id !== (subscriptionId ?? null))
+        return reply.code(409).send({ error: "idempotency_key_reused", message: "This message identity was already used with a different body or SIM." });
+      reply.code(["queued", "active"].includes(original.status) ? 202 : 200);
+      return { ok: true, requestId: sendStore.requestId(original.id), statusUrl: `/send/status/${sendStore.requestId(original.id)}`,
+        jobId: original.job_id, status: ["queued", "active"].includes(original.status) ? "queued" : original.status === "sent" ? "completed" : original.status,
+        deduped: true };
+    }
+  }
+  if (subscriptionId !== undefined) {
+    const primary = agentAuthService.getPrimaryIdentity();
+    const caps = require("./smsCapabilities").smsCapabilities(primary ? deviceTelemetryStore.get(primary.device_id) : null);
+    const sim = caps.items.find(item => item.subscriptionId === subscriptionId && item.isActive && item.sendCapable !== false);
+    if (!caps.available || !sim) return reply.code(409).send({ error: "selected_sim_unavailable", message: "Selected SIM unavailable. Refresh the Primary phone's SIM information." });
+    if (caps.sendSmsPermission === false) return reply.code(409).send({ error: "send_sms_permission_missing", message: "SEND_SMS permission missing" });
+    if (caps.isDefaultSmsApp === false) return reply.code(409).send({ error: "not_default_sms_app", message: "Phone is not default SMS app" });
+  }
   // Optional consumer notification identity. No meta = the historical payload,
   // handled exactly as before. A HALF-filled tag is rejected (400) rather than
   // stored: a tag that cannot be revoked is worse than no tag at all.
@@ -4015,8 +4064,9 @@ app.post("/send", {
 
   // Idempotency: if the caller sends an `Idempotency-Key` header, dedupe retries
   // so a network blip doesn't send the SMS twice. Same key -> original jobId.
-  const idemKey = String(request.headers["idempotency-key"] || "").trim().slice(0, 200) || null;
-  const bodyHash = idemKey ? crypto.createHash("sha256").update(`${to}\n${text}`).digest("hex").slice(0, 16) : null;
+  const idemKey = String(request.headers["idempotency-key"] || (clientMessageId ? `client:${projectKey?.name || "master"}:${clientMessageId}` : "")).trim().slice(0, 200) || null;
+  const bodyHash = idemKey ? crypto.createHash("sha256").update(subscriptionId === undefined && !clientMessageId
+    ? `${to}\n${text}` : JSON.stringify([to, text, subscriptionId ?? null, clientMessageId ?? null])).digest("hex").slice(0, 16) : null;
   if (idemKey) {
     const reserved = await sendQueue.reserveIdempotency(idemKey, bodyHash).catch(() => "OK");
     if (reserved !== "OK") {
@@ -4090,7 +4140,7 @@ app.post("/send", {
     const claim = sendStore.claim({
       to, text, keyName: projectKey?.name || "master",
       priority: sendPriority.name, windowMs: SEND_DEDUPE_MS,
-      notification: notificationMeta
+      notification: notificationMeta, subscriptionId
     });
     if (claim.action !== "new") {
       app.log.warn({ to, reason: claim.action }, "duplicate send suppressed by ledger");
@@ -4111,11 +4161,20 @@ app.post("/send", {
     }
     ledgerId = claim.id;
   } else {
-    ledgerId = sendStore.create({
-      to, text, keyName: projectKey?.name || "master",
-      priority: sendPriority.name, idempotencyKey: idemKey,
-      notification: notificationMeta
-    });
+    try {
+      ledgerId = sendStore.create({
+        to, text, keyName: projectKey?.name || "master",
+        priority: sendPriority.name, idempotencyKey: idemKey,
+        notification: notificationMeta, subscriptionId, clientMessageId
+      });
+    } catch (error) {
+      if (error.message !== "client_message_already_exists") throw error;
+      const original = error.row;
+      reply.code(["queued", "active"].includes(original.status) ? 202 : 200);
+      return { ok: true, requestId: sendStore.requestId(original.id), statusUrl: `/send/status/${sendStore.requestId(original.id)}`,
+        jobId: original.job_id, status: ["queued", "active"].includes(original.status) ? "queued" : original.status === "sent" ? "completed" : original.status,
+        deduped: true };
+    }
   }
   const requestId = sendStore.requestId(ledgerId);
 
@@ -4125,6 +4184,8 @@ app.post("/send", {
       {
         to,
         text,
+        subscriptionId,
+        clientMessageId,
         keyId: projectKey?.id || null,
         keyName: projectKey?.name || "master",
         priority: sendPriority.name,
@@ -4268,6 +4329,8 @@ app.get("/send/status/:reference", {
           carrierStatus: { type: "object", additionalProperties: true },
           carrierEvents: { type: "array", items: { type: "object", additionalProperties: true } },
           gatewayRequestId: { type: ["string", "null"] },
+          clientMessageId: { type: ["string", "null"] },
+          subscriptionId: { type: ["integer", "null"] },
           priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
           priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           stage: { type: ["string", "null"] },
@@ -4378,6 +4441,8 @@ app.get("/send/status/:reference", {
     ok: true,
     requestId: sendStore.requestId(ledger.id),
     statusUrl: `/send/status/${sendStore.requestId(ledger.id)}`,
+    clientMessageId: ledger.client_message_id || null,
+    subscriptionId: ledger.subscription_id ?? null,
     jobId: ledger.job_id || live?.id || null,
     id: ledger.job_id || live?.id || null,
     state: superseded && !revoked ? "superseded" : (live?.state || fallbackState),
@@ -5723,6 +5788,7 @@ async function reconcilePending() {
       const job = await sendQueue.enqueue(
         {
           to: row.to_number, text: row.text, keyId: null,
+          subscriptionId: row.subscription_id ?? undefined, clientMessageId: row.client_message_id ?? undefined,
           keyName: row.key_name || "reconcile",
           priority: priority.name,
           priorityLevel: priority.level

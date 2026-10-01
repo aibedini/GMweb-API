@@ -31,6 +31,7 @@ export function useSSE(onEvent: (e: SseEvent) => void, enabled: boolean) {
       };
       es.onopen = () => {
         retry = 1000;
+        cb.current({ type: "connected" });
       };
       es.onerror = () => {
         es?.close();

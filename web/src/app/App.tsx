@@ -16,6 +16,7 @@ import { applyReadConfirmation, contactTitle, phoneKey, simHelp } from "../lib/i
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress } from "../lib/threadHistory";
 import { selectSmsSim } from "../lib/simSelection";
+import { androidError } from "../../../shared/smsStatus";
 
 type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug";
 type ThreadState = "IDLE" | "LOADING" | "READY" | "LOCKED" | "EMPTY" | "FAILED";
@@ -115,7 +116,9 @@ export default function App() {
   const [composeRecipient, setComposeRecipient] = useState("");
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
-  const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; recipient: string; at: number } | null>(null);
+  const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; recipient: string; at: number; failure?: string } | null>(null);
+  const sendEvidence = useRef<{ clientMessageId: string; status: string } | null>(null);
+  const observedSendStatus = (id: string) => sendEvidence.current?.clientMessageId === id ? sendEvidence.current.status : null;
   const markReadSent = useRef(new Set<string>());
   const contactsLoading = useRef(false);
   const lastThreadSelection = useRef<string | null>(null);
@@ -432,19 +435,23 @@ export default function App() {
     getItemKey: index => messages[index]?.payload.messageId ?? messages[index]?.event.eventId ?? index,
   });
   const selectedRecipient = composeRecipient || messages.map(item => item.payload.address).find(Boolean);
-  const activeSims = telemetry?.smsSubscriptions?.items.filter(sim => sim.isActive) ?? [];
+  const activeSims = telemetry?.smsSubscriptions?.items.filter(sim => sim.isActive && sim.sendCapable !== false) ?? [];
   const chosenSim = selectSmsSim(activeSims, selectedSubscriptionId);
   const simInstructions = simHelp(telemetry, Boolean(chosenSim));
   const simAvailable = !simInstructions;
-  const chooseSim = (id: number) => {
+  const chooseSim = (id: number | null) => {
     setSelectedSubscriptionId(id);
-    window.localStorage.setItem("gmweb:selected-sms-subscription", String(id));
+    if (id === null) window.localStorage.removeItem("gmweb:selected-sms-subscription");
+    else window.localStorage.setItem("gmweb:selected-sms-subscription", String(id));
   };
 
   useEffect(() => {
-    if (pendingMessage && messages.some(item =>
-      item.payload.clientMessageId === pendingMessage.clientMessageId)) {
-      setPendingMessage(null);
+    const clientId = pendingMessage?.clientMessageId || sendEvidence.current?.clientMessageId;
+    const matched = clientId && messages.find(item => item.payload.clientMessageId === clientId);
+    if (matched) {
+      sendEvidence.current = { clientMessageId: clientId, status: messageStatus(matched.payload.status) };
+      setCommandStatus(sendEvidence.current.status);
+      if (pendingMessage) setPendingMessage(null);
     }
   }, [messages, pendingMessage]);
 
@@ -477,12 +484,12 @@ export default function App() {
             if (!cancelled) setReadStatus(null);
             return;
           }
-          if (state && ["FAILED", "EXPIRED"].includes(state.state)) throw new Error("read_failed");
+          if (state && ["FAILED", "EXPIRED"].includes(state.state)) throw new Error(state.result || state.state);
         }
         throw new Error("read_pending");
-      } catch {
+      } catch (cause) {
         markReadSent.current.delete(key);
-        if (!cancelled) setReadStatus("Read confirmation is pending. Check the phone's connection, then retry.");
+        if (!cancelled) setReadStatus(`Read not confirmed · ${androidError(cause instanceof Error ? cause.message : "Check the phone's connection, then retry")}`);
       }
     })();
     return () => { cancelled = true; };
@@ -503,18 +510,19 @@ export default function App() {
   };
 
   const send = async () => {
-    const body = draft.trim();
-    if (!body) { setCommandStatus("EMPTY_BODY"); return; }
+    const body = draft;
+    if (!body.trim()) { setCommandStatus("EMPTY_BODY"); return; }
     if (!selectedRecipient) { setCommandStatus("NO_RECIPIENT"); return; }
     if (!capabilities.includes("SEND_MESSAGES")) { setCommandStatus("SEND_CAPABILITY_MISSING"); return; }
     if (!simAvailable) { setCommandStatus(!telemetry?.smsSubscriptions ? "SIM_STATE_UNAVAILABLE" : "SELECTED_SIM_UNAVAILABLE"); return; }
-    if (recoveringSend.current) return;
+    if (recoveringSend.current || sending) return;
     recoveringSend.current = true;
     setSending(true);
     const clientMessageId = commandStatus !== "COMPLETED" && !commandStatus?.startsWith("Command completed") &&
-      pendingMessage?.body === body && pendingMessage.recipient === selectedRecipient
+      pendingMessage?.body === body && !pendingMessage.failure && pendingMessage.recipient === selectedRecipient
       ? pendingMessage.clientMessageId : crypto.randomUUID();
     setCommandStatus("Preparing send…");
+    sendEvidence.current = null;
     setPendingMessage({ clientMessageId, body, recipient: selectedRecipient, at: Date.now() });
     let failureCode = "COMMAND_CREATE_FAILED";
     try {
@@ -547,17 +555,18 @@ export default function App() {
       failureCode = "COMMAND_CREATE_FAILED";
       const commandId = await ensurePendingCommandId(pending);
       setCommandStatus("Accepted by GMweb; waiting for phone");
-      if (!existing) setDraft("");
+      if (!existing) setDraft(current => current === body ? "" : current);
       for (let attempt = 0; attempt < 20; attempt += 1) {
         await new Promise(resolve => setTimeout(resolve, 1_000));
         failureCode = "COMMAND_POLL_FAILED";
         const state = await fetchCommand(commandId);
-        setCommandStatus(state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
-          state?.state === "FAILED" ? "COMMAND_FAILED" : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
-          "Waiting for phone");
+        setCommandStatus(observedSendStatus(clientMessageId) || (state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
+          state?.state === "FAILED" ? (state.result || "COMMAND_FAILED") : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
+    state?.state === "DELIVERED_TO_AGENT" ? "Pulled by phone" : ["ACCEPTED_BY_AGENT", "EXECUTING"].includes(state?.state || "") ? "Submitting" : "Queued"));
         if (state && ["FAILED", "EXPIRED"].includes(state.state)) {
           if (!existing) setDraft(body);
-          setPendingMessage(null);
+          setPendingMessage(current => current?.clientMessageId === clientMessageId ? { ...current,
+            failure: state.state === "FAILED" ? `Failed · ${androidError(state.result || "Phone did not report a reason")}` : "Request expired; phone outcome unconfirmed" } : current);
           await clearPendingSend(pending.clientMessageId);
           break;
         }
@@ -569,7 +578,7 @@ export default function App() {
     } catch {
       // A lost response may follow a committed command. Retain the encrypted
       // envelope and identity so the next retry cannot create a second SMS.
-      setCommandStatus(failureCode);
+      setCommandStatus(observedSendStatus(clientMessageId) || failureCode);
     } finally {
       recoveringSend.current = false;
       setSending(false);
@@ -590,9 +599,9 @@ export default function App() {
           try {
             const commandId = await ensurePendingCommandId(pending);
             const state = await fetchCommand(commandId);
-          setCommandStatus(state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
-            state?.state === "FAILED" ? "COMMAND_FAILED" : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
-            "Waiting for phone");
+          setCommandStatus(observedSendStatus(pending.clientMessageId) || (state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
+            state?.state === "FAILED" ? (state.result || "COMMAND_FAILED") : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
+    state?.state === "DELIVERED_TO_AGENT" ? "Pulled by phone" : ["ACCEPTED_BY_AGENT", "EXECUTING"].includes(state?.state || "") ? "Submitting" : "Queued"));
             if (state && ["COMPLETED", "FAILED", "EXPIRED"].includes(state.state))
               await clearPendingSend(pending.clientMessageId);
           } catch {
@@ -755,7 +764,11 @@ export default function App() {
               ) : selectedConversation ? (
                 <>
                   <div className="message-header"><button className="mobile-back" onClick={() => { setSelected(null); setComposeRecipient(""); }}>←</button><Avatar title={selectedConversation.title} /><div><h2>{selectedConversation.title}</h2><p>{selectedConversation.subtitle ? `${selectedConversation.subtitle} · ` : ""}Synced from Android · {shortId(selectedConversation.aggregateId)}</p></div></div>
-                  {readStatus && <div className="read-status" role="status">{readStatus}<Button size="sm" variant="ghost" onPress={() => { markReadSent.current.delete(`${selectedConversation.aggregateId}:${selectedConversation.lastSequence}`); setReadRetry(value => value + 1); }}>Retry read</Button></div>}
+                  {capabilities.includes("MARK_READ") && <div className="read-status" role="status">
+                    {readStatus || (needsPhoneRead ? "Phone read confirmation pending" : "Read on phone")}
+                    {needsPhoneRead && <Button size="sm" variant="ghost" isDisabled={threadState !== "READY" || readyThreadId !== selected}
+                      onPress={() => { markReadSent.current.delete(`${selectedConversation.aggregateId}:${selectedConversation.lastSequence}`); setReadRetry(value => value + 1); }}>Mark as read</Button>}
+                  </div>}
                   {threadHasMore && (
                     <Button size="sm" variant="ghost" className="load-older-thread" onPress={() => void loadOlderThread()} isDisabled={loadingOlderThread}>
                       {loadingOlderThread ? "Loading…" : "Load older messages"}
@@ -776,9 +789,9 @@ export default function App() {
                           </div>;
                       })}
                     </div>
-                    {pendingMessage && (
+                    {pendingMessage && pendingMessage.recipient === selectedRecipient && (
                       <div className="message-line out">
-                        <div className="message-bubble"><p dir="auto">{pendingMessage.body}</p><span>{formatTime(pendingMessage.at)} · {commandStatus || "queued"}</span></div>
+                        <div className="message-bubble"><p dir="auto">{pendingMessage.body}</p><span>{formatTime(pendingMessage.at)} · {pendingMessage.failure || commandStatus || "Sending…"}</span></div>
                       </div>
                     )}
                     {threadState === "LOADING" && <div className="empty-conversation"><Spinner /><h3>Loading messages…</h3></div>}
@@ -788,12 +801,12 @@ export default function App() {
                   </div>
                   <MessageComposer draft={draft} onDraft={setDraft} sims={activeSims} selected={chosenSim}
                     onSim={chooseSim} help={simInstructions} retry={refreshTelemetry} send={() => void send()}
-                    sending={sending} canSend={capabilities.includes("SEND_MESSAGES")} status={commandStatus} />
+                    sending={sending} canSend={capabilities.includes("SEND_MESSAGES")} status={commandStatus} useDefault={selectedSubscriptionId === null} />
                 </>
               ) : (
                 <><div className="message-header"><button className="mobile-back" onClick={() => { setComposeRecipient(""); setSelected(null); }}>←</button><div><h2>{composeRecipient ? contactNames.get(phoneKey(composeRecipient)) || composeRecipient : "New message"}</h2><p>{composeRecipient || "Choose a conversation or contact."}</p></div></div><div className="empty-conversation"><div className="empty-icon">✦</div><h3>{composeRecipient ? "Start a conversation" : "Choose a conversation or compose a message"}</h3></div>{composeRecipient && <MessageComposer draft={draft} onDraft={setDraft} sims={activeSims} selected={chosenSim}
                     onSim={chooseSim} help={simInstructions} retry={refreshTelemetry} send={() => void send()}
-                    sending={sending} canSend={capabilities.includes("SEND_MESSAGES")} status={commandStatus} />}</>
+                    sending={sending} canSend={capabilities.includes("SEND_MESSAGES")} status={commandStatus} useDefault={selectedSubscriptionId === null} />}</>
               )}
             </main>
           </div>
