@@ -293,6 +293,14 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     schema: { summary: "Latest Android fleet telemetry", tags: ["Admin"] },
   }, async () => ({ devices: deviceTelemetryStore?.getAll() || [] }));
 
+  app.get("/admin/sms-capabilities", {
+    schema: { summary: "Current Primary SIM capabilities; unknown permissions remain null", tags: ["Admin"] },
+  }, async () => {
+    const primary = agentAuthService?.getPrimaryIdentity();
+    const telemetry = primary ? deviceTelemetryStore?.get(primary.device_id) : null;
+    return require("./smsCapabilities").smsCapabilities(telemetry);
+  });
+
   app.get("/api/v1/admin/sync-stats", {
     schema: { summary: "Encrypted sync and device queue statistics", tags: ["Admin"] },
   }, async () => {

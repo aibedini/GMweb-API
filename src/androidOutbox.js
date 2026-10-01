@@ -194,6 +194,8 @@ class AndroidOutbox {
         requestId: key,
         to: item.to,
         text: item.text,
+        subscriptionId: item.subscriptionId,
+        clientMessageId: item.clientMessageId,
         priority: item.priority,
         // The consumer notification identity, used by the phone to validate
         // before submitting. Always an OBJECT (never null): the Android client
@@ -227,6 +229,9 @@ class AndroidOutbox {
         this.pending.set(entry.requestId, entry);
       }
       try { this.onOffer?.(entry.requestId, entry); } catch { /* ledger sync is best effort */ }
+      if (entry.claimedAt !== null) {
+        try { this.onPull?.(entry.requestId, entry); } catch { /* observability only */ }
+      }
     });
   }
 
@@ -329,6 +334,8 @@ class AndroidOutbox {
       requestId: entry.requestId,
       to: entry.to,
       text: entry.text,
+      ...(entry.subscriptionId == null ? {} : { subscriptionId: entry.subscriptionId }),
+      ...(entry.clientMessageId ? { clientMessageId: entry.clientMessageId } : {}),
       priority: entry.priority,
       meta: entry.meta || EMPTY_TASK_META
     };
@@ -637,7 +644,7 @@ class AndroidOutbox {
    * with the GMweb "sent" event shape when the device acks success — or with
    * {superseded:true} when a lifecycle invalidation got there first.
    */
-  sendMessage({ to, text, priority, onStage, meta = null, ledgerId = null,
+  sendMessage({ to, text, priority, onStage, subscriptionId, clientMessageId, meta = null, ledgerId = null,
                 jobId = null, requestId = null, shouldCancel = null } = {}) {
     const id = requestId || `pull_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     if (typeof shouldCancel === "function" && shouldCancel()) {
@@ -649,7 +656,7 @@ class AndroidOutbox {
       return Promise.reject(error);
     }
     onStage?.("phone_pull_queued");
-    return this.offer(id, { to, text, priority: priority || "announcement", meta, ledgerId, jobId });
+    return this.offer(id, { to, text, subscriptionId, clientMessageId, priority: priority || "announcement", meta, ledgerId, jobId });
   }
 }
 

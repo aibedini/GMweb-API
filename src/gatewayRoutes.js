@@ -23,6 +23,8 @@ function registerGatewayRoutes(app, deps = {}) {
     sendStore,
     checkDeviceKey,
     revocation = null,
+    onCarrierReport = null,
+    onSendProgress = null,
     isPullModeActive = () => true,
     checkRateLimit = null,
     diagnosticLimit = { max: 120, windowMs: 60000 },
@@ -185,6 +187,8 @@ function registerGatewayRoutes(app, deps = {}) {
                 requestId: { type: "string" },
                 to: { type: "string" },
                 text: { type: "string" },
+                subscriptionId: { type: "integer", minimum: 0 },
+                clientMessageId: { type: "string", maxLength: 128 },
                 priority: { type: "string" },
                 meta: {
                   type: ["object", "null"],
@@ -376,9 +380,38 @@ function registerGatewayRoutes(app, deps = {}) {
     const result = sendStore.recordCarrierReport({ eventId, requestId, status, occurredAt,
       deviceId: request.headers["x-gateway-device-id"] || null });
     if (result.error) return reply.code(result.error === "unknown_request_id" ? 404 : result.error === "invalid_delivery_report" ? 400 : 409).send({ error: result.error });
+    if (!result.duplicate) {
+      const row = sendStore.byGatewayRequest(requestId);
+      if (row) onCarrierReport?.({ type: status === "delivered" ? "sms.delivered" : "sms.delivery_failed",
+        requestId: sendStore.requestId(row.id), jobId: row.job_id,
+        at: new Date(occurredAt).toISOString() });
+    }
     log?.info?.({ event: result.duplicate ? "carrier_dlr_duplicate" : status === "delivered" ? "carrier_delivered" : "carrier_failed",
       gatewayRequestId: requestId, status, duplicate: result.duplicate }, "carrier report recorded");
     return { ...result, eventId, requestId };
+  });
+
+  app.post("/gateway/progress", {
+    schema: { summary: "Android reports modem submission in progress", tags: ["Gateway"],
+      body: { type: "object", required: ["requestId", "stage"], properties: {
+        requestId: { type: "string", minLength: 1, maxLength: MAX_REQUEST_ID },
+        stage: { type: "string", enum: ["submitting"] },
+        clientMessageId: { type: "string", maxLength: 128 }
+      } } },
+  }, async (request, reply) => {
+    if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-progress", operationalLimit)) return;
+    if (!isPullModeActive()) return reply.code(409).send({ error: "pull_mode_inactive" });
+    const row = sendStore?.byGatewayRequest(request.body.requestId);
+    if (!row) return reply.code(404).send({ error: "unknown_request_id" });
+    if (!["active", "queued"].includes(row.status) || row.revoked_at)
+      return reply.code(409).send({ error: "task_not_active" });
+    if (request.body.clientMessageId && row.client_message_id !== request.body.clientMessageId)
+      return reply.code(409).send({ error: "client_message_id_mismatch" });
+    sendStore.markStage(row.job_id, "phone_submitting");
+    onSendProgress?.({ type: "send_stage", requestId: sendStore.requestId(row.id), jobId: row.job_id,
+      stage: "phone_submitting", at: new Date().toISOString() });
+    return { ok: true, requestId: sendStore.requestId(row.id), stage: "submitting" };
   });
 
   app.post("/gateway/ack", {

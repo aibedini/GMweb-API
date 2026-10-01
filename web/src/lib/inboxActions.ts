@@ -1,4 +1,5 @@
 import type { ConversationProjection } from "./inbox.ts";
+import { androidError } from "../../../shared/smsStatus.ts";
 
 export function phoneKey(value: string): string {
   const digits = value.replace(/[۰-۹]/g, char => String(char.charCodeAt(0) - 1776))
@@ -43,5 +44,5 @@ export function commandFeedback(status: string | null): string | null {
     COMMAND_FAILED: "The phone could not complete this send. Check the phone before retrying.",
     COMMAND_EXPIRED: "The send request expired. Reconnect the phone before retrying.",
   };
-  return messages[status] || status;
+  return messages[status] || androidError(status);
 }
