@@ -759,7 +759,7 @@ function requireToken(request, reply, done) {
       requestPath(request.url) === "/api/v1/pairing/status") return done();
   // POST-PAIR: linked-session introspection is public — the route itself
   // reports authenticated:false when no valid cookie is present.
-  if (requestPath(request.url) === "/api/v1/linked-session") return done();
+  if (requestPath(request.url) === "/api/v1/linked-session" && request.method === "GET") return done();
   if (requestPath(request.url) === "/api/v1/pairing/challenge" || requestPath(request.url) === "/api/v1/pairing/complete") return done();
   // FIX 2 (review): the Android-only pairing endpoints delegate to the SAME
   // agent pipeline as /api/v1/agent/* — verified here ONCE (method-aware,
@@ -818,13 +818,13 @@ function requireToken(request, reply, done) {
         p === "/api/v1/linked-device/telemetry") ||
       (caps.includes("CONTACTS_READ") && request.method === "GET" &&
         p === "/api/v1/linked-device/contacts/events") ||
-      (caps.includes("SEND_MESSAGES") && request.method === "GET" &&
+      ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ")) && request.method === "GET" &&
         p === "/api/v1/linked-device/command-key") ||
       ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ")) &&
         (p === "/api/v1/commands" || p.startsWith("/api/v1/commands/"))) ||
       (caps.includes("READ_PAIRING_DIAGNOSTICS") &&
         request.method === "GET" && p === "/api/v1/pairing/diagnostics") ||
-      p === "/api/v1/linked-session"; // introspection always allowed
+      (p === "/api/v1/linked-session" && ["GET", "DELETE"].includes(request.method));
     if (allowed) {
       request.linkedDevice = linkedSession;
       linkedSessions.observe(linkedCookie, request.ip, request.headers["user-agent"],
@@ -1059,7 +1059,8 @@ function recordActivity(request, reply, done) {
       route: request.routeOptions?.url || null,
       params: safeActivityFields(request.params),
       query: safeActivityFields(request.query),
-      ...(pairing ? { pairing } : {})
+      ...(pairing ? { pairing } : {}),
+      ...(request._readAudit ? { read: request._readAudit } : {})
     }
   }).catch(() => {});
   done();
