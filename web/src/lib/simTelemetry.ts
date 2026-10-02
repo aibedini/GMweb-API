@@ -88,3 +88,57 @@ export function validateSelectedSim(
   }
   return { state: "ACTIVE", message: null };
 }
+
+/**
+ * §20: "Refresh SIMs" must never fake success.
+ *
+ * GMweb can only re-read the last telemetry the phone published; there is no
+ * Android-side command to force re-enumeration yet (see ANDROID_DEPENDENCY).
+ * So the honest outcomes are "a newer report arrived" or "no newer report
+ * arrived" — never a green "refreshed" tick.
+ */
+export type SimRefreshOutcome =
+  | "IDLE" | "CHECKING" | "UPDATED" | "NO_NEW" | "PHONE_OFFLINE" | "STALE" | "FAILED";
+
+export interface SimRefreshResult {
+  outcome: SimRefreshOutcome;
+  message: string | null;
+}
+
+export function simRefreshMessage(outcome: SimRefreshOutcome): SimRefreshResult {
+  switch (outcome) {
+    case "IDLE":
+      return { outcome, message: null };
+    case "CHECKING":
+      return { outcome, message: "Checking for a newer SIM report…" };
+    case "UPDATED":
+      return { outcome, message: "SIM information updated." };
+    case "NO_NEW":
+      return { outcome,
+        message: "No newer SIM report has been received from the phone." };
+    case "PHONE_OFFLINE":
+      return { outcome, message: "Primary phone is offline. SIM information cannot be refreshed." };
+    case "STALE":
+      return { outcome, message: "Primary phone connection is stale. Waiting for a fresh SIM report." };
+    case "FAILED":
+      return { outcome, message: "SIM information could not be refreshed." };
+  }
+}
+
+/**
+ * Decide the outcome of a user-initiated refresh by comparing the report the
+ * phone has published before and after the refetch. A refetch that returns the
+ * SAME `receivedAt` has learned nothing and must not be presented as success.
+ */
+export function classifySimRefresh(input: {
+  previousReceivedAt: number | null;
+  nextReceivedAt: number | null;
+  presence: PhonePresence;
+}): SimRefreshOutcome {
+  if (input.presence === "OFFLINE" || input.presence === "NEVER_SEEN") return "PHONE_OFFLINE";
+  if (input.nextReceivedAt === null || input.nextReceivedAt === undefined) return "NO_NEW";
+  if (input.previousReceivedAt === null) return "UPDATED";
+  if (input.nextReceivedAt > input.previousReceivedAt) return "UPDATED";
+  // Same report: honest "nothing new", and flag a stale phone separately.
+  return input.presence === "STALE" ? "STALE" : "NO_NEW";
+}

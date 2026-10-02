@@ -54,3 +54,4 @@ export { default as IconPending } from "@gravity-ui/icons/CircleDashed";
 export { default as IconReport } from "@gravity-ui/icons/FileText";
 export { default as IconSliders } from "@gravity-ui/icons/Sliders";
 export { default as IconChevronDown } from "@gravity-ui/icons/ChevronDown";
+export { default as IconSmile } from "@gravity-ui/icons/FaceSmile";
