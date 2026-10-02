@@ -396,7 +396,12 @@
 
 .message-composer-shell {
   flex: 0 0 auto;
+  /* The thread pane's flex column already stretches this to the full width;
+     an explicit `width: 100%` would ADD to `margin-inline` and push the
+     composer past the pane's right edge (where it is silently clipped). */
+  width: auto;
   min-width: 0;
+  max-width: 100%;
   margin-inline: 12px;
   margin-block-end: max(10px, env(safe-area-inset-bottom));
   padding: 8px 10px 10px;
@@ -406,10 +411,17 @@
   box-shadow: var(--surface-shadow);
 }
 
+/* The native textarea must own the full width of the shell. HeroUI's
+   `.textarea` declares no width, so without `fullWidth` + these rules a bare
+   <textarea> renders at its ~20-column default. */
 .message-composer__textarea {
   --field-shadow: none;
-  min-height: 44px;
-  max-height: 160px;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  min-height: 56px;
+  max-height: min(200px, 30dvh);
 }
 
 .composer-toolbar {
@@ -474,6 +486,12 @@
   margin-block-start: 6px;
   color: var(--muted);
   font-size: 10.5px;
+}
+
+/* §20: SIM refresh outcome — informational, not an alarm. */
+.composer-hint--notice {
+  color: var(--foreground);
+  font-size: 11.5px;
 }
 
 .sim-select {
@@ -576,6 +594,171 @@
   text-align: end;
   overflow-wrap: anywhere;
   font-variant-numeric: tabular-nums;
+}
+
+/* §13: compact contextual read status. Only a failure gets alarm styling. */
+.read-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.read-status-row__label {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.read-status-row__label--ok {
+  color: var(--success-soft-foreground);
+}
+
+.read-status-row__label--failed {
+  color: var(--danger);
+}
+
+/* ------------------------------------------------------------ emoji picker */
+
+/* §18: native Unicode emoji come from the platform font. Apple's assets are
+   never bundled; the stack just tells the browser where to look. */
+.message-bubble__body,
+.message-composer__textarea,
+.emoji-picker {
+  font-family:
+    Inter,
+    Vazirmatn,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    Apple Color Emoji,
+    "Segoe UI Emoji",
+    "Noto Color Emoji",
+    sans-serif;
+}
+
+.emoji-popover {
+  padding: 0;
+}
+
+.emoji-anchor {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+/* Full-pane invisible catcher: closes the picker on an outside click without
+   stealing focus from the draft. */
+.emoji-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+}
+
+.emoji-popover-panel {
+  position: absolute;
+  inset-block-end: calc(100% + 8px);
+  inset-inline-start: 0;
+  z-index: 20;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--overlay);
+  box-shadow: var(--overlay-shadow);
+}
+
+.emoji-picker {
+  width: min(340px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+}
+
+.emoji-picker__loading {
+  display: grid;
+  place-items: center;
+  min-height: 180px;
+}
+
+.emoji-picker__tabs {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  overscroll-behavior: contain;
+  padding-block-end: 2px;
+}
+
+.emoji-picker__tab {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  font-size: 16px;
+  line-height: 1;
+  transition: background-color 120ms ease;
+}
+
+.emoji-picker__tab:hover {
+  background: var(--default-soft);
+}
+
+.emoji-picker__tab[aria-selected="true"] {
+  background: var(--accent-soft);
+}
+
+.emoji-picker__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(34px, 1fr));
+  gap: 2px;
+  max-height: min(260px, 38dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.emoji-picker__cell {
+  display: grid;
+  place-items: center;
+  /* 34px grid cell with a 44px-class hit area via padding on larger screens. */
+  min-width: 34px;
+  min-height: 34px;
+  border-radius: 8px;
+  font-size: 20px;
+  line-height: 1;
+  transition: background-color 120ms ease;
+}
+
+@media (min-width: 768px) {
+  .emoji-picker__cell {
+    min-height: 40px;
+    font-size: 22px;
+  }
+}
+
+.emoji-picker__cell:hover {
+  background: var(--default-soft);
+}
+
+.emoji-picker__empty {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 18px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* --------------------------------------------------------------- drawers */

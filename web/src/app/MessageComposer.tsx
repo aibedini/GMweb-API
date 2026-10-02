@@ -1,13 +1,19 @@
+import { Suspense, lazy, useRef, useState } from "react";
 import { Alert, Button, Spinner } from "@heroui/react";
 import type { DeviceTelemetry } from "../lib/api";
 import { sendDisabled } from "../lib/inboxActions";
+import { insertEmoji } from "../lib/emojiInsert";
 import { ComposerStatus } from "./components/ComposerStatus";
 import { SimSelector } from "./components/SimSelector";
 import { SmsCounter } from "./components/SmsCounter";
-import { IconSend } from "./components/icons";
+import { IconSend, IconSmile } from "./components/icons";
 import { MessageTextarea } from "./MessageTextarea";
 
 type Sim = NonNullable<DeviceTelemetry["smsSubscriptions"]>["items"][number];
+
+// The picker (and its emoji table) is a separate chunk: it must cost nothing
+// until the user actually opens it.
+const LazyEmojiPicker = lazy(() => import("./components/EmojiPicker"));
 
 /**
  * §17/§21: the composer.
@@ -30,6 +36,7 @@ export function MessageComposer({
   canSend,
   status,
   useDefault,
+  refreshNotice,
 }: {
   draft: string;
   onDraft: (value: string) => void;
@@ -43,12 +50,32 @@ export function MessageComposer({
   sending: boolean;
   canSend: boolean;
   status: string | null;
+  /** §20: outcome of a user-initiated SIM refresh; never fakes success. */
+  refreshNotice?: string | null;
 }) {
   const disabled = sendDisabled({ draft, sending, canSend, simInstructions: help });
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const [emojiOpen, setEmojiOpen] = useState(false);
 
   const guardedSend = () => {
     if (disabled) return;
     send();
+  };
+
+  /** §16/§19: insert exactly at the caret and restore focus + caret. */
+  const onPickEmoji = (emoji: string) => {
+    const node = textareaRef.current;
+    const { value: next, caret } = insertEmoji(
+      draft, node?.selectionStart ?? null, node?.selectionEnd ?? null, emoji,
+    );
+    onDraft(next);
+    // Wait for React to commit the new value before moving the caret.
+    requestAnimationFrame(() => {
+      const target = textareaRef.current;
+      if (!target) return;
+      target.focus();
+      target.setSelectionRange(caret, caret);
+    });
   };
 
   return (
@@ -60,10 +87,57 @@ export function MessageComposer({
         disabled={sending}
         placeholder="Type a message…"
         className="message-composer__textarea"
+        textareaRef={textareaRef}
       />
 
       <div className="composer-toolbar">
         <div className="composer-options">
+          {/*
+            A composer-local overlay rather than a portalled HeroUI Popover:
+            RAC's popover moves focus onto its own dialog, which pulls the
+            caret out of the draft after every insertion. An overlay that never
+            takes focus keeps the textarea focused, so the caret the user left
+            survives — and Escape / outside-click still close it explicitly.
+          */}
+          <div className="emoji-anchor">
+            <Button
+              variant="ghost"
+              isIconOnly
+              aria-label="Choose emoji"
+              aria-haspopup="dialog"
+              aria-expanded={emojiOpen}
+              onPress={() => setEmojiOpen(open => !open)}
+            >
+              <IconSmile width={18} height={18} aria-hidden />
+            </Button>
+
+            {emojiOpen ? (
+              <>
+                <div
+                  className="emoji-backdrop"
+                  aria-hidden="true"
+                  onClick={() => setEmojiOpen(false)}
+                />
+                <div
+                  className="emoji-popover-panel"
+                  role="dialog"
+                  aria-label="Choose emoji"
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.stopPropagation();
+                      setEmojiOpen(false);
+                      textareaRef.current?.focus();
+                    }
+                  }}
+                >
+                  <Suspense fallback={<div className="emoji-picker__loading"><Spinner size="sm" /></div>}>
+                    <LazyEmojiPicker onPick={onPickEmoji} />
+                  </Suspense>
+                </div>
+              </>
+            ) : null}
+          </div>
+
           <SimSelector sims={sims} selected={selected} onSim={onSim} useDefault={useDefault} />
           <SmsCounter draft={draft} />
         </div>
@@ -110,6 +184,10 @@ export function MessageComposer({
       ) : null}
 
       <ComposerStatus status={status} />
+
+      {refreshNotice ? (
+        <p className="composer-hint composer-hint--notice" role="status">{refreshNotice}</p>
+      ) : null}
 
       <p className="composer-hint">Ctrl+Enter / ⌘+Enter to send</p>
     </section>

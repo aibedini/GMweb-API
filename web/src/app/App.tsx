@@ -14,7 +14,18 @@ import { MessageComposer } from "./MessageComposer";
 import { applyReadConfirmation, contactTitle, phoneKey, simHelp } from "../lib/inboxActions";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress } from "../lib/threadHistory";
+import {
+  EMPTY_HISTORY_TRACE, IDLE_HISTORY, canLoadOlder, describeHistory, historyErrorMessage,
+  isValidCursor, pagingFailed, pagingFromPage, pagingLoading, showLoadOlder,
+  type HistoryPagingState, type HistoryTrace,
+} from "../lib/threadPaging";
 import { selectSmsSim } from "../lib/simSelection";
+import { derivePhonePresence } from "../lib/phonePresence";
+import { describeSimTelemetry, classifySimRefresh, simRefreshMessage, type SimRefreshResult } from "../lib/simTelemetry";
+import {
+  IDLE_READ, readFailureCode, readStateKey, readSyncLabel, readSyncRetryable, readSyncTone,
+  shouldAutoRead, type ReadSyncState,
+} from "../lib/readSync";
 import { androidError } from "../../../shared/smsStatus";
 
 import { AppShell } from "./components/AppShell";
@@ -62,10 +73,10 @@ export default function App() {
   const [tab, setTab] = useState<TabKey>("inbox");
   const [events, setEvents] = useState<StoredEvent[]>([]);
   const [threadEvents, setThreadEvents] = useState<StoredEvent[]>([]);
-  const [threadNext, setThreadNext] = useState<number | string | undefined>();
-  const [threadHasMore, setThreadHasMore] = useState(false);
-  const [loadingOlderThread, setLoadingOlderThread] = useState(false);
-  const [historyError, setHistoryError] = useState<string | null>(null);
+  // History paging is ONE value so `hasMore` and its cursor can never drift
+  // apart (see lib/threadPaging.ts for the invariant).
+  const [history, setHistory] = useState<HistoryPagingState>(IDLE_HISTORY);
+  const historyTrace = useRef<HistoryTrace>(EMPTY_HISTORY_TRACE);
   const historyLoadingRef = useRef(false);
   const [cursor, setCursor] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -77,7 +88,7 @@ export default function App() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [browserDeviceId, setBrowserDeviceId] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
-  const [readStatus, setReadStatus] = useState<string | null>(null);
+  const [readSync, setReadSync] = useState<ReadSyncState>(IDLE_READ);
   const [readRetry, setReadRetry] = useState(0);
   const [readConfirmations, setReadConfirmations] = useState<Record<string, number>>({});
   const [viewedReadThrough, setViewedReadThrough] = useState<Record<string, number>>({});
@@ -128,7 +139,10 @@ export default function App() {
   const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; recipient: string; at: number; failure?: string } | null>(null);
   const sendEvidence = useRef<{ clientMessageId: string; status: string } | null>(null);
   const observedSendStatus = (id: string) => sendEvidence.current?.clientMessageId === id ? sendEvidence.current.status : null;
-  const markReadSent = useRef(new Set<string>());
+  // Keyed by `conversationId:readThroughSequence`: at most ONE live
+  // MARK_THREAD_READ observation per read-through, so switching threads
+  // rapidly cannot produce a command storm.
+  const readInFlight = useRef(new Set<string>());
   const contactsLoading = useRef(false);
   const lastThreadSelection = useRef<string | null>(null);
   const recoveringSend = useRef(false);
@@ -142,9 +156,31 @@ export default function App() {
   // never depends on a JS breakpoint for correctness.
   const isWideViewport = useMediaQuery("(min-width: 768px)", { defaultValue: true });
 
+  const [simRefresh, setSimRefresh] = useState<SimRefreshResult>({ outcome: "IDLE", message: null });
+
   const refreshTelemetry = () => void fetchPrimaryTelemetry().then(value => {
     setTelemetry(value);
   }).catch(() => setTelemetry(null));
+
+  /**
+   * §20: user-initiated SIM refresh. Compares the phone's report timestamp
+   * before and after, and reports "nothing newer" rather than a fake success.
+   */
+  const refreshSims = async () => {
+    const previousReceivedAt = telemetry?.receivedAt ?? null;
+    setSimRefresh(simRefreshMessage("CHECKING"));
+    try {
+      const next = await fetchPrimaryTelemetry();
+      setTelemetry(next);
+      const presence = derivePhonePresence(next?.receivedAt ?? null);
+      const outcome = classifySimRefresh({
+        previousReceivedAt, nextReceivedAt: next?.receivedAt ?? null, presence,
+      });
+      setSimRefresh(simRefreshMessage(outcome));
+    } catch {
+      setSimRefresh(simRefreshMessage("FAILED"));
+    }
+  };
 
   const refresh = async () => {
     const [nextCursor, nextEvents, nextTrust, nextContacts] = await Promise.all([
@@ -379,10 +415,14 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     setThreadError(null);
-    if (lastThreadSelection.current !== selected) setHistoryError(null);
+    if (lastThreadSelection.current !== selected) {
+      setHistory(IDLE_HISTORY);
+      historyTrace.current = EMPTY_HISTORY_TRACE;
+    }
     if (!selected || !authed) {
       lastThreadSelection.current = null;
       setThreadEvents([]);
+      setHistory(IDLE_HISTORY);
       setThreadState("IDLE");
       return () => { cancelled = true; };
     }
@@ -396,17 +436,18 @@ export default function App() {
     void listAggregateEventsPage(selected, { limit: 10 }).then(page => {
       if (cancelled) return;
       setReadyThreadId(selected);
-      if (page.hasMore && page.next === undefined) {
-        setHistoryError("PAGINATION_STALLED");
-        setThreadHasMore(false);
-      }
       setThreadFirstPageMs(Math.round(performance.now() - startedAt));
       if (sameThread && !stickToBottom) {
+        // Merging newer arrivals must NOT rewind the user's deep history
+        // cursor, but the invariant still has to hold afterwards.
         setThreadEvents(previous => mergeThreadEvents(previous, page.items));
+        setHistory(previous => (!previous.hasMore || isValidCursor(previous.next)
+          ? previous
+          : pagingFromPage({ hasMore: false })));
       } else {
         setThreadEvents(page.items);
-        setThreadHasMore(page.hasMore && page.next !== undefined);
-        setThreadNext(page.next);
+        // One atomic derivation for the whole (hasMore, next) pair.
+        setHistory(pagingFromPage(page));
         requestAnimationFrame(() => {
           const pane = messageScrollRef.current;
           if (pane) pane.scrollTop = pane.scrollHeight;
@@ -429,12 +470,15 @@ export default function App() {
     return () => { cancelled = true; };
   }, [selected, events, authed, threadReload]);
   const loadOlderThread = async () => {
-    if (!selected || threadNext === undefined || historyLoadingRef.current) return;
+    const cursor = history.next;
+    // Guarded by the same predicate that gates rendering: if this is true the
+    // control was rendered, so a silent no-op is impossible by construction.
+    if (!selected || !canLoadOlder(history, threadState) || !isValidCursor(cursor) ||
+        historyLoadingRef.current) return;
     historyLoadingRef.current = true;
-    setLoadingOlderThread(true);
-    setHistoryError(null);
+    setHistory(pagingLoading);
     try {
-      const requestedCursor = threadNext;
+      const requestedCursor = cursor;
       const page = await listAggregateEventsPage(selected, {
         limit: 20,
         ...(typeof requestedCursor === "string" ? { beforeState: requestedCursor } : { beforeSequence: requestedCursor }),
@@ -447,11 +491,18 @@ export default function App() {
       requestAnimationFrame(() => {
         if (scroll) scroll.scrollTop += scroll.scrollHeight - previousHeight;
       });
-      setThreadHasMore(page.hasMore);
-      setThreadNext(page.next);
+      historyTrace.current = {
+        lastRequestAt: Date.now(),
+        lastReturnedCount: page.items.length,
+        lastNextCursorChanged: page.next !== requestedCursor,
+      };
+      setHistory(pagingFromPage(page));
     } catch (cause) {
-      setHistoryError(cause instanceof Error ? cause.message : "HISTORY_PAGE_FAILED");
-    } finally { historyLoadingRef.current = false; setLoadingOlderThread(false); }
+      historyTrace.current = {
+        ...historyTrace.current, lastRequestAt: Date.now(), lastReturnedCount: 0, lastNextCursorChanged: false,
+      };
+      setHistory(previous => pagingFailed(previous, cause instanceof Error ? cause.message : "HISTORY_PAGE_FAILED"));
+    } finally { historyLoadingRef.current = false; }
   };
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
   const selectedRecipient = composeRecipient || messages.map(item => item.payload.address).find(Boolean);
@@ -482,38 +533,75 @@ export default function App() {
     return createCommand({ type, payload: encrypted, idempotencyKey, targetAgentId: target.deviceId });
   };
 
+  // §12.1: opening an unread conversation clears the Web unread UI FIRST, then
+  // the phone is asked to confirm in the background.
   useEffect(() => {
-    if (!needsPhoneRead) { setReadStatus(null); return; }
-    if (tab !== "inbox" || !selectedConversation || readyThreadId !== selected || threadState !== "READY" ||
-        !capabilities.includes("MARK_READ") || !pageVisible) return;
+    if (!selectedConversation) { setReadSync(IDLE_READ); return; }
     const { aggregateId, lastSequence } = selectedConversation;
-    const key = `${aggregateId}:${lastSequence}`;
-    if (markReadSent.current.has(key)) { setReadStatus("Read confirmation is pending on your phone."); return; }
-    markReadSent.current.add(key);
-    let cancelled = false;
-    setReadStatus("Marking as read on your phone…");
+    const confirmedSequence = Math.max(
+      readConfirmations[aggregateId] ?? -1,
+      viewedReadThrough[aggregateId] ?? -1,
+    );
+    const key = readStateKey(aggregateId, lastSequence);
+    const auto = shouldAutoRead({
+      tabActive: tab === "inbox",
+      hasSelection: Boolean(selected),
+      threadReady: threadState === "READY",
+      readyThreadIdMatches: readyThreadId === selected,
+      documentVisible: pageVisible,
+      canMarkRead: capabilities.includes("MARK_READ"),
+      lastSequence,
+      confirmedSequence,
+      alreadyInFlight: readInFlight.current.has(key),
+    });
+    if (!auto) {
+      // Already read (locally or confirmed) -> reflect the authoritative state
+      // instead of leaving a stale "syncing" label behind.
+      if (lastSequence <= confirmedSequence && !readInFlight.current.has(key)) {
+        setReadSync({ state: "CONFIRMED", sequence: lastSequence });
+      }
+      return;
+    }
+
+    // Optimistic local read-through happens BEFORE any network work, so the
+    // badge, the row styling and the global unread total clear immediately.
+    setViewedReadThrough(previous => ({
+      ...previous, [aggregateId]: Math.max(previous[aggregateId] ?? -1, lastSequence),
+    }));
+    readInFlight.current.add(key);
+    setReadSync({ state: "SYNCING", sequence: lastSequence, commandId: null });
+
     void (async () => {
+      let commandId: string | null = null;
       try {
         const command = await submitCommand("MARK_THREAD_READ", { conversationId: aggregateId });
-        setViewedReadThrough(previous => ({ ...previous, [aggregateId]: Math.max(previous[aggregateId] ?? -1, lastSequence) }));
+        commandId = command.commandId;
+        // Durable on the server: from here on the phone owns confirmation.
+        setReadSync({ state: "WAITING_FOR_PHONE", sequence: lastSequence, commandId: command.commandId });
         for (let i = 0; i < 30; i++) {
           await new Promise(resolve => window.setTimeout(resolve, 1000));
-          const state = await fetchCommand(command.commandId);
-          if (state?.state === "COMPLETED") {
-            setReadConfirmations(previous => ({ ...previous, [aggregateId]: Math.max(previous[aggregateId] ?? -1, lastSequence) }));
-            if (!cancelled) setReadStatus(null);
+          const view = await fetchCommand(command.commandId);
+          if (view?.state === "COMPLETED") {
+            setReadConfirmations(previous => ({
+              ...previous, [aggregateId]: Math.max(previous[aggregateId] ?? -1, lastSequence),
+            }));
+            readInFlight.current.delete(key);
+            setReadSync({ state: "CONFIRMED", sequence: lastSequence });
             return;
           }
-          if (state && ["FAILED", "EXPIRED"].includes(state.state)) throw new Error(state.result || state.state);
+          if (view && ["FAILED", "EXPIRED"].includes(view.state)) throw new Error(view.result || view.state);
         }
         throw new Error("read_pending");
       } catch (cause) {
-        markReadSent.current.delete(key);
-        if (!cancelled) setReadStatus(`Read not confirmed · ${androidError(cause instanceof Error ? cause.message : "Check the phone's connection, then retry")}`);
+        readInFlight.current.delete(key);
+        setReadSync({
+          state: "FAILED", sequence: lastSequence,
+          errorCode: readFailureCode(cause), commandId,
+        });
       }
     })();
-    return () => { cancelled = true; };
-  }, [selected, selectedConversation?.lastSequence, needsPhoneRead, readyThreadId, threadState, tab, capabilities, readRetry, pageVisible]);
+  }, [selected, selectedConversation?.lastSequence, needsPhoneRead, readyThreadId, threadState,
+      tab, capabilities, readRetry, pageVisible]);
 
   const signOut = async () => {
     setSigningOut(true);
@@ -661,8 +749,16 @@ export default function App() {
         events: threadEvents,
         state: threadState,
         firstPageDurationMs: threadFirstPageMs,
-        lastPageError: historyError || threadError,
-      } : undefined));
+        lastPageError: history.error || threadError,
+        // §32: enough to tell "no deeper history on the phone" apart from
+        // "the client lost its cursor" in the field.
+        history: describeHistory(history, historyTrace.current),
+      } : undefined, {
+        phonePresence,
+        phoneTelemetryAgeMs: telemetry?.receivedAt == null ? null : Math.max(0, Date.now() - telemetry.receivedAt),
+        simState: simTelemetry.state,
+        simActiveCount: simTelemetry.active.length,
+      }));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -721,6 +817,11 @@ export default function App() {
     : events.length
       ? "See payload diagnostics"
       : "No payloads received";
+
+  // §8: presence is derived from the phone's SERVER receipt time, never from
+  // the browser being able to reach the API. These are independent facts.
+  const phonePresence = derivePhonePresence(telemetry?.receivedAt ?? null);
+  const simTelemetry = describeSimTelemetry(telemetry, Date.now(), phonePresence);
 
   const conversationsLoading = conversationPage.length === 0 && bootstrapState === "BOOTSTRAPPING_SYNC";
   const emptyInboxMessage = conversations.length === 0 ? "No conversations yet" : "No matching conversations";
@@ -797,7 +898,8 @@ export default function App() {
       selected={chosenSim}
       onSim={chooseSim}
       help={simInstructions}
-      retry={refreshTelemetry}
+      retry={() => void refreshSims()}
+      refreshNotice={simRefresh.message}
       send={() => void send()}
       sending={sending}
       canSend={capabilities.includes("SEND_MESSAGES")}
@@ -809,34 +911,40 @@ export default function App() {
   const threadNotices = (
     <>
       {capabilities.includes("MARK_READ") && selectedConversation ? (
-        <div className="row" style={{ gap: 8, justifyContent: "space-between" }} role="status">
-          <span className="text-xs text-muted">
-            {readStatus || (needsPhoneRead ? "Phone read confirmation pending" : "Read on phone")}
+        <div className="read-status-row" role="status">
+          <span className={`read-status-row__label read-status-row__label--${readSyncTone(readSync)}`}>
+            {readSyncLabel(readSync) ?? "Read"}
           </span>
-          {needsPhoneRead ? (
+          {readSyncRetryable(readSync) ? (
             <Button
               size="sm"
               variant="ghost"
-              isDisabled={threadState !== "READY" || readyThreadId !== selected}
               onPress={() => {
-                markReadSent.current.delete(`${selectedConversation.aggregateId}:${selectedConversation.lastSequence}`);
+                readInFlight.current.delete(
+                  readStateKey(selectedConversation.aggregateId, selectedConversation.lastSequence),
+                );
                 setReadRetry(value => value + 1);
               }}
             >
-              Mark as read
+              Retry
             </Button>
           ) : null}
         </div>
       ) : null}
 
-      {historyError ? (
+      {history.error ? (
         <Alert status="danger">
           <Alert.Indicator />
           <Alert.Content>
             <Alert.Title>Could not load older messages</Alert.Title>
-            <Alert.Description>{historyError}</Alert.Description>
+            <Alert.Description>{historyErrorMessage(history.error)}</Alert.Description>
           </Alert.Content>
-          <Button size="sm" variant="ghost" onPress={() => void loadOlderThread()}>
+          <Button
+            size="sm"
+            variant="ghost"
+            isDisabled={!canLoadOlder(history, threadState)}
+            onPress={() => void loadOlderThread()}
+          >
             Retry
           </Button>
         </Alert>
@@ -903,8 +1011,8 @@ export default function App() {
           }
           notices={threadNotices}
           composer={composer}
-          hasMore={threadHasMore}
-          loadingOlder={loadingOlderThread}
+          hasMore={showLoadOlder(history, threadState)}
+          loadingOlder={history.loading}
           onLoadOlder={() => void loadOlderThread()}
           onOpenStatus={(item) => {
             setDeliveryItem(item);
@@ -952,6 +1060,13 @@ export default function App() {
           subtitle={destination.subtitle}
           connection={connection}
           connectionDetail={connectionDetail}
+          phonePresence={phonePresence}
+          phoneReceivedAt={telemetry?.receivedAt ?? null}
+          phoneModel={
+            telemetry?.device
+              ? `${telemetry.device.manufacturer ?? ""} ${telemetry.device.model ?? ""}`.trim() || null
+              : null
+          }
           syncStatus={syncStatus}
           syncBusy={busy}
           onSync={() => void pull()}
@@ -1003,6 +1118,8 @@ export default function App() {
           bootstrapState={bootstrapState}
           error={error}
           payloadState={payloadState}
+          phonePresence={phonePresence}
+          simView={simTelemetry}
         />
       ) : null}
 

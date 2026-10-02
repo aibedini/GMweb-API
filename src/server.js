@@ -1100,6 +1100,60 @@ function emitSse(event) {
 // if the SSE drops, the cursor sync still catches everything up.
 const controlSseClients = new Set();
 
+// ── SSE transport hardening (P0: realtime never reached the browser) ────────
+//
+// ROOT CAUSE: nginx sits in front of this API in production and its default is
+// `proxy_buffering on`. A proxied `text/event-stream` response is therefore
+// accumulated in nginx's proxy buffer instead of being flushed, so
+// {type:"sync.available"} never reached the PWA. The browser's EventSource
+// still fired `onopen` (the response HEAD is forwarded immediately), so the UI
+// showed a healthy "Connected" indicator while zero invalidations arrived —
+// exactly the "I have to press Refresh" defect.
+//
+// `X-Accel-Buffering: no` disables proxy buffering for THIS response only
+// (nginx honours it per-response, so no global proxy setting has to change),
+// and the heartbeat comment frame gives intermediaries traffic so idle
+// connections are not reaped and the client can detect a dead stream.
+const SSE_HEARTBEAT_MS = 20_000;
+const SSE_RETRY_MS = 3_000;
+
+function sseResponseHeaders() {
+  return {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    // nginx / ingress: never buffer this stream.
+    "x-accel-buffering": "no"
+  };
+}
+
+/**
+ * Keep the stream warm AND observable.
+ *
+ * A comment frame (`: hb`) is invisible to `EventSource`, so it could never be
+ * used by the client to tell a healthy stream from a black-holed one. This
+ * sends a `data:` heartbeat instead: it keeps intermediaries from reaping the
+ * connection and lets the browser prove the channel is still live. It carries
+ * no identifiers, no content and performs no database work, and the client
+ * only ever acts on `sync.available` frames.
+ */
+function attachSseHeartbeat(reply) {
+  const timer = setInterval(() => {
+    if (reply.raw.writableEnded || reply.raw.destroyed) {
+      clearInterval(timer);
+      return;
+    }
+    try {
+      reply.raw.write(`data: ${JSON.stringify({ type: "heartbeat", at: new Date().toISOString() })}\n\n`);
+    } catch {
+      clearInterval(timer);
+    }
+  }, SSE_HEARTBEAT_MS);
+  timer.unref?.();
+  reply.raw.on("close", () => clearInterval(timer));
+  return timer;
+}
+
 function emitControlEvent(event) {
   const payload = `data: ${JSON.stringify(event)}\n\n`;
   for (const reply of controlSseClients) {
@@ -3358,12 +3412,12 @@ app.get("/api/v1/sse", {
   // "return reply" alone does NOT stop Fastify from later serializing.
   reply.hijack();
 
-  reply.raw.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive"
-  });
+  reply.raw.writeHead(200, sseResponseHeaders());
+  // `retry:` tells EventSource how fast to reconnect; the comment frame forces
+  // any intermediary to flush the response head immediately.
+  reply.raw.write(`retry: ${SSE_RETRY_MS}\n\n`);
   reply.raw.write(": connected\n\n");
+  attachSseHeartbeat(reply);
 
   if (request.linkedDevice) {
     reply._linkedToken = request.cookies[linkedSessions.COOKIE_NAME];
@@ -5748,12 +5802,10 @@ app.get("/events", {
   // double-sends and crashes the process (Eve/dashboard can trigger this).
   reply.hijack();
 
-  reply.raw.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive"
-  });
+  reply.raw.writeHead(200, sseResponseHeaders());
+  reply.raw.write(`retry: ${SSE_RETRY_MS}\n\n`);
   reply.raw.write(": connected\n\n");
+  attachSseHeartbeat(reply);
   const scope = request._projectKey
     ? { type: "project", keyName: request._projectKey.name }
     : { type: "full" };
