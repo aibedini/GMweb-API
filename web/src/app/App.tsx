@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, useMediaQuery } from "@heroui/react";
 import { syncVisibleInbox, loadContactsOnDemand, listRecentEvents, listAggregateEventsPage, listContacts, listConversations, listChangedConversationHeads, getCursor, getBrowserSyncStatus, resetLocal, subscribeSyncAvailable, subscribeKeyMaintenance, type BrowserSyncStatus, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, reconcileConversationHead, type ConversationProjection } from "../lib/inbox";
-import { createCommand, fetchCommand, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type LinkedBrowserSession, type TrustSnapshot } from "../lib/api";
+import { createCommand, fetchCommand, fetchLinkedDeviceStatus, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type LinkedBrowserSession, type LinkedDeviceStatus, type TrustSnapshot } from "../lib/api";
 import { encryptCommand } from "../lib/commandCrypto";
 import { getStoredDeviceIdentity, wipeDeviceKeys } from "../lib/deviceKeys";
 import { clearPendingSend, loadPendingSends, savePendingSend, type PendingEncryptedSend } from "../lib/commandOutbox";
@@ -108,6 +108,7 @@ export default function App() {
   const [composeOpen, setComposeOpen] = useState(false);
   const [recipientSearch, setRecipientSearch] = useState("");
   const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
+  const [deviceStatus, setDeviceStatus] = useState<LinkedDeviceStatus | null>(null);
   const [linkedBrowsers, setLinkedBrowsers] = useState<LinkedBrowserSession[]>([]);
   const [showLinkedBrowsers, setShowLinkedBrowsers] = useState(false);
   const [showDetails, setShowDetails] = useState(false);
@@ -296,6 +297,11 @@ export default function App() {
       });
     refreshTelemetry();
     const telemetryTimer = window.setInterval(refreshTelemetry, 60_000);
+    // Presence transitions on a 90s/180s scale, so a 20s poll is responsive
+    // without hammering the API.
+    const refreshDeviceStatus = () => void fetchLinkedDeviceStatus().then(setDeviceStatus).catch(() => {});
+    refreshDeviceStatus();
+    const deviceStatusTimer = window.setInterval(refreshDeviceStatus, 20_000);
     const refreshLinkedBrowsers = () => void fetchLinkedSessions().then(setLinkedBrowsers).catch(() => setLinkedBrowsers([]));
     refreshLinkedBrowsers();
     const linkedBrowsersTimer = window.setInterval(refreshLinkedBrowsers, 60_000);
@@ -328,7 +334,7 @@ export default function App() {
       void refresh();
       void refreshContacts();
     });
-    return () => { window.clearInterval(telemetryTimer); window.clearInterval(linkedBrowsersTimer); window.clearInterval(visibleTimer); unsubscribe(); unsubscribeKeys(); };
+    return () => { window.clearInterval(telemetryTimer); window.clearInterval(deviceStatusTimer); window.clearInterval(linkedBrowsersTimer); window.clearInterval(visibleTimer); unsubscribe(); unsubscribeKeys(); };
   }, [authed]);
 
   useEffect(() => {
@@ -818,9 +824,15 @@ export default function App() {
       ? "See payload diagnostics"
       : "No payloads received";
 
-  // §8: presence is derived from the phone's SERVER receipt time, never from
-  // the browser being able to reach the API. These are independent facts.
-  const phonePresence = derivePhonePresence(telemetry?.receivedAt ?? null);
+  // Presence comes from the SERVER's view of authenticated phone activity.
+  // Telemetry freshness is a separate axis and is never used for liveness.
+  // The local derivation remains only as a fallback if the status call fails.
+  const phonePresence = deviceStatus
+    ? deviceStatus.phone.state
+    : derivePhonePresence(telemetry?.receivedAt ?? null);
+  const phoneLastActivityAt = deviceStatus
+    ? deviceStatus.phone.lastActivityAt
+    : telemetry?.receivedAt ?? null;
   const simTelemetry = describeSimTelemetry(telemetry, Date.now(), phonePresence);
 
   const conversationsLoading = conversationPage.length === 0 && bootstrapState === "BOOTSTRAPPING_SYNC";
@@ -1061,7 +1073,9 @@ export default function App() {
           connection={connection}
           connectionDetail={connectionDetail}
           phonePresence={phonePresence}
-          phoneReceivedAt={telemetry?.receivedAt ?? null}
+          // Last AUTHENTICATED ACTIVITY, not last telemetry: a stalled
+          // telemetry channel must not read as "phone gone".
+          phoneReceivedAt={phoneLastActivityAt}
           phoneModel={
             telemetry?.device
               ? `${telemetry.device.manufacturer ?? ""} ${telemetry.device.model ?? ""}`.trim() || null
