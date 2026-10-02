@@ -1,0 +1,219 @@
+/*
+ * Responsive rules.
+ *
+ * Four real adaptive modes — not a scaled-down desktop:
+ *
+ *   >= 1440px   rail | conversations | thread | details
+ *   1180-1439   rail | conversations | thread            (details -> Drawer)
+ *    768-1179   conversations | thread  + bottom nav      (details -> Drawer)
+ *    < 768      one screen at a time      + bottom nav     (details -> Drawer)
+ */
+
+/* Safe areas on the inline axis (landscape notch / rounded corners). */
+.app-body {
+  padding-inline: env(safe-area-inset-left) env(safe-area-inset-right);
+}
+
+/* --------------------------------------------------------------- >= 1440 */
+
+@media (min-width: 1440px) {
+  .messaging-layout {
+    grid-template-columns: var(--gmweb-conversation-width) minmax(0, 1fr) var(--gmweb-details-width);
+  }
+
+  /* Details are only rendered when a conversation is selected; without the
+     third column the grid must collapse or the thread keeps a dead gutter. */
+  .messaging-layout--no-details {
+    grid-template-columns: var(--gmweb-conversation-width) minmax(0, 1fr);
+  }
+
+  .details-pane {
+    display: flex;
+  }
+}
+
+/* ---------------------------------------------------------- 1180 - 1439 */
+
+@media (min-width: 1180px) and (max-width: 1439px) {
+  .messaging-layout,
+  .messaging-layout--no-details {
+    grid-template-columns: 300px minmax(0, 1fr);
+  }
+
+  .details-pane {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------ 768 - 1179 */
+
+@media (min-width: 768px) and (max-width: 1179px) {
+  .messaging-layout,
+  .messaging-layout--no-details {
+    grid-template-columns: minmax(280px, 38%) minmax(0, 1fr);
+  }
+
+  .details-pane {
+    display: none;
+  }
+
+  .message-bubble {
+    max-width: 75%;
+  }
+}
+
+/* Portrait tablets get a slightly wider list; landscape keeps a fixed list. */
+@media (min-width: 768px) and (max-width: 1024px) and (orientation: portrait) {
+  .messaging-layout,
+  .messaging-layout--no-details {
+    grid-template-columns: minmax(280px, 40%) minmax(0, 1fr);
+  }
+}
+
+@media (min-width: 768px) and (max-width: 1179px) and (orientation: landscape) {
+  .messaging-layout,
+  .messaging-layout--no-details {
+    grid-template-columns: 300px minmax(0, 1fr);
+  }
+}
+
+/* The rail is a large-screen affordance. Below 1180 the bottom navigation
+   takes over so a tablet keeps a compact top bar instead of a full rail. */
+@media (max-width: 1179px) {
+  .app-rail {
+    display: none;
+  }
+
+  .mobile-nav {
+    display: flex;
+  }
+
+  .app-topbar {
+    padding-inline: 12px;
+  }
+}
+
+/* ---------------------------------------------------------------- < 768 */
+
+@media (max-width: 767px) {
+  .messaging-layout {
+    display: block;
+    position: relative;
+  }
+
+  .conversation-pane,
+  .thread-pane {
+    position: absolute;
+    inset-block: 0;
+    inset-inline: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  .details-pane {
+    display: none;
+  }
+
+  /* Exactly one primary screen at a time. */
+  .messaging-layout[data-mobile-view="list"] .thread-pane {
+    display: none;
+  }
+
+  .messaging-layout[data-mobile-view="thread"] .conversation-pane {
+    display: none;
+  }
+
+  .thread-header__back {
+    display: inline-flex;
+  }
+
+  .thread-header {
+    padding-inline: 8px;
+    gap: 6px;
+  }
+
+  .thread-scroll {
+    padding: 10px 10px 14px;
+  }
+
+  .message-bubble {
+    max-width: 86%;
+  }
+
+  .message-composer-shell {
+    margin-inline: 8px;
+    margin-block-end: max(8px, env(safe-area-inset-bottom));
+    padding: 6px 8px 8px;
+    border-radius: 14px;
+  }
+
+  .composer-toolbar {
+    align-items: center;
+  }
+
+  .composer-counter__full {
+    display: none;
+  }
+
+  .composer-counter__compact {
+    display: inline;
+  }
+
+  .message-composer__textarea {
+    max-height: 132px;
+  }
+
+  .sim-select {
+    max-width: 138px;
+  }
+
+  .conversation-list {
+    padding-inline: 6px;
+  }
+
+  .pane-bar {
+    padding: 10px 10px 6px;
+  }
+
+  .pane-tools {
+    padding-inline: 10px;
+  }
+
+  .view-scroll {
+    padding: 16px 12px 28px;
+  }
+
+  .status-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .app-alerts {
+    padding-inline: 10px;
+  }
+
+  .thread-notices {
+    padding-inline: 10px;
+  }
+
+  /* Verbose keyboard help is a desktop affordance. */
+  .composer-hint {
+    display: none;
+  }
+
+  /* The thread header already names the open conversation; a wrapping
+     subtitle in the top bar only steals vertical room. */
+  .app-topbar__title span {
+    display: none;
+  }
+}
+
+/* Very short viewports (landscape phones): keep the composer usable. */
+@media (max-height: 480px) and (max-width: 900px) {
+  .app-topbar {
+    min-height: 48px;
+  }
+
+  .message-composer-shell {
+    margin-block-end: max(6px, env(safe-area-inset-bottom));
+  }
+}

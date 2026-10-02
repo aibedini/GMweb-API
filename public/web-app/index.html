@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" dir="ltr">
+<html lang="en" dir="ltr" data-theme="dark" class="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
@@ -7,10 +7,38 @@
     <!-- §4: installable PWA shell; manifest is served from /web/manifest.webmanifest -->
     <link rel="manifest" href="/web/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/web/icons/icon-192.png" />
-    <meta name="theme-color" content="#0b0c0f" />
-    <title>Messages</title>
-    <script type="module" crossorigin src="/web/assets/index-B6WfwNyC.js"></script>
-    <link rel="stylesheet" crossorigin href="/web/assets/index-BU0En8Io.css">
+    <meta name="theme-color" content="#0f1512" />
+    <title>GMweb Messages</title>
+    <!--
+      §8/§46: resolve the HeroUI theme before first paint so a dark-first
+      product never flashes light. `useTheme` reads the same
+      `heroui-theme` key, so React and this bootstrap always agree, and the
+      class is *replaced* (not appended) so a stale class can never linger.
+    -->
+    <script>
+      (function () {
+        try {
+          var key = "heroui-theme";
+          if (!localStorage.getItem(key)) localStorage.setItem(key, "dark");
+          var intent = localStorage.getItem(key);
+          var resolved =
+            intent === "system"
+              ? window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light"
+              : intent;
+          if (resolved !== "light" && resolved !== "dark") resolved = "dark";
+          document.documentElement.className = resolved;
+          document.documentElement.setAttribute("data-theme", resolved);
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute("content", resolved === "light" ? "#f7faf8" : "#0f1512");
+        } catch (error) {
+          /* localStorage unavailable: keep the dark defaults from the markup */
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/web/assets/index-D6F0-JpD.js"></script>
+    <link rel="stylesheet" crossorigin href="/web/assets/index-VLtWZ8Ek.css">
   </head>
   <body>
     <div id="root"></div>

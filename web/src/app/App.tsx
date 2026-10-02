@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Card, CardContent, Chip, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
+import { Alert, Button, useMediaQuery } from "@heroui/react";
 import { syncVisibleInbox, loadContactsOnDemand, listRecentEvents, listAggregateEventsPage, listContacts, listConversations, listChangedConversationHeads, getCursor, getBrowserSyncStatus, resetLocal, subscribeSyncAvailable, subscribeKeyMaintenance, type BrowserSyncStatus, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, reconcileConversationHead, type ConversationProjection } from "../lib/inbox";
 import { createCommand, fetchCommand, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type LinkedBrowserSession, type TrustSnapshot } from "../lib/api";
@@ -9,8 +9,7 @@ import { clearPendingSend, loadPendingSends, savePendingSend, type PendingEncryp
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
-import { collectWebDiagnostics, formatWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnostics";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { collectWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnostics";
 import { MessageComposer } from "./MessageComposer";
 import { applyReadConfirmation, contactTitle, phoneKey, simHelp } from "../lib/inboxActions";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
@@ -18,31 +17,37 @@ import { mergeThreadEvents, assertHistoryProgress } from "../lib/threadHistory";
 import { selectSmsSim } from "../lib/simSelection";
 import { androidError } from "../../../shared/smsStatus";
 
-type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug";
-type ThreadState = "IDLE" | "LOADING" | "READY" | "LOCKED" | "EMPTY" | "FAILED";
+import { AppShell } from "./components/AppShell";
+import { AppSidebar } from "./components/AppSidebar";
+import { AppTopbar } from "./components/AppTopbar";
+import { MobileBottomNav } from "./components/MobileBottomNav";
+import { ConversationPane } from "./components/ConversationPane";
+import { ConversationDetails } from "./components/ConversationDetails";
+import { ConversationDetailsDrawer } from "./components/ConversationDetailsDrawer";
+import { DeliveryDetailsDrawer } from "./components/DeliveryDetailsDrawer";
+import { LinkedBrowsersDrawer } from "./components/LinkedBrowsersDrawer";
+import { NewMessageView } from "./components/NewMessageView";
+import { ThreadHeader } from "./components/ThreadHeader";
+import { ThreadPane } from "./components/ThreadPane";
+import { ThreadPlaceholder } from "./components/ThreadEmptyState";
+import { SyncAlerts } from "./components/SyncAlerts";
+import { DESTINATION_TITLES } from "./components/destinations";
+import { withDaySeparators } from "./components/format";
+import type { ConnectionState, ConversationFilter, ThreadItem, ThreadState } from "./components/types";
+import { ContactsView } from "./views/ContactsView";
+import { DeviceView } from "./views/DeviceView";
+import { DiagnosticsView } from "./views/DiagnosticsView";
+import { SecurityView } from "./views/SecurityView";
+import { SettingsView } from "./views/SettingsView";
 
-function shortId(value: string | null | undefined) {
-  return value ? `${value.slice(0, 8)}…` : "—";
-}
+type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug" | "settings";
 
-function formatTime(value: number) {
-  const date = new Date(value);
-  const today = new Date();
-  return date.toDateString() === today.toDateString()
-    ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : date.toLocaleDateString([], { month: "short", day: "numeric" });
-}
-
+/** Existing projection status mapping — unchanged (§15/§23). */
 function messageStatus(status: number): string {
   if (status === 64) return "failed";
   if (status === 32) return "queued";
   if (status === 0) return "delivered";
   return "sent";
-}
-
-function Avatar({ title }: { title: string }) {
-  const initials = title.replace(/^Conversation\s+/, "").slice(0, 2).toUpperCase();
-  return <div className="avatar" aria-hidden="true">{initials}</div>;
 }
 
 async function ensurePendingCommandId(pending: PendingEncryptedSend): Promise<string> {
@@ -88,11 +93,15 @@ export default function App() {
   const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const [conversationFilter, setConversationFilter] = useState<ConversationFilter>("all");
   const [composeOpen, setComposeOpen] = useState(false);
   const [recipientSearch, setRecipientSearch] = useState("");
   const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
   const [linkedBrowsers, setLinkedBrowsers] = useState<LinkedBrowserSession[]>([]);
   const [showLinkedBrowsers, setShowLinkedBrowsers] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const [deliveryOpen, setDeliveryOpen] = useState(false);
+  const [deliveryItem, setDeliveryItem] = useState<ThreadItem | null>(null);
   const [contacts, setContacts] = useState<StoredContact[]>([]);
   const [contactSearch, setContactSearch] = useState("");
   const [contactsBusy, setContactsBusy] = useState(false);
@@ -123,11 +132,16 @@ export default function App() {
   const contactsLoading = useRef(false);
   const lastThreadSelection = useRef<string | null>(null);
   const recoveringSend = useRef(false);
-  const conversationScrollRef = useRef<HTMLDivElement>(null);
   const loadingOlderRef = useRef(false);
   const hasLoadedOlderConversations = useRef(false);
   const messageScrollRef = useRef<HTMLDivElement>(null);
+  const conversationSearchRef = useRef<HTMLInputElement>(null);
   const scriptFile = useMemo(() => loadedScriptFile(), []);
+
+  // Layout capability only. Visual breakpoints live in CSS (§38) so the shell
+  // never depends on a JS breakpoint for correctness.
+  const isWideViewport = useMediaQuery("(min-width: 768px)", { defaultValue: true });
+
   const refreshTelemetry = () => void fetchPrimaryTelemetry().then(value => {
     setTelemetry(value);
   }).catch(() => setTelemetry(null));
@@ -292,6 +306,22 @@ export default function App() {
     return () => document.removeEventListener("visibilitychange", visible);
   }, []);
 
+  // §31: Ctrl/Cmd+K focuses conversation search. Never hijacks a text field,
+  // textarea, select or contenteditable region.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "k" || !(event.ctrlKey || event.metaKey)) return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) return;
+      if (tab !== "inbox") return;
+      event.preventDefault();
+      conversationSearchRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [tab]);
+
   const contactNames = useMemo(() => new Map(contacts.map(contact => [phoneKey(contact.normalizedPhone), contact.displayName])), [contacts]);
   const conversations = useMemo(() => reconcileConversationHead(conversationPage, selected,
     selected ? messagesForAggregate(threadEvents, selected).at(-1) : undefined)
@@ -316,15 +346,19 @@ export default function App() {
     setRecipientSearch("");
     setTab("inbox");
   };
+  const unreadTotal = useMemo(() => conversations.reduce((sum, item) => sum + item.unreadCount, 0), [conversations]);
   const filteredConversations = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
-    if (!query) return conversations;
-    return conversations.filter((item) => `${item.title}\n${item.preview}`.toLocaleLowerCase().includes(query));
-  }, [conversations, search]);
+    const base = conversationFilter === "unread"
+      ? conversations.filter(item => item.unreadCount > 0)
+      : conversations;
+    if (!query) return base;
+    return base.filter((item) => `${item.title}\n${item.preview}`.toLocaleLowerCase().includes(query));
+  }, [conversations, search, conversationFilter]);
 
   useEffect(() => {
-    if (window.innerWidth > 720 && !selected && !composeRecipient && !composeOpen && conversations[0]) setSelected(conversations[0].aggregateId);
-  }, [conversations, selected, composeRecipient, composeOpen]);
+    if (isWideViewport && !selected && !composeRecipient && !composeOpen && conversations[0]) setSelected(conversations[0].aggregateId);
+  }, [conversations, selected, composeRecipient, composeOpen, isWideViewport]);
 
   const selectedConversation = conversations.find((item) => item.aggregateId === selected) ||
     (selectedConversationCache?.aggregateId === selected ? contactTitle(selectedConversationCache, contactNames) : null);
@@ -420,20 +454,6 @@ export default function App() {
     } finally { historyLoadingRef.current = false; setLoadingOlderThread(false); }
   };
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
-  const conversationVirtualizer = useVirtualizer({
-    count: filteredConversations.length,
-    getScrollElement: () => conversationScrollRef.current,
-    estimateSize: () => 76,
-    overscan: 8,
-    getItemKey: index => filteredConversations[index]?.aggregateId ?? index,
-  });
-  const messageVirtualizer = useVirtualizer({
-    count: messages.length,
-    getScrollElement: () => messageScrollRef.current,
-    estimateSize: () => 72,
-    overscan: 12,
-    getItemKey: index => messages[index]?.payload.messageId ?? messages[index]?.event.eventId ?? index,
-  });
   const selectedRecipient = composeRecipient || messages.map(item => item.payload.address).find(Boolean);
   const activeSims = telemetry?.smsSubscriptions?.items.filter(sim => sim.isActive && sim.sendCapable !== false) ?? [];
   const chosenSim = selectSmsSim(activeSims, selectedSubscriptionId);
@@ -650,11 +670,69 @@ export default function App() {
     }
   };
 
-  let syncBanner = "Refreshing recent conversations…";
-  if (syncStatus.state === "UP_TO_DATE") syncBanner = "Recent conversations are up to date";
-  if (syncStatus.state === "DEGRADED") syncBanner = "Recent conversations need attention";
-  if (syncStatus.state === "FAILED") syncBanner = "Conversation refresh paused";
-  const emptyInboxMessage = "No recent conversations are available yet.";
+  /* ------------------------------------------------------------ view model */
+
+  const connection: ConnectionState = !online
+    ? "offline"
+    : version === "unreachable"
+      ? "unreachable"
+      : version
+        ? "connected"
+        : "checking";
+  const connectionDetail = `GMweb API ${version || "checking"} · browser ${online ? "online" : "offline"}`;
+
+  const threadItems = useMemo<ThreadItem[]>(() => {
+    const items: ThreadItem[] = messages.map(item => ({
+      key: item.payload.messageId || item.event.eventId,
+      direction: item.payload.direction,
+      body: item.payload.body,
+      dateMs: item.payload.dateMs,
+      status: item.payload.status,
+      clientMessageId: item.payload.clientMessageId ?? null,
+    }));
+    if (pendingMessage && pendingMessage.recipient === selectedRecipient) {
+      items.push({
+        key: `pending-${pendingMessage.clientMessageId}`,
+        direction: "out",
+        body: pendingMessage.body,
+        dateMs: pendingMessage.at,
+        pending: true,
+        failure: pendingMessage.failure ?? null,
+        progress: commandStatus,
+        clientMessageId: pendingMessage.clientMessageId,
+      });
+    }
+    return items;
+  }, [messages, pendingMessage, selectedRecipient, commandStatus]);
+
+  const threadRows = useMemo(() => withDaySeparators(threadItems), [threadItems]);
+
+  const lastOutgoing = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].payload.direction === "out") {
+        return { status: messages[index].payload.status, at: messages[index].payload.dateMs };
+      }
+    }
+    return { status: null, at: null };
+  }, [messages]);
+
+  const payloadState = events.some(event => event.decryption?.state === "decrypted")
+    ? "E2EE locally decrypted"
+    : events.length
+      ? "See payload diagnostics"
+      : "No payloads received";
+
+  const conversationsLoading = conversationPage.length === 0 && bootstrapState === "BOOTSTRAPPING_SYNC";
+  const emptyInboxMessage = conversations.length === 0 ? "No conversations yet" : "No matching conversations";
+  const mobileView = selected || composeOpen || composeRecipient ? "thread" : "list";
+  // §6/§40: the bottom navigation is only dropped on a TRUE phone-sized
+  // viewport, where the full-screen thread genuinely needs the room. On a
+  // tablet the list and thread are side by side and navigation stays.
+  const hideBottomNav = !isWideViewport && tab === "inbox" && mobileView === "thread";
+  const destination = DESTINATION_TITLES[tab];
+  const linkedOnlineCount = linkedBrowsers.filter(row => row.onlineNow).length;
+
+  const navigate = (key: TabKey) => setTab(key);
 
   if (authed === false || authed === null) {
     return (
@@ -669,227 +747,329 @@ export default function App() {
           const probe = await fetch("/api/v1/linked-session", { credentials: "include" });
           const session = await probe.json().catch(() => ({}));
           if (!probe.ok || session.authenticated !== true) throw new Error("Linked session cookie was not established");
-        setCapabilities(session.capabilities || []);
-        setBrowserDeviceId(session.deviceId || null);
+          setCapabilities(session.capabilities || []);
+          setBrowserDeviceId(session.deviceId || null);
           setAuthed(true);
         }}
         onRecoveryLinked={async () => {
           const probe = await fetch("/api/v1/linked-session", { credentials: "include" });
           const session = await probe.json().catch(() => ({}));
           if (!probe.ok || session.authenticated !== true) throw new Error("Restricted PWA session cookie was not established");
-        setCapabilities(session.capabilities || []);
-        setBrowserDeviceId(session.deviceId || null);
+          setCapabilities(session.capabilities || []);
+          setBrowserDeviceId(session.deviceId || null);
           setAuthed(true);
         }}
       />
     );
   }
 
-  return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div className="brand-mark">M</div>
-        <div className="brand-copy"><strong>Messages</strong><span>GMweb companion</span></div>
-        <div className="topbar-actions">
-          <span className="version-pill" title={`${scriptFile} · cursor ${cursor}`}>v{version || "…"}</span>
-          <span className={`connection-dot ${!online || version === "unreachable" ? "offline" : ""}`} />
-          <span className="connection-label">{!online || version === "unreachable" ? "Offline" : version ? "Connected" : "Checking"}</span>
-          <Button className="topbar-button" size="sm" variant="ghost" aria-label="Linked browsers" onPress={() => setShowLinkedBrowsers(value => !value)}>👁 {linkedBrowsers.filter(row => row.onlineNow).length}</Button>
-          <Button className="topbar-button" size="sm" variant="ghost" onPress={() => void pull()} isDisabled={busy}>{busy ? <Spinner size="sm" /> : "Sync"}</Button>
-          <Button className="topbar-button" size="sm" variant="ghost" onPress={() => void signOut()} isDisabled={signingOut}>{signingOut ? "Signing out…" : "Sign out"}</Button>
-        </div>
-      </header>
-      {showLinkedBrowsers && <section className="linked-browser-panel" aria-label="Linked browser sessions">
-        <div className="linked-browser-title"><strong>Linked browsers</strong><Button size="sm" variant="ghost" onPress={() => setShowLinkedBrowsers(false)}>Close</Button></div>
-        {linkedBrowsers.length === 0 && <p>No linked browsers are currently visible.</p>}
-        <p className="linked-browser-note">Sign out removes this browser's access. To revoke another browser's trust, open Linked devices on your Primary phone.</p>
-        {linkedBrowsers.map((row, index) => <div className="linked-browser-row" key={`${row.deviceId}-${index}`}><strong>{row.onlineNow ? "● Online" : "○ Inactive"} · {shortId(row.deviceId)}{row.deviceId === browserDeviceId ? " · This browser" : ""}</strong><span>{row.ip || "IP unavailable"}</span><small>{row.userAgent || "Browser unknown"}</small><small>Last seen: {new Date(row.lastSeenAt).toLocaleString()}</small><small>Last data request: {row.lastDataAt ? new Date(row.lastDataAt).toLocaleString() : "No data request observed"}</small><small>Last durable sync: {row.lastSyncAt ? new Date(row.lastSyncAt).toLocaleString() : "No sync acknowledgement"}</small>{row.deviceId === browserDeviceId && <Button size="sm" variant="ghost" onPress={() => void signOut()} isDisabled={signingOut}>Unlink this browser</Button>}</div>)}
-      </section>}
+  /* --------------------------------------------------------------- actions */
 
-      <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(key as TabKey)} className="app-tabs">
-        <TabList className="tab-list" aria-label="Messages navigation">
-          <Tab id="inbox">Messages{conversations.reduce((sum, item) => sum + item.unreadCount, 0) ? ` (${conversations.reduce((sum, item) => sum + item.unreadCount, 0)})` : ""}</Tab>
-          <Tab id="contacts">Contacts</Tab>
-          <Tab id="connection">Connection</Tab>
-          <Tab id="security">Security</Tab>
-          <Tab id="debug">Debug</Tab>
-        </TabList>
+  const openConversation = (conversation: ConversationProjection) => {
+    setComposeOpen(false);
+    setComposeRecipient("");
+    setSelected(conversation.aggregateId);
+    setSelectedConversationCache(conversation);
+  };
 
-        <TabPanel id="inbox" className="inbox-panel">
-          <div className={`notice ${syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED" ? "danger" : ""}`} role="status">
-            <span>{syncBanner}</span>
-            {(syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED") &&
-              <Button size="sm" variant="ghost" onPress={() => void pull()}>Retry</Button>}
-          </div>
-          {syncStatus.keyState === "FAILED" && <div className="key-sync-note" role="status">Encryption keys need a retry. Recent messages remain available. <Button size="sm" variant="ghost" onPress={() => void pull()}>Retry</Button></div>}
-          <div className={`inbox-layout ${selected || composeRecipient || composeOpen ? "mobile-thread" : "mobile-list"}`}>
-            <aside className="conversation-pane">
-              <div className="pane-heading"><div><p className="eyebrow">Inbox</p><h1>Conversations</h1></div><Chip size="sm" variant="soft">{conversations.length} loaded</Chip></div>
-              <Button className="compose-button" size="sm" onPress={() => { setComposeOpen(true); setSelected(null); setComposeRecipient(""); setRecipientSearch(""); }}>＋ Compose</Button>
-              <label className="search-box"><span aria-hidden="true">⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search messages" aria-label="Search messages" /></label>
-              <div ref={conversationScrollRef} className="conversation-list" onScroll={(event) => {
-                const element = event.currentTarget;
-                if (conversationHasMore && !loadingOlder &&
-                    element.scrollHeight - element.scrollTop - element.clientHeight < 180) void loadOlderConversations();
-              }}>
-                <div style={{ height: conversationVirtualizer.getTotalSize(), position: "relative" }}>
-                  {conversationVirtualizer.getVirtualItems().map(virtualRow => {
-                    const item = filteredConversations[virtualRow.index];
-                    return <button key={item.aggregateId} ref={conversationVirtualizer.measureElement} data-index={virtualRow.index}
-                      style={{ position: "absolute", width: "100%", transform: "translateY(" + virtualRow.start + "px)" }}
-                      className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => { setComposeOpen(false); setComposeRecipient(""); setSelected(item.aggregateId); setSelectedConversationCache(item); }}>
-                        <Avatar title={item.title} />
-                        <span className="conversation-copy"><span className="conversation-title">{item.title}{item.subtitle ? ` · ${item.subtitle}` : ""}</span><span className="conversation-preview">{item.preview}</span></span>
-                        <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time>{item.unreadCount > 0 && <Chip size="sm">{item.unreadCount}</Chip>}</span>
-                      </button>;
-                  })}
-                </div>
-                {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : emptyInboxMessage}</p></div>}
-              </div>
-              {conversationHasMore && (
-                <Button size="sm" variant="ghost" className="load-older" onPress={() => void loadOlderConversations()} isDisabled={loadingOlder}>
-                  {loadingOlder ? "Loading…" : "Load older conversations"}
-                </Button>
-              )}
-            </aside>
+  const openComposer = () => {
+    setComposeOpen(true);
+    setSelected(null);
+    setComposeRecipient("");
+    setRecipientSearch("");
+  };
 
-            <main className="message-pane">
-              {composeOpen ? (
-                <><div className="message-header"><button className="mobile-back" onClick={() => { setComposeOpen(false); setSelected(null); }}>←</button><div><h2>New message</h2><p>Choose a contact or enter a phone number</p></div></div>
-                  <div className="recipient-picker">
-                    <label className="search-box"><span aria-hidden="true">⌕</span><input autoFocus value={recipientSearch} onChange={event => setRecipientSearch(event.target.value)} placeholder="Search contacts or type a number" aria-label="Recipient" /></label>
-                    {/^\+?[0-9\s()-]{3,}$/.test(recipientSearch.trim()) && <button className="recipient-row" onClick={() => selectRecipient(recipientSearch.replace(/[^+0-9]/g, ""))}>Send to {recipientSearch.trim()}</button>}
-                    <div className="recipient-results">{recipientMatches.map(contact => <button key={contact.normalizedPhone} className="recipient-row" onClick={() => selectRecipient(contact.normalizedPhone)}><Avatar title={contact.displayName} /><span><strong>{contact.displayName}</strong><small>{contact.normalizedPhone}</small></span><span aria-hidden="true">✉</span></button>)}</div>
-                  </div></>
-              ) : selectedConversation ? (
-                <>
-                  <div className="message-header"><button className="mobile-back" onClick={() => { setSelected(null); setComposeRecipient(""); }}>←</button><Avatar title={selectedConversation.title} /><div><h2>{selectedConversation.title}</h2><p>{selectedConversation.subtitle ? `${selectedConversation.subtitle} · ` : ""}Synced from Android · {shortId(selectedConversation.aggregateId)}</p></div></div>
-                  {capabilities.includes("MARK_READ") && <div className="read-status" role="status">
-                    {readStatus || (needsPhoneRead ? "Phone read confirmation pending" : "Read on phone")}
-                    {needsPhoneRead && <Button size="sm" variant="ghost" isDisabled={threadState !== "READY" || readyThreadId !== selected}
-                      onPress={() => { markReadSent.current.delete(`${selectedConversation.aggregateId}:${selectedConversation.lastSequence}`); setReadRetry(value => value + 1); }}>Mark as read</Button>}
-                  </div>}
-                  {threadHasMore && (
-                    <Button size="sm" variant="ghost" className="load-older-thread" onPress={() => void loadOlderThread()} isDisabled={loadingOlderThread}>
-                      {loadingOlderThread ? "Loading…" : "Load older messages"}
-                    </Button>
-                  )}
-                  {historyError && <div role="alert" className="history-error">{historyError} <Button size="sm" onPress={() => void loadOlderThread()}>Retry</Button></div>}
-                  <div ref={messageScrollRef} className="message-scroll" onScroll={(event) => {
-                    if (threadHasMore && !loadingOlderThread && event.currentTarget.scrollTop < 80) void loadOlderThread();
-                  }}>
-                    <div className="message-day"><span>Message history</span></div>
-                    <div style={{ height: messageVirtualizer.getTotalSize(), position: "relative" }}>
-                      {messageVirtualizer.getVirtualItems().map(virtualRow => {
-                        const { payload } = messages[virtualRow.index];
-                        return <div key={payload.messageId} ref={messageVirtualizer.measureElement} data-index={virtualRow.index}
-                          style={{ position: "absolute", width: "100%", transform: "translateY(" + virtualRow.start + "px)" }}
-                          className={`message-line ${payload.direction}`}>
-                            <div className="message-bubble"><p dir="auto">{payload.body}</p><span>{formatTime(payload.dateMs)}{payload.direction === "out" ? ` · ${messageStatus(payload.status)}` : ""}</span></div>
-                          </div>;
-                      })}
-                    </div>
-                    {pendingMessage && pendingMessage.recipient === selectedRecipient && (
-                      <div className="message-line out">
-                        <div className="message-bubble"><p dir="auto">{pendingMessage.body}</p><span>{formatTime(pendingMessage.at)} · {pendingMessage.failure || commandStatus || "Sending…"}</span></div>
-                      </div>
-                    )}
-                    {threadState === "LOADING" && <div className="empty-conversation"><Spinner /><h3>Loading messages…</h3></div>}
-                    {threadState === "LOCKED" && <div className="empty-conversation"><div className="empty-icon">↻</div><h3>Messages are encrypted</h3><p>The browser is waiting for an authorized key.</p></div>}
-                    {threadState === "EMPTY" && <div className="empty-conversation"><div className="empty-icon">✦</div><h3>No messages in this conversation.</h3></div>}
-                    {threadState === "FAILED" && <div className="empty-conversation"><div className="empty-icon">!</div><h3>Unable to load messages</h3><p>{threadError || "Thread page read failed"}</p><Button size="sm" onPress={() => setThreadReload(value => value + 1)}>Retry</Button></div>}
-                  </div>
-                  <MessageComposer draft={draft} onDraft={setDraft} sims={activeSims} selected={chosenSim}
-                    onSim={chooseSim} help={simInstructions} retry={refreshTelemetry} send={() => void send()}
-                    sending={sending} canSend={capabilities.includes("SEND_MESSAGES")} status={commandStatus} useDefault={selectedSubscriptionId === null} />
-                </>
-              ) : (
-                <><div className="message-header"><button className="mobile-back" onClick={() => { setComposeRecipient(""); setSelected(null); }}>←</button><div><h2>{composeRecipient ? contactNames.get(phoneKey(composeRecipient)) || composeRecipient : "New message"}</h2><p>{composeRecipient || "Choose a conversation or contact."}</p></div></div><div className="empty-conversation"><div className="empty-icon">✦</div><h3>{composeRecipient ? "Start a conversation" : "Choose a conversation or compose a message"}</h3></div>{composeRecipient && <MessageComposer draft={draft} onDraft={setDraft} sims={activeSims} selected={chosenSim}
-                    onSim={chooseSim} help={simInstructions} retry={refreshTelemetry} send={() => void send()}
-                    sending={sending} canSend={capabilities.includes("SEND_MESSAGES")} status={commandStatus} useDefault={selectedSubscriptionId === null} />}</>
-              )}
-            </main>
-          </div>
-        </TabPanel>
+  const leaveThread = () => {
+    setSelected(null);
+    setComposeRecipient("");
+    setComposeOpen(false);
+  };
 
-        <TabPanel id="contacts" className="content-panel" onScroll={(event) => {
-          const element = event.currentTarget;
-          if (element.scrollHeight - element.scrollTop - element.clientHeight < 240)
-            setVisibleContactCount(count => Math.min(count + 100, filteredContacts.length));
-        }}>
-          <div className="page-title"><p className="eyebrow">Phone book</p><h1>Contacts</h1><p>End-to-end encrypted contacts synced from the Primary Android device.</p></div>
-          <div className="contact-sync-status" role="status">
-            <span>{contactsBusy ? `Syncing encrypted contacts… ${contactsProgress} event(s) checked`
-              : contactsError ? contactsError : `${contacts.length} contacts ready${contactsCheckedAt ? ` · checked ${formatTime(contactsCheckedAt)}` : ""}`}</span>
-            <Button size="sm" variant="ghost" onPress={() => void refreshContacts()} isDisabled={contactsBusy}>
-              {contactsBusy ? <Spinner size="sm" /> : "Sync contacts"}
+  const syncAlerts = (
+    <SyncAlerts syncStatus={syncStatus} error={error} busy={busy} onRetry={() => void pull()} />
+  );
+
+  const composer = (
+    <MessageComposer
+      draft={draft}
+      onDraft={setDraft}
+      sims={activeSims}
+      selected={chosenSim}
+      onSim={chooseSim}
+      help={simInstructions}
+      retry={refreshTelemetry}
+      send={() => void send()}
+      sending={sending}
+      canSend={capabilities.includes("SEND_MESSAGES")}
+      status={commandStatus}
+      useDefault={selectedSubscriptionId === null}
+    />
+  );
+
+  const threadNotices = (
+    <>
+      {capabilities.includes("MARK_READ") && selectedConversation ? (
+        <div className="row" style={{ gap: 8, justifyContent: "space-between" }} role="status">
+          <span className="text-xs text-muted">
+            {readStatus || (needsPhoneRead ? "Phone read confirmation pending" : "Read on phone")}
+          </span>
+          {needsPhoneRead ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              isDisabled={threadState !== "READY" || readyThreadId !== selected}
+              onPress={() => {
+                markReadSent.current.delete(`${selectedConversation.aggregateId}:${selectedConversation.lastSequence}`);
+                setReadRetry(value => value + 1);
+              }}
+            >
+              Mark as read
             </Button>
-          </div>
-          <label className="search-box"><span aria-hidden="true">⌕</span><input value={contactSearch} onChange={(event) => setContactSearch(event.target.value)} placeholder="Search names or numbers" aria-label="Search contacts" /></label>
-          <div className="contact-list">
-            {filteredContacts.slice(0, visibleContactCount).map(contact => (
-              <button className="contact-row" key={contact.normalizedPhone} type="button" onClick={() => selectRecipient(contact.normalizedPhone)}><Avatar title={contact.displayName} /><span className="contact-copy"><strong>{contact.displayName}</strong><small>{contact.normalizedPhone}</small></span>{contact.starred && <span title="Starred">★</span>}<span className="contact-sms" aria-label="Send SMS" title="Send SMS">✉</span></button>
-            ))}
-            {filteredContacts.length > visibleContactCount && <Button size="sm" variant="ghost"
-              onPress={() => setVisibleContactCount(count => count + 100)}>Load more contacts</Button>}
-            {filteredContacts.length === 0 && <div className="empty-list"><span>✦</span><p>{contacts.length
-              ? "No matching contacts"
-              : !capabilities.includes("CONTACTS_READ")
-                ? "Contacts access was not approved for this linked browser. Re-link or re-approve this browser."
-                : "No contacts are available yet; phone sync or a contact key grant may be pending."}</p></div>}
-          </div>
-        </TabPanel>
+          ) : null}
+        </div>
+      ) : null}
 
-        <TabPanel id="connection" className="content-panel">
-          <div className="page-title"><p className="eyebrow">System</p><h1>Connection</h1><p>Live state of the PWA, Android sync and trust registry.</p></div>
-          <div className="status-grid">
-            <Card><CardContent className="status-card"><span>API</span><strong>{version}</strong><Chip size="sm" color={version === "unreachable" ? "danger" : "success"} variant="soft">{version === "unreachable" ? "offline" : "healthy"}</Chip></CardContent></Card>
-            <Card><CardContent className="status-card"><span>PWA build</span><strong>{PWA_BUILD_VERSION}</strong><small>{scriptFile}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Sync cursor</span><strong>{cursor}</strong><small>{applied === null ? "Ready" : `${applied} new event(s)`}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Trust sequence</span><strong>{trust?.trustSequence ?? "—"}</strong><small>{trust ? "Android-signed registry available" : "Waiting for first Android trust statement"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Payload protection</span><strong>{events.some(event => event.decryption?.state === "decrypted") ? "E2EE locally decrypted" : events.length ? "See payload diagnostics" : "No payloads received"}</strong><small>Encrypted messages require an authorized key grant. Missing keys stay locked; failed authentication is reported as corrupt.</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Linked session</span><strong>Authenticated</strong><small>Latest stored sequence: {events[0]?.sequence ?? 0}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Android battery</span><strong>{telemetry?.battery?.level == null ? "—" : `${telemetry.battery.level}%${telemetry.battery.isCharging ? " · charging" : ""}`}</strong><small>{telemetry?.device ? `${telemetry.device.manufacturer} ${telemetry.device.model}` : "Waiting for telemetry"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Android outbox</span><strong>{telemetry?.sync?.outboxDepth ?? "—"}</strong><small>{telemetry?.sync?.deadLetterCount ? `${telemetry.sync.deadLetterCount} dead letter` : "No dead letters"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Android network</span><strong>{telemetry?.network?.isConnected ? "Connected" : telemetry ? "Offline" : "—"}</strong><small>{telemetry?.network?.networkType || "Waiting for telemetry"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Android app</span><strong>{telemetry?.app?.versionName || "—"}</strong><small>{telemetry?.receivedAt ? `Last report ${formatTime(telemetry.receivedAt)}` : "Never reported"}</small></CardContent></Card>
-          </div>
-          {bootstrapState && syncStatus.state !== "UP_TO_DATE" && <div className="notice">Secure session: {bootstrapState}</div>}
-          {error && <div className="notice danger">{error}</div>}
-        </TabPanel>
+      {historyError ? (
+        <Alert status="danger">
+          <Alert.Indicator />
+          <Alert.Content>
+            <Alert.Title>Could not load older messages</Alert.Title>
+            <Alert.Description>{historyError}</Alert.Description>
+          </Alert.Content>
+          <Button size="sm" variant="ghost" onPress={() => void loadOlderThread()}>
+            Retry
+          </Button>
+        </Alert>
+      ) : null}
+    </>
+  );
 
-        <TabPanel id="security" className="content-panel">
-          <div className="page-title"><p className="eyebrow">Protection</p><h1>Security</h1><p>Credentials and identities visible to this linked browser.</p></div>
-          <div className="security-list">
-            <Card><CardContent className="security-row"><div><strong>Message encryption</strong><p>{threadEvents.filter(event => event.decryption?.state === "decrypted").length} open-thread decrypted · {threadEvents.filter(event => event.decryption?.state === "locked").length} open-thread locked · {threadEvents.filter(event => event.decryption?.state === "invalid").length} open-thread invalid</p><p>Messages load when a conversation is opened. Key grants come from your primary phone.</p></div></CardContent></Card>
-            <Card><CardContent className="security-row"><div><strong>Passkeys</strong><p>Manage dashboard passkeys in the GMweb dashboard.</p></div></CardContent></Card>
-            <Card><CardContent className="security-row"><div><strong>Android trust registry</strong><p>{trust ? `Verified root published at sequence ${trust.trustSequence}` : "Waiting for the primary phone's first signed trust statement"}</p></div><Chip size="sm" variant="soft">{trust ? "Ready" : "Pending"}</Chip></CardContent></Card>
-            <Card><CardContent className="security-row"><div><strong>Private push</strong><p>Notifications contain no sender or message text.</p></div></CardContent></Card>
-          </div>
-        </TabPanel>
+  /* ---------------------------------------------------------------- views */
 
-        <TabPanel id="debug" className="content-panel">
-          <div className="page-title"><p className="eyebrow">Diagnostics</p><h1>Web message diagnostics</h1><p>Privacy-safe counts across server, browser storage, crypto and projection.</p></div>
-          <div className="debug-actions">
-            <Button variant="secondary" onPress={() => void runDiagnostics()} isDisabled={diagnosticsBusy}>{diagnosticsBusy ? "Collecting…" : "Run diagnostics"}</Button>
-            <Button variant="ghost" onPress={() => webDiagnostics && void navigator.clipboard.writeText(formatWebDiagnostics(webDiagnostics))} isDisabled={!webDiagnostics}>Copy diagnostic report</Button>
-            <Button variant="ghost" onPress={() => void pull()} isDisabled={busy}>Retry sync</Button>
+  const inboxView = (
+    <div
+      className={`messaging-layout${selectedConversation ? "" : " messaging-layout--no-details"}`}
+      data-mobile-view={mobileView}
+    >
+      <ConversationPane
+        conversations={filteredConversations}
+        totalConversations={conversations.length}
+        selectedId={selected}
+        onSelect={openConversation}
+        search={search}
+        onSearch={setSearch}
+        searchInputRef={conversationSearchRef}
+        filter={conversationFilter}
+        onFilter={setConversationFilter}
+        unreadTotal={unreadTotal}
+        loading={conversationsLoading}
+        emptyMessage={emptyInboxMessage}
+        hasMore={conversationHasMore}
+        loadingMore={loadingOlder}
+        onLoadMore={() => void loadOlderConversations()}
+        onCompose={openComposer}
+      />
+
+      {composeOpen ? (
+        <NewMessageView
+          recipientSearch={recipientSearch}
+          onRecipientSearch={setRecipientSearch}
+          matches={recipientMatches}
+          contactsAvailable={contacts.length > 0}
+          contactsAccessMissing={!capabilities.includes("CONTACTS_READ")}
+          onPickRecipient={selectRecipient}
+          onBack={leaveThread}
+        />
+      ) : selectedConversation ? (
+        <ThreadPane
+          scrollRef={messageScrollRef}
+          rows={threadRows}
+          state={threadState}
+          error={threadError}
+          onRetryThread={() => setThreadReload(value => value + 1)}
+          header={
+            <ThreadHeader
+              title={selectedConversation.title}
+              subtitle={[
+                selectedConversation.subtitle,
+                `Synced from Android · ${selectedConversation.aggregateId.slice(0, 8)}…`,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+              phone={selectedConversation.subtitle ?? selectedConversation.title}
+              onBack={leaveThread}
+              onDetails={() => setShowDetails(true)}
+            />
+          }
+          notices={threadNotices}
+          composer={composer}
+          hasMore={threadHasMore}
+          loadingOlder={loadingOlderThread}
+          onLoadOlder={() => void loadOlderThread()}
+          onOpenStatus={(item) => {
+            setDeliveryItem(item);
+            setDeliveryOpen(true);
+          }}
+        />
+      ) : (
+        <section className="thread-pane" aria-label="Conversation">
+          <ThreadHeader
+            title={composeRecipient ? contactNames.get(phoneKey(composeRecipient)) || composeRecipient : "New message"}
+            subtitle={composeRecipient || "Choose a conversation or contact."}
+            onBack={leaveThread}
+          />
+          <div className="thread-scroll scroll-region">
+            <ThreadPlaceholder composeRecipient={composeRecipient} />
           </div>
-          {webDiagnostics && <div className="status-grid">
-            <Card><CardContent className="status-card"><span>Server</span><strong>{webDiagnostics.session.linked && webDiagnostics.server ? "PASS" : "FAIL"}</strong><small>{webDiagnostics.server?.total ?? "Unavailable"} events · max sequence {webDiagnostics.server?.maxSequence ?? "—"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Browser Sync</span><strong>{webDiagnostics.browserSync.state === "UP_TO_DATE" ? "PASS" : webDiagnostics.browserSync.state === "FAILED" ? "FAIL" : webDiagnostics.browserSync.state === "DEGRADED" ? "WARN" : "SYNCING"}</strong><small>{webDiagnostics.replicaProgress?.lazyMode ? `on-demand · observed sequence ${webDiagnostics.browserSync.cursor}` : `cursor ${webDiagnostics.browserSync.cursor} · lag ${webDiagnostics.browserSync.syncLag ?? "unknown"} · snapshot ${webDiagnostics.replicaProgress?.snapshotComplete ? "complete" : `loading ${webDiagnostics.replicaProgress?.snapshotPosition ?? 0} rows / ${webDiagnostics.replicaProgress?.snapshotPageCount ?? 0} pages`}`} · keyring {webDiagnostics.replicaProgress?.keyringCursor ?? "unknown"} · grants {webDiagnostics.replicaProgress?.grantCursor ?? "unknown"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Encryption keys</span><strong>{webDiagnostics.browserSync.keyState}</strong><small>{webDiagnostics.browserSync.keyError || `Last successful refresh ${webDiagnostics.browserSync.lastKeySyncAt ? formatTime(webDiagnostics.browserSync.lastKeySyncAt) : "pending"}`}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Live updates</span><strong>{webDiagnostics.liveSync.connection}</strong><small>{webDiagnostics.liveSync.reconnectCount} reconnects · last frame {webDiagnostics.liveSync.lastFrameAt ? formatTime(webDiagnostics.liveSync.lastFrameAt) : "none"} · server → render {webDiagnostics.liveSync.serverPublishedAt && webDiagnostics.liveSync.browserRenderedAt ? `${Math.max(0, webDiagnostics.liveSync.browserRenderedAt - webDiagnostics.liveSync.serverPublishedAt)} ms` : "not measured"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>IndexedDB</span><strong>PASS</strong><small>{webDiagnostics.indexedDb.total} raw events · {webDiagnostics.indexedDb.distinctMessageAggregateCount} message aggregates</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Crypto</span><strong>{webDiagnostics.crypto.messages.invalid || webDiagnostics.crypto.keyGrants.invalid ? "FAIL" : webDiagnostics.crypto.messages.locked ? "WARN" : "PASS"}</strong><small>{webDiagnostics.crypto.messages.decrypted} decrypted · {webDiagnostics.crypto.messages.locked} locked · {webDiagnostics.crypto.messages.invalid} invalid<br />Grant probe: {webDiagnostics.crypto.keyGrants.accepted} accepted · {Object.keys(webDiagnostics.crypto.keyGrants.reasons).join(", ") || "no rejection"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Projection</span><strong>{webDiagnostics.projection.failure ? "FAIL" : webDiagnostics.projection.lag ? "SYNCING" : "PASS"}</strong><small>{webDiagnostics.projection.failure || `${webDiagnostics.projection.rows} rows`} · cursor {webDiagnostics.projection.cursor} · lag {webDiagnostics.projection.lag}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Contacts</span><strong>{webDiagnostics.contacts.failure ? "WARN" : "PASS"}</strong><small>{webDiagnostics.contacts.failure || `${webDiagnostics.contacts.stored} rows`} · {webDiagnostics.contacts.grants} grants · {webDiagnostics.contacts.snapshots} snapshots</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Selected Thread</span><strong>{!webDiagnostics.selectedThread ? "PASS" : webDiagnostics.selectedThread.state === "FAILED" ? "FAIL" : webDiagnostics.selectedThread.state === "LOADING" ? "SYNCING" : webDiagnostics.selectedThread.state === "LOCKED" ? "WARN" : "PASS"}</strong><small>{webDiagnostics.selectedThread ? `${webDiagnostics.selectedThread.state} · ${webDiagnostics.selectedThread.decrypted} decrypted · ${webDiagnostics.selectedThread.locked} locked` : "Select a conversation"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Build / Service Worker</span><strong>{webDiagnostics.session.buildMismatch ? "BUILD_MISMATCH" : "PASS"}</strong><small>{webDiagnostics.session.pwaVersion} · loaded {webDiagnostics.session.loadedScript} · served {webDiagnostics.session.servedScript ?? "unknown"} · revision {webDiagnostics.session.buildRevision ?? "unknown"} · {webDiagnostics.session.serviceWorker}</small></CardContent></Card>
-          </div>}
-          {webDiagnostics && <div className={`notice ${webDiagnostics.overall === "FAIL" ? "danger" : ""}`}>Overall: {webDiagnostics.overall}</div>}
-        </TabPanel>
-      </Tabs>
+          {composeRecipient ? composer : null}
+        </section>
+      )}
+
+      {selectedConversation ? (
+        <aside className="details-pane" aria-label="Conversation details">
+          <div className="details-pane__head">
+            <span className="details-section__label">Conversation details</span>
+          </div>
+          <ConversationDetails
+            conversation={selectedConversation}
+            capabilities={capabilities}
+            syncStatus={syncStatus}
+            telemetry={telemetry}
+            lastOutgoingStatus={lastOutgoing.status}
+            lastOutgoingAt={lastOutgoing.at}
+          />
+        </aside>
+      ) : null}
     </div>
+  );
+
+  return (
+    <AppShell
+      sidebar={<AppSidebar active={tab} unreadTotal={unreadTotal} onNavigate={navigate} />}
+      topbar={
+        <AppTopbar
+          title={destination.title}
+          subtitle={destination.subtitle}
+          connection={connection}
+          connectionDetail={connectionDetail}
+          syncStatus={syncStatus}
+          syncBusy={busy}
+          onSync={() => void pull()}
+          linkedOnlineCount={linkedOnlineCount}
+          onOpenLinkedBrowsers={() => setShowLinkedBrowsers(true)}
+          onOpenSettings={() => setTab("settings")}
+          onSignOut={() => void signOut()}
+          signingOut={signingOut}
+        />
+      }
+      alerts={syncAlerts}
+      bottomNav={
+        hideBottomNav ? undefined : (
+          <MobileBottomNav active={tab} unreadTotal={unreadTotal} onNavigate={navigate} />
+        )
+      }
+    >
+      {tab === "inbox" ? inboxView : null}
+
+      {tab === "contacts" ? (
+        <ContactsView
+          contacts={filteredContacts}
+          total={contacts.length}
+          search={contactSearch}
+          onSearch={setContactSearch}
+          visibleCount={visibleContactCount}
+          onShowMore={() => setVisibleContactCount(count => Math.min(count + 100, filteredContacts.length))}
+          busy={contactsBusy}
+          progress={contactsProgress}
+          checkedAt={contactsCheckedAt}
+          error={contactsError}
+          onRefresh={() => void refreshContacts()}
+          canReadContacts={capabilities.includes("CONTACTS_READ")}
+          onPick={selectRecipient}
+        />
+      ) : null}
+
+      {tab === "connection" ? (
+        <DeviceView
+          apiVersion={version || "checking"}
+          pwaVersion={PWA_BUILD_VERSION}
+          scriptFile={scriptFile}
+          cursor={cursor}
+          appliedEvents={applied}
+          latestSequence={events[0]?.sequence ?? 0}
+          trust={trust}
+          telemetry={telemetry}
+          syncStatus={syncStatus}
+          bootstrapState={bootstrapState}
+          error={error}
+          payloadState={payloadState}
+        />
+      ) : null}
+
+      {tab === "security" ? (
+        <SecurityView
+          decrypted={threadEvents.filter(event => event.decryption?.state === "decrypted").length}
+          locked={threadEvents.filter(event => event.decryption?.state === "locked").length}
+          invalid={threadEvents.filter(event => event.decryption?.state === "invalid").length}
+          trust={trust}
+          keyState={syncStatus.keyState}
+          keyError={syncStatus.keyError}
+          browserIdentity={webDiagnostics ? webDiagnostics.crypto.browserIdentity : null}
+          verifiedPrimary={webDiagnostics ? webDiagnostics.crypto.verifiedPrimary : null}
+        />
+      ) : null}
+
+      {tab === "debug" ? (
+        <DiagnosticsView
+          report={webDiagnostics}
+          busy={diagnosticsBusy}
+          syncBusy={busy}
+          onRun={() => void runDiagnostics()}
+          onRetrySync={() => void pull()}
+        />
+      ) : null}
+
+      {tab === "settings" ? (
+        <SettingsView
+          apiVersion={version || "checking"}
+          pwaVersion={PWA_BUILD_VERSION}
+          scriptFile={scriptFile}
+          buildRevision={webDiagnostics?.session.buildRevision ?? null}
+          linkedOnlineCount={linkedOnlineCount}
+          linkedTotal={linkedBrowsers.length}
+          onOpenLinkedBrowsers={() => setShowLinkedBrowsers(true)}
+          onOpenDiagnostics={() => setTab("debug")}
+          onSignOut={() => void signOut()}
+          signingOut={signingOut}
+        />
+      ) : null}
+
+      <LinkedBrowsersDrawer
+        isOpen={showLinkedBrowsers}
+        onOpenChange={setShowLinkedBrowsers}
+        sessions={linkedBrowsers}
+        browserDeviceId={browserDeviceId}
+        signingOut={signingOut}
+        onUnlink={() => void signOut()}
+      />
+
+      <DeliveryDetailsDrawer
+        isOpen={deliveryOpen}
+        onOpenChange={setDeliveryOpen}
+        item={deliveryItem}
+        messageId={deliveryItem?.key}
+      />
+
+      <ConversationDetailsDrawer
+        isOpen={showDetails}
+        onOpenChange={setShowDetails}
+        conversation={selectedConversation}
+        capabilities={capabilities}
+        syncStatus={syncStatus}
+        telemetry={telemetry}
+        lastOutgoingStatus={lastOutgoing.status}
+        lastOutgoingAt={lastOutgoing.at}
+      />
+    </AppShell>
   );
 }

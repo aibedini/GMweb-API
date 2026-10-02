@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
-import { Button, Card, Chip } from "@heroui/react";
+import { Alert, Button, Card, Chip } from "@heroui/react";
 import { beginPairing, type PairingHandle, type PairingProgress } from "../lib/pairing";
 import { loginWithPwaToken } from "../lib/adminAccess";
 import { wipeDeviceKeys } from "../lib/deviceKeys";
 import { resetLocal } from "../lib/sync";
+import { IconCopy, IconKey, IconLock } from "../app/components/icons";
 
 export interface LinkContext {
   pairingSessionId: string;
@@ -37,6 +38,11 @@ interface PairingScreenProps {
   onRecoveryLinked: () => void | Promise<void>;
 }
 
+/**
+ * §58: pairing is VISUAL only. WebAuthn, the pairing protocol, polling,
+ * device identity, certificate logic and session establishment are unchanged;
+ * only the presentation moved onto HeroUI v3 semantic tokens.
+ */
 export function PairingScreen({
   apiVersion,
   pwaVersion,
@@ -156,92 +162,172 @@ export function PairingScreen({
   const ss = String(secondsLeft % 60).padStart(2, "0");
 
   return (
-    <div className="min-h-full overflow-y-auto px-4 py-8">
-      <Card className="mx-auto w-full max-w-lg">
-        <div className="flex flex-col items-center gap-4 p-6 sm:p-8">
-          <div className="text-center">
-            <h1 className="text-2xl font-semibold">Messages</h1>
-            <p className="mt-1 text-base font-medium">Link this browser</p>
+    <div className="pairing-shell">
+      <Card className="pairing-card">
+        <Card.Content className="flex flex-col items-center gap-5 p-6 sm:p-8">
+          <div className="pairing-brand">
+            <span className="pairing-brand__mark" aria-hidden="true">M</span>
+            <div>
+              <h1 className="view-title" style={{ fontSize: 18 }}>GMweb Messages</h1>
+              <p className="view-subtitle" style={{ marginTop: 2 }}>Link this browser to your phone</p>
+            </div>
           </div>
 
-          <div className="flex flex-wrap justify-center gap-2 text-xs">
-            <Chip size="sm" variant="soft" color={compatible ? "success" : "danger"}>API {apiVersion}</Chip>
-            <Chip size="sm" variant="soft" color={compatible ? "success" : "danger"}>PWA {pwaVersion}</Chip>
-            <Chip size="sm" variant="soft">{scriptFile}</Chip>
+          <div className="flex flex-wrap justify-center gap-2">
+            <Chip size="sm" variant="soft" color={compatible ? "success" : "danger"}>
+              <Chip.Label>API {apiVersion}</Chip.Label>
+            </Chip>
+            <Chip size="sm" variant="soft" color={compatible ? "success" : "danger"}>
+              <Chip.Label>PWA {pwaVersion}</Chip.Label>
+            </Chip>
+            <Chip size="sm" variant="soft">
+              <Chip.Label>{scriptFile}</Chip.Label>
+            </Chip>
           </div>
 
-          {!compatible && (
-            <div className="w-full rounded-lg border p-3 text-sm" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
-              Deployment mismatch: the API and loaded PWA are different versions. Hard-refresh after the server update before pairing.
+          {!compatible ? (
+            <Alert status="danger">
+              <Alert.Indicator />
+              <Alert.Content>
+                <Alert.Title>Deployment mismatch</Alert.Title>
+                <Alert.Description>
+                  The API and the loaded PWA are different versions. Hard-refresh after the server update
+                  before pairing.
+                </Alert.Description>
+              </Alert.Content>
+            </Alert>
+          ) : null}
+
+          {compatible && qrDataUrl ? (
+            <div className="pairing-qr">
+              <img src={qrDataUrl} alt="Pairing QR code" width={336} height={336} />
             </div>
-          )}
+          ) : null}
 
-          {compatible && qrDataUrl && <img src={qrDataUrl} alt="Pairing QR code" width={336} height={336} />}
-          {compatible && <Button variant="ghost" onPress={() => {
-            ++attemptRef.current;
-            handle?.cancel();
-            setHandle(null);
-            setQrDataUrl(null);
-            startedRef.current = false;
-            void Promise.all([wipeDeviceKeys(), resetLocal()]).then(start).catch(cause => setError(String(cause)));
-          }}>Reset browser identity and pair again</Button>}
+          {compatible ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onPress={() => {
+                ++attemptRef.current;
+                handle?.cancel();
+                setHandle(null);
+                setQrDataUrl(null);
+                startedRef.current = false;
+                void Promise.all([wipeDeviceKeys(), resetLocal()]).then(start).catch((cause) => setError(String(cause)));
+              }}
+            >
+              Reset browser identity and pair again
+            </Button>
+          ) : null}
 
-          {compatible && !qrDataUrl && !error && (
-            <p className="text-sm" style={{ color: "var(--muted-fg)" }}>{STAGE_LABELS[stage]}…</p>
-          )}
+          {compatible && !qrDataUrl && !error ? (
+            <p className="text-sm text-muted" role="status">
+              {STAGE_LABELS[stage]}…
+            </p>
+          ) : null}
 
-          {error && (
-            <div className="w-full rounded-lg border p-3 text-sm" style={{ borderColor: "var(--danger)" }}>
-              <p className="font-medium" style={{ color: "var(--danger)" }}>{STAGE_LABELS[stage]}</p>
-              <p className="mt-1 break-words" style={{ color: "var(--muted-fg)" }}>{error}</p>
-            </div>
-          )}
+          {error ? (
+            <Alert status="danger">
+              <Alert.Indicator />
+              <Alert.Content>
+                <Alert.Title>{STAGE_LABELS[stage]}</Alert.Title>
+                <Alert.Description>{error}</Alert.Description>
+              </Alert.Content>
+            </Alert>
+          ) : null}
 
-          {compatible && (
+          {compatible ? (
             <div className="flex w-full flex-col items-center gap-3">
-              <p className="text-center text-sm" style={{ color: "var(--muted-fg)" }}>
-                Current stage: <b style={{ color: "var(--fg)" }}>{STAGE_LABELS[stage]}</b>
-                {handle ? <><br />Session {handle.session.pairingSessionId.slice(0, 10)}…</> : null}
+              <p className="text-center text-sm text-muted" role="status">
+                Current stage: <b className="text-foreground">{STAGE_LABELS[stage]}</b>
+                {handle ? (
+                  <>
+                    <br />
+                    Session {handle.session.pairingSessionId.slice(0, 10)}…
+                  </>
+                ) : null}
               </p>
-              {handle && qrDataUrl && (
+
+              {handle && qrDataUrl ? (
                 <>
-                  <Chip
-                    size="sm"
-                    variant="soft"
-                    color="warning"
-                  >
-                    {handle.primaryVerified ? "Primary phone verified" : "Primary phone enrollment required"}
+                  <Chip size="sm" variant="soft" color={handle.primaryVerified ? "success" : "warning"}>
+                    <Chip.Label>
+                      {handle.primaryVerified ? "Primary phone verified" : "Primary phone enrollment required"}
+                    </Chip.Label>
                   </Chip>
-                  <p className="text-center text-sm" style={{ color: "var(--muted-fg)" }}>
-                    Android Messages → Settings → Linked devices → <b>Link new device</b>
-                  </p>
-                  {!handle.primaryVerified && (
-                    <p className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--border)", color: "var(--muted-fg)" }}>
-                      For a new or reinstalled phone, first create a phone setup QR in the dashboard and scan it using Enroll this phone as Primary. Then return here to link this browser.
-                    </p>
-                  )}
-                  <Chip size="sm" variant="soft" color={secondsLeft > 20 ? "default" : "warning"}>QR expires in {mm}:{ss}</Chip>
-                  <div className="w-full rounded-lg border p-3 text-center" style={{ borderColor: "var(--border)" }}>
-                    <p className="text-xs" style={{ color: "var(--muted-fg)" }}>Can't scan? Enter this pairing code on Android</p>
-                    <code className="mt-1 block text-lg font-semibold tracking-[0.2em]">{handle.pairingCode.match(/.{1,5}/g)?.join(" ")}</code>
-                    <Button size="sm" variant="ghost" onPress={() => void navigator.clipboard.writeText(handle.pairingCode)}>Copy</Button>
+
+                  <ol className="pairing-steps">
+                    <li>Open Android Messages on your Primary phone.</li>
+                    <li>Go to Settings → Linked devices → Link new device.</li>
+                    <li>Scan the code above.</li>
+                  </ol>
+
+                  {!handle.primaryVerified ? (
+                    <Alert status="warning">
+                      <Alert.Indicator />
+                      <Alert.Content>
+                        <Alert.Description>
+                          For a new or reinstalled phone, first create a phone setup QR in the dashboard and
+                          scan it using &ldquo;Enroll this phone as Primary&rdquo;. Then return here to link
+                          this browser.
+                        </Alert.Description>
+                      </Alert.Content>
+                    </Alert>
+                  ) : null}
+
+                  <Chip size="sm" variant="soft" color={secondsLeft > 20 ? "default" : "warning"}>
+                    <Chip.Label>QR expires in {mm}:{ss}</Chip.Label>
+                  </Chip>
+
+                  <div className="w-full rounded-xl border border-border p-3 text-center">
+                    <p className="text-xs text-muted">Can&apos;t scan? Enter this pairing code on Android</p>
+                    <code className="mt-1 block text-lg font-semibold tracking-[0.2em]">
+                      {handle.pairingCode.match(/.{1,5}/g)?.join(" ")}
+                    </code>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      aria-label="Copy pairing code"
+                      onPress={() => void navigator.clipboard.writeText(handle.pairingCode)}
+                    >
+                      <IconCopy width={15} height={15} aria-hidden />
+                      <span>Copy</span>
+                    </Button>
                   </div>
                 </>
-              )}
-              {!handle && !tokenBusy && (
-                <Button variant="primary" onPress={() => void start()}>Generate fresh QR</Button>
-              )}
-            </div>
-          )}
+              ) : null}
 
-          <div className="w-full border-t pt-4" style={{ borderColor: "var(--border)" }}>
-            <Button variant="ghost" size="sm" className="w-full" onPress={() => setShowAlternative((value) => !value)}>
-              {showAlternative ? "Hide alternative" : "Can't scan? Use a one-time PWA token"}
+              {!handle && !tokenBusy ? (
+                <Button variant="primary" onPress={() => void start()}>
+                  Generate fresh QR
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+
+          <div className="w-full border-t border-border pt-4">
+            <Button
+              variant="ghost"
+              size="sm"
+              fullWidth
+              onPress={() => setShowAlternative((value) => !value)}
+            >
+              <IconKey width={15} height={15} aria-hidden />
+              <span>{showAlternative ? "Hide alternative" : "Can't scan? Use a one-time PWA token"}</span>
             </Button>
-            {showAlternative && (
-              <form className="mt-3 space-y-3" onSubmit={(event) => { event.preventDefault(); void useAdminToken(); }}>
-                <p className="text-xs" style={{ color: "var(--muted-fg)" }}>
-                  In the GMweb dashboard, open <b>PWA Access</b>, create a short-lived token, and paste it here. The master API token is not accepted.
+
+            {showAlternative ? (
+              <form
+                className="mt-3 flex flex-col gap-3"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void useAdminToken();
+                }}
+              >
+                <p className="text-xs text-muted">
+                  In the GMweb dashboard, open <b className="text-foreground">PWA Access</b>, create a
+                  short-lived token, and paste it here. The master API token is not accepted.
                 </p>
                 <input
                   aria-label="One-time PWA access token"
@@ -251,16 +337,21 @@ export function PairingScreen({
                   autoComplete="off"
                   spellCheck={false}
                   placeholder="pwa_…"
-                  className="h-11 w-full rounded-lg border bg-transparent px-3 text-sm outline-none focus:ring-2"
-                  style={{ borderColor: "var(--border)" }}
+                  className="w-full rounded-field border border-field-border bg-field px-3 py-2.5 text-sm text-field-foreground outline-none focus-visible:ring-2 focus-visible:ring-focus"
                 />
-                <Button type="submit" variant="primary" className="w-full" isDisabled={!accessToken.trim() || tokenBusy}>
-                  {tokenBusy ? "Checking token…" : "Open Messages securely"}
+                <Button
+                  type="submit"
+                  variant="primary"
+                  fullWidth
+                  isDisabled={!accessToken.trim() || tokenBusy}
+                >
+                  <IconLock width={15} height={15} aria-hidden />
+                  <span>{tokenBusy ? "Checking token…" : "Open Messages securely"}</span>
                 </Button>
               </form>
-            )}
+            ) : null}
           </div>
-        </div>
+        </Card.Content>
       </Card>
     </div>
   );

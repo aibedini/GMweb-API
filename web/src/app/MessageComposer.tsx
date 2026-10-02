@@ -1,39 +1,117 @@
-import { Button } from "@heroui/react";
+import { Alert, Button, Spinner } from "@heroui/react";
 import type { DeviceTelemetry } from "../lib/api";
-import { calculateSmsSegments } from "../lib/smsSegments";
-import { commandFeedback } from "../lib/inboxActions";
+import { sendDisabled } from "../lib/inboxActions";
+import { ComposerStatus } from "./components/ComposerStatus";
+import { SimSelector } from "./components/SimSelector";
+import { SmsCounter } from "./components/SmsCounter";
+import { IconSend } from "./components/icons";
 import { MessageTextarea } from "./MessageTextarea";
 
 type Sim = NonNullable<DeviceTelemetry["smsSubscriptions"]>["items"][number];
-export function MessageComposer({ draft, onDraft, sims, selected, onSim, help, retry, send,
-  sending, canSend, status, useDefault }: {
-  draft: string; onDraft: (value: string) => void; sims: Sim[]; selected?: Sim;
-  onSim: (id: number | null) => void; help: string | null; retry: () => void; useDefault: boolean;
-  send: () => void; sending: boolean; canSend: boolean; status: string | null;
+
+/**
+ * §17/§21: the composer.
+ *
+ * Every existing capability is preserved: multiline draft, SIM selection,
+ * SMS segment calculation, send button, SIM help, keyboard send shortcut and
+ * the `sending` / `canSend` / `draft.trim()` / `help` guards. Only the visual
+ * implementation moved to HeroUI.
+ */
+export function MessageComposer({
+  draft,
+  onDraft,
+  sims,
+  selected,
+  onSim,
+  help,
+  retry,
+  send,
+  sending,
+  canSend,
+  status,
+  useDefault,
+}: {
+  draft: string;
+  onDraft: (value: string) => void;
+  sims: Sim[];
+  selected?: Sim;
+  onSim: (id: number | null) => void;
+  help: string | null;
+  retry: () => void;
+  useDefault: boolean;
+  send: () => void;
+  sending: boolean;
+  canSend: boolean;
+  status: string | null;
 }) {
-  const segments = calculateSmsSegments(draft);
-  return <section className="message-composer" aria-label="Write a message">
-    <MessageTextarea value={draft} onChange={onDraft} onSend={() => { if (!sending && canSend && !help) send(); }}
-      disabled={sending} placeholder="Write a message…" />
-    <div className="composer-toolbar">
-      <div className="composer-options">
-        {sims.length > 0 && <label className="composer-sim">Send using
-          <select aria-label="Send using SIM" value={useDefault && sims.some(sim => sim.isDefaultSms) ? "" : selected?.subscriptionId ?? ""}
-            onChange={event => onSim(event.target.value === "" ? null : Number(event.target.value))}>
-            <option value="" disabled={!sims.some(sim => sim.isDefaultSms)}>{sims.some(sim => sim.isDefaultSms) ? "Default" : "Choose SIM"}</option>
-            {sims.map(sim => <option key={sim.subscriptionId} value={sim.subscriptionId}>
-            SIM {sim.slotIndex + 1} — {sim.carrierName || sim.displayName || "Carrier unavailable"}{sim.isDefaultSms ? " (Default)" : ""}
-            </option>)}
-          </select>
-        </label>}
-        <span className="composer-count" title={`${segments.encoding} · ${segments.units} encoding units`}>{Array.from(draft).length} chars · {segments.segments} SMS</span>
+  const disabled = sendDisabled({ draft, sending, canSend, simInstructions: help });
+
+  const guardedSend = () => {
+    if (disabled) return;
+    send();
+  };
+
+  return (
+    <section className="message-composer-shell" aria-label="Write a message">
+      <MessageTextarea
+        value={draft}
+        onChange={onDraft}
+        onSend={guardedSend}
+        disabled={sending}
+        placeholder="Type a message…"
+        className="message-composer__textarea"
+      />
+
+      <div className="composer-toolbar">
+        <div className="composer-options">
+          <SimSelector sims={sims} selected={selected} onSim={onSim} useDefault={useDefault} />
+          <SmsCounter draft={draft} />
+        </div>
+
+        <Button
+          className="composer-send"
+          variant="primary"
+          aria-label={sending ? "Sending message" : "Send message"}
+          isDisabled={disabled}
+          onPress={send}
+        >
+          {sending ? <Spinner size="sm" /> : <IconSend width={16} height={16} aria-hidden />}
+          <span>{sending ? "Sending…" : "Send"}</span>
+        </Button>
       </div>
-      <Button className="composer-send" onPress={send}
-        isDisabled={sending || !canSend || !draft.trim() || Boolean(help)}>{sending ? "Sending…" : "Send message"}</Button>
-    </div>
-    {help && <div className="composer-help" role="status"><span>{help}</span><Button size="sm" variant="ghost" onPress={retry}>Refresh SIMs</Button></div>}
-    <p className="composer-help">Ctrl+Enter / ⌘+Enter to send</p>
-    {!canSend && <p className="composer-help">Sending access is required. Approve this browser on your Primary phone.</p>}
-    {status && <p className="composer-status" role="status">{commandFeedback(status)}</p>}
-  </section>;
+
+      {help ? (
+        <div className="mt-2">
+          <Alert status="warning">
+            <Alert.Indicator />
+            <Alert.Content>
+              <Alert.Title>SIM needs attention</Alert.Title>
+              <Alert.Description>{help}</Alert.Description>
+            </Alert.Content>
+            <Button size="sm" variant="ghost" onPress={retry}>
+              Refresh SIMs
+            </Button>
+          </Alert>
+        </div>
+      ) : null}
+
+      {!canSend ? (
+        <div className="mt-2">
+          <Alert status="danger">
+            <Alert.Indicator />
+            <Alert.Content>
+              <Alert.Title>Sending is not approved for this browser</Alert.Title>
+              <Alert.Description>
+                Approve sending access for this browser on your Primary phone, then retry.
+              </Alert.Description>
+            </Alert.Content>
+          </Alert>
+        </div>
+      ) : null}
+
+      <ComposerStatus status={status} />
+
+      <p className="composer-hint">Ctrl+Enter / ⌘+Enter to send</p>
+    </section>
+  );
 }

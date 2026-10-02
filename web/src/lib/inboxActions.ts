@@ -46,3 +46,35 @@ export function commandFeedback(status: string | null): string | null {
   };
   return messages[status] || androidError(status);
 }
+
+/** Presentation tone for the authoritative command lifecycle (§22). */
+export type CommandTone = "pending" | "ok" | "failed";
+
+export function commandTone(status: string): CommandTone {
+  const value = status.toLowerCase();
+  if (/(failed|expired|unavailable|missing|empty_body|no_recipient|needs retry)/.test(value)) {
+    return "failed";
+  }
+  if (/(delivered|sent|completed)/.test(value) && !/waiting/.test(value)) return "ok";
+  return "pending";
+}
+
+export interface ComposerSendGate {
+  draft: string;
+  sending: boolean;
+  /** `SEND_MESSAGES` capability from the linked session. */
+  canSend: boolean;
+  /** Result of `simHelp(...)`: a non-null value blocks sending. */
+  simInstructions: string | null;
+}
+
+/**
+ * The single send-enablement rule for the composer.
+ *
+ * Both the Send button's disabled state and the keyboard shortcut guard use
+ * this, so the button and the shortcut can never disagree.
+ */
+export function sendDisabled(gate: ComposerSendGate): boolean {
+  return gate.sending || !gate.canSend || gate.draft.trim().length === 0 || Boolean(gate.simInstructions);
+}
+
