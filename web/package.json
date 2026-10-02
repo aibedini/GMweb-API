@@ -9,14 +9,17 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@heroui/react": "^3.2.4",
-    "@heroui/styles": "^3.2.4",
+    "@gravity-ui/icons": "^2.22.0",
+    "@heroui/react": "^3.2.6",
+    "@heroui/styles": "^3.2.6",
     "@hpke/core": "^1.9.0",
+    "@react-aria/i18n": "^3.13.1",
     "@simplewebauthn/browser": "^13.3.0",
     "@tanstack/react-virtual": "^3.13.12",
-    "framer-motion": "^13.1.1",
     "qrcode": "^1.5.4",
     "react": "^19.1.0",
+    "react-aria": "^3.52.1",
+    "react-aria-components": "^1.21.1",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
