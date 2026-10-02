@@ -263,6 +263,40 @@ export async function fetchPrimaryTelemetry(): Promise<DeviceTelemetry | null> {
   return (await jsonOrThrow<{ telemetry: DeviceTelemetry | null }>(res)).telemetry;
 }
 
+/**
+ * Phone liveness and telemetry freshness are SEPARATE facts, and only the
+ * server can decide the first one (it observes authenticated activity).
+ *
+ * Deriving presence from `telemetry.receivedAt` in the browser is what produced
+ * a false "Phone Offline · last seen 2 days ago" while the phone was polling
+ * every few seconds.
+ */
+export interface LinkedDeviceStatus {
+  phone: {
+    state: "ONLINE" | "STALE" | "OFFLINE" | "NEVER_SEEN";
+    lastActivityAt: number | null;
+    lastActivitySource: string | null;
+    ageMs: number | null;
+    model: string | null;
+    manufacturer: string | null;
+    androidVersion: string | null;
+    appVersion: string | null;
+  };
+  telemetry: {
+    state: "FRESH" | "STALE" | "OLD" | "NEVER_REPORTED";
+    receivedAt: number | null;
+    ageMs: number | null;
+    clockSkewMs: number | null;
+  };
+  now: number;
+}
+
+export async function fetchLinkedDeviceStatus(): Promise<LinkedDeviceStatus | null> {
+  const res = await fetch(`${API}/linked-device/status`, { credentials: "include" });
+  if (!res.ok) return null;
+  return jsonOrThrow<LinkedDeviceStatus>(res);
+}
+
 export interface LinkedBrowserSession {
   deviceId: string;
   ip: string | null;

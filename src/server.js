@@ -207,6 +207,11 @@ require("node:fs").mkdirSync(path.join(config.rootDir, "data"), { recursive: tru
 const controlDb = new (require("better-sqlite3"))(path.join(config.rootDir, "data", "control-plane.db"));
 const { DeviceTelemetryStore } = require("./deviceTelemetry");
 const deviceTelemetryStore = new DeviceTelemetryStore(controlDb);
+const { AgentActivityStore, derivePhonePresence, deriveTelemetryFreshness, ACTIVITY_SOURCES } = require("./agentActivity");
+// Phone liveness is server-observed authenticated activity, NOT telemetry
+// freshness. See src/agentActivity.js for the production incident this fixes.
+const agentActivityStore = new AgentActivityStore(controlDb);
+const activityBackfilled = agentActivityStore.backfillFromEvents();
 controlDb.pragma("journal_mode = WAL");
 const trustRegistry = new TrustRegistry(controlDb);
 const commandEngine = new CommandEngine(controlDb);
@@ -254,23 +259,43 @@ const DEFAULT_ACCOUNT_ID = "default";
  * the shared key alone no longer authorizes that device. Returns the bound
  * deviceId or null.
  */
+/** Which channel a request belongs to, for the presence evidence breakdown. */
+const ACTIVITY_SOURCE_BY_PATH = [
+  [/\/api\/v1\/agent\/commands/, ACTIVITY_SOURCES.COMMAND_POLL],
+  [/\/api\/v1\/agent\/events/, ACTIVITY_SOURCES.EVENT_UPLOAD],
+  [/\/api\/v1\/agent\/device-telemetry/, ACTIVITY_SOURCES.TELEMETRY],
+  [/\/api\/v1\/agent\/trust/, ACTIVITY_SOURCES.TRUST],
+  [/\/api\/v1\/agent\/identity/, ACTIVITY_SOURCES.IDENTITY],
+];
+
+/**
+ * Every authenticated agent request is proof the phone is running. Recording
+ * it here — the single choke point all /api/v1/agent/* routes pass through —
+ * means presence is correct even when a particular channel (telemetry) stops
+ * working while others keep succeeding.
+ */
+function recordAgentActivity(deviceId, url) {
+  const path = String(url || "");
+  const match = ACTIVITY_SOURCE_BY_PATH.find(([pattern]) => pattern.test(path));
+  agentActivityStore.record(deviceId, match ? match[1] : ACTIVITY_SOURCES.UNKNOWN);
+}
+
+function grantAgent(deviceId, request) {
+  recordAgentActivity(deviceId, request.url || request.raw?.url);
+  return { deviceId, role: agentAuthService.getRole(deviceId) };
+}
+
 function authorizeAgent(request, rawBody) {
   // The global /api/v1/agent/* gate has already verified this exact request.
   // Re-verifying here would reject the same timestamp as a replay.
   if (request.authenticatedAgentId) {
-    return {
-      deviceId: request.authenticatedAgentId,
-      role: agentAuthService.getRole(request.authenticatedAgentId),
-    };
+    return grantAgent(request.authenticatedAgentId, request);
   }
   const header = String(request.headers["x-agent-auth"] || "");
   if (header) {
     const result = agentAuthService.verifyAgentHeader(request, rawBody);
     if (!result.ok) return null;
-    return {
-      deviceId: result.deviceId,
-      role: agentAuthService.getRole(result.deviceId),
-    };
+    return grantAgent(result.deviceId, request);
   }
   // Legacy fallback: shared device key (pre-PR-08b agents). Only valid while
   // the agent has NOT enrolled a signature identity — an enrolled device
@@ -280,7 +305,7 @@ function authorizeAgent(request, rawBody) {
     if (claimed && agentAuthService.getIdentity(String(claimed))) {
       return null; // enrolled device MUST use signatures
     }
-    return { deviceId: "legacy-shared-agent", role: "LEGACY_AGENT" };
+    return grantAgent("legacy-shared-agent", request);
   }
   return null;
 }
@@ -823,7 +848,7 @@ function requireToken(request, reply, done) {
         (p === "/api/v1/web/sync/ack" || p === "/api/v1/web/snapshot-v2" ||
           p === "/api/v1/web/conversations/changed")) ||
       (caps.includes("READ_MESSAGES") && request.method === "GET" &&
-        p === "/api/v1/linked-device/telemetry") ||
+        (p === "/api/v1/linked-device/telemetry" || p === "/api/v1/linked-device/status")) ||
       (caps.includes("CONTACTS_READ") && request.method === "GET" &&
         p === "/api/v1/linked-device/contacts/events") ||
       ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ")) && request.method === "GET" &&
@@ -907,6 +932,9 @@ function requireToken(request, reply, done) {
     const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
     if (auth.ok) {
       request.authenticatedAgentId = auth.deviceId;
+      // Record liveness at the gate so EVERY authenticated agent route counts,
+      // including ones that never call authorizeAgent.
+      recordAgentActivity(auth.deviceId, request.url);
       return done();
     }
     reply.code(401).send({ error: "unauthorized" });
@@ -3342,6 +3370,9 @@ registerControlPlaneRoutes(app, {
   authorizeAgent,
   linkedSessions,
   deviceTelemetryStore,
+  agentActivityStore,
+  derivePhonePresence,
+  deriveTelemetryFreshness,
   agentAuthService,
   checkRateLimit,
 });

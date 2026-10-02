@@ -796,3 +796,50 @@ All browser composers preserve exact message text, including leading/trailing wh
 The dashboard Android conversation archive now exposes correlated outbound ledger rows and uses SSE invalidation instead of six-second thread polling. It is still an outbound archive, not the encrypted Android inbox; phone unread/incoming/read authority belongs to the linked PWA. Browser/phone/carrier production acceptance is NOT RUN for this change.
 
 Android pull clients may POST `/gateway/progress` with `{requestId, stage:"submitting", clientMessageId?}` using the gateway device key. GMweb validates the durable task/correlation and rejects revoked or terminal tasks, persists the stage and emits SSE. This endpoint cannot assert Sent or Delivered. Older clients that do not publish progress skip the Submitting transition; GMweb never invents it. Real Android progress publication is NOT VERIFIED in this repository-only change.
+
+## Phone liveness vs telemetry freshness (0.19.33)
+
+These are **two independent facts** and the API reports them separately. Do not
+derive one from the other.
+
+- **Liveness** answers "is the Primary phone running and reachable?". It comes
+  only from server-observed **authenticated agent activity** — any successful
+  `/api/v1/agent/*` request (command poll, event batch, trust, telemetry).
+  GMweb stamps this with its own clock on every authenticated request; the
+  phone's clock is never consulted.
+- **Telemetry freshness** answers "how old is the last device/SIM report?".
+  It is the server receipt time of the newest row in
+  `device_telemetry_history`.
+
+`GET /api/v1/linked-device/status` (linked session, `READ_MESSAGES`) returns:
+
+```json
+{
+  "phone":     { "state": "ONLINE|STALE|OFFLINE|NEVER_SEEN",
+                 "lastActivityAt": 1760000000000, "lastActivitySource": "COMMAND_POLL",
+                 "ageMs": 3200, "model": "SM-G998B", "appVersion": "3.4.21" },
+  "telemetry": { "state": "FRESH|STALE|OLD|NEVER_REPORTED",
+                 "receivedAt": 1759900000000, "ageMs": 174000000, "clockSkewMs": -120 },
+  "now": 1760000003200
+}
+```
+
+Thresholds: activity age `<= 90s` is `ONLINE`, `<= 180s` is `STALE`, beyond is
+`OFFLINE`; no accepted activity is `NEVER_SEEN`. Telemetry is `FRESH` within the
+same 90s, then `STALE`, then `OLD` beyond 24h.
+
+**Why this exists.** GMweb previously derived phone presence from
+`telemetry.receivedAt`. When the Android telemetry upload stalled, every other
+channel kept working, yet the UI reported
+`Phone Offline · Samsung SM-G998B · last seen 2 days ago`. Liveness and
+telemetry freshness must never be collapsed into one signal.
+
+**Ordering.** The newest telemetry row is selected by `received_at`
+(**server** receipt), never by `observed_at` (phone-supplied clock). A phone
+whose clock was ever ahead would otherwise write a future-dated row that
+permanently shadowed newer reports. `observed_at` is retained for diagnostics
+and exposed as `clockSkewMs`; it never influences presence or freshness.
+
+Consumers that only need SIM/device facts may keep using
+`GET /api/v1/linked-device/telemetry`; anything that renders "is the phone
+online?" must use `GET /api/v1/linked-device/status`.

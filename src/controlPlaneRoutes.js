@@ -33,7 +33,7 @@ const SAFE_INGEST_ERROR_CODES = new Set(["invalid_event_id", "invalid_metadata",
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentAuthService, checkRateLimit, enableCommandLeases = false }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentActivityStore, derivePhonePresence, deriveTelemetryFreshness, agentAuthService, checkRateLimit, enableCommandLeases = false }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
   const replicationCapabilities = () => ({
     preferredProtocolVersion: 1,
@@ -320,6 +320,56 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     const primary = agentAuthService?.getPrimaryIdentity();
     return { telemetry: primary ? deviceTelemetryStore?.get(primary.device_id) || null
       : deviceTelemetryStore?.getPrimary() || null };
+  });
+
+  /**
+   * Canonical, honest Android status: PHONE LIVENESS and TELEMETRY FRESHNESS are
+   * reported as two independent axes.
+   *
+   * This exists because deriving presence from telemetry `receivedAt` produced a
+   * production false "Phone Offline · last seen 2 days ago" while the phone was
+   * authenticating command polls every few seconds. Liveness comes from
+   * server-observed authenticated activity only.
+   */
+  app.get("/api/v1/linked-device/status", {
+    schema: { summary: "Primary Android liveness and telemetry freshness", tags: ["Trust"] },
+  }, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    const now = Date.now();
+    const primary = agentAuthService?.getPrimaryIdentity?.() || null;
+    const deviceId = primary?.device_id || null;
+    const activity = deviceId ? agentActivityStore?.get(deviceId) || null : null;
+    const telemetry = deviceId ? deviceTelemetryStore?.get(deviceId) || null
+      : deviceTelemetryStore?.getPrimary() || null;
+
+    const phoneState = derivePhonePresence
+      ? derivePhonePresence(activity?.lastActivityAt ?? null, now)
+      : "NEVER_SEEN";
+    const telemetryState = deriveTelemetryFreshness
+      ? deriveTelemetryFreshness(telemetry?.receivedAt ?? null, now)
+      : "NEVER_REPORTED";
+
+    return {
+      phone: {
+        state: phoneState,
+        lastActivityAt: activity?.lastActivityAt ?? null,
+        lastActivitySource: activity?.lastSource ?? null,
+        ageMs: activity?.lastActivityAt ? Math.max(0, now - activity.lastActivityAt) : null,
+        // Safe device facts only; never SIM identifiers or phone numbers.
+        model: telemetry?.device?.model ?? null,
+        manufacturer: telemetry?.device?.manufacturer ?? null,
+        androidVersion: telemetry?.device?.androidVersion ?? null,
+        appVersion: telemetry?.app?.versionName ?? null,
+      },
+      telemetry: {
+        state: telemetryState,
+        receivedAt: telemetry?.receivedAt ?? null,
+        ageMs: telemetry?.receivedAt ? Math.max(0, now - telemetry.receivedAt) : null,
+        // Diagnostic only: the phone's clock offset, which NEVER affects state.
+        clockSkewMs: telemetry?.clockSkewMs ?? null,
+      },
+      now,
+    };
   });
 
   app.delete("/api/v1/linked-session", {
