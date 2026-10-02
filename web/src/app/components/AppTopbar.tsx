@@ -1,7 +1,10 @@
 import type { ReactNode } from "react";
 import { Button, Dropdown, Tooltip } from "@heroui/react";
 import type { BrowserSyncStatus } from "../../lib/sync/sync-state";
+import type { PhonePresence } from "../../lib/phonePresence";
 import { ConnectionIndicator } from "./ConnectionIndicator";
+import { PhoneIndicator } from "./PhoneIndicator";
+import { RealtimeIndicator } from "./RealtimeIndicator";
 import { SyncIndicator } from "./SyncIndicator";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import { IconLinked, IconPerson, IconSettings, IconSignOut } from "./icons";
@@ -10,15 +13,19 @@ import type { ConnectionState } from "./types";
 /**
  * §11: a compact 56px top bar.
  *
- * Right side: connection Chip, sync action, theme, linked browsers and the
- * account/app menu. The API version deliberately does NOT live here — it is
- * surfaced in Settings/About and in Diagnostics (§11).
+ * Right side: API / Realtime / Phone chips (three INDEPENDENT axes), sync
+ * action, theme, linked browsers and the account/app menu. The API version
+ * deliberately does NOT live here — it is surfaced in Settings/About and in
+ * Diagnostics (§11).
  */
 export function AppTopbar({
   title,
   subtitle,
   connection,
   connectionDetail,
+  phonePresence,
+  phoneReceivedAt,
+  phoneModel,
   syncStatus,
   syncBusy,
   onSync,
@@ -33,6 +40,9 @@ export function AppTopbar({
   subtitle?: string;
   connection: ConnectionState;
   connectionDetail?: string;
+  phonePresence: PhonePresence;
+  phoneReceivedAt: number | null;
+  phoneModel?: string | null;
   syncStatus: BrowserSyncStatus;
   syncBusy: boolean;
   onSync: () => void;
@@ -56,6 +66,10 @@ export function AppTopbar({
 
       <div className="app-topbar__actions">
         <ConnectionIndicator state={connection} detail={connectionDetail} />
+
+        <RealtimeIndicator />
+
+        <PhoneIndicator presence={phonePresence} receivedAt={phoneReceivedAt} model={phoneModel} />
 
         <SyncIndicator status={syncStatus} busy={syncBusy} onSync={onSync} compact />
 

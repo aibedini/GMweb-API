@@ -15,6 +15,8 @@ import { applyReadConfirmation, contactTitle, phoneKey, simHelp } from "../lib/i
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress } from "../lib/threadHistory";
 import { selectSmsSim } from "../lib/simSelection";
+import { derivePhonePresence } from "../lib/phonePresence";
+import { describeSimTelemetry } from "../lib/simTelemetry";
 import { androidError } from "../../../shared/smsStatus";
 
 import { AppShell } from "./components/AppShell";
@@ -722,6 +724,11 @@ export default function App() {
       ? "See payload diagnostics"
       : "No payloads received";
 
+  // §8: presence is derived from the phone's SERVER receipt time, never from
+  // the browser being able to reach the API. These are independent facts.
+  const phonePresence = derivePhonePresence(telemetry?.receivedAt ?? null);
+  const simTelemetry = describeSimTelemetry(telemetry, Date.now(), phonePresence);
+
   const conversationsLoading = conversationPage.length === 0 && bootstrapState === "BOOTSTRAPPING_SYNC";
   const emptyInboxMessage = conversations.length === 0 ? "No conversations yet" : "No matching conversations";
   const mobileView = selected || composeOpen || composeRecipient ? "thread" : "list";
@@ -952,6 +959,13 @@ export default function App() {
           subtitle={destination.subtitle}
           connection={connection}
           connectionDetail={connectionDetail}
+          phonePresence={phonePresence}
+          phoneReceivedAt={telemetry?.receivedAt ?? null}
+          phoneModel={
+            telemetry?.device
+              ? `${telemetry.device.manufacturer ?? ""} ${telemetry.device.model ?? ""}`.trim() || null
+              : null
+          }
           syncStatus={syncStatus}
           syncBusy={busy}
           onSync={() => void pull()}
@@ -1003,6 +1017,8 @@ export default function App() {
           bootstrapState={bootstrapState}
           error={error}
           payloadState={payloadState}
+          phonePresence={phonePresence}
+          simView={simTelemetry}
         />
       ) : null}
 

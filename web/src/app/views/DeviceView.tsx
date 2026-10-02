@@ -1,6 +1,9 @@
 import { Alert, Card, Chip } from "@heroui/react";
 import type { DeviceTelemetry, TrustSnapshot } from "../../lib/api";
 import type { BrowserSyncStatus } from "../../lib/sync/sync-state";
+import type { PhonePresence } from "../../lib/phonePresence";
+import type { SimTelemetryView } from "../../lib/simTelemetry";
+import { phonePresenceLabel } from "../../lib/phonePresence";
 import { syncLabel } from "../components/SyncIndicator";
 import { formatListTime } from "../components/format";
 import { IconDevice, IconKey, IconStorage, IconSync } from "../components/icons";
@@ -53,6 +56,8 @@ export function DeviceView({
   bootstrapState,
   error,
   payloadState,
+  phonePresence,
+  simView,
 }: {
   apiVersion: string;
   pwaVersion: string;
@@ -66,6 +71,8 @@ export function DeviceView({
   bootstrapState: string | null;
   error: string | null;
   payloadState: string;
+  phonePresence: PhonePresence;
+  simView: SimTelemetryView;
 }) {
   const apiOffline = apiVersion === "unreachable";
   const battery = telemetry?.battery;
@@ -126,6 +133,24 @@ export function DeviceView({
               }
               color={telemetry?.device ? "success" : "default"}
               statusText={telemetry?.device ? "Reported" : "Pending"}
+            />
+            <StatusCard
+              label="Phone presence"
+              value={phonePresenceLabel(phonePresence)}
+              detail={
+                telemetry?.receivedAt
+                  ? `Last server receipt ${formatListTime(telemetry.receivedAt)}`
+                  : "The phone has never reported telemetry"
+              }
+              color={
+                phonePresence === "ONLINE"
+                  ? "success"
+                  : phonePresence === "STALE"
+                    ? "warning"
+                    : phonePresence === "OFFLINE"
+                      ? "danger"
+                      : "default"
+              }
             />
             <StatusCard
               label="Battery"
@@ -280,18 +305,21 @@ export function DeviceView({
             <StatusCard
               label="SIM telemetry"
               value={
-                telemetry?.smsSubscriptions
-                  ? `${telemetry.smsSubscriptions.items.filter((sim) => sim.isActive).length} active`
-                  : "—"
+                simView.state === "OK"
+                  ? `${simView.active.length} active`
+                  : simView.state === "NO_ACTIVE_SUBSCRIPTIONS"
+                    ? "None"
+                    : "Unavailable"
               }
-              detail={
-                telemetry?.smsSubscriptions
-                  ? telemetry.smsSubscriptions.available
-                    ? "Phone permission granted"
-                    : "Phone permission not granted"
-                  : "Phone has not reported its SIMs"
+              detail={simView.copy}
+              color={
+                simView.state === "OK" && !simView.stale
+                  ? "success"
+                  : simView.state === "NO_ACTIVE_SUBSCRIPTIONS"
+                    ? "warning"
+                    : "default"
               }
-              color={telemetry?.smsSubscriptions?.available ? "success" : "warning"}
+              statusText={simView.stale ? "stale" : undefined}
             />
           </div>
         </section>

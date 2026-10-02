@@ -396,6 +396,7 @@
 
 .message-composer-shell {
   flex: 0 0 auto;
+  width: 100%;
   min-width: 0;
   margin-inline: 12px;
   margin-block-end: max(10px, env(safe-area-inset-bottom));
@@ -406,10 +407,17 @@
   box-shadow: var(--surface-shadow);
 }
 
+/* The native textarea must own the full width of the shell. HeroUI's
+   `.textarea` declares no width, so without `fullWidth` + these rules a bare
+   <textarea> renders at its ~20-column default. */
 .message-composer__textarea {
   --field-shadow: none;
-  min-height: 44px;
-  max-height: 160px;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  min-height: 56px;
+  max-height: min(200px, 30dvh);
 }
 
 .composer-toolbar {

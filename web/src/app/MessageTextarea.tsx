@@ -41,12 +41,19 @@ export function MessageTextarea({
       dir="auto"
       rows={1}
       variant="secondary"
+      // HeroUI's `.textarea` sets no width, and a bare <textarea> falls back to
+      // its ~20-column default — which rendered as a tiny pill inside the wide
+      // composer shell. `fullWidth` is the component's own API for this.
+      fullWidth
       value={value}
       disabled={disabled}
       placeholder={placeholder}
       className={className}
       style={{
-        minHeight: 44,
+        display: "block",
+        width: "100%",
+        boxSizing: "border-box",
+        minWidth: 0,
         overflowY: "auto",
         resize: "none",
         whiteSpace: "pre-wrap",
