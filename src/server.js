@@ -212,6 +212,10 @@ const { AgentActivityStore, derivePhonePresence, deriveTelemetryFreshness, ACTIV
 // freshness. See src/agentActivity.js for the production incident this fixes.
 const agentActivityStore = new AgentActivityStore(controlDb);
 const activityBackfilled = agentActivityStore.backfillFromEvents();
+// Live Android runtime metadata (app version + advertised command types) from
+// the authenticated command poll — deliberately NOT from device telemetry.
+const { AgentRuntimeStore } = require("./agentRuntime");
+const agentRuntimeStore = new AgentRuntimeStore(controlDb);
 controlDb.pragma("journal_mode = WAL");
 const trustRegistry = new TrustRegistry(controlDb);
 const commandEngine = new CommandEngine(controlDb);
@@ -3371,6 +3375,7 @@ registerControlPlaneRoutes(app, {
   linkedSessions,
   deviceTelemetryStore,
   agentActivityStore,
+  agentRuntimeStore,
   derivePhonePresence,
   deriveTelemetryFreshness,
   agentAuthService,

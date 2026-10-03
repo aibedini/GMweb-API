@@ -40,17 +40,50 @@ export type SimRefreshState =
 export const IDLE_SIM_REFRESH: SimRefreshState = { state: "IDLE" };
 
 /**
- * Capability-based feature detection. NEVER infer support from versionName:
- * an older build that does not advertise the capability must be reported as
- * "unsupported", not as an error and not as an offline phone.
+ * Capability-based feature detection. NEVER infer support from versionName.
  *
- * Contract (shared with Android):
- *   telemetry.capabilities.commandTypes: string[]
+ * PRIORITY: live runtime metadata first, telemetry only as a fallback.
+ *
+ * This ordering is the fix for a bootstrap deadlock. The PWA used to require
+ * `telemetry.capabilities.commandTypes` before sending
+ * REFRESH_DEVICE_TELEMETRY — but stale telemetry is exactly what that command
+ * exists to repair. An upgraded phone could genuinely support the command while
+ * GMweb kept reading an old pre-capability snapshot and refusing to ask.
+ *
+ * So: if the LIVE runtime advertises it, allow the refresh even when telemetry
+ * is old, missing or pre-capability.
+ *
+ * An older telemetry snapshot is only trustworthy while it is still FRESH; a
+ * stale one must not be used to claim support either way.
  */
-export function supportsRemoteRefresh(telemetry: DeviceTelemetry | null | undefined): boolean {
+export function supportsRemoteRefresh(
+  deviceStatus?: LinkedDeviceStatus | null,
+  telemetry?: DeviceTelemetry | null,
+): boolean {
+  const live = deviceStatus?.runtime?.commandTypes;
+  if (Array.isArray(live)) {
+    // An explicit live answer is authoritative, including "no".
+    if (live.includes(REFRESH_COMMAND_TYPE)) return true;
+    if (deviceStatus?.runtime?.receivedAt) return false;
+  }
+  // Fallback: telemetry, but only while it still describes the running phone.
+  if (deviceStatus?.telemetry?.state && deviceStatus.telemetry.state !== "FRESH") return false;
   const list = telemetry?.capabilities?.commandTypes;
   if (!Array.isArray(list)) return false;
   return list.includes(REFRESH_COMMAND_TYPE);
+}
+
+/** Which source granted (or denied) remote refresh, for honest UI copy. */
+export function remoteRefreshEvidence(
+  deviceStatus?: LinkedDeviceStatus | null,
+  telemetry?: DeviceTelemetry | null,
+): "RUNTIME" | "TELEMETRY" | "NONE" {
+  const live = deviceStatus?.runtime?.commandTypes;
+  if (Array.isArray(live) && live.includes(REFRESH_COMMAND_TYPE)) return "RUNTIME";
+  if (deviceStatus?.runtime?.receivedAt) return "NONE";
+  if (deviceStatus?.telemetry?.state && deviceStatus.telemetry.state !== "FRESH") return "NONE";
+  const list = telemetry?.capabilities?.commandTypes;
+  return Array.isArray(list) && list.includes(REFRESH_COMMAND_TYPE) ? "TELEMETRY" : "NONE";
 }
 
 /** Success rule: a strictly newer SERVER receipt time, or first-ever report. */
@@ -116,7 +149,9 @@ export function planSimRefresh(
 ): SimRefreshPlan {
   const presence = authoritativePhonePresence(deviceStatus, telemetry);
   if (presence === "OFFLINE" || presence === "NEVER_SEEN") return { action: "OFFLINE", presence };
-  // Capability-based feature detection; never a version comparison.
-  if (!supportsRemoteRefresh(telemetry)) return { action: "UNSUPPORTED", presence };
+  // Capability-based feature detection; never a version comparison. Live
+  // runtime metadata outranks stale telemetry so a stale snapshot cannot
+  // deadlock the very command that would fix it.
+  if (!supportsRemoteRefresh(deviceStatus, telemetry)) return { action: "UNSUPPORTED", presence };
   return { action: "PROCEED", presence, baselineReceivedAt: telemetry?.receivedAt ?? null };
 }

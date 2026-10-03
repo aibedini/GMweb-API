@@ -57,6 +57,11 @@ export function DeviceView({
   error,
   payloadState,
   phonePresence,
+  phoneLastActivityAt,
+  lastActivitySource,
+  runtimeAppVersion,
+  runtimeAppVersionCode,
+  runtimeReceivedAt,
   simView,
 }: {
   apiVersion: string;
@@ -72,6 +77,13 @@ export function DeviceView({
   error: string | null;
   payloadState: string;
   phonePresence: PhonePresence;
+  /** Last AUTHENTICATED activity, not last telemetry. */
+  phoneLastActivityAt: number | null;
+  lastActivitySource: string | null;
+  /** Live runtime metadata; null when the phone has not reported it. */
+  runtimeAppVersion: string | null;
+  runtimeAppVersionCode: number | null;
+  runtimeReceivedAt: number | null;
   simView: SimTelemetryView;
 }) {
   const apiOffline = apiVersion === "unreachable";
@@ -137,10 +149,13 @@ export function DeviceView({
             <StatusCard
               label="Phone presence"
               value={phonePresenceLabel(phonePresence)}
+              // Liveness detail comes from authenticated ACTIVITY. Telemetry age
+              // belongs on the telemetry card, never here.
               detail={
-                telemetry?.receivedAt
-                  ? `Last server receipt ${formatListTime(telemetry.receivedAt)}`
-                  : "The phone has never reported telemetry"
+                phoneLastActivityAt
+                  ? `Last authenticated activity ${formatListTime(phoneLastActivityAt)}${
+                    lastActivitySource ? ` · ${lastActivitySource}` : ""}`
+                  : "No authenticated phone activity recorded yet"
               }
               color={
                 phonePresence === "ONLINE"
@@ -165,16 +180,26 @@ export function DeviceView({
               detail={network?.networkType || "Waiting for telemetry"}
               color={network ? (network.isConnected ? "success" : "danger") : "default"}
             />
+            {/*
+              The running APK version comes from LIVE runtime metadata reported
+              on the authenticated command poll. Telemetry is a historical
+              fallback and is labelled as such: presenting a stale telemetry
+              version as the current app is exactly the bug this fixes.
+            */}
             <StatusCard
               label="Android app"
-              value={telemetry?.app?.versionName || "—"}
+              value={runtimeAppVersion || telemetry?.app?.versionName || "—"}
               detail={
-                telemetry?.receivedAt
-                  ? `Last report ${formatListTime(telemetry.receivedAt)}`
-                  : "Never reported"
+                runtimeAppVersion
+                  ? `Seen ${runtimeReceivedAt ? formatListTime(runtimeReceivedAt) : "recently"} via command poll`
+                  : telemetry?.app?.versionName
+                    ? `Last telemetry ${formatListTime(telemetry.receivedAt)} · STALE SOURCE`
+                    : "No runtime metadata reported yet"
               }
-              color={telemetry ? "success" : "default"}
-              statusText={telemetry ? undefined : "Waiting"}
+              color={runtimeAppVersion ? "success" : telemetry?.app?.versionName ? "warning" : "default"}
+              statusText={runtimeAppVersion
+                ? (runtimeAppVersionCode ? `code ${runtimeAppVersionCode}` : undefined)
+                : telemetry?.app?.versionName ? "Stale" : "Waiting"}
             />
           </div>
         </section>

@@ -902,3 +902,84 @@ freshness comes from server **`received_at`**. Neither is ever derived from the
 other, and `refreshSims` must not re-derive liveness from telemetry age — a
 3-day-old report with a live phone means "online, SIM information is outdated",
 never "phone offline".
+## Live Android runtime metadata (0.19.35)
+
+Phone liveness, Android runtime metadata and device telemetry are **three
+separate facts**. They are reported in separate sections and never derived from
+one another.
+
+### Why
+
+The Android app version used to be learned only from device telemetry. When the
+telemetry upload stalled, GMweb kept reporting the version from the last
+telemetry row (`3.4.17`, Sep 30) while a newer APK was actually running — while
+presence correctly said ONLINE.
+
+It also caused a **bootstrap deadlock**: the PWA refused to send
+`REFRESH_DEVICE_TELEMETRY` unless *telemetry* advertised the capability, but
+stale telemetry is exactly what that command exists to repair. A phone that
+genuinely supported the command could never be asked.
+
+### Transport
+
+Runtime metadata rides on the command poll the phone already performs — no new
+endpoint and no extra traffic. The signed body is extended **additively**;
+older clients that omit `runtime` keep working unchanged:
+
+```json
+{ "agentId": "...", "limit": 25,
+  "runtime": { "protocolVersion": 1, "appVersionName": "3.4.22", "appVersionCode": 129,
+               "commandTypes": ["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY"] } }
+```
+
+Recorded **only** after AgentAuth succeeds, and keyed by the **authenticated**
+device id — a body-supplied `agentId` cannot write another device's runtime.
+It is runtime/feature **evidence only** and never grants authorization.
+
+### Validation and storage
+
+`appVersionName` (string, ≤64), `appVersionCode` (safe non-negative integer),
+`protocolVersion` (bounded integer), `commandTypes` (array, ≤32 entries, strings
+only, ≤64 chars each, de-duplicated). A block with nothing usable creates no row.
+
+Stored in a dedicated `agent_runtime` table (`device_id` primary key). Server
+receipt time is authoritative. Changed metadata persists immediately; unchanged
+repeated polls are coalesced (`RUNTIME_WRITE_INTERVAL_MS`, 15s) while the
+in-memory view stays exact. No SIM, battery or message content is stored here.
+
+### `GET /api/v1/linked-device/status`
+
+```json
+{
+  "phone":     { "state": "ONLINE", "lastActivityAt": 0, "lastActivitySource": "COMMAND_POLL", "ageMs": 0 },
+  "runtime":   { "appVersionName": "3.4.22", "appVersionCode": 129, "protocolVersion": 1,
+                 "commandTypes": ["REFRESH_DEVICE_TELEMETRY"], "receivedAt": 0, "source": "COMMAND_POLL", "ageMs": 0 },
+  "telemetry": { "state": "OLD", "receivedAt": 0, "ageMs": 0, "clockSkewMs": 0, "reportedAppVersion": "3.4.17" },
+  "now": 0
+}
+```
+
+`phone.appVersion` is retained for older clients but is **derived** and
+self-describing: `runtime.appVersionName ?? telemetry.app.versionName ?? null`,
+with `appVersionSource` (`RUNTIME` | `TELEMETRY_FALLBACK`) and
+`appVersionIsFallback`. A telemetry fallback must be presented as a historical
+value, never as the running APK.
+
+### Capability negotiation priority
+
+`deviceStatus.runtime.commandTypes` **first**; telemetry capability is a
+fallback only while that telemetry is still `FRESH`. Therefore:
+
+- live runtime advertises `REFRESH_DEVICE_TELEMETRY` ⇒ refresh **ALLOWED**, even
+  with old / missing / pre-capability telemetry (the production recovery path);
+- no live runtime, no (fresh) telemetry capability ⇒ `UNSUPPORTED`;
+- a stale telemetry capability is **not** evidence of support.
+
+Support is always determined by advertised command name — never by guessing from
+`versionName`.
+
+### Success rule (unchanged)
+
+`command COMPLETED` is still **not** success. A strictly newer
+`telemetry.receivedAt` than the baseline is required before showing
+"SIM information updated."
