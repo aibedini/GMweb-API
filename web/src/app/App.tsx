@@ -20,8 +20,13 @@ import {
   type HistoryPagingState, type HistoryTrace,
 } from "../lib/threadPaging";
 import { selectSmsSim } from "../lib/simSelection";
-import { derivePhonePresence } from "../lib/phonePresence";
-import { describeSimTelemetry, classifySimRefresh, simRefreshMessage, type SimRefreshResult } from "../lib/simTelemetry";
+import { describeSimTelemetry } from "../lib/simTelemetry";
+import { authoritativePhonePresence, authoritativeTelemetryFreshness } from "../lib/deviceState";
+import {
+  IDLE_SIM_REFRESH, REFRESH_COMMAND_TYPE, REFRESH_TIMEOUT_MS, TELEMETRY_POLL_INTERVAL_MS,
+  TELEMETRY_POLL_TIMEOUT_MS, planSimRefresh, refreshFailureForCommand, simRefreshCopy,
+  simRefreshInFlight, telemetryAdvanced, type SimRefreshState,
+} from "../lib/simRefresh";
 import {
   IDLE_READ, readFailureCode, readStateKey, readSyncLabel, readSyncRetryable, readSyncTone,
   shouldAutoRead, type ReadSyncState,
@@ -157,29 +162,85 @@ export default function App() {
   // never depends on a JS breakpoint for correctness.
   const isWideViewport = useMediaQuery("(min-width: 768px)", { defaultValue: true });
 
-  const [simRefresh, setSimRefresh] = useState<SimRefreshResult>({ outcome: "IDLE", message: null });
+  const [simRefresh, setSimRefresh] = useState<SimRefreshState>(IDLE_SIM_REFRESH);
 
   const refreshTelemetry = () => void fetchPrimaryTelemetry().then(value => {
     setTelemetry(value);
   }).catch(() => setTelemetry(null));
 
+  // Guard against double-click enqueueing two concurrent refresh commands.
+  const simRefreshInFlightRef = useRef(false);
+
   /**
-   * §20: user-initiated SIM refresh. Compares the phone's report timestamp
-   * before and after, and reports "nothing newer" rather than a fake success.
+   * "Refresh SIMs" asks the PHONE to re-report device telemetry through the
+   * existing durable encrypted command channel, then PROVES the server stored a
+   * newer report. Re-reading the telemetry we already have is not a refresh.
    */
   const refreshSims = async () => {
-    const previousReceivedAt = telemetry?.receivedAt ?? null;
-    setSimRefresh(simRefreshMessage("CHECKING"));
+    if (simRefreshInFlightRef.current) return;
+    simRefreshInFlightRef.current = true;
+    setSimRefresh({ state: "REQUESTING" });
     try {
-      const next = await fetchPrimaryTelemetry();
-      setTelemetry(next);
-      const presence = derivePhonePresence(next?.receivedAt ?? null);
-      const outcome = classifySimRefresh({
-        previousReceivedAt, nextReceivedAt: next?.receivedAt ?? null, presence,
+      // STEP 1/2: authoritative liveness + current telemetry.
+      const [status, current] = await Promise.all([
+        fetchLinkedDeviceStatus().catch(() => null),
+        fetchPrimaryTelemetry().catch(() => null),
+      ]);
+      if (status) setDeviceStatus(status);
+      if (current) setTelemetry(current);
+
+      // STEP 3/4: one testable decision — can the phone receive it, and does
+      // it advertise the capability?
+      const plan = planSimRefresh(status, current);
+      if (plan.action === "OFFLINE") { setSimRefresh({ state: "PHONE_OFFLINE" }); return; }
+      if (plan.action === "UNSUPPORTED") { setSimRefresh({ state: "UNSUPPORTED" }); return; }
+      if (plan.presence === "STALE") setSimRefresh({ state: "PHONE_STALE" });
+      const baselineReceivedAt = plan.baselineReceivedAt;
+
+      // STEP 5: durable encrypted command on the existing channel.
+      const command = await submitCommand(REFRESH_COMMAND_TYPE, {
+        reason: "SIM_REFRESH", requestedAt: Date.now(),
       });
-      setSimRefresh(simRefreshMessage(outcome));
-    } catch {
-      setSimRefresh(simRefreshMessage("FAILED"));
+      setSimRefresh({ state: "WAITING_FOR_PHONE", commandId: command.commandId });
+
+      // STEP 6: observe the real lifecycle. CREATE/ACCEPTED/COMPLETED are NOT
+      // proof of a refresh on their own.
+      const deadline = Date.now() + REFRESH_TIMEOUT_MS;
+      let completed = false;
+      while (Date.now() < deadline) {
+        await new Promise(resolve => window.setTimeout(resolve, 500));
+        const view = await fetchCommand(command.commandId);
+        const failure = refreshFailureForCommand(view?.state);
+        if (failure === "EXPIRED") { setSimRefresh({ state: "TIMED_OUT" }); return; }
+        if (failure) {
+          setSimRefresh({ state: "COMMAND_FAILED", errorCode: view?.result || view?.state || "FAILED" });
+          return;
+        }
+        if (view?.state === "COMPLETED") { completed = true; break; }
+      }
+      if (!completed) { setSimRefresh({ state: "TIMED_OUT" }); return; }
+
+      // STEP 7: COMPLETED only means Android says its POST succeeded. Prove a
+      // NEW server receipt time actually exists.
+      setSimRefresh({ state: "WAITING_FOR_TELEMETRY", commandId: command.commandId, baselineReceivedAt });
+      const pollDeadline = Date.now() + TELEMETRY_POLL_TIMEOUT_MS;
+      while (Date.now() < pollDeadline) {
+        const next = await fetchPrimaryTelemetry().catch(() => null);
+        if (telemetryAdvanced(baselineReceivedAt, next)) {
+          // STEP 8: only now is this an update.
+          setTelemetry(next);
+          setSimRefresh({ state: "UPDATED", receivedAt: Number(next?.receivedAt) });
+          return;
+        }
+        await new Promise(resolve => window.setTimeout(resolve, TELEMETRY_POLL_INTERVAL_MS));
+      }
+      setSimRefresh({ state: "TIMED_OUT" });
+    } catch (cause) {
+      setSimRefresh({ state: "COMMAND_FAILED", errorCode: readFailureCode(cause) });
+    } finally {
+      // STEP 9: presence/freshness must be current either way.
+      void fetchLinkedDeviceStatus().then(setDeviceStatus).catch(() => {});
+      simRefreshInFlightRef.current = false;
     }
   };
 
@@ -532,7 +593,10 @@ export default function App() {
     }
   }, [messages, pendingMessage]);
 
-  const submitCommand = async (type: "SEND_SMS" | "MARK_THREAD_READ", payload: Record<string, unknown>) => {
+  const submitCommand = async (
+    type: "SEND_SMS" | "MARK_THREAD_READ" | "REFRESH_DEVICE_TELEMETRY",
+    payload: Record<string, unknown>,
+  ) => {
     const idempotencyKey = crypto.randomUUID();
     const target = await fetchPrimaryCommandKey();
     const encrypted = await encryptCommand(target.encryptionPublicKey, type, idempotencyKey, { type, ...payload });
@@ -825,15 +889,14 @@ export default function App() {
       : "No payloads received";
 
   // Presence comes from the SERVER's view of authenticated phone activity.
-  // Telemetry freshness is a separate axis and is never used for liveness.
-  // The local derivation remains only as a fallback if the status call fails.
-  const phonePresence = deviceStatus
-    ? deviceStatus.phone.state
-    : derivePhonePresence(telemetry?.receivedAt ?? null);
+  // Both the normal UI and the refresh flow use this ONE helper so there is
+  // never a second liveness algorithm to drift out of sync.
+  const phonePresence = authoritativePhonePresence(deviceStatus, telemetry);
+  const telemetryFreshness = authoritativeTelemetryFreshness(deviceStatus, telemetry);
   const phoneLastActivityAt = deviceStatus
     ? deviceStatus.phone.lastActivityAt
     : telemetry?.receivedAt ?? null;
-  const simTelemetry = describeSimTelemetry(telemetry, Date.now(), phonePresence);
+  const simTelemetry = describeSimTelemetry(telemetry, Date.now(), phonePresence, telemetryFreshness);
 
   const conversationsLoading = conversationPage.length === 0 && bootstrapState === "BOOTSTRAPPING_SYNC";
   const emptyInboxMessage = conversations.length === 0 ? "No conversations yet" : "No matching conversations";
@@ -911,7 +974,8 @@ export default function App() {
       onSim={chooseSim}
       help={simInstructions}
       retry={() => void refreshSims()}
-      refreshNotice={simRefresh.message}
+      refreshNotice={simRefreshCopy(simRefresh)}
+      refreshing={simRefreshInFlight(simRefresh)}
       send={() => void send()}
       sending={sending}
       canSend={capabilities.includes("SEND_MESSAGES")}

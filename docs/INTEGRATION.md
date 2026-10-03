@@ -843,3 +843,62 @@ and exposed as `clockSkewMs`; it never influences presence or freshness.
 Consumers that only need SIM/device facts may keep using
 `GET /api/v1/linked-device/telemetry`; anything that renders "is the phone
 online?" must use `GET /api/v1/linked-device/status`.
+## Refresh SIMs — remote device telemetry refresh (0.19.34)
+
+`Refresh SIMs` is a **real remote request**, not a re-read of cached telemetry.
+Re-reading what the server already has can never discover a newly inserted SIM.
+
+### Command type
+
+`REFRESH_DEVICE_TELEMETRY` (the report carries device + SIM + permission state,
+so it is not named for SIM alone). Encrypted plaintext:
+
+```json
+{ "type": "REFRESH_DEVICE_TELEMETRY", "reason": "SIM_REFRESH", "requestedAt": 1760000000000 }
+```
+
+It uses the **existing** `POST /api/v1/commands` durable encrypted channel —
+there is no parallel endpoint, and no plaintext downgrade. A linked browser
+must send `cryptoVersion === 1`, `encoding === "envelope.v1"`,
+`schemaVersion === 1`, or it receives `400 encrypted_command_required`. It
+needs the `READ_MESSAGES` capability (a browser may refresh exactly what it may
+read); otherwise `403 read_messages_capability_required`.
+
+### Capability negotiation
+
+Android advertises support in device telemetry — **never** inferred from
+`versionName`:
+
+```json
+{ "capabilities": { "commandTypes": ["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY"] } }
+```
+
+Validated defensively on ingest (optional array, strings only, max 32 types,
+max 64 chars each, duplicates dropped). Absent or malformed means "remote
+refresh unsupported" — which is **not** an error and **not** an offline phone;
+the ordinary telemetry display keeps working. Capabilities are feature
+negotiation only and never grant authorization.
+
+### Client flow and success rule
+
+1. read `GET /api/v1/linked-device/status` (authoritative liveness)
+2. read `GET /api/v1/linked-device/telemetry` → `baselineReceivedAt`
+3. `OFFLINE`/`NEVER_SEEN` ⇒ do **not** enqueue; `STALE` may proceed but is labelled
+4. require `capabilities.commandTypes` to include `REFRESH_DEVICE_TELEMETRY`
+5. submit the encrypted command
+6. observe the durable lifecycle (`QUEUED` → `…` → `COMPLETED`, or `FAILED`/`EXPIRED`)
+7. after `COMPLETED`, poll telemetry (500 ms, ≤10 s) until
+   **`receivedAt > baselineReceivedAt`**
+8. only then report updated; total budget 15 s
+
+**`COMPLETED` does not mean refreshed.** It only means Android believes its POST
+succeeded. A new server `receivedAt` is the sole proof. If the baseline is
+`null`, any non-null `receivedAt` counts.
+
+### Liveness vs freshness invariant
+
+Phone liveness comes from server-observed **authenticated activity**; telemetry
+freshness comes from server **`received_at`**. Neither is ever derived from the
+other, and `refreshSims` must not re-derive liveness from telemetry age — a
+3-day-old report with a live phone means "online, SIM information is outdated",
+never "phone offline".

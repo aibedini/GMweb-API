@@ -64,7 +64,7 @@ test("the four SIM telemetry states stay distinct with their own copy", async ()
   // A: property missing entirely
   const missing = describeSimTelemetry(telemetry(), now, "ONLINE");
   assert.equal(missing.state, "NOT_REPORTED");
-  assert.match(missing.copy, /has not been reported by the phone/);
+  assert.match(missing.copy, /has not been reported yet/);
 
   // No telemetry at all
   assert.equal(describeSimTelemetry(null, now, "ONLINE").state, "NOT_REPORTED");
@@ -103,13 +103,19 @@ test("stale and offline SIM snapshots are labelled, never claimed fresh", async 
   const staleView = describeSimTelemetry(
     telemetry({ receivedAt: now - 18 * 60_000, smsSubscriptions: fresh }), now, "STALE");
   assert.equal(staleView.stale, true);
-  assert.match(staleView.copy, /outdated/);
+  // A stale CONNECTION is not an outdated report; the copy must say which.
+  assert.match(staleView.copy, /stale/i);
+  assert.doesNotMatch(staleView.copy, /offline/i);
+
+  const oldView = describeSimTelemetry(
+    telemetry({ receivedAt: now - 18 * 60_000, smsSubscriptions: fresh }), now, "ONLINE");
+  assert.match(oldView.copy, /outdated/);
 
   const offlineView = describeSimTelemetry(
     telemetry({ receivedAt: now - 20 * 60_000, smsSubscriptions: fresh }), now, "OFFLINE");
   assert.equal(offlineView.stale, true);
   assert.match(offlineView.copy, /Primary phone is offline/);
-  assert.match(offlineView.copy, /cannot be refreshed/);
+  assert.match(offlineView.copy, /Reconnect the phone/);
 });
 
 test("a remembered SIM is rejected when it vanished or the report is stale", async () => {
