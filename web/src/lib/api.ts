@@ -231,7 +231,7 @@ export async function fetchPrimaryCommandKey(): Promise<{ deviceId: string; encr
 }
 
 export async function createCommand(body: {
-  type: "SEND_SMS" | "MARK_THREAD_READ";
+  type: "SEND_SMS" | "MARK_THREAD_READ" | "REFRESH_DEVICE_TELEMETRY";
   payload: string;
   idempotencyKey: string;
   targetAgentId: string;
@@ -256,6 +256,12 @@ export interface DeviceTelemetry {
     subscriptionId: number; slotIndex: number; displayName: string; carrierName: string;
     isDefaultSms: boolean; isActive: boolean; sendCapable?: boolean;
   }> };
+  /**
+   * Feature negotiation only — never authorization. An older build that omits
+   * this must be treated as "remote refresh unsupported", not as broken.
+   * Contract shared with Android: `capabilities.commandTypes: string[]`.
+   */
+  capabilities?: { commandTypes?: string[] };
 }
 
 export async function fetchPrimaryTelemetry(): Promise<DeviceTelemetry | null> {

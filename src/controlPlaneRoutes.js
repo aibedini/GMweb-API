@@ -15,7 +15,41 @@ const EVENT_TYPES = Object.keys({
   ...eventCryptoPolicy.controlKey,
   ...eventCryptoPolicy.nonContentControl,
 });
-const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ"]);
+const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY"]);
+
+/**
+ * Defensive validation of Android-advertised command capabilities.
+ *
+ * These are FEATURE NEGOTIATION ONLY, never authorization: a linked browser
+ * still needs its session, the command crypto and a valid target agent.
+ */
+const MAX_COMMAND_TYPES = 32;
+const MAX_COMMAND_TYPE_LENGTH = 64;
+
+function normalizeCommandTypes(value) {
+  if (!Array.isArray(value)) return null;
+  const out = [];
+  for (const entry of value.slice(0, MAX_COMMAND_TYPES)) {
+    if (typeof entry !== "string") continue;
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.length > MAX_COMMAND_TYPE_LENGTH) continue;
+    if (!out.includes(trimmed)) out.push(trimmed);
+  }
+  return out;
+}
+
+/** Persist only the capability block, leaving the rest of the payload intact. */
+function withNormalizedCapabilities(body) {
+  if (!body || typeof body !== "object") return body;
+  const types = normalizeCommandTypes(body.capabilities?.commandTypes);
+  if (types === null) {
+    // Older clients simply omit it; do not invent an empty capability set
+    // (absent means "unsupported", which is the honest reading).
+    const { capabilities, ...rest } = body;
+    return rest;
+  }
+  return { ...body, capabilities: { ...body.capabilities, commandTypes: types } };
+}
 const SAFE_INGEST_ERROR_CODES = new Set(["invalid_event_id", "invalid_metadata", "invalid_payload_encoding",
   "invalid_encrypted_envelope", "unsupported_schema_version", "unsupported_crypto_version",
   "encrypted_payload_required", "event_payload_too_large"]);
@@ -285,7 +319,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (!agent) return reply.code(401).send({ error: "agent_auth_required" });
     if (request.body.deviceId !== agent.deviceId) return reply.code(403).send({ error: "device_id_mismatch" });
     if (!deviceTelemetryStore) return reply.code(503).send({ error: "telemetry_unavailable" });
-    deviceTelemetryStore.upsert(request.body, agent.role);
+    deviceTelemetryStore.upsert(withNormalizedCapabilities(request.body), agent.role);
     return { ok: true };
   });
 
@@ -446,7 +480,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         type: "object",
         required: ["type", "payload"],
         properties: {
-          type: { type: "string", examples: ["SEND_SMS", "MARK_THREAD_READ"] },
+          type: { type: "string", examples: ["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY"] },
           payload: { type: "string", description: "base64-encoded opaque payload bytes" },
           encoding: { type: "string", default: "application/json" },
           schemaVersion: { type: "integer", default: 1 },
@@ -475,6 +509,13 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (request.linkedDevice && body.type === "SEND_SMS" &&
         !request.linkedDevice.capabilities?.includes("SEND_MESSAGES")) {
       return reply.code(403).send({ error: "send_messages_capability_required" });
+    }
+    // Refreshing device telemetry reads device/SIM state, so it needs the same
+    // capability that already gates reading that state. A linked browser may
+    // refresh exactly what it is allowed to read.
+    if (request.linkedDevice && body.type === "REFRESH_DEVICE_TELEMETRY" &&
+        !request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
     }
     if (request.linkedDevice && ENCRYPTED_LINKED_COMMAND_TYPES.has(String(body.type))) {
       if (Number(body.cryptoVersion) !== 1 || body.encoding !== "envelope.v1" || Number(body.schemaVersion) !== 1) {

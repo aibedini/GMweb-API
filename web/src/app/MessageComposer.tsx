@@ -37,6 +37,7 @@ export function MessageComposer({
   status,
   useDefault,
   refreshNotice,
+  refreshing,
 }: {
   draft: string;
   onDraft: (value: string) => void;
@@ -50,8 +51,10 @@ export function MessageComposer({
   sending: boolean;
   canSend: boolean;
   status: string | null;
-  /** §20: outcome of a user-initiated SIM refresh; never fakes success. */
+  /** Outcome of a user-initiated SIM refresh; never fakes success. */
   refreshNotice?: string | null;
+  /** True while a refresh command is in flight; blocks duplicate enqueues. */
+  refreshing?: boolean;
 }) {
   const disabled = sendDisabled({ draft, sending, canSend, simInstructions: help });
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -162,8 +165,8 @@ export function MessageComposer({
               <Alert.Title>SIM needs attention</Alert.Title>
               <Alert.Description>{help}</Alert.Description>
             </Alert.Content>
-            <Button size="sm" variant="ghost" onPress={retry}>
-              Refresh SIMs
+            <Button size="sm" variant="ghost" onPress={retry} isDisabled={refreshing === true}>
+              {refreshing ? "Refreshing…" : "Refresh SIMs"}
             </Button>
           </Alert>
         </div>
