@@ -1197,6 +1197,11 @@ export default function App() {
           error={error}
           payloadState={payloadState}
           phonePresence={phonePresence}
+          phoneLastActivityAt={phoneLastActivityAt}
+          lastActivitySource={deviceStatus?.phone.lastActivitySource ?? null}
+          runtimeAppVersion={deviceStatus?.runtime.appVersionName ?? null}
+          runtimeAppVersionCode={deviceStatus?.runtime.appVersionCode ?? null}
+          runtimeReceivedAt={deviceStatus?.runtime.receivedAt ?? null}
           simView={simTelemetry}
         />
       ) : null}

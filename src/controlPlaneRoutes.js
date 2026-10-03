@@ -18,24 +18,14 @@ const EVENT_TYPES = Object.keys({
 const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY"]);
 
 /**
- * Defensive validation of Android-advertised command capabilities.
+ * Defensive validation of Android-advertised command capabilities (telemetry
+ * path). Shared with the live runtime store so there is one implementation.
  *
  * These are FEATURE NEGOTIATION ONLY, never authorization: a linked browser
  * still needs its session, the command crypto and a valid target agent.
  */
-const MAX_COMMAND_TYPES = 32;
-const MAX_COMMAND_TYPE_LENGTH = 64;
-
 function normalizeCommandTypes(value) {
-  if (!Array.isArray(value)) return null;
-  const out = [];
-  for (const entry of value.slice(0, MAX_COMMAND_TYPES)) {
-    if (typeof entry !== "string") continue;
-    const trimmed = entry.trim();
-    if (!trimmed || trimmed.length > MAX_COMMAND_TYPE_LENGTH) continue;
-    if (!out.includes(trimmed)) out.push(trimmed);
-  }
-  return out;
+  return require("./agentRuntime").normalizeCommandTypes(value);
 }
 
 /** Persist only the capability block, leaving the rest of the payload intact. */
@@ -67,7 +57,7 @@ const SAFE_INGEST_ERROR_CODES = new Set(["invalid_event_id", "invalid_metadata",
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentActivityStore, derivePhonePresence, deriveTelemetryFreshness, agentAuthService, checkRateLimit, enableCommandLeases = false }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentActivityStore, agentRuntimeStore, derivePhonePresence, deriveTelemetryFreshness, agentAuthService, checkRateLimit, enableCommandLeases = false }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
   const replicationCapabilities = () => ({
     preferredProtocolVersion: 1,
@@ -383,17 +373,39 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       ? deriveTelemetryFreshness(telemetry?.receivedAt ?? null, now)
       : "NEVER_REPORTED";
 
+    // Live runtime metadata comes from the authenticated command poll, never
+    // from telemetry. See src/agentRuntime.js.
+    const runtime = deviceId ? agentRuntimeStore?.get(deviceId) || null : null;
+
+    // `phone.appVersion` is retained for older clients but is explicitly a
+    // DERIVED value, and says whether it fell back to a stale telemetry row.
+    const appVersionName = runtime?.appVersionName ?? telemetry?.app?.versionName ?? null;
+    const appVersionSource = runtime?.appVersionName ? "RUNTIME"
+      : telemetry?.app?.versionName ? "TELEMETRY_FALLBACK" : null;
+
     return {
       phone: {
         state: phoneState,
         lastActivityAt: activity?.lastActivityAt ?? null,
         lastActivitySource: activity?.lastSource ?? null,
         ageMs: activity?.lastActivityAt ? Math.max(0, now - activity.lastActivityAt) : null,
+        // Deprecated: use `runtime`. True when this is a stale telemetry value.
+        appVersion: appVersionName,
+        appVersionSource,
+        appVersionIsFallback: appVersionSource === "TELEMETRY_FALLBACK",
         // Safe device facts only; never SIM identifiers or phone numbers.
         model: telemetry?.device?.model ?? null,
         manufacturer: telemetry?.device?.manufacturer ?? null,
         androidVersion: telemetry?.device?.androidVersion ?? null,
-        appVersion: telemetry?.app?.versionName ?? null,
+      },
+      runtime: {
+        appVersionName: runtime?.appVersionName ?? null,
+        appVersionCode: runtime?.appVersionCode ?? null,
+        protocolVersion: runtime?.protocolVersion ?? null,
+        commandTypes: runtime?.commandTypes ?? [],
+        receivedAt: runtime?.receivedAt ?? null,
+        source: runtime?.source ?? null,
+        ageMs: runtime?.receivedAt ? Math.max(0, now - runtime.receivedAt) : null,
       },
       telemetry: {
         state: telemetryState,
@@ -401,6 +413,8 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         ageMs: telemetry?.receivedAt ? Math.max(0, now - telemetry.receivedAt) : null,
         // Diagnostic only: the phone's clock offset, which NEVER affects state.
         clockSkewMs: telemetry?.clockSkewMs ?? null,
+        // The version the last telemetry row carried. Historical, not current.
+        reportedAppVersion: telemetry?.app?.versionName ?? null,
       },
       now,
     };
@@ -599,7 +613,20 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         type: "object",
         properties: {
           agentId: { type: "string", description: "device/agent identity (device-key auth until PR-08 mTLS)" },
-          limit: { type: "integer", minimum: 1, maximum: 100, default: 25 }
+          limit: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+          // Optional, additive live runtime evidence. Older clients omit it.
+          // Feature negotiation only — never authorization.
+          runtime: {
+            type: "object",
+            description: "Live Android runtime metadata (app version, advertised command types)",
+            additionalProperties: true,
+            properties: {
+              protocolVersion: { type: "integer" },
+              appVersionName: { type: "string", maxLength: 64 },
+              appVersionCode: { type: "integer", minimum: 0 },
+              commandTypes: { type: "array", items: { type: "string", maxLength: 64 }, maxItems: 32 }
+            }
+          }
         }
       },
       response: { 200: { type: "object", properties: { commands: { type: "array", items: { type: "object", additionalProperties: true } } } } }
@@ -607,6 +634,14 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   }, async (request) => {
     const agentId = String(request.body?.agentId || "android-agent");
     const limit = Math.max(1, Math.min(100, Number(request.body?.limit) || 25));
+
+    // Runtime metadata is recorded only for an AgentAuth-authenticated request,
+    // and is keyed by the AUTHENTICATED device id — never the body's claim.
+    const authenticated = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (authenticated && request.body?.runtime) {
+      agentRuntimeStore?.record(authenticated.deviceId, request.body.runtime, "COMMAND_POLL");
+    }
+
     const commands = commandEngine.claimForAgent(agentId, { limit }).map((c) => ({
       ...c,
       ciphertext: b64(c.ciphertext),

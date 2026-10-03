@@ -283,16 +283,34 @@ export interface LinkedDeviceStatus {
     lastActivityAt: number | null;
     lastActivitySource: string | null;
     ageMs: number | null;
+    /** Deprecated: prefer `runtime`. Derived, and may be a stale telemetry value. */
+    appVersion?: string | null;
+    appVersionSource?: "RUNTIME" | "TELEMETRY_FALLBACK" | null;
+    appVersionIsFallback?: boolean;
     model: string | null;
     manufacturer: string | null;
     androidVersion: string | null;
-    appVersion: string | null;
+  };
+  /**
+   * Live Android runtime metadata, from the authenticated command poll. This is
+   * the CURRENT running APK — never sourced from device telemetry.
+   */
+  runtime: {
+    appVersionName: string | null;
+    appVersionCode: number | null;
+    protocolVersion: number | null;
+    commandTypes: string[];
+    receivedAt: number | null;
+    source: string | null;
+    ageMs: number | null;
   };
   telemetry: {
     state: "FRESH" | "STALE" | "OLD" | "NEVER_REPORTED";
     receivedAt: number | null;
     ageMs: number | null;
     clockSkewMs: number | null;
+    /** The version the last telemetry row carried. Historical, not current. */
+    reportedAppVersion?: string | null;
   };
   now: number;
 }
