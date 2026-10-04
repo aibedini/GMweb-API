@@ -30,16 +30,23 @@ export function SimSelector({
   selected,
   onSim,
   useDefault,
+  historical = false,
 }: {
   sims: Sim[];
   selected?: Sim;
   onSim: (id: number | null) => void;
   useDefault: boolean;
+  /** True when the list is not current; entries are labelled "Last reported". */
+  historical?: boolean;
 }) {
-  if (sims.length === 0) return null;
-
   const defaultSim = sims.find((sim) => sim.isDefaultSms);
   const value = simSelectValue(sims, selected, useDefault);
+  // "Phone default" is ALWAYS offered: it is the one mode that stays safe and
+  // usable when SIM telemetry is stale, because Android resolves the current
+  // system default at execution time.
+  const defaultCarrier = defaultSim
+    ? `SIM ${defaultSim.slotIndex + 1} · ${defaultSim.carrierName || defaultSim.displayName || "Carrier unavailable"}`
+    : "Let the phone choose at send time";
 
   return (
     <Select
@@ -55,22 +62,16 @@ export function SimSelector({
       </Select.Trigger>
       <Select.Popover>
         <ListBox>
-          {defaultSim ? (
-            <ListBox.Item id={DEFAULT_SIM_KEY} textValue="Default">
-              <SimOption
-                name="Default"
-                carrier={`SIM ${defaultSim.slotIndex + 1} · ${
-                  defaultSim.carrierName || defaultSim.displayName || "Carrier unavailable"
-                }`}
-              />
-              <ListBox.ItemIndicator />
-            </ListBox.Item>
-          ) : null}
+          <ListBox.Item id={DEFAULT_SIM_KEY} textValue="Phone default">
+            <SimOption name="Phone default" carrier={defaultCarrier} />
+            <ListBox.ItemIndicator />
+          </ListBox.Item>
           {sims.map((sim) => (
             <ListBox.Item key={sim.subscriptionId} id={String(sim.subscriptionId)} textValue={simLabel(sim)}>
               <SimOption
                 name={simLabel(sim)}
-                carrier={sim.carrierName || sim.displayName || "Carrier unavailable"}
+                carrier={`${sim.carrierName || sim.displayName || "Carrier unavailable"}${
+                  historical ? " · Last reported" : ""}`}
               />
               <ListBox.ItemIndicator />
             </ListBox.Item>

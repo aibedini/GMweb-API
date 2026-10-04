@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, useMediaQuery } from "@heroui/react";
 import { syncVisibleInbox, loadContactsOnDemand, listRecentEvents, listAggregateEventsPage, listContacts, listConversations, listChangedConversationHeads, getCursor, getBrowserSyncStatus, resetLocal, subscribeSyncAvailable, subscribeKeyMaintenance, type BrowserSyncStatus, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, reconcileConversationHead, type ConversationProjection } from "../lib/inbox";
-import { createCommand, fetchCommand, fetchLinkedDeviceStatus, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, CommandKeyError, type DeviceTelemetry, type LinkedBrowserSession, type LinkedDeviceStatus, type PrimaryCommandKey, type TrustSnapshot } from "../lib/api";
+import { createCommand, fetchCommand, fetchLinkedDeviceStatus, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, CommandKeyError, type DeviceTelemetry, type EncryptedCommandType, type LinkedBrowserSession, type LinkedDeviceStatus, type PrimaryCommandKey, type TrustSnapshot } from "../lib/api";
 import { encryptCommand, CommandCryptoError } from "../lib/commandCrypto";
 import { getStoredDeviceIdentity, wipeDeviceKeys } from "../lib/deviceKeys";
 import { clearPendingSend, loadPendingSends, savePendingSend, type PendingEncryptedSend } from "../lib/commandOutbox";
@@ -11,7 +11,8 @@ import { PairingScreen } from "../screens/PairingScreen";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
 import { collectWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnostics";
 import { MessageComposer } from "./MessageComposer";
-import { applyReadConfirmation, contactTitle, phoneKey, simHelp } from "../lib/inboxActions";
+import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActions";
+import { commandSubscriptionId, defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress } from "../lib/threadHistory";
 import {
@@ -28,8 +29,8 @@ import {
   simRefreshInFlight, telemetryAdvanced, type SimRefreshState,
 } from "../lib/simRefresh";
 import {
-  IDLE_READ, readFailureCode, readStateKey, readSyncLabel, readSyncRetryable, readSyncTone,
-  shouldAutoRead, type ReadSyncState,
+  IDLE_READ, readFailureCode, readStateForCommand, readStateKey, readSyncLabel, readSyncRetryable,
+  readSyncTone, shouldAutoRead, type ReadSyncState,
 } from "../lib/readSync";
 import { androidError } from "../../../shared/smsStatus";
 
@@ -147,11 +148,17 @@ export default function App() {
   // Safe crypto failure diagnostics (code/stage/format/errorName) — never key
   // material, ciphertext, message body or recipient.
   const cryptoDiagnostic = useRef<string | null>(null);
+  // Machine-readable reason for the last encrypted-command failure, set by the
+  // canonical prepare helper so every command type reports the same way.
+  const commandFailureCode = useRef<string | null>(null);
   const observedSendStatus = (id: string) => sendEvidence.current?.clientMessageId === id ? sendEvidence.current.status : null;
   // Keyed by `conversationId:readThroughSequence`: at most ONE live
   // MARK_THREAD_READ observation per read-through, so switching threads
   // rapidly cannot produce a command storm.
   const readInFlight = useRef(new Set<string>());
+  // Durable read commands awaiting phone confirmation, keyed the same way, so
+  // a still-pending read can be re-observed on resume instead of being lost.
+  const pendingReadCommands = useRef(new Map<string, { commandId: string; state: string }>());
   const contactsLoading = useRef(false);
   const lastThreadSelection = useRef<string | null>(null);
   const recoveringSend = useRef(false);
@@ -201,7 +208,7 @@ export default function App() {
       const baselineReceivedAt = plan.baselineReceivedAt;
 
       // STEP 5: durable encrypted command on the existing channel.
-      const command = await submitCommand(REFRESH_COMMAND_TYPE, {
+      const command = await submitEncryptedCommand(REFRESH_COMMAND_TYPE, {
         reason: "SIM_REFRESH", requestedAt: Date.now(),
       });
       setSimRefresh({ state: "WAITING_FOR_PHONE", commandId: command.commandId });
@@ -577,9 +584,10 @@ export default function App() {
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
   const selectedRecipient = composeRecipient || messages.map(item => item.payload.address).find(Boolean);
   const activeSims = telemetry?.smsSubscriptions?.items.filter(sim => sim.isActive && sim.sendCapable !== false) ?? [];
-  const chosenSim = selectSmsSim(activeSims, selectedSubscriptionId);
-  const simInstructions = simHelp(telemetry, Boolean(chosenSim));
-  const simAvailable = !simInstructions;
+  // DISPLAY vs COMMAND: `chosenSim` is only ever for rendering. The command
+  // subscription is derived separately so a display fallback can never silently
+  // change what the phone is told to do.
+  const displayResolvedSim = selectSmsSim(activeSims, selectedSubscriptionId);
   const chooseSim = (id: number | null) => {
     setSelectedSubscriptionId(id);
     if (id === null) window.localStorage.removeItem("gmweb:selected-sms-subscription");
@@ -596,14 +604,69 @@ export default function App() {
     }
   }, [messages, pendingMessage]);
 
-  const submitCommand = async (
-    type: "SEND_SMS" | "MARK_THREAD_READ" | "REFRESH_DEVICE_TELEMETRY",
+  /**
+   * THE canonical encrypted-command preparation.
+   *
+   * Every encrypted command type — SEND_SMS, MARK_THREAD_READ,
+   * REFRESH_DEVICE_TELEMETRY — MUST go through this. Having SEND_SMS encrypt
+   * separately (and forget to pass `encryptionPublicKeyFormat`) created two
+   * crypto contracts; the READ and REFRESH paths only worked by lucky
+   * format sniffing. One helper, one contract.
+   *
+   * Records a SAFE diagnostic (command type, stage, code) and the failure code
+   * so the caller can surface a precise reason without duplicating this logic.
+   */
+  const prepareEncryptedCommand = async (
+    type: EncryptedCommandType,
     payload: Record<string, unknown>,
-  ) => {
-    const idempotencyKey = crypto.randomUUID();
-    const target = await fetchPrimaryCommandKey();
-    const encrypted = await encryptCommand(target.encryptionPublicKey, type, idempotencyKey, { type, ...payload });
-    return createCommand({ type, payload: encrypted, idempotencyKey, targetAgentId: target.deviceId });
+    idempotencyKey: string = crypto.randomUUID(),
+  ): Promise<{ idempotencyKey: string; targetAgentId: string; encrypted: string }> => {
+    let target: PrimaryCommandKey;
+    try {
+      target = await fetchPrimaryCommandKey();
+    } catch (cause) {
+      const code = cause instanceof CommandKeyError ? cause.code : "COMMAND_KEY_UNAVAILABLE";
+      commandFailureCode.current = code;
+      cryptoDiagnostic.current = `commandType=${type} stage=FETCH_COMMAND_KEY code=${code}`;
+      throw cause;
+    }
+    // Never encrypt to a stale/absent target agent.
+    if (!target.deviceId) {
+      commandFailureCode.current = "COMMAND_KEY_UNAVAILABLE";
+      cryptoDiagnostic.current = `commandType=${type} stage=FETCH_COMMAND_KEY code=COMMAND_KEY_UNAVAILABLE reason=no_device_id`;
+      throw new CommandCryptoError({ code: "COMMAND_KEY_UNAVAILABLE", stage: "FETCH_COMMAND_KEY" });
+    }
+    try {
+      const encrypted = await encryptCommand(
+        target.encryptionPublicKey, type, idempotencyKey, { type, ...payload },
+        target.encryptionPublicKeyFormat,
+      );
+      return { idempotencyKey, targetAgentId: target.deviceId, encrypted };
+    } catch (cause) {
+      if (cause instanceof CommandCryptoError) {
+        commandFailureCode.current = cause.code;
+        cryptoDiagnostic.current = `commandType=${type} ${cause.diagnostics()}`;
+      } else {
+        commandFailureCode.current = "ENCRYPTION_FAILED";
+        cryptoDiagnostic.current = `commandType=${type} stage=ENCRYPT code=ENCRYPTION_FAILED error=${
+          cause instanceof Error ? cause.name : "unknown"}`;
+      }
+      throw cause;
+    }
+  };
+
+  /** Encrypt + create the durable command in one step (READ, REFRESH). */
+  const submitEncryptedCommand = async (type: EncryptedCommandType, payload: Record<string, unknown>) => {
+    const prepared = await prepareEncryptedCommand(type, payload);
+    try {
+      return await createCommand({
+        type, payload: prepared.encrypted,
+        idempotencyKey: prepared.idempotencyKey, targetAgentId: prepared.targetAgentId,
+      });
+    } catch (cause) {
+      commandFailureCode.current = "COMMAND_CREATE_FAILED";
+      throw cause;
+    }
   };
 
   // §12.1: opening an unread conversation clears the Web unread UI FIRST, then
@@ -642,35 +705,49 @@ export default function App() {
       ...previous, [aggregateId]: Math.max(previous[aggregateId] ?? -1, lastSequence),
     }));
     readInFlight.current.add(key);
-    setReadSync({ state: "SYNCING", sequence: lastSequence, commandId: null });
+    setReadSync({ state: "PREPARING_COMMAND", sequence: lastSequence });
 
     void (async () => {
       let commandId: string | null = null;
       try {
-        const command = await submitCommand("MARK_THREAD_READ", { conversationId: aggregateId });
+        const command = await submitEncryptedCommand("MARK_THREAD_READ", { conversationId: aggregateId });
         commandId = command.commandId;
         // Durable on the server: from here on the phone owns confirmation.
-        setReadSync({ state: "WAITING_FOR_PHONE", sequence: lastSequence, commandId: command.commandId });
+        setReadSync(readStateForCommand(command.state, lastSequence, command.commandId));
+        // Observe the real lifecycle. A NON-TERMINAL command is never a failure:
+        // the command is durable and may complete later, so after the window we
+        // simply keep waiting instead of reporting "Read sync failed".
+        let observed = command.state;
         for (let i = 0; i < 30; i++) {
           await new Promise(resolve => window.setTimeout(resolve, 1000));
           const view = await fetchCommand(command.commandId);
-          if (view?.state === "COMPLETED") {
+          if (view?.state) observed = view.state;
+          if (observed === "COMPLETED") {
             setReadConfirmations(previous => ({
               ...previous, [aggregateId]: Math.max(previous[aggregateId] ?? -1, lastSequence),
             }));
             readInFlight.current.delete(key);
+            pendingReadCommands.current.set(key, { commandId: command.commandId, state: observed });
             setReadSync({ state: "CONFIRMED", sequence: lastSequence });
             return;
           }
-          if (view && ["FAILED", "EXPIRED"].includes(view.state)) throw new Error(view.result || view.state);
+          if (observed === "FAILED" || observed === "EXPIRED") break;
+          setReadSync(readStateForCommand(observed, lastSequence, command.commandId));
         }
-        throw new Error("read_pending");
+        // Keep the command for resume re-observation; do NOT report failure.
+        pendingReadCommands.current.set(key, { commandId: command.commandId, state: observed });
+        if (observed === "FAILED" || observed === "EXPIRED") {
+          readInFlight.current.delete(key);
+          setReadSync(readStateForCommand(observed, lastSequence, command.commandId));
+          return;
+        }
+        setReadSync(readStateForCommand(observed, lastSequence, command.commandId));
       } catch (cause) {
         readInFlight.current.delete(key);
-        setReadSync({
-          state: "FAILED", sequence: lastSequence,
-          errorCode: readFailureCode(cause), commandId,
-        });
+        const errorCode = cause instanceof CommandCryptoError || cause instanceof CommandKeyError
+          ? readFailureCode(cause.code)
+          : readFailureCode(cause);
+        setReadSync({ state: "FAILED", sequence: lastSequence, errorCode, commandId });
       }
     })();
   }, [selected, selectedConversation?.lastSequence, needsPhoneRead, readyThreadId, threadState,
@@ -695,7 +772,13 @@ export default function App() {
     if (!body.trim()) { setCommandStatus("EMPTY_BODY"); return; }
     if (!selectedRecipient) { setCommandStatus("NO_RECIPIENT"); return; }
     if (!capabilities.includes("SEND_MESSAGES")) { setCommandStatus("SEND_CAPABILITY_MISSING"); return; }
-    if (!simAvailable) { setCommandStatus(!telemetry?.smsSubscriptions ? "SIM_STATE_UNAVAILABLE" : "SELECTED_SIM_UNAVAILABLE"); return; }
+    // Structured readiness owns the gate. The old `simHelp()` string blocked
+    // every send on stale telemetry, including PHONE_DEFAULT.
+    if (sendBlockedNow) {
+      commandFailureCode.current = readiness.state;
+      setCommandStatus(readiness.state);
+      return;
+    }
     if (recoveringSend.current || sending) return;
     recoveringSend.current = true;
     setSending(true);
@@ -706,8 +789,7 @@ export default function App() {
     sendEvidence.current = null;
     setPendingMessage({ clientMessageId, body, recipient: selectedRecipient, at: Date.now() });
     let failureCode = "COMMAND_CREATE_FAILED";
-    try {
-      const identity = await getStoredDeviceIdentity();
+    try {      const identity = await getStoredDeviceIdentity();
       if (!identity) { failureCode = "BROWSER_IDENTITY_UNAVAILABLE"; throw new Error(failureCode); }
       const pendingRows = (await loadPendingSends()).filter(row => row.browserDeviceId === identity.deviceId);
       const existing = pendingRows.find(row =>
@@ -719,33 +801,17 @@ export default function App() {
       }
       let pending: PendingEncryptedSend | undefined = existing;
       if (!pending) {
-        const idempotencyKey = crypto.randomUUID();
-        let target: PrimaryCommandKey;
-        try {
-          target = await fetchPrimaryCommandKey();
-        } catch (cause) {
-          failureCode = cause instanceof CommandKeyError ? cause.code : "DEVICE_COMMAND_KEY_UNAVAILABLE";
-          throw cause;
-        }
         setCommandStatus("Encrypting…");
-        let payload: string;
-        try {
-          payload = await encryptCommand(target.encryptionPublicKey, "SEND_SMS", idempotencyKey,
-            { type: "SEND_SMS", phone: selectedRecipient, body, clientMessageId,
-              ...(chosenSim ? { subscriptionId: chosenSim.subscriptionId } : {}) },
-            target.encryptionPublicKeyFormat);
-        } catch (cause) {
-          // Surface the real code and stage instead of a blanket ENCRYPTION_FAILED.
-          if (cause instanceof CommandCryptoError) {
-            failureCode = cause.code;
-            cryptoDiagnostic.current = cause.diagnostics();
-          } else {
-            failureCode = "ENCRYPTION_FAILED";
-          }
-          throw cause;
-        }
-        pending = { browserDeviceId: identity.deviceId, clientMessageId, idempotencyKey, payload,
-          targetAgentId: target.deviceId, createdAt: Date.now() };
+        // Canonical crypto path — identical to READ and REFRESH.
+        const prepared = await prepareEncryptedCommand("SEND_SMS", {
+          phone: selectedRecipient, body, clientMessageId,
+          // PHONE_DEFAULT omits subscriptionId entirely so Android resolves the
+          // CURRENT default at execution time. Only an explicit selection is sent.
+          ...(commandSubscriptionId === undefined ? {} : { subscriptionId: commandSubscriptionId }),
+        });
+        pending = { browserDeviceId: identity.deviceId, clientMessageId,
+          idempotencyKey: prepared.idempotencyKey, payload: prepared.encrypted,
+          targetAgentId: prepared.targetAgentId, createdAt: Date.now() };
         failureCode = "LOCAL_OUTBOX_FAILED";
         await savePendingSend(pending); // durable encrypted retry identity before HTTP
         setCommandStatus("Queued locally");
@@ -776,7 +842,8 @@ export default function App() {
     } catch {
       // A lost response may follow a committed command. Retain the encrypted
       // envelope and identity so the next retry cannot create a second SMS.
-      setCommandStatus(observedSendStatus(clientMessageId) || failureCode);
+      // The canonical prepare helper records the precise crypto/command reason.
+      setCommandStatus(observedSendStatus(clientMessageId) || commandFailureCode.current || failureCode);
     } finally {
       recoveringSend.current = false;
       setSending(false);
@@ -918,6 +985,20 @@ export default function App() {
     : telemetry?.receivedAt ?? null;
   const simTelemetry = describeSimTelemetry(telemetry, Date.now(), phonePresence, telemetryFreshness);
 
+  // ONE deterministic send-readiness model owns composer gating (replaces the
+  // legacy simHelp() string, which blocked every send on stale telemetry).
+  const readiness = deriveSendReadiness({
+    draft, hasRecipient: Boolean(selectedRecipient), canSend: capabilities.includes("SEND_MESSAGES"),
+    sending, phonePresence, telemetryFreshness, sim: simTelemetry, selectedSubscriptionId,
+  });
+  const sendBlockedNow = sendBlocked(readiness);
+  const simInstructions = sendReadinessNotice(readiness)?.message ?? null;
+  // Informational only; never gates PHONE_DEFAULT sending.
+  const freshnessNotice = readiness.state === "READY_DEFAULT"
+    ? defaultModeFreshnessNotice(telemetryFreshness,
+      displayResolvedSim ? `${displayResolvedSim.displayName} · ${displayResolvedSim.carrierName}` : null)
+    : null;
+
   const conversationsLoading = conversationPage.length === 0 && bootstrapState === "BOOTSTRAPPING_SYNC";
   const emptyInboxMessage = conversations.length === 0 ? "No conversations yet" : "No matching conversations";
   const mobileView = selected || composeOpen || composeRecipient ? "thread" : "list";
@@ -990,9 +1071,11 @@ export default function App() {
       draft={draft}
       onDraft={setDraft}
       sims={activeSims}
-      selected={chosenSim}
+      selected={displayResolvedSim}
       onSim={chooseSim}
       help={simInstructions}
+      freshnessNotice={freshnessNotice?.message ?? null}
+      simListHistorical={simListIsHistorical(telemetryFreshness)}
       retry={() => void refreshSims()}
       refreshNotice={simRefreshCopy(simRefresh)}
       refreshing={simRefreshInFlight(simRefresh)}

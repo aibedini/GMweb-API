@@ -63,7 +63,7 @@ test("self unlink removes this identity's sessions and rejects replay without re
 });
 
 test("contact names match national, international and Persian digit numbers without changing messages", async () => {
-  const { phoneKey, contactTitle, applyReadConfirmation, simHelp, commandFeedback } = await import("../web/src/lib/inboxActions.ts");
+  const { phoneKey, contactTitle, applyReadConfirmation, commandFeedback } = await import("../web/src/lib/inboxActions.ts");
   const names = new Map([[phoneKey("+989120000000"), "Test contact"]]);
   for (const number of ["09120000000", "+98 912 000 0000", "۰۰۹۸۹۱۲۰۰۰۰۰۰۰"]) {
     assert.equal(contactTitle({ title: number, preview: "synthetic" }, names).title, "Test contact");
@@ -71,10 +71,10 @@ test("contact names match national, international and Persian digit numbers with
   const row = { lastSequence: 10, read: false, unreadCount: 2 };
   assert.equal(applyReadConfirmation(row, 10).unreadCount, 0);
   assert.equal(applyReadConfirmation({ ...row, lastSequence: 11 }, 10).unreadCount, 2);
-  assert.equal(simHelp(null, false).includes("Waiting for your phone"), true);
-  assert.match(simHelp({ receivedAt: 100, smsSubscriptions: { available: false } }, false, 101), /Phone permission/);
-  assert.match(simHelp({ receivedAt: 100 }, false, 101), /Update Messages/);
-  assert.match(simHelp({ receivedAt: 100, smsSubscriptions: { available: true } }, true, 200000), /out of date/);
-  assert.equal(simHelp({ receivedAt: 100, smsSubscriptions: { available: true } }, true, 101), null);
+  // The legacy simHelp() was removed from send gating; structured readiness
+  // (deriveSendReadiness) now owns composer behaviour and is covered in
+  // test/webComposerUi.test.js.
+  assert.equal(typeof (await import("../web/src/lib/inboxActions.ts")).simHelp, "undefined",
+    "simHelp must not come back as a send gate");
   assert.doesNotMatch(commandFeedback("SIM_STATE_UNAVAILABLE"), /SIM_STATE/);
 });

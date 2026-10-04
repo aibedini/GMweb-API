@@ -8,7 +8,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  IDLE_READ, readStateKey, readSyncLabel, readSyncTone, readSyncRetryable,
+  IDLE_READ, isTerminalCommandState, readStateForCommand, readStateKey, readStillPending,
+  readSyncLabel, readSyncTone, readSyncRetryable,
   shouldAutoRead, readFailureCode,
 } from "../web/src/lib/readSync.ts";
 
@@ -21,11 +22,47 @@ const GATE = {
 test("local read and phone-confirmed read are distinct states", () => {
   assert.equal(readSyncLabel(IDLE_READ), null);
   assert.equal(readSyncLabel({ state: "READ_LOCAL", sequence: 5 }), "Read locally");
-  assert.equal(readSyncLabel({ state: "SYNCING", sequence: 5, commandId: null }), "Read · syncing to phone");
+  assert.equal(readSyncLabel({ state: "PREPARING_COMMAND", sequence: 5 }), "Read · syncing to phone");
+  assert.equal(readSyncLabel({ state: "QUEUED", sequence: 5, commandId: "c1" }), "Read · waiting for phone");
   assert.equal(readSyncLabel({ state: "WAITING_FOR_PHONE", sequence: 5, commandId: "c1" }), "Read · waiting for phone");
+  assert.equal(readSyncLabel({ state: "PHONE_ACCEPTED", sequence: 5, commandId: "c1" }), "Read · accepted by phone");
+  assert.equal(readSyncLabel({ state: "EXECUTING", sequence: 5, commandId: "c1" }), "Read · phone is updating");
   assert.equal(readSyncLabel({ state: "CONFIRMED", sequence: 5 }), "Read");
-  assert.equal(readSyncLabel({ state: "FAILED", sequence: 5, errorCode: "PHONE_OFFLINE", commandId: null }),
+  assert.equal(readSyncLabel({ state: "FAILED", sequence: 5, errorCode: "READ_PHONE_REJECTED", commandId: null }),
     "Read sync failed");
+  assert.equal(readSyncLabel({ state: "EXPIRED", sequence: 5, commandId: null }), "Read sync expired");
+});
+
+// ===== PENDING IS NOT FAILURE (the "Read sync failed" production symptom) =====
+test("a non-terminal command maps to a WAITING state, never to FAILED", () => {
+  const sequence = 12;
+  const commandId = "cmd-1";
+  for (const commandState of ["QUEUED", "DELIVERED_TO_AGENT", "ACCEPTED_BY_AGENT", "EXECUTING"]) {
+    const state = readStateForCommand(commandState, sequence, commandId);
+    assert.notEqual(state.state, "FAILED", `${commandState} must never become FAILED`);
+    assert.notEqual(state.state, "EXPIRED", `${commandState} must never become EXPIRED`);
+    assert.equal(readStillPending(state), true, `${commandState} must still be pending`);
+    assert.equal(readSyncRetryable(state), false, `${commandState} must not offer Retry`);
+    assert.equal(readSyncTone(state), "muted", `${commandState} must not be alarm-styled`);
+    assert.equal(isTerminalCommandState(commandState), false);
+  }
+  assert.equal(readStateForCommand("COMPLETED", sequence, commandId).state, "CONFIRMED");
+  assert.equal(readStateForCommand("FAILED", sequence, commandId).state, "FAILED");
+  assert.equal(readStateForCommand("EXPIRED", sequence, commandId).state, "EXPIRED");
+  for (const commandState of ["COMPLETED", "FAILED", "EXPIRED"]) {
+    assert.equal(isTerminalCommandState(commandState), true);
+  }
+  assert.equal(readStateForCommand(undefined, sequence, commandId).state, "QUEUED");
+});
+
+test("the 30s observation window expiring keeps the read pending, not failed", () => {
+  // The old code threw `read_pending` after the window and rendered
+  // "Read sync failed" for a healthy queued command.
+  const afterWindow = readStateForCommand("QUEUED", 12, "cmd-1");
+  assert.equal(readStillPending(afterWindow), true);
+  assert.equal(readSyncLabel(afterWindow), "Read · waiting for phone");
+  assert.equal(readSyncTone(afterWindow), "muted");
+  assert.doesNotMatch(readSyncLabel(afterWindow), /failed/i);
 });
 
 test("only a failure gets alarm styling and offers Retry", () => {
@@ -64,13 +101,17 @@ test("auto-read requires every precondition", () => {
     "a server-confirmed read-through ahead of the local one wins");
 });
 
-test("read failures map to stable machine codes, never raw strings for logic", () => {
-  assert.equal(readFailureCode(new Error("phone offline")), "PHONE_OFFLINE");
-  assert.equal(readFailureCode(new Error("device unreachable")), "PHONE_OFFLINE");
-  assert.equal(readFailureCode(new Error("COMMAND_EXPIRED")), "READ_EXPIRED");
-  assert.equal(readFailureCode(new Error("read_pending")), "READ_PHONE_PENDING");
-  assert.equal(readFailureCode(new Error("weird")), "weird");
-  assert.equal(readFailureCode(null), "READ_FAILED");
+test("read failures map to READ_* machine codes, never raw strings for logic", () => {
+  assert.equal(readFailureCode(new Error("phone offline")), "READ_PHONE_OFFLINE");
+  assert.equal(readFailureCode(new Error("device unreachable")), "READ_PHONE_OFFLINE");
+  assert.equal(readFailureCode(new Error("COMMAND_EXPIRED")), "READ_COMMAND_EXPIRED");
+  assert.equal(readFailureCode(new Error("COMMAND_KEY_UNAVAILABLE")), "READ_COMMAND_KEY_UNAVAILABLE");
+  assert.equal(readFailureCode(new Error("COMMAND_KEY_FORMAT_UNSUPPORTED")), "READ_COMMAND_CRYPTO_INVALID");
+  assert.equal(readFailureCode(new Error("COMMAND_CRYPTO_IMPORT_FAILED")), "READ_COMMAND_CRYPTO_INVALID");
+  assert.equal(readFailureCode(new Error("COMMAND_CREATE_FAILED")), "READ_COMMAND_CREATE_FAILED");
+  assert.equal(readFailureCode(null), "READ_SYNC_FAILED");
+  // A pending command is no longer a failure reason at all.
+  assert.equal(readFailureCode(new Error("read_pending")), "read_pending");
 });
 
 /**
@@ -156,7 +197,7 @@ test("a failed read stays retryable and keeps the local read", async () => {
   const driver = makeReadDriver({ failWith: "phone offline" });
   assert.equal(await driver.open("conv-a", 10), "FAILED");
   assert.equal(driver.state.state, "FAILED");
-  assert.equal(driver.state.errorCode, "PHONE_OFFLINE");
+  assert.equal(driver.state.errorCode, "READ_PHONE_OFFLINE");
   assert.equal(readSyncRetryable(driver.state), true, "manual Retry becomes available");
   // The optimistic local read is NOT rolled back — the user did open the thread.
   assert.equal(driver.readThrough["conv-a"], 10);

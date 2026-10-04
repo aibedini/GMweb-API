@@ -38,6 +38,8 @@ export function MessageComposer({
   useDefault,
   refreshNotice,
   refreshing,
+  freshnessNotice,
+  simListHistorical,
 }: {
   draft: string;
   onDraft: (value: string) => void;
@@ -55,6 +57,10 @@ export function MessageComposer({
   refreshNotice?: string | null;
   /** True while a refresh command is in flight; blocks duplicate enqueues. */
   refreshing?: boolean;
+  /** Informational freshness note for PHONE_DEFAULT; never blocks sending. */
+  freshnessNotice?: string | null;
+  /** True when the cached SIM list is not current and must be labelled. */
+  simListHistorical?: boolean;
 }) {
   const disabled = sendDisabled({ draft, sending, canSend, simInstructions: help });
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -141,7 +147,8 @@ export function MessageComposer({
             ) : null}
           </div>
 
-          <SimSelector sims={sims} selected={selected} onSim={onSim} useDefault={useDefault} />
+          <SimSelector sims={sims} selected={selected} onSim={onSim} useDefault={useDefault}
+            historical={simListHistorical === true} />
           <SmsCounter draft={draft} />
         </div>
 
@@ -190,6 +197,10 @@ export function MessageComposer({
 
       {refreshNotice ? (
         <p className="composer-hint composer-hint--notice" role="status">{refreshNotice}</p>
+      ) : null}
+
+      {freshnessNotice ? (
+        <p className="composer-hint composer-hint--freshness" role="status">{freshnessNotice}</p>
       ) : null}
 
       <p className="composer-hint">Ctrl+Enter / ⌘+Enter to send</p>

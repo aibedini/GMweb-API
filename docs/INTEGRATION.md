@@ -1065,3 +1065,80 @@ The screenshot's `502 Bad Gateway` was **not** this bug. All 502s fall in
 00:04–01:04 and align exactly with `systemd` restart cycles of GMweb (~6-minute
 loop, 6 s with no upstream); every endpoint was hit equally and
 `/command-key` received **zero** 502s.
+## Integration hardening (0.19.37)
+
+Four integration/state gaps closed. **No change to the command envelope, the ECDH
+algorithm, or the Tauri/SPKI recipient-key compatibility** added in 0.19.36.
+
+### 1. One canonical command-crypto path
+
+`SEND_SMS` used to encrypt separately from `MARK_THREAD_READ` and
+`REFRESH_DEVICE_TELEMETRY`, and only `SEND_SMS` passed
+`encryptionPublicKeyFormat`. READ/REFRESH worked only by lucky format sniffing —
+two contracts for one wire format. All three now go through
+`prepareEncryptedCommand()` / `submitEncryptedCommand()`, which fetch the key,
+validate the target device, pass the explicit format and produce a safe staged
+diagnostic (`commandType`, `stage`, `code`, `format`, `decodedLength`,
+`errorName`). Diagnostics never contain the body, recipient, key bytes,
+ciphertext or plaintext payload.
+
+### 2. Pending read is not a failure
+
+`MARK_THREAD_READ` was observed for a fixed ~30 s and then reported as
+`FAILED` / "Read sync failed" while the command was still `QUEUED`. Pending is
+not failure.
+
+`ReadSyncState` is now: `IDLE`, `READ_LOCAL`, `PREPARING_COMMAND`, `QUEUED`,
+`WAITING_FOR_PHONE`, `PHONE_ACCEPTED`, `EXECUTING`, `CONFIRMED`, `FAILED`,
+`EXPIRED`. `QUEUED`, `DELIVERED_TO_AGENT`, `ACCEPTED_BY_AGENT` and `EXECUTING`
+map to waiting states and are never alarm-styled or offered as Retry. Only
+`FAILED` and `EXPIRED` are terminal. When the observation window closes, the
+command is retained so it can be re-observed on resume instead of being
+misreported.
+
+Read failures now carry `READ_*` machine codes (`READ_COMMAND_KEY_UNAVAILABLE`,
+`READ_COMMAND_CRYPTO_INVALID`, `READ_COMMAND_CREATE_FAILED`,
+`READ_COMMAND_EXPIRED`, `READ_PHONE_REJECTED`, `READ_PHONE_OFFLINE`, …) so
+diagnostics answer *why*.
+
+### 3. Structured send readiness replaces `simHelp()`
+
+`simHelp()` returned one blocking string and treated telemetry older than 180 s
+as a global blocker — including for **Phone default**, which does not depend on
+the SIM list. That produced the contradictory UI (selector showing "SIM 2 ·
+IR-MCI" next to "SIM needs attention / Reconnect the Primary phone" for a phone
+that was ONLINE).
+
+`deriveSendReadiness()` now owns composer gating, keeping four independent facts
+apart: phone presence, telemetry freshness, SIM discovery, selection mode.
+
+| mode | stale telemetry | behaviour |
+| --- | --- | --- |
+| `PHONE_DEFAULT` (`selectedSubscriptionId === null`) | any | **send allowed**; informational note only |
+| `EXPLICIT_SIM` | not `FRESH` | blocked — `EXPLICIT_SIM_TELEMETRY_STALE` |
+| `EXPLICIT_SIM` | `FRESH`, subscription gone | blocked — `EXPLICIT_SIM_MISSING`, never falls back |
+
+**Phone default omits `subscriptionId` entirely** so Android resolves the
+CURRENT system default at execution time; only an explicit selection is sent.
+Display resolution (`displayResolvedSim`, via `selectSmsSim`) is kept separate
+from command semantics (`commandSubscriptionId`) so a display fallback can never
+change what the phone is told to do. A yellow "last reported" label is not a
+fault: the SIM selector always offers "Phone default" first and marks stale
+entries as `Last reported`.
+
+### 4. Transport shutdown no longer throws
+
+`server.js` called `client.detachForShutdown()`. `client` is the
+TransportSelector Proxy, whose `get` trap falls through to the **active**
+transport — which in pull mode is the outbox, with no such method. The
+resulting `TypeError: client.detachForShutdown is not a function` aborted
+shutdown before `app.close()`, and correlated with restart cycles and the nginx
+502 windows.
+
+`TransportSelector` now defines `detachForShutdown()` and `stop()` explicitly.
+Every step is optional-safe (a missing method is skipped, not called),
+idempotent, and safe during partial initialization. `detachForShutdown()`
+detaches the Chrome client without killing an externally managed browser, and
+**stops** the outbox and direct-push client because they are in-process workers
+holding timers and sockets. `server.js` additionally guards the call so one
+failure cannot skip the remaining cleanup.

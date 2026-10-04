@@ -32,31 +32,67 @@ test("send is enabled only when the capability and SIM state allow it", async ()
   );
 });
 
-test("SIM help states follow the existing domain rules, including refresh", async () => {
-  const { simHelp } = await import("../web/src/lib/inboxActions.ts");
-  const now = 1_700_000_000_000;
-  assert.match(simHelp(null, true, now), /Waiting for your phone/);
-  assert.match(simHelp({ receivedAt: now - 180_001 }, true, now), /out of date/);
-  assert.equal(
-    simHelp({ receivedAt: now - 180_000, smsSubscriptions: { available: true } }, true, now),
-    null,
-    "telemetry exactly at the freshness boundary is still accepted",
-  );
-  assert.match(simHelp({ receivedAt: now }, true, now), /has not reported its SIMs/);
-  assert.match(
-    simHelp({ receivedAt: now - 180_001, smsSubscriptions: { available: true } }, true, now),
-    /out of date/,
-    "a stale subscription block is reported as out of date, not as missing",
-  );
-  assert.match(
-    simHelp({ receivedAt: now, smsSubscriptions: { available: false } }, true, now),
-    /Allow Phone permission/,
-  );
-  assert.match(
-    simHelp({ receivedAt: now, smsSubscriptions: { available: true } }, false, now),
-    /Choose an active SMS SIM/,
-  );
-  assert.equal(simHelp({ receivedAt: now, smsSubscriptions: { available: true } }, true, now), null);
+test("structured send readiness replaces the legacy simHelp gating", async () => {
+  const { deriveSendReadiness, sendBlocked, sendReadinessNotice, commandSubscriptionId, defaultModeFreshnessNotice } =
+    await import("../web/src/lib/sendReadiness.ts");
+
+  const SIM_A = { subscriptionId: 7, slotIndex: 0, displayName: "SIM 1", carrierName: "Irancell",
+    isDefaultSms: true, isActive: true, sendCapable: true };
+  const SIM_B = { subscriptionId: 9, slotIndex: 1, displayName: "SIM 2", carrierName: "IR-MCI",
+    isDefaultSms: false, isActive: true, sendCapable: true };
+  const sim = (over = {}) => ({ state: "OK", active: [SIM_A, SIM_B], ...over });
+  const base = {
+    draft: "hello", hasRecipient: true, canSend: true, sending: false,
+    phonePresence: "ONLINE", telemetryFreshness: "FRESH",
+    sim: sim(), selectedSubscriptionId: null,
+  };
+
+  // PHONE_DEFAULT with stale telemetry is ALLOWED — this was the production bug.
+  const staleDefault = deriveSendReadiness({ ...base, telemetryFreshness: "OLD" });
+  assert.equal(staleDefault.state, "READY_DEFAULT");
+  assert.equal(sendBlocked(staleDefault), false, "stale SIM telemetry must not block Phone default");
+  // ...and the freshness note is informational, never an "offline" alarm.
+  const note = defaultModeFreshnessNotice("OLD", "SIM 2 · IR-MCI");
+  assert.equal(note.blocking, false);
+  assert.doesNotMatch(note.message, /offline|reconnect/i);
+  assert.match(note.message, /outdated/i);
+
+  // EXPLICIT SIM with stale telemetry is BLOCKED, with a truthful reason.
+  const staleExplicit = deriveSendReadiness({ ...base, telemetryFreshness: "OLD", selectedSubscriptionId: 9 });
+  assert.equal(staleExplicit.state, "EXPLICIT_SIM_TELEMETRY_STALE");
+  assert.equal(sendBlocked(staleExplicit), true);
+  assert.match(sendReadinessNotice(staleExplicit).message, /outdated/i);
+  assert.doesNotMatch(sendReadinessNotice(staleExplicit).message, /offline/i);
+
+  // Fresh + still-active explicit SIM is ready.
+  assert.deepEqual(deriveSendReadiness({ ...base, selectedSubscriptionId: 9 }),
+    { state: "READY_EXPLICIT", subscriptionId: 9 });
+  // Fresh + vanished explicit SIM fails closed (no silent fallback).
+  assert.equal(deriveSendReadiness({ ...base, selectedSubscriptionId: 999 }).state, "EXPLICIT_SIM_MISSING");
+
+  // A live phone is never "offline" just because telemetry is old.
+  for (const presence of ["ONLINE", "STALE", "OFFLINE"]) {
+    const readiness = deriveSendReadiness({ ...base, phonePresence: presence, telemetryFreshness: "OLD" });
+    assert.doesNotMatch(sendReadinessNotice(readiness)?.message ?? "", /offline|Reconnect the Primary phone/i,
+      `${presence} + old telemetry must not claim the phone is offline`);
+  }
+
+  // No active SIM is only authoritative while telemetry is FRESH.
+  assert.equal(deriveSendReadiness({ ...base, sim: sim({ state: "NO_ACTIVE_SUBSCRIPTIONS", active: [] }) }).state,
+    "NO_ACTIVE_SIM");
+  assert.equal(deriveSendReadiness({ ...base, telemetryFreshness: "OLD",
+    sim: sim({ state: "NO_ACTIVE_SUBSCRIPTIONS", active: [] }) }).state,
+    "READY_DEFAULT", "a stale empty list must not block Phone default");
+
+  // PHONE_DEFAULT must OMIT subscriptionId; EXPLICIT must carry it exactly.
+  assert.equal(commandSubscriptionId(null), undefined);
+  assert.equal(commandSubscriptionId(9), 9);
+
+  // Precondition ordering.
+  assert.equal(deriveSendReadiness({ ...base, draft: "   " }).state, "EMPTY_BODY");
+  assert.equal(deriveSendReadiness({ ...base, hasRecipient: false }).state, "NO_RECIPIENT");
+  assert.equal(deriveSendReadiness({ ...base, canSend: false }).state, "SEND_CAPABILITY_MISSING");
+  assert.equal(deriveSendReadiness({ ...base, phonePresence: "NEVER_SEEN" }).state, "PHONE_NEVER_SEEN");
 });
 
 test("single SIM, dual SIM and default SIM keep the null-subscription sentinel", async () => {
@@ -98,14 +134,20 @@ test("single SIM, dual SIM and default SIM keep the null-subscription sentinel",
   assert.equal(simSelectChoice(undefined), null);
 });
 
-test("no SIM telemetry keeps sending blocked and reports no SIMs", async () => {
-  const { simHelp } = await import("../web/src/lib/inboxActions.ts");
+test("no SIM telemetry keeps the selector showing Phone default and reports no SIMs", async () => {
   const { selectSmsSim, simSelectValue } = await import("../web/src/lib/simSelection.ts");
+  const { deriveSendReadiness } = await import("../web/src/lib/sendReadiness.ts");
   const now = 1_700_000_000_000;
   const telemetry = { receivedAt: now };
-  assert.match(simHelp(telemetry, false, now), /has not reported its SIMs/);
   assert.equal(selectSmsSim([], null), undefined);
   assert.equal(simSelectValue([], undefined, true), null);
+  // With no SIM data at all, Phone default is still the safe option.
+  assert.equal(deriveSendReadiness({
+    draft: "x", hasRecipient: true, canSend: true, sending: false,
+    phonePresence: "ONLINE", telemetryFreshness: "NEVER_REPORTED",
+    sim: { state: "NOT_REPORTED", active: [] }, selectedSubscriptionId: null,
+  }).state, "READY_DEFAULT");
+  assert.ok(telemetry.receivedAt);
 });
 
 test("SMSCounter segments GSM-7, UCS-2 and multiline drafts honestly", async () => {

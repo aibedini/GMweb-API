@@ -260,8 +260,11 @@ export async function fetchPrimaryCommandKey(): Promise<PrimaryCommandKey> {
   return jsonOrThrow<PrimaryCommandKey>(res);
 }
 
+/** Command types a linked browser may submit (always encrypted). */
+export type EncryptedCommandType = "SEND_SMS" | "MARK_THREAD_READ" | "REFRESH_DEVICE_TELEMETRY";
+
 export async function createCommand(body: {
-  type: "SEND_SMS" | "MARK_THREAD_READ" | "REFRESH_DEVICE_TELEMETRY";
+  type: EncryptedCommandType;
   payload: string;
   idempotencyKey: string;
   targetAgentId: string;
