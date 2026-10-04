@@ -18,15 +18,11 @@ export function applyReadConfirmation(row: ConversationProjection, confirmedSequ
   return row.lastSequence <= confirmedSequence ? { ...row, read: true, unreadCount: 0 } : row;
 }
 
-export function simHelp(telemetry: { receivedAt: number; smsSubscriptions?: { available: boolean } } | null,
-  selectedAvailable: boolean, now = Date.now()): string | null {
-  if (!telemetry) return "Waiting for your phone. Open Messages on the Primary phone and check its connection.";
-  if (now - telemetry.receivedAt > 180_000) return "Your phone's SIM information is out of date. Reconnect the Primary phone, then retry.";
-  if (!telemetry.smsSubscriptions) return "Your phone has not reported its SIMs. Update Messages on the Primary phone and check Phone permission.";
-  if (!telemetry.smsSubscriptions.available) return "Allow Phone permission for Messages on the Primary phone, then retry.";
-  if (!selectedAvailable) return "Choose an active SMS SIM on your phone, then retry. Your saved SIM may no longer be available.";
-  return null;
-}
+// The legacy `simHelp()` lived here. It was REMOVED from send gating because it
+// collapsed independent facts into one blocking string and treated telemetry
+// older than 180s as a global blocker — including for "Phone default", which
+// does not depend on the SIM list at all. Structured readiness now lives in
+// web/src/lib/sendReadiness.ts (deriveSendReadiness / sendReadinessNotice).
 
 export function commandFeedback(status: string | null): string | null {
   if (!status) return null;
@@ -72,7 +68,7 @@ export interface ComposerSendGate {
   sending: boolean;
   /** `SEND_MESSAGES` capability from the linked session. */
   canSend: boolean;
-  /** Result of `simHelp(...)`: a non-null value blocks sending. */
+  /** BLOCKING notice from the structured send-readiness model, if any. */
   simInstructions: string | null;
 }
 
@@ -81,6 +77,10 @@ export interface ComposerSendGate {
  *
  * Both the Send button's disabled state and the keyboard shortcut guard use
  * this, so the button and the shortcut can never disagree.
+ *
+ * `simInstructions` now carries the BLOCKING notice from
+ * `deriveSendReadiness()`; PHONE_DEFAULT freshness warnings are informational
+ * and deliberately do not arrive here.
  */
 export function sendDisabled(gate: ComposerSendGate): boolean {
   return gate.sending || !gate.canSend || gate.draft.trim().length === 0 || Boolean(gate.simInstructions);

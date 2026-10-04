@@ -5979,8 +5979,16 @@ async function shutdown(signal) {
   await sendQueue.close({ force: true }).catch((error) => app.log.warn({ error }, "queue close failed"));
   await eveSmsEvents.stop().catch((error) => app.log.warn({ error }, "Eve callback worker close failed"));
   try { sendStore.close(); } catch (error) { app.log.warn({ error }, "ledger close failed"); }
-  if (config.browserMode === "connect") client.detachForShutdown();
-  else await client.stop().catch((error) => app.log.warn({ error }, "browser stop failed"));
+  // Transport shutdown goes through the SELECTOR's explicit lifecycle methods.
+  // Calling a transport method directly relied on proxy fall-through to the
+  // ACTIVE transport, which in pull mode is the outbox and has no
+  // detachForShutdown — that threw, aborted shutdown before app.close(), and
+  // produced the restart/502 cycles. Guarded so one failure cannot skip the
+  // remaining cleanup.
+  try {
+    if (config.browserMode === "connect") await client.detachForShutdown?.();
+    else await client.stop?.();
+  } catch (error) { app.log.warn({ error }, "transport shutdown failed"); }
   await app.close().catch((error) => app.log.warn({ error }, "server close failed"));
   clearTimeout(forceExit);
   process.exit(0);
