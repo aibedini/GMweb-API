@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, useMediaQuery } from "@heroui/react";
 import { syncVisibleInbox, loadContactsOnDemand, listRecentEvents, listAggregateEventsPage, listContacts, listConversations, listChangedConversationHeads, getCursor, getBrowserSyncStatus, resetLocal, subscribeSyncAvailable, subscribeKeyMaintenance, type BrowserSyncStatus, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, reconcileConversationHead, type ConversationProjection } from "../lib/inbox";
-import { createCommand, fetchCommand, fetchLinkedDeviceStatus, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type LinkedBrowserSession, type LinkedDeviceStatus, type TrustSnapshot } from "../lib/api";
-import { encryptCommand } from "../lib/commandCrypto";
+import { createCommand, fetchCommand, fetchLinkedDeviceStatus, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, CommandKeyError, type DeviceTelemetry, type LinkedBrowserSession, type LinkedDeviceStatus, type PrimaryCommandKey, type TrustSnapshot } from "../lib/api";
+import { encryptCommand, CommandCryptoError } from "../lib/commandCrypto";
 import { getStoredDeviceIdentity, wipeDeviceKeys } from "../lib/deviceKeys";
 import { clearPendingSend, loadPendingSends, savePendingSend, type PendingEncryptedSend } from "../lib/commandOutbox";
 import { completeLinkedSession } from "../lib/pairing";
@@ -144,6 +144,9 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; recipient: string; at: number; failure?: string } | null>(null);
   const sendEvidence = useRef<{ clientMessageId: string; status: string } | null>(null);
+  // Safe crypto failure diagnostics (code/stage/format/errorName) — never key
+  // material, ciphertext, message body or recipient.
+  const cryptoDiagnostic = useRef<string | null>(null);
   const observedSendStatus = (id: string) => sendEvidence.current?.clientMessageId === id ? sendEvidence.current.status : null;
   // Keyed by `conversationId:readThroughSequence`: at most ONE live
   // MARK_THREAD_READ observation per read-through, so switching threads
@@ -717,13 +720,30 @@ export default function App() {
       let pending: PendingEncryptedSend | undefined = existing;
       if (!pending) {
         const idempotencyKey = crypto.randomUUID();
-        failureCode = "DEVICE_COMMAND_KEY_UNAVAILABLE";
-        const target = await fetchPrimaryCommandKey();
+        let target: PrimaryCommandKey;
+        try {
+          target = await fetchPrimaryCommandKey();
+        } catch (cause) {
+          failureCode = cause instanceof CommandKeyError ? cause.code : "DEVICE_COMMAND_KEY_UNAVAILABLE";
+          throw cause;
+        }
         setCommandStatus("Encrypting…");
-        failureCode = "ENCRYPTION_FAILED";
-        const payload = await encryptCommand(target.encryptionPublicKey, "SEND_SMS", idempotencyKey,
-          { type: "SEND_SMS", phone: selectedRecipient, body, clientMessageId,
-            ...(chosenSim ? { subscriptionId: chosenSim.subscriptionId } : {}) });
+        let payload: string;
+        try {
+          payload = await encryptCommand(target.encryptionPublicKey, "SEND_SMS", idempotencyKey,
+            { type: "SEND_SMS", phone: selectedRecipient, body, clientMessageId,
+              ...(chosenSim ? { subscriptionId: chosenSim.subscriptionId } : {}) },
+            target.encryptionPublicKeyFormat);
+        } catch (cause) {
+          // Surface the real code and stage instead of a blanket ENCRYPTION_FAILED.
+          if (cause instanceof CommandCryptoError) {
+            failureCode = cause.code;
+            cryptoDiagnostic.current = cause.diagnostics();
+          } else {
+            failureCode = "ENCRYPTION_FAILED";
+          }
+          throw cause;
+        }
         pending = { browserDeviceId: identity.deviceId, clientMessageId, idempotencyKey, payload,
           targetAgentId: target.deviceId, createdAt: Date.now() };
         failureCode = "LOCAL_OUTBOX_FAILED";

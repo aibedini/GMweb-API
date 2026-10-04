@@ -225,9 +225,39 @@ export async function health(): Promise<{ ok: boolean; version: string }> {
   return jsonOrThrow<{ ok: boolean; version: string }>(res);
 }
 
-export async function fetchPrimaryCommandKey(): Promise<{ deviceId: string; encryptionPublicKey: string }> {
+export type CommandPublicKeyFormat = "spki-p256" | "raw-p256";
+
+export interface PrimaryCommandKey {
+  deviceId: string;
+  encryptionPublicKey: string;
+  /** Optional for backward compatibility with older servers. */
+  encryptionPublicKeyFormat?: CommandPublicKeyFormat;
+}
+
+/** Typed failure so the composer can distinguish "missing" from "malformed". */
+export class CommandKeyError extends Error {
+  readonly code: "COMMAND_KEY_UNAVAILABLE" | "COMMAND_KEY_INVALID";
+  readonly reason: string | null;
+
+  constructor(code: "COMMAND_KEY_UNAVAILABLE" | "COMMAND_KEY_INVALID", reason: string | null = null) {
+    super(code === "COMMAND_KEY_UNAVAILABLE"
+      ? "Phone encryption key is unavailable."
+      : "Phone encryption key is invalid. Reconnect the Primary phone.");
+    this.name = "CommandKeyError";
+    this.code = code;
+    this.reason = reason;
+  }
+}
+
+export async function fetchPrimaryCommandKey(): Promise<PrimaryCommandKey> {
   const res = await fetch(`${API}/linked-device/command-key`, { credentials: "include" });
-  return jsonOrThrow(res);
+  if (res.status === 404) throw new CommandKeyError("COMMAND_KEY_UNAVAILABLE");
+  if (res.status === 409) {
+    let reason: string | null = null;
+    try { reason = (await res.json())?.reason ?? null; } catch { /* body may be empty */ }
+    throw new CommandKeyError("COMMAND_KEY_INVALID", reason);
+  }
+  return jsonOrThrow<PrimaryCommandKey>(res);
 }
 
 export async function createCommand(body: {

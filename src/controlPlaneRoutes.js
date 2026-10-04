@@ -456,7 +456,17 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     }
     const identity = agentAuthService?.getPrimaryIdentity();
     if (!identity?.encryption_public_key) return reply.code(404).send({ error: "primary_command_key_unavailable" });
-    return { deviceId: identity.device_id, encryptionPublicKey: identity.encryption_public_key };
+    // The format travels with the key so the client never has to guess from
+    // byte length. An unusable stored key is reported, never served as valid.
+    const classified = require("./publicKeyFormat").classifyPublicKey(identity.encryption_public_key);
+    if (!classified.ok) {
+      return reply.code(409).send({ error: "invalid_primary_command_key", reason: classified.error });
+    }
+    return {
+      deviceId: identity.device_id,
+      encryptionPublicKey: identity.encryption_public_key,
+      encryptionPublicKeyFormat: classified.format,
+    };
   });
 
   // ── POST-PAIR: linked-device presence telemetry (Android-authenticated) ──
