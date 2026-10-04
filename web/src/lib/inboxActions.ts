@@ -38,6 +38,14 @@ export function commandFeedback(status: string | null): string | null {
     BROWSER_IDENTITY_UNAVAILABLE: "Browser identity is unavailable. Link this browser again.",
     DEVICE_COMMAND_KEY_UNAVAILABLE: "The phone's encryption key is unavailable. Check its connection.",
     ENCRYPTION_FAILED: "Could not encrypt this message. Your draft is saved; retry.",
+    // Command crypto failures, mapped explicitly so a key-format problem is
+    // never reported as a generic encryption error. Raw WebCrypto exception
+    // text is deliberately never shown.
+    COMMAND_KEY_UNAVAILABLE: "Phone encryption key is unavailable.",
+    COMMAND_KEY_INVALID: "Phone encryption key is invalid. Reconnect the Primary phone.",
+    COMMAND_KEY_FORMAT_UNSUPPORTED: "Phone encryption key format is not supported. Update Messages and retry.",
+    COMMAND_CRYPTO_IMPORT_FAILED: "Could not securely prepare this message.",
+    COMMAND_CRYPTO_FAILED: "Could not securely prepare this message.",
     LOCAL_OUTBOX_FAILED: "Could not save the send locally. Check browser storage and retry.",
     COMMAND_CREATE_FAILED: "Could not confirm the send request. Retry will reuse the saved request.",
     COMMAND_POLL_FAILED: "Could not check the request. Its outcome is still unknown; reconnect to check.",

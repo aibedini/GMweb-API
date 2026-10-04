@@ -983,3 +983,85 @@ Support is always determined by advertised command name — never by guessing fr
 `command COMPLETED` is still **not** success. A strictly newer
 `telemetry.receivedAt` than the baseline is required before showing
 "SIM information updated."
+## Command public-key wire format (0.19.36)
+
+### The bug (confirmed against production)
+
+Android v3.4.x registers its identity keys as **DER SubjectPublicKeyInfo**
+(`toSpkiB64`). `web/src/lib/commandCrypto.ts` imported the command encryption
+key with WebCrypto `"raw"`, which expects an **uncompressed point**
+(`0x04||X||Y`). The browser therefore raised `DataError: Invalid keyData` and
+the composer reported "Could not encrypt this message."
+
+Measured on the live Primary identity:
+
+```
+signing:    91 bytes, firstByte 0x30, DER_SPKI_P256
+encryption: 91 bytes, firstByte 0x30, DER_SPKI_P256
+GET /api/v1/linked-device/command-key served it unchanged (same fingerprint)
+importKey("raw")  => DataError: Invalid keyData
+importKey("spki") => OK
+```
+
+`agentAuth.js` had already accepted **both** formats for the **signing** key —
+the migration was simply only half applied. Web `SEND_SMS` was broken while the
+EVE path kept working because EVE uses `LEGACY_PULL` (`AndroidOutbox` →
+`OutboxPoller` → `SmsSender`) and never performs browser-side ECDH. **EVE
+success is not evidence that Web command encryption works.**
+
+### Contract
+
+`GET /api/v1/linked-device/command-key` now declares the format explicitly:
+
+```json
+{ "deviceId": "...", "encryptionPublicKey": "...", "encryptionPublicKeyFormat": "spki-p256" }
+```
+
+Supported values: `spki-p256`, `raw-p256`. The field is **optional** for
+backward compatibility: when absent the client sniffs — 65 bytes starting
+`0x04` is `raw-p256`, otherwise `spki-p256` is attempted.
+
+Status codes: `404 primary_command_key_unavailable` (no key),
+`409 invalid_primary_command_key` with a `reason` (stored key is not a usable
+P-256 key), `403 command_capability_required`. A malformed stored key is
+**never** served as if valid.
+
+### Client behaviour
+
+`importCommandPublicKey(publicKeyB64, format?)` decodes once, honours an
+explicit format, rejects a format that contradicts the bytes, and imports with
+`"spki"` or `"raw"` accordingly. Non-P-256 curves and malformed DER are
+rejected with a machine-readable code rather than silently accepted.
+
+Failure taxonomy (never a blanket `ENCRYPTION_FAILED`):
+
+| code | user copy |
+| --- | --- |
+| `COMMAND_KEY_UNAVAILABLE` | Phone encryption key is unavailable. |
+| `COMMAND_KEY_INVALID` | Phone encryption key is invalid. Reconnect the Primary phone. |
+| `COMMAND_KEY_FORMAT_UNSUPPORTED` | Phone encryption key format is not supported. Update Messages and retry. |
+| `COMMAND_CRYPTO_IMPORT_FAILED` / `COMMAND_CRYPTO_FAILED` | Could not securely prepare this message. |
+
+Errors carry **safe** diagnostics only — `code`, `stage` (`FETCH_COMMAND_KEY`,
+`IMPORT_RECIPIENT_KEY`, `GENERATE_EPHEMERAL`, `ECDH_DERIVE`, `HKDF_DERIVE`,
+`AES_GCM_ENCRYPT`, `EXPORT_EPHEMERAL`), `format`, `decodedLength` and
+`errorName`. Never the message body, key material, ciphertext or recipient.
+
+### Unchanged
+
+The **envelope format is untouched**: `v`, `kind: "command"`,
+`ephemeralPublicKey` (still a raw uncompressed point), `iv`, `ciphertext`. Only
+the *recipient* key import was wrong. The success rule still requires a strictly
+newer `telemetry.receivedAt` — `COMPLETED` alone is not success. Android private
+keys remain non-exportable in the Keystore; no private material leaves the phone.
+
+Shared helpers moved to `web/src/lib/binary.ts` so `commandCrypto.ts` no longer
+pulls in the HPKE suite and device-key storage — that dependency is why this
+path had no isolated test.
+
+### Separately: the nginx 502
+
+The screenshot's `502 Bad Gateway` was **not** this bug. All 502s fall in
+00:04–01:04 and align exactly with `systemd` restart cycles of GMweb (~6-minute
+loop, 6 s with no upstream); every endpoint was hit equally and
+`/command-key` received **zero** 502s.

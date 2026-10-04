@@ -20,15 +20,21 @@ test("self unlink removes this identity's sessions and rejects replay without re
     request.linkedDevice = sessions.resolve(request.headers["x-test-token"]);
     done();
   });
+  // A REAL P-256 SPKI key: the command-key endpoint now refuses to serve a
+  // malformed key (409) instead of handing the browser something unusable.
+  const { generateKeyPairSync } = require("node:crypto");
+  const spkiB64 = generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+    .publicKey.export({ format: "der", type: "spki" }).toString("base64");
   registerControlPlaneRoutes(app, { commandEngine: engine, trustRegistry: new TrustRegistry(db),
     eventStore: {}, accountId: "a", linkedSessions: sessions, authorizeAgent: () => null,
-    agentAuthService: { getPrimaryIdentity: () => ({ device_id: "phone", encryption_public_key: "public-key" }) } });
+    agentAuthService: { getPrimaryIdentity: () => ({ device_id: "phone", encryption_public_key: spkiB64 }) } });
   t.after(async () => { await app.close(); db.close(); });
   const own = sessions.issue("browser", ["MARK_READ"]);
   const secondSession = sessions.issue("browser", ["MARK_READ"]);
   const other = sessions.issue("other-browser", ["READ_MESSAGES"]);
   const key = await app.inject({ url: "/api/v1/linked-device/command-key", headers: { "x-test-token": own } });
   assert.equal(key.statusCode, 200);
+  assert.equal(key.json().encryptionPublicKeyFormat, "spki-p256");
   assert.equal((await app.inject({ url: "/api/v1/linked-device/command-key", headers: { "x-test-token": other } })).statusCode, 403);
   const command = await app.inject({ method: "POST", url: "/api/v1/commands", headers: { "x-test-token": own },
     payload: { type: "MARK_THREAD_READ", payload: Buffer.from("encrypted").toString("base64"),
