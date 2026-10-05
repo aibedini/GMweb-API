@@ -27,8 +27,13 @@ GMWEB_AUTO_CACHE_CLEANUP_MB="${GMWEB_AUTO_CACHE_CLEANUP_MB:-0}"
 # Shared helpers (timing, size formatting, zstd bootstrap). When installed to
 # /usr/local/bin/gmweb this resolves next to the script; the repo copy sources
 # it from scripts/.
-for _lib in "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")")/gmweb-lib.sh" \
-            "$APP_DIR/scripts/gmweb-lib.sh" "$SCRIPT_DIR/gmweb-lib.sh"; do
+#
+# This script runs under `set -u`, so EVERY referenced variable must be set.
+# SCRIPT_DIR is only defined when the backup script sources the same lib, so it
+# must be defaulted here (an unbound reference aborted the whole update).
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /nonexistent)}"
+for _lib in "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")")/gmweb-lib.sh" \
+            "$APP_DIR/scripts/gmweb-lib.sh" "${SCRIPT_DIR:-/nonexistent}/gmweb-lib.sh"; do
   if [[ -n "${_lib:-}" && -f "$_lib" ]]; then
     # shellcheck source=/dev/null
     source "$_lib"
