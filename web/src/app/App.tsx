@@ -992,7 +992,7 @@ export default function App() {
     sending, phonePresence, telemetryFreshness, sim: simTelemetry, selectedSubscriptionId,
   });
   const sendBlockedNow = sendBlocked(readiness);
-  const simInstructions = sendReadinessNotice(readiness)?.message ?? null;
+  const simInstructions = sendReadinessNotice(readiness);
   // Informational only; never gates PHONE_DEFAULT sending.
   const freshnessNotice = readiness.state === "READY_DEFAULT"
     ? defaultModeFreshnessNotice(telemetryFreshness,
@@ -1073,7 +1073,7 @@ export default function App() {
       sims={activeSims}
       selected={displayResolvedSim}
       onSim={chooseSim}
-      help={simInstructions}
+      notice={simInstructions}
       freshnessNotice={freshnessNotice?.message ?? null}
       simListHistorical={simListIsHistorical(telemetryFreshness)}
       retry={() => void refreshSims()}
