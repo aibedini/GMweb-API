@@ -13,6 +13,7 @@ import { collectWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnost
 import { MessageComposer } from "./MessageComposer";
 import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActions";
 import { senderSearchText } from "../lib/senderIdentity";
+import { resolveSendStatus, detectSendDivergence, diagnosticHash } from "../lib/sendEvidence";
 import { commandSubscriptionId, defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress, assertHistoryMergeProgress } from "../lib/threadHistory";
@@ -149,6 +150,13 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; recipient: string; at: number; failure?: string } | null>(null);
   const sendEvidence = useRef<{ clientMessageId: string; status: string } | null>(null);
+  // Carrier/message evidence for the in-flight send as REACTIVE state. The ref
+  // above is not reactive, so a footer that only read it could keep showing the
+  // low-truth command view after true delivery evidence had arrived.
+  const [evidenceStatus, setEvidenceStatus] = useState<number | null>(null);
+  // Privacy-safe divergence record: carrier evidence settled while the command
+  // lifecycle still claimed the send was queued/in flight.
+  const sendDivergenceSeen = useRef<string | null>(null);
   // Safe crypto failure diagnostics (code/stage/format/errorName) — never key
   // material, ciphertext, message body or recipient.
   const cryptoDiagnostic = useRef<string | null>(null);
@@ -625,8 +633,12 @@ export default function App() {
     const clientId = pendingMessage?.clientMessageId || sendEvidence.current?.clientMessageId;
     const matched = clientId && messages.find(item => item.payload.clientMessageId === clientId);
     if (matched) {
-      sendEvidence.current = { clientMessageId: clientId, status: messageStatus(matched.payload.status) };
-      setCommandStatus(sendEvidence.current.status);
+      const status = messageStatus(matched.payload.status);
+      sendEvidence.current = { clientMessageId: clientId, status };
+      // Carrier evidence is delivery truth and must be reactive, not only a ref,
+      // so the footer re-renders the moment evidence lands.
+      setEvidenceStatus(matched.payload.status ?? null);
+      setCommandStatus(status);
       if (pendingMessage) setPendingMessage(null);
     }
   }, [messages, pendingMessage]);
@@ -952,6 +964,26 @@ export default function App() {
 
   /* ------------------------------------------------------------ view model */
 
+  // ONE model for the send status. Precedence is explicit and total, so message
+  // evidence (carrier truth) can never be overwritten by the command lifecycle:
+  // "Delivered bubble + Queued footer" is unrepresentable by construction.
+  const resolvedSendStatus = resolveSendStatus({ evidenceStatus, commandStatus });
+  useEffect(() => {
+    const divergence = detectSendDivergence({ evidenceStatus, commandStatus });
+    if (!divergence) return;
+    const key = `${divergence.evidenceState}:${divergence.commandState ?? "none"}`;
+    if (sendDivergenceSeen.current === key) return;
+    sendDivergenceSeen.current = key;
+    // Never downgrade true delivery evidence; record it instead so the command
+    // ACK path can be investigated separately. Ids are hashed, never raw.
+    console.warn(divergence.code, {
+      clientMessageIdHash: diagnosticHash(sendEvidence.current?.clientMessageId),
+      commandState: divergence.commandState,
+      evidenceState: divergence.evidenceState,
+      commandStatus: divergence.commandStatus,
+    });
+  }, [evidenceStatus, commandStatus]);
+
   const connection: ConnectionState = !online
     ? "offline"
     : version === "unreachable"
@@ -978,12 +1010,12 @@ export default function App() {
         dateMs: pendingMessage.at,
         pending: true,
         failure: pendingMessage.failure ?? null,
-        progress: commandStatus,
+        progress: resolvedSendStatus.text,
         clientMessageId: pendingMessage.clientMessageId,
       });
     }
     return items;
-  }, [messages, pendingMessage, selectedRecipient, commandStatus]);
+  }, [messages, pendingMessage, selectedRecipient, resolvedSendStatus.text]);
 
   const threadRows = useMemo(() => withDaySeparators(threadItems), [threadItems]);
 
@@ -1110,7 +1142,7 @@ export default function App() {
       send={() => void send()}
       sending={sending}
       canSend={capabilities.includes("SEND_MESSAGES")}
-      status={commandStatus}
+      status={resolvedSendStatus.text}
       useDefault={selectedSubscriptionId === null}
     />
   );
