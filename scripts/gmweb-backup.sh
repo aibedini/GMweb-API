@@ -15,6 +15,20 @@ APP_DIR="${APP_DIR:-/opt/gmweb-api}"
 BACKUP_DIR="${BACKUP_DIR:-/root/gmweb-backup}"
 KEEP="${KEEP:-1}"
 
+# Shared zstd bootstrap + size formatting. Absent lib is not fatal: we simply
+# fall back to gzip below.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/gmweb-lib.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/gmweb-lib.sh"
+fi
+if ! declare -F ensure_zstd >/dev/null 2>&1; then
+  ensure_zstd() { command -v zstd >/dev/null 2>&1; }
+fi
+if ! declare -F gmweb_fmt_bytes >/dev/null 2>&1; then
+  gmweb_fmt_bytes() { du -h "$1" 2>/dev/null | cut -f1; }
+fi
+
 log() { echo "$*"; }
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -29,9 +43,19 @@ fi
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR" 2>/dev/null || true
 stamp="$(date +%Y%m%d-%H%M%S)"
-archive="$BACKUP_DIR/gmweb-$stamp.tar.gz"
 staging="$(mktemp -d "$BACKUP_DIR/.staging.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
+
+# Prefer zstd (multi-threaded), fall back to gzip. Never fail the backup just
+# because zstd is unavailable.
+if ensure_zstd; then
+  archive="$BACKUP_DIR/gmweb-$stamp.tar.zst"
+  ZSTD=1
+else
+  archive="$BACKUP_DIR/gmweb-$stamp.tar.gz"
+  ZSTD=0
+  log "zstd unavailable; using gzip fallback"
+fi
 
 # SQLite hot backup. A plain cp of a WAL database taken mid-write is not a
 # trustworthy restore point; better-sqlite3's backup API is safe while the API
@@ -73,20 +97,29 @@ fi
   echo "version=$(node -e "console.log(require('$APP_DIR/package.json').version)" 2>/dev/null || echo unknown)"
 } > "$staging/MANIFEST"
 
-tar czf "$archive" -C "$staging" .
+if (( ZSTD == 1 )); then
+  # -T0 = all cores, -1 = fastest level: a ~1 GB snapshot compresses in seconds.
+  tar -C "$staging" -cf - . | zstd -T0 -1 -q -o "$archive"
+else
+  tar czf "$archive" -C "$staging" .
+fi
 chmod 600 "$archive"
-log "Snapshot written: $archive ($(du -h "$archive" | cut -f1))"
+log "Snapshot written: $archive ($(gmweb_fmt_bytes "$(stat -c%s "$archive" 2>/dev/null || echo 0)"))"
 
-# Retention: keep the newest KEEP archives (default exactly one) and remove our
-# older snapshots. Other files in BACKUP_DIR are left alone -- this script only
-# ever cleans up after itself.
+# Retention: keep the newest KEEP snapshots created by THIS script and remove
+# only those. Both formats are recognised so a gzip fallback snapshot still
+# participates. Unrelated files (api-keys.pre-*, sends.db.pre-correction, ...)
+# are never touched.
 if (( KEEP > 0 )); then
-  mapfile -t snapshots < <(find "$BACKUP_DIR" -maxdepth 1 -name 'gmweb-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}')
+  mapfile -t snapshots < <(find "$BACKUP_DIR" -maxdepth 1 \
+    \( -name 'gmweb-*.tar.gz' -o -name 'gmweb-*.tar.zst' \) \
+    -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}')
   if (( ${#snapshots[@]} > KEEP )); then
     for old in "${snapshots[@]:KEEP}"; do
       rm -f -- "$old"
       log "Pruned older backup: $old"
     done
   fi
-  log "Backups kept: $(find "$BACKUP_DIR" -maxdepth 1 -name 'gmweb-*.tar.gz' | wc -l)"
+  log "Backups kept: $(find "$BACKUP_DIR" -maxdepth 1 \
+    \( -name 'gmweb-*.tar.gz' -o -name 'gmweb-*.tar.zst' \) | wc -l)"
 fi
