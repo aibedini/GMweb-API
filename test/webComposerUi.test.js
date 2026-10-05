@@ -9,7 +9,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const GATE = { sending: false, canSend: true, simInstructions: null };
+const GATE = { sending: false, canSend: true, noticeBlocks: false };
 
 test("send is disabled for an empty or whitespace-only draft", async () => {
   const { sendDisabled } = await import("../web/src/lib/inboxActions.ts");
@@ -26,10 +26,58 @@ test("send is enabled only when the capability and SIM state allow it", async ()
   assert.equal(sendDisabled({ ...GATE, draft: "hello", sending: true }), true, "no duplicate send while sending");
   assert.equal(sendDisabled({ ...GATE, draft: "hello", canSend: false }), true, "SEND_MESSAGES missing blocks send");
   assert.equal(
-    sendDisabled({ ...GATE, draft: "hello", simInstructions: "Your phone's SIM information is out of date. Reconnect the Primary phone, then retry." }),
+    sendDisabled({ ...GATE, draft: "hello", noticeBlocks: true }),
     true,
-    "stale SIM blocks send",
+    "a blocking readiness notice blocks send",
   );
+});
+
+// ===== COMPOSER VALIDATION MUST NOT BE REPORTED AS A SIM FAULT =====
+test("only SIM problems may render a SIM alert or offer Refresh SIMs", async () => {
+  const { deriveSendReadiness, sendReadinessNotice, defaultModeFreshnessNotice } =
+    await import("../web/src/lib/sendReadiness.ts");
+  const SIM_A = { subscriptionId: 7, slotIndex: 0, displayName: "SIM 1", carrierName: "Irancell",
+    isDefaultSms: true, isActive: true, sendCapable: true };
+  const base = {
+    draft: "hello", hasRecipient: true, canSend: true, sending: false,
+    phonePresence: "ONLINE", telemetryFreshness: "FRESH",
+    sim: { state: "OK", active: [SIM_A] }, selectedSubscriptionId: null,
+  };
+
+  // PRODUCTION BUG: an empty draft rendered "SIM needs attention /
+  // Write a message first." with a Refresh SIMs button.
+  const empty = sendReadinessNotice(deriveSendReadiness({ ...base, draft: "" }));
+  assert.equal(empty, null, "EMPTY_BODY must render no alert at all");
+  const noRecipient = sendReadinessNotice(deriveSendReadiness({ ...base, hasRecipient: false }));
+  assert.equal(noRecipient, null, "NO_RECIPIENT must render no SIM alert");
+  // The composer's own capability alert owns this case, so no duplicate notice.
+  assert.equal(sendReadinessNotice(deriveSendReadiness({ ...base, canSend: false })), null);
+
+  // A phone problem is not a SIM problem.
+  const noPhone = sendReadinessNotice(deriveSendReadiness({ ...base, phonePresence: "NEVER_SEEN" }));
+  assert.equal(noPhone.kind, "PHONE");
+  assert.notEqual(noPhone.title, "SIM needs attention");
+  assert.equal(noPhone.offersSimRefresh, false);
+
+  // Only these three may claim a SIM problem, and only they offer a refresh.
+  const simStates = [
+    deriveSendReadiness({ ...base, sim: { state: "NO_ACTIVE_SUBSCRIPTIONS", active: [] } }),
+    deriveSendReadiness({ ...base, telemetryFreshness: "OLD", selectedSubscriptionId: 7 }),
+    deriveSendReadiness({ ...base, selectedSubscriptionId: 999 }),
+  ];
+  for (const readiness of simStates) {
+    const notice = sendReadinessNotice(readiness);
+    assert.equal(notice.kind, "SIM", `${readiness.state} should be a SIM notice`);
+    assert.equal(notice.title, "SIM needs attention");
+    assert.equal(notice.offersSimRefresh, true, `${readiness.state} should offer Refresh SIMs`);
+  }
+
+  // The informational PHONE_DEFAULT freshness note is not a fault and must not
+  // read like the phone is gone.
+  const freshness = defaultModeFreshnessNotice("OLD", "SIM 2 · IR-MCI");
+  assert.equal(freshness.blocking, false);
+  assert.equal(freshness.kind, "SIM");
+  assert.doesNotMatch(freshness.message, /offline|reconnect/i);
 });
 
 test("structured send readiness replaces the legacy simHelp gating", async () => {

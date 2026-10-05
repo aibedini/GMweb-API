@@ -2,6 +2,7 @@ import { Suspense, lazy, useRef, useState } from "react";
 import { Alert, Button, Spinner } from "@heroui/react";
 import type { DeviceTelemetry } from "../lib/api";
 import { sendDisabled } from "../lib/inboxActions";
+import type { SendNotice } from "../lib/sendReadiness";
 import { insertEmoji } from "../lib/emojiInsert";
 import { ComposerStatus } from "./components/ComposerStatus";
 import { SimSelector } from "./components/SimSelector";
@@ -29,7 +30,7 @@ export function MessageComposer({
   sims,
   selected,
   onSim,
-  help,
+  notice,
   retry,
   send,
   sending,
@@ -46,7 +47,8 @@ export function MessageComposer({
   sims: Sim[];
   selected?: Sim;
   onSim: (id: number | null) => void;
-  help: string | null;
+  /** Blocking or informational notice from the structured readiness model. */
+  notice: SendNotice | null;
   retry: () => void;
   useDefault: boolean;
   send: () => void;
@@ -62,7 +64,7 @@ export function MessageComposer({
   /** True when the cached SIM list is not current and must be labelled. */
   simListHistorical?: boolean;
 }) {
-  const disabled = sendDisabled({ draft, sending, canSend, simInstructions: help });
+  const disabled = sendDisabled({ draft, sending, canSend, noticeBlocks: notice?.blocking === true });
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [emojiOpen, setEmojiOpen] = useState(false);
 
@@ -164,17 +166,25 @@ export function MessageComposer({
         </Button>
       </div>
 
-      {help ? (
+      {/*
+        Only SIM problems may claim a SIM problem. Composer validation
+        (empty draft / no recipient) shows no alert here at all; permission and
+        phone problems get their own titles. "Refresh SIMs" appears only where
+        refreshing SIM data could actually help.
+      */}
+      {notice ? (
         <div className="mt-2">
-          <Alert status="warning">
+          <Alert status={notice.tone === "info" ? "default" : notice.tone}>
             <Alert.Indicator />
             <Alert.Content>
-              <Alert.Title>SIM needs attention</Alert.Title>
-              <Alert.Description>{help}</Alert.Description>
+              <Alert.Title>{notice.title}</Alert.Title>
+              <Alert.Description>{notice.message}</Alert.Description>
             </Alert.Content>
-            <Button size="sm" variant="ghost" onPress={retry} isDisabled={refreshing === true}>
-              {refreshing ? "Refreshing…" : "Refresh SIMs"}
-            </Button>
+            {notice.offersSimRefresh ? (
+              <Button size="sm" variant="ghost" onPress={retry} isDisabled={refreshing === true}>
+                {refreshing ? "Refreshing…" : "Refresh SIMs"}
+              </Button>
+            ) : null}
           </Alert>
         </div>
       ) : null}

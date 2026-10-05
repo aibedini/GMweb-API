@@ -68,8 +68,17 @@ export interface ComposerSendGate {
   sending: boolean;
   /** `SEND_MESSAGES` capability from the linked session. */
   canSend: boolean;
-  /** BLOCKING notice from the structured send-readiness model, if any. */
-  simInstructions: string | null;
+  /**
+   * True when the structured send-readiness model has a BLOCKING notice.
+   *
+   * The legacy `simHelp()` string was removed: it blocked every send whenever
+   * telemetry was older than 180s — including "Phone default", which does not
+   * depend on the SIM list at all.
+   *
+   * Composer validation (empty draft, no recipient) is handled by the explicit
+   * checks below, NOT by a notice, so it produces no alert.
+   */
+  noticeBlocks: boolean;
 }
 
 /**
@@ -77,12 +86,8 @@ export interface ComposerSendGate {
  *
  * Both the Send button's disabled state and the keyboard shortcut guard use
  * this, so the button and the shortcut can never disagree.
- *
- * `simInstructions` now carries the BLOCKING notice from
- * `deriveSendReadiness()`; PHONE_DEFAULT freshness warnings are informational
- * and deliberately do not arrive here.
  */
 export function sendDisabled(gate: ComposerSendGate): boolean {
-  return gate.sending || !gate.canSend || gate.draft.trim().length === 0 || Boolean(gate.simInstructions);
+  return gate.sending || !gate.canSend || gate.draft.trim().length === 0 || gate.noticeBlocks;
 }
 

@@ -1142,3 +1142,36 @@ detaches the Chrome client without killing an externally managed browser, and
 **stops** the outbox and direct-push client because they are in-process workers
 holding timers and sockets. `server.js` additionally guards the call so one
 failure cannot skip the remaining cleanup.
+## Composer notice classification (0.19.38)
+
+`MessageComposer` rendered **every** readiness notice inside a hard-coded
+`Alert` titled "SIM needs attention" with a "Refresh SIMs" button. Because
+`sendReadinessNotice()` returned a message for `EMPTY_BODY`, an empty draft
+produced:
+
+```
+SIM needs attention
+Write a message first.
+[ Refresh SIMs ]
+```
+
+a composer-validation state presented as a SIM fault, with a refresh action that
+could not possibly help.
+
+Notices now carry an explicit `kind` (`COMPOSER | PERMISSION | PHONE | SIM`),
+a `title`, and `offersSimRefresh`:
+
+| state | alert | Refresh SIMs |
+| --- | --- | --- |
+| `EMPTY_BODY`, `NO_RECIPIENT` | **none** (Send is simply disabled) | no |
+| `SEND_CAPABILITY_MISSING` | the composer's existing, security-worded alert | no |
+| `PHONE_NEVER_SEEN` | "Phone unavailable" | no |
+| `NO_ACTIVE_SIM`, `EXPLICIT_SIM_TELEMETRY_STALE`, `EXPLICIT_SIM_MISSING` | "SIM needs attention" | **yes** |
+
+Only a SIM problem may claim a SIM problem, and "Refresh SIMs" appears only
+where refreshing SIM data can actually help. The informational
+`PHONE_DEFAULT` freshness note is `kind: "SIM"` but `blocking: false` and never
+reads as "phone offline".
+
+`sendDisabled()` takes `noticeBlocks: boolean` instead of the legacy
+`simInstructions` string.

@@ -93,11 +93,32 @@ export function sendBlocked(readiness: SendReadiness): boolean {
   }
 }
 
+/**
+ * Which surface a notice belongs to.
+ *
+ * PRODUCTION BUG this fixes: MessageComposer rendered EVERY notice inside a
+ * hard-coded "SIM needs attention" alert with a "Refresh SIMs" button, so an
+ * empty draft produced "SIM needs attention / Write a message first." — a
+ * composer validation problem presented as a SIM fault.
+ *
+ * Only SIM_KIND states may claim a SIM problem or offer a SIM refresh.
+ */
+export type SendNoticeKind = "COMPOSER" | "PERMISSION" | "PHONE" | "SIM";
+
 export interface SendNotice {
+  kind: SendNoticeKind;
+  /** Alert title. Never "SIM needs attention" for a non-SIM problem. */
+  title: string;
   tone: "info" | "warning" | "danger";
   message: string;
   /** False when the notice is purely informational and sending is allowed. */
   blocking: boolean;
+  /** True only where refreshing SIM data could actually help. */
+  offersSimRefresh: boolean;
+}
+
+export function isSimNotice(notice: SendNotice | null): boolean {
+  return notice?.kind === "SIM";
 }
 
 /**
@@ -110,31 +131,31 @@ export function sendReadinessNotice(readiness: SendReadiness): SendNotice | null
     case "READY_EXPLICIT":
     case "SENDING":
       return null;
+    // Composer validation: no alert at all — Send is simply disabled.
     case "EMPTY_BODY":
-      return { tone: "info", message: "Write a message first.", blocking: true };
     case "NO_RECIPIENT":
-      return { tone: "info", message: "Choose a recipient first.", blocking: true };
+      return null;
+    // The composer already renders a dedicated, security-worded alert for a
+    // missing SEND_MESSAGES capability; do not duplicate it here.
     case "SEND_CAPABILITY_MISSING":
-      return { tone: "danger",
-        message: "This browser cannot send. Approve sending access on your Primary phone.",
-        blocking: true };
+      return null;
     case "PHONE_NEVER_SEEN":
-      return { tone: "danger",
+      return { kind: "PHONE", title: "Phone unavailable", tone: "danger",
         message: "No Primary phone has connected yet. Pair your phone, then retry.",
-        blocking: true };
+        blocking: true, offersSimRefresh: false };
     case "NO_ACTIVE_SIM":
-      return { tone: "danger",
+      return { kind: "SIM", title: "SIM needs attention", tone: "danger",
         message: "No active SMS SIM was detected. Insert an active SIM or check Phone permission.",
-        blocking: true };
+        blocking: true, offersSimRefresh: true };
     case "EXPLICIT_SIM_TELEMETRY_STALE":
-      return { tone: "warning",
+      return { kind: "SIM", title: "SIM needs attention", tone: "warning",
         message: "This SIM was reported previously, but the SIM list is outdated. "
           + "Refresh SIM information before sending from a specific SIM, or use Phone default.",
-        blocking: true };
+        blocking: true, offersSimRefresh: true };
     case "EXPLICIT_SIM_MISSING":
-      return { tone: "warning",
+      return { kind: "SIM", title: "SIM needs attention", tone: "warning",
         message: "Previously selected SIM is no longer active. Choose another SIM or use Phone default.",
-        blocking: true };
+        blocking: true, offersSimRefresh: true };
   }
 }
 
@@ -151,8 +172,11 @@ export function defaultModeFreshnessNotice(
     ? "This phone has not reported SIM information yet."
     : "SIM information is outdated.";
   return {
+    kind: "SIM",
+    title: "SIM information is outdated",
     tone: "info",
     blocking: false,
+    offersSimRefresh: true,
     message: displaySimLabel
       ? `${base} Last reported default: ${displaySimLabel}. Sending uses whatever default the phone has at that moment.`
       : `${base} Sending uses whatever default the phone has at that moment.`,
