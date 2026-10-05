@@ -14,7 +14,7 @@ import { MessageComposer } from "./MessageComposer";
 import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActions";
 import { commandSubscriptionId, defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
-import { mergeThreadEvents, assertHistoryProgress } from "../lib/threadHistory";
+import { mergeThreadEvents, assertHistoryProgress, assertHistoryMergeProgress } from "../lib/threadHistory";
 import {
   EMPTY_HISTORY_TRACE, IDLE_HISTORY, canLoadOlder, describeHistory, historyErrorMessage,
   isValidCursor, pagingFailed, pagingFromPage, pagingLoading, showLoadOlder,
@@ -83,6 +83,9 @@ export default function App() {
   // apart (see lib/threadPaging.ts for the invariant).
   const [history, setHistory] = useState<HistoryPagingState>(IDLE_HISTORY);
   const historyTrace = useRef<HistoryTrace>(EMPTY_HISTORY_TRACE);
+  // Counts clicks on a visible Load Older control that could not proceed, so a
+  // dead control is observable in diagnostics instead of vanishing silently.
+  const LOAD_OLDER_VIOLATIONS = useRef(0);
   const historyLoadingRef = useRef(false);
   const [cursor, setCursor] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -548,23 +551,42 @@ export default function App() {
   }, [selected, events, authed, threadReload]);
   const loadOlderThread = async () => {
     const cursor = history.next;
-    // Guarded by the same predicate that gates rendering: if this is true the
-    // control was rendered, so a silent no-op is impossible by construction.
-    if (!selected || !canLoadOlder(history, threadState) || !isValidCursor(cursor) ||
-        historyLoadingRef.current) return;
+    // A VISIBLE control must never be a silent no-op. If the button rendered but
+    // the handler cannot proceed, record which predicate failed and surface it
+    // instead of returning with no feedback at all.
+    const guardFailure = !selected ? "no_selection"
+      : !canLoadOlder(history, threadState) ? (history.loading ? "already_loading" : "not_actionable")
+        : !isValidCursor(cursor) ? "cursor_invalid"
+          : historyLoadingRef.current ? "ref_locked" : null;
+    if (guardFailure) {
+      LOAD_OLDER_VIOLATIONS.current += 1;
+      historyTrace.current = { ...historyTrace.current, lastRequestAt: Date.now(),
+        lastReturnedCount: 0, lastNextCursorChanged: false };
+      setHistory(previous => pagingFailed(previous, `LOAD_OLDER_INVARIANT_VIOLATION:${guardFailure}`));
+      return;
+    }
     historyLoadingRef.current = true;
     setHistory(pagingLoading);
     try {
-      const requestedCursor = cursor;
-      const page = await listAggregateEventsPage(selected, {
+      // The guard above already returned unless BOTH are usable, so these are
+      // narrowed here for the type system without a second runtime check.
+      const conversationId = selected!;
+      const requestedCursor = cursor!;
+      const page = await listAggregateEventsPage(conversationId, {
         limit: 20,
         ...(typeof requestedCursor === "string" ? { beforeState: requestedCursor } : { beforeSequence: requestedCursor }),
       });
       if (page.items.some(event => event.decryption?.state === "invalid")) throw new Error("DECRYPTION_FAILED");
       assertHistoryProgress(requestedCursor, page);
+      // Prove progress by the MERGE, not by the cursor. A duplicate-only page
+      // advanced the cursor while adding nothing, which rendered as a dead
+      // button. Compute the merge first so it can be asserted.
+      const merged = mergeThreadEvents(threadEvents, page.items);
+      const mergedNewCount = merged.length - threadEvents.length;
+      assertHistoryMergeProgress(requestedCursor, page, mergedNewCount);
       const scroll = messageScrollRef.current;
       const previousHeight = scroll?.scrollHeight ?? 0;
-      setThreadEvents(prev => mergeThreadEvents(prev, page.items));
+      setThreadEvents(merged);
       requestAnimationFrame(() => {
         if (scroll) scroll.scrollTop += scroll.scrollHeight - previousHeight;
       });
