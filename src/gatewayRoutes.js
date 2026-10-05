@@ -351,7 +351,16 @@ function registerGatewayRoutes(app, deps = {}) {
           eventId: { type: "string", pattern: "^dlr_[A-Za-z0-9_-]{1,192}$", maxLength: 196 },
           requestId: { type: "string", minLength: 1, maxLength: MAX_REQUEST_ID },
           status: { type: "string", enum: ["delivered", "failed"] },
-          occurredAt: { type: "integer", minimum: 1577836800000 }
+          occurredAt: { type: "integer", minimum: 1577836800000 },
+          // ── Android v3.4.27 additive carrier metadata (all OPTIONAL) ──────
+          // A legacy client sending only the four fields above stays valid.
+          eventType: { type: "string", enum: ["carrier_delivery"] },
+          segmentIndex: { type: "integer", minimum: 0, maximum: 63 },
+          segmentCount: { type: "integer", minimum: 1, maximum: 64 },
+          allSegmentsDelivered: { type: "boolean" },
+          receivedAtDevice: { type: "integer", minimum: 1577836800000 },
+          subscriptionId: { type: "integer", minimum: 0, maximum: 1000000 },
+          carrierResultCode: { type: "integer", minimum: -1000000, maximum: 1000000 }
         }
       },
       response: {
@@ -370,15 +379,51 @@ function registerGatewayRoutes(app, deps = {}) {
   }, async (request, reply) => {
     if (!checkDeviceKey(request)) return unauthorized(request, reply);
     if (!enforceRateLimit(request, reply, "gateway-delivery-report", operationalLimit)) return;
-    const { eventId, requestId, status, occurredAt } = request.body || {};
+    const { eventId, requestId, status, occurredAt, eventType,
+      segmentIndex, segmentCount, allSegmentsDelivered, receivedAtDevice,
+      subscriptionId, carrierResultCode } = request.body || {};
     if (!/^dlr_[A-Za-z0-9_-]{1,192}$/.test(eventId || "") ||
         !/^[\x21-\x7e]{1,120}$/.test(requestId || "") ||
         !["delivered", "failed"].includes(status) ||
         !Number.isSafeInteger(occurredAt) || occurredAt > Date.now() + 86_400_000) {
       return reply.code(400).send({ error: "invalid_delivery_report" });
     }
+    // Additive v3.4.27 validation. Absent stays absent; only a SUPPLIED invalid
+    // value is rejected, so an older client is never penalised.
+    const hasSegments = segmentIndex !== undefined || segmentCount !== undefined;
+    if (eventType !== undefined && eventType !== "carrier_delivery") {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (segmentIndex !== undefined && (!Number.isSafeInteger(segmentIndex) || segmentIndex < 0)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (segmentCount !== undefined && (!Number.isSafeInteger(segmentCount) || segmentCount < 1)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (hasSegments && segmentIndex !== undefined && segmentCount !== undefined &&
+        segmentIndex >= segmentCount) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (allSegmentsDelivered !== undefined && typeof allSegmentsDelivered !== "boolean") {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (receivedAtDevice !== undefined &&
+        (!Number.isSafeInteger(receivedAtDevice) || receivedAtDevice < 1577836800000 ||
+         receivedAtDevice > Date.now() + 86_400_000)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (subscriptionId !== undefined && (!Number.isSafeInteger(subscriptionId) || subscriptionId < 0)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (carrierResultCode !== undefined && !Number.isSafeInteger(carrierResultCode)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
     const result = sendStore.recordCarrierReport({ eventId, requestId, status, occurredAt,
-      deviceId: request.headers["x-gateway-device-id"] || null });
+      deviceId: request.headers["x-gateway-device-id"] || null,
+      // `undefined` stays `undefined` here; sendStore's normalizer turns only
+      // genuinely-supplied values into numbers, so 0 is preserved as 0.
+      meta: { segmentIndex, segmentCount, allSegmentsDelivered, receivedAtDevice,
+        subscriptionId, carrierResultCode } });
     if (result.error) return reply.code(result.error === "unknown_request_id" ? 404 : result.error === "invalid_delivery_report" ? 400 : 409).send({ error: result.error });
     if (!result.duplicate) {
       const row = sendStore.byGatewayRequest(requestId);
