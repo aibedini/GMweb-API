@@ -15,7 +15,7 @@ const EVENT_TYPES = Object.keys({
   ...eventCryptoPolicy.controlKey,
   ...eventCryptoPolicy.nonContentControl,
 });
-const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY"]);
+const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY", "FETCH_THREAD_HISTORY"]);
 
 /**
  * Defensive validation of Android-advertised command capabilities (telemetry
@@ -533,6 +533,14 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (request.linkedDevice && body.type === "SEND_SMS" &&
         !request.linkedDevice.capabilities?.includes("SEND_MESSAGES")) {
       return reply.code(403).send({ error: "send_messages_capability_required" });
+    }
+    // Fetching older provider history READS message content from the phone, so it
+    // is gated by the same READ_MESSAGES capability as reading history. The
+    // payload is opaque encrypted data: the server never learns the phone
+    // number, the branded sender, the Android thread id or the SMS body.
+    if (request.linkedDevice && body.type === "FETCH_THREAD_HISTORY" &&
+        !request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
     }
     // Refreshing device telemetry reads device/SIM state, so it needs the same
     // capability that already gates reading that state. A linked browser may

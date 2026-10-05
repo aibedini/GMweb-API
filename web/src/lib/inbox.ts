@@ -1,8 +1,8 @@
 import type { StoredEvent } from "./sync";
 import { acceptsContentCrypto, isContentBearingEvent } from "./eventCryptoPolicy.ts";
+import { classifySender } from "./senderIdentity.ts";
 
-export interface MessagePayload {
-  messageId: string;
+export interface MessagePayload {  messageId: string;
   direction: "in" | "out";
   body: string;
   dateMs: number;
@@ -14,6 +14,16 @@ export interface MessagePayload {
   /** Exact correlation for replacing the Web optimistic bubble. */
   originCommandId?: string;
   clientMessageId?: string;
+  /**
+   * Android Telephony thread id, decrypted from the conversation/message
+   * payload. Needed to request older provider history; absent on old events.
+   */
+  androidThreadId?: number;
+  /** Provider provenance, when Android supplies it. */
+  source?: string;
+  providerId?: number;
+  /** Raw provider sender address, preserved verbatim (never digits-normalized). */
+  rawAddress?: string;
 }
 
 export interface ConversationSummary {
@@ -38,6 +48,20 @@ export interface ConversationProjection extends ConversationSummary {
   lastMessageId: string;
   lastSequence: number;
   decodeState: "ready" | "locked";
+  /**
+   * Android Telephony thread id. Decrypted only — deliberately NOT persisted in
+   * plaintext server metadata. Absent means history cannot be requested for this
+   * conversation (THREAD_MAPPING_UNAVAILABLE), never that a guess should be made.
+   */
+  androidThreadId?: number;
+  /** Raw provider sender address from the latest (possibly repaired) metadata. */
+  rawAddress?: string;
+  /**
+   * Sequence of the newest conversation-metadata event applied. Lets a repaired
+   * CONVERSATION_UPSERTED supersede an older "Unknown" projection WITHOUT
+   * Android resending historical messages.
+   */
+  metadataSequence?: number;
 }
 
 /** The opened thread may arrive before its encrypted conversation summary. */
@@ -93,7 +117,65 @@ function messagePayload(event: StoredEvent): MessagePayload | null {
       : undefined,
     originCommandId: typeof value.originCommandId === "string" ? value.originCommandId : undefined,
     clientMessageId: typeof value.clientMessageId === "string" ? value.clientMessageId : undefined,
+    // Additive Android metadata. Absent on old events -> undefined, never guessed.
+    androidThreadId: Number.isSafeInteger(Number(value.androidThreadId)) && value.androidThreadId !== undefined
+      && value.androidThreadId !== null ? Number(value.androidThreadId) : undefined,
+    source: typeof value.source === "string" ? value.source : undefined,
+    providerId: Number.isSafeInteger(Number(value.providerId)) && value.providerId !== undefined
+      && value.providerId !== null ? Number(value.providerId) : undefined,
+    rawAddress: typeof value.address === "string" && value.address.trim()
+      ? value.address.trim() : undefined,
   };
+}
+
+/**
+ * Repair a conversation projection from newer decrypted conversation metadata.
+ *
+ * PRODUCTION BUG this fixes: "Unknown conversation" rows existed because the
+ * projection derived title/address only from MESSAGE_CREATED/MESSAGE_UPDATED
+ * events. Android now publishes a conversation-level metadata event
+ * (CONVERSATION_UPSERTED) after upgrade, so a branded sender can be repaired to
+ * its real identity WITHOUT resending hundreds of thousands of historical SMS.
+ *
+ * Rules:
+ *  - Only NEWER metadata wins (metadataSequence is monotonic).
+ *  - A repaired raw address wins over a placeholder title.
+ *  - A real contact name still outranks the raw address for PHONE senders.
+ *  - Fields absent from the event never erase existing values, so old events and
+ *    partial metadata stay backward compatible.
+ */
+export function applyConversationMetadata(
+  row: ConversationProjection,
+  metadata: { sequence?: number; title?: string; rawAddress?: string; androidThreadId?: number;
+    contactName?: string } | null | undefined,
+): ConversationProjection {
+  if (!metadata) return row;
+  const sequence = typeof metadata.sequence === "number" ? metadata.sequence : undefined;
+  if (sequence !== undefined && row.metadataSequence !== undefined && sequence <= row.metadataSequence) {
+    return row;
+  }
+  const rawAddress = metadata.rawAddress?.trim() || undefined;
+  const contactName = metadata.contactName?.trim() || undefined;
+  const identity = classifySender(rawAddress ?? null);
+
+  let title = row.title;
+  if (contactName && identity.kind === "PHONE") {
+    // A contact name only applies to a real phone number.
+    title = contactName;
+  } else if (metadata.title?.trim()) {
+    title = metadata.title.trim();
+  } else if (rawAddress) {
+    // Branded/alphanumeric senders render verbatim; blank stays a placeholder.
+    title = classifySender(rawAddress).displayValue ?? row.title;
+  }
+
+  const subtitle = identity.kind === "PHONE" ? rawAddress ?? row.subtitle
+    : rawAddress ?? row.subtitle;
+
+  return { ...row, title, subtitle,
+    ...(rawAddress ? { rawAddress } : {}),
+    ...(metadata.androidThreadId !== undefined ? { androidThreadId: metadata.androidThreadId } : {}),
+    ...(sequence !== undefined ? { metadataSequence: sequence } : {}) };
 }
 
 function fallbackTitle(id: string): string {

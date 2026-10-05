@@ -261,7 +261,25 @@ export async function fetchPrimaryCommandKey(): Promise<PrimaryCommandKey> {
 }
 
 /** Command types a linked browser may submit (always encrypted). */
-export type EncryptedCommandType = "SEND_SMS" | "MARK_THREAD_READ" | "REFRESH_DEVICE_TELEMETRY";
+export type EncryptedCommandType = "SEND_SMS" | "MARK_THREAD_READ" | "REFRESH_DEVICE_TELEMETRY"
+  | "FETCH_THREAD_HISTORY";
+
+/**
+ * Ask the Primary phone for one page of older provider history.
+ *
+ * The payload is encrypted to the phone; the server only sees ciphertext. The
+ * thread is addressed by the Android Telephony thread id taken from the
+ * DECRYPTED conversation payload — never guessed from a phone number, title,
+ * contact name or sender string.
+ */
+export interface FetchThreadHistoryPayload {
+  type: "FETCH_THREAD_HISTORY";
+  requestId: string;
+  conversationId: string;
+  androidThreadId: number;
+  before?: { dateMs: number; providerId: number } | null;
+  limit: number;
+}
 
 export async function createCommand(body: {
   type: EncryptedCommandType;
