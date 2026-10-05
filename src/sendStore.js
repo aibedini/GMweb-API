@@ -33,6 +33,52 @@ const {
   isTerminalSendStatus
 } = require("./notificationMeta");
 
+/** Maximum segments we will accept from a device for one message. */
+const MAX_CARRIER_SEGMENTS = 64;
+/** Android subscription ids are small non-negative integers. */
+const MAX_SUBSCRIPTION_ID = 1_000_000;
+
+/**
+ * Normalize the additive Android v3.4.27 carrier metadata.
+ *
+ * Every field is optional. ABSENT must stay `null` — it must never be coerced
+ * to 0/false, because `carrierResultCode: 0` (RESULT_OK) and
+ * `subscriptionId: 0` are meaningful and distinct from "not reported".
+ */
+function normalizeCarrierMeta(meta) {
+  const out = {
+    segmentIndex: null, segmentCount: null, allSegmentsDelivered: null,
+    receivedAtDevice: null, subscriptionId: null, carrierResultCode: null
+  };
+  if (!meta || typeof meta !== "object") return out;
+  const int = (value, min, max) =>
+    Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
+  out.segmentIndex = int(meta.segmentIndex, 0, MAX_CARRIER_SEGMENTS - 1);
+  out.segmentCount = int(meta.segmentCount, 1, MAX_CARRIER_SEGMENTS);
+  out.allSegmentsDelivered = typeof meta.allSegmentsDelivered === "boolean"
+    ? (meta.allSegmentsDelivered ? 1 : 0) : null;
+  // A device clock may be slightly off; allow a day of skew like occurredAt.
+  out.receivedAtDevice = Number.isSafeInteger(meta.receivedAtDevice)
+    && meta.receivedAtDevice >= 1577836800000 ? meta.receivedAtDevice : null;
+  out.subscriptionId = int(meta.subscriptionId, 0, MAX_SUBSCRIPTION_ID);
+  out.carrierResultCode = int(meta.carrierResultCode, -1_000_000, 1_000_000);
+  return out;
+}
+
+/** Only two DIFFERENT non-null values for the same event are a real conflict. */
+function carrierMetaConflicts(previous, incoming) {
+  const pairs = [
+    [previous.segment_index, incoming.segmentIndex],
+    [previous.segment_count, incoming.segmentCount],
+    [previous.all_segments_delivered, incoming.allSegmentsDelivered],
+    [previous.received_at_device, incoming.receivedAtDevice],
+    [previous.subscription_id, incoming.subscriptionId],
+    [previous.carrier_result_code, incoming.carrierResultCode]
+  ];
+  return pairs.some(([before, after]) =>
+    before !== null && before !== undefined && after !== null && Number(before) !== Number(after));
+}
+
 class SendStore {
   constructor(dbPath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -204,7 +250,16 @@ class SendStore {
         event_id TEXT PRIMARY KEY, send_id INTEGER NOT NULL,
         gateway_request_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('delivered','failed')),
         occurred_at INTEGER NOT NULL, received_at INTEGER NOT NULL,
-        device_id TEXT
+        device_id TEXT,
+        -- Android v3.4.27 additive carrier metadata. All nullable: a legacy
+        -- client that sends only the original four fields stays valid, and a
+        -- missing value must never be fabricated as 0/false.
+        segment_index INTEGER,
+        segment_count INTEGER,
+        all_segments_delivered INTEGER,
+        received_at_device INTEGER,
+        subscription_id INTEGER,
+        carrier_result_code INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_carrier_reports_send
         ON carrier_delivery_reports(send_id, occurred_at);
@@ -270,10 +325,26 @@ class SendStore {
       END;
     `);
     try { this.db.exec("ALTER TABLE carrier_delivery_reports ADD COLUMN device_id TEXT"); } catch { /* already present */ }
+    // Android v3.4.27 carrier contract, additive and nullable. Matching the
+    // existing ALTER-TABLE migration style; historical rows keep NULL.
+    for (const clause of [
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN segment_index INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN segment_count INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN all_segments_delivered INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN received_at_device INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN subscription_id INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN carrier_result_code INTEGER"
+    ]) {
+      try { this.db.exec(clause); } catch { /* already present */ }
+    }
     this._carrierByEvent = this.db.prepare("SELECT * FROM carrier_delivery_reports WHERE event_id=?");
     this._carrierDelivered = this.db.prepare("SELECT status, occurred_at FROM carrier_delivery_reports WHERE send_id=? AND status='delivered' ORDER BY occurred_at DESC LIMIT 1");
     this._carrierLatest = this.db.prepare("SELECT status, occurred_at FROM carrier_delivery_reports WHERE send_id=? ORDER BY occurred_at DESC LIMIT 1");
-    this._insertCarrier = this.db.prepare("INSERT INTO carrier_delivery_reports (event_id,send_id,gateway_request_id,status,occurred_at,received_at,device_id) VALUES (@eventId,@sendId,@requestId,@status,@occurredAt,@receivedAt,@deviceId)");
+    this._insertCarrier = this.db.prepare(`INSERT INTO carrier_delivery_reports
+      (event_id,send_id,gateway_request_id,status,occurred_at,received_at,device_id,
+       segment_index,segment_count,all_segments_delivered,received_at_device,subscription_id,carrier_result_code)
+      VALUES (@eventId,@sendId,@requestId,@status,@occurredAt,@receivedAt,@deviceId,
+       @segmentIndex,@segmentCount,@allSegmentsDelivered,@receivedAtDevice,@subscriptionId,@carrierResultCode)`);
     this._insertCarrierCallback = this.db.prepare("INSERT INTO eve_sms_outbox (event_id,delivery_id,send_id,event_type,body,next_attempt_at,created_at) VALUES (@eventId,@eventId,@sendId,@eventType,@body,@receivedAt,@receivedAt)");
     for (const sql of [
       "CREATE INDEX IF NOT EXISTS idx_sends_service ON sends (source, service_key, status)",
@@ -633,15 +704,31 @@ class SendStore {
     return this._byGatewayRequest.get(value) || null;
   }
 
-  /** Commit a carrier receipt and its Eve callback in one SQLite transaction. */
-  recordCarrierReport({ eventId, requestId, status, occurredAt, deviceId = null }, { fault = null } = {}) {
+  /**
+   * Commit a carrier receipt and its Eve callback in one SQLite transaction.
+   *
+   * `meta` carries the additive Android v3.4.27 carrier metadata. Every field is
+   * OPTIONAL and may be null: a legacy client sending only the original four
+   * fields must remain valid, and absent must never be stored as 0/false.
+   */
+  recordCarrierReport({ eventId, requestId, status, occurredAt, deviceId = null, meta = null }, { fault = null } = {}) {
     const receivedAt = Date.now();
     const safeDeviceId = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(String(deviceId || "")) ? String(deviceId) : null;
+    const optional = normalizeCarrierMeta(meta);
     const commit = this.db.transaction(() => {
       const previous = this._carrierByEvent.get(eventId);
       if (previous) {
+        // Core identity fields are immutable evidence: any disagreement is a
+        // genuine conflict.
         if (previous.gateway_request_id !== requestId || previous.status !== status ||
             Number(previous.occurred_at) !== occurredAt) {
+          this._bumpCounter.run({ name: "sms_carrier_conflicts_total", delta: 1, now: receivedAt });
+          return { error: "event_id_conflict" };
+        }
+        // Optional metadata is additive. A retry that omits it (legacy client,
+        // or a later re-send that simply carries less) is NOT a conflict. Only
+        // two DIFFERENT non-null values contradict each other.
+        if (carrierMetaConflicts(previous, optional)) {
           this._bumpCounter.run({ name: "sms_carrier_conflicts_total", delta: 1, now: receivedAt });
           return { error: "event_id_conflict" };
         }
@@ -657,7 +744,8 @@ class SendStore {
       if (recipientDigits.length >= 10 && eventId.includes(recipientDigits)) {
         return { error: "invalid_delivery_report" };
       }
-      this._insertCarrier.run({ eventId, sendId: row.id, requestId, status, occurredAt, receivedAt, deviceId: safeDeviceId });
+      this._insertCarrier.run({ eventId, sendId: row.id, requestId, status, occurredAt, receivedAt,
+        deviceId: safeDeviceId, ...optional });
       this._bumpCounter.run({ name: "sms_carrier_reports_total", delta: 1, now: receivedAt });
       this._bumpCounter.run({ name: status === "delivered" ? "sms_carrier_delivered_total" : "sms_carrier_failed_total", delta: 1, now: receivedAt });
       if (fault === "afterReportInsert") throw new Error("injected_carrier_report_failure");
@@ -680,8 +768,26 @@ class SendStore {
           trace_id: `send_${row.id}`,
           message_id: `send_${row.id}`,
           type: status === "delivered" ? "sms.delivered" : "sms.delivery_failed",
-          occurred_at: new Date(occurredAt).toISOString()
+          occurred_at: new Date(occurredAt).toISOString(),
+          // Additive carrier diagnostics EVE already understands. Snake_case,
+          // ISO-8601 UTC for timestamps. Never the phone number or SMS body.
+          gateway_request_id: requestId,
+          carrier_status: status,
+          evidence: "android_delivery_report"
         };
+        // Android's callback timestamp and GMweb's own receipt timestamp are
+        // DIFFERENT facts and must stay distinct.
+        if (optional.receivedAtDevice !== null) {
+          body.android_delivery_received_at = new Date(optional.receivedAtDevice).toISOString();
+        }
+        body.gmweb_delivery_received_at = new Date(receivedAt).toISOString();
+        if (optional.carrierResultCode !== null) body.carrier_result_code = optional.carrierResultCode;
+        if (optional.segmentIndex !== null) body.segment_index = optional.segmentIndex;
+        if (optional.segmentCount !== null) body.segment_count = optional.segmentCount;
+        if (optional.allSegmentsDelivered !== null) {
+          // Stored as 0/1 in SQLite; Eve expects a real boolean.
+          body.all_segments_delivered = Boolean(optional.allSegmentsDelivered);
+        }
         if (row.eve_notification_id && !row.eve_notification_id.includes(String(row.to_number).replace(/\D/g, "")) &&
             !/^\+?\d{10,15}$/.test(row.eve_notification_id)) body.eve_notification_id = row.eve_notification_id;
         if (safeDeviceId && !safeDeviceId.includes(recipientDigits)) body.device_id = safeDeviceId;
@@ -711,14 +817,24 @@ class SendStore {
   }
 
   carrierTimeline(sendId, limit = 50) {
-    const rows = this.db.prepare(`SELECT event_id, status, occurred_at, received_at
+    const rows = this.db.prepare(`SELECT event_id, status, occurred_at, received_at,
+      segment_index, segment_count, all_segments_delivered, received_at_device,
+      subscription_id, carrier_result_code
       FROM carrier_delivery_reports WHERE send_id=?
       ORDER BY occurred_at DESC, event_id DESC LIMIT ?`).all(Number(sendId), Math.max(1, Math.min(Number(limit) || 50, 100)));
     return rows.reverse().map((row) => ({
       eventId: row.event_id, status: row.status,
       occurredAt: new Date(Number(row.occurred_at)).toISOString(),
       receivedAt: new Date(Number(row.received_at)).toISOString(),
-      evidence: "android_delivery_report"
+      evidence: "android_delivery_report",
+      segmentIndex: row.segment_index ?? null,
+      segmentCount: row.segment_count ?? null,
+      allSegmentsDelivered: row.all_segments_delivered === null
+        || row.all_segments_delivered === undefined ? null : Boolean(row.all_segments_delivered),
+      receivedAtDevice: row.received_at_device === null || row.received_at_device === undefined
+        ? null : new Date(Number(row.received_at_device)).toISOString(),
+      subscriptionId: row.subscription_id ?? null,
+      carrierResultCode: row.carrier_result_code ?? null
     }));
   }
 
@@ -741,7 +857,9 @@ class SendStore {
     params.push(Math.max(1, Math.min(Number(limit) || 50, 100)));
     const sql = `SELECT d.event_id, d.status, d.occurred_at, d.received_at,
       d.gateway_request_id, d.device_id, s.id AS send_id, s.job_id, s.to_number,
-      s.eve_notification_id, o.state AS callback_state
+      s.eve_notification_id, o.state AS callback_state,
+      d.segment_index, d.segment_count, d.all_segments_delivered,
+      d.received_at_device, d.subscription_id, d.carrier_result_code
       FROM carrier_delivery_reports d
       JOIN sends s ON s.id=d.send_id
       LEFT JOIN eve_sms_outbox o ON o.event_id=d.event_id
@@ -759,7 +877,17 @@ class SendStore {
       status: row.status,
       occurredAt: new Date(Number(row.occurred_at)).toISOString(),
       receivedAt: new Date(Number(row.received_at)).toISOString(),
-      callbackState: row.callback_state || null
+      callbackState: row.callback_state || null,
+      // Additive Android v3.4.27 diagnostics. Null means "not reported" and is
+      // never fabricated; 0 is a real value (RESULT_OK, subscription id 0).
+      segmentIndex: row.segment_index ?? null,
+      segmentCount: row.segment_count ?? null,
+      allSegmentsDelivered: row.all_segments_delivered === null
+        || row.all_segments_delivered === undefined ? null : Boolean(row.all_segments_delivered),
+      receivedAtDevice: row.received_at_device === null || row.received_at_device === undefined
+        ? null : new Date(Number(row.received_at_device)).toISOString(),
+      subscriptionId: row.subscription_id ?? null,
+      carrierResultCode: row.carrier_result_code ?? null
     }));
   }
 

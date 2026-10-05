@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.38",
+    "version": "0.19.39",
     "contact": {
       "name": "GMweb API"
     }
@@ -2004,6 +2004,39 @@
                   "occurredAt": {
                     "type": "integer",
                     "minimum": 1577836800000
+                  },
+                  "eventType": {
+                    "type": "string",
+                    "enum": [
+                      "carrier_delivery"
+                    ]
+                  },
+                  "segmentIndex": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 63
+                  },
+                  "segmentCount": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 64
+                  },
+                  "allSegmentsDelivered": {
+                    "type": "boolean"
+                  },
+                  "receivedAtDevice": {
+                    "type": "integer",
+                    "minimum": 1577836800000
+                  },
+                  "subscriptionId": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000000
+                  },
+                  "carrierResultCode": {
+                    "type": "integer",
+                    "minimum": -1000000,
+                    "maximum": 1000000
                   }
                 }
               }
