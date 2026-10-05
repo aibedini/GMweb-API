@@ -795,7 +795,14 @@ async function projectEncryptedConversations(encrypted: EncryptedConversationSta
     const value = decrypted.payload;
     const address = typeof value.address === "string" ? value.address : "";
     const displayName = typeof value.displayName === "string" ? value.displayName : address;
-    items.push({ aggregateId: row.conversationId, title: displayName || "Unknown conversation",
+    // Preferred title order: explicit display/contact name, else the RAW sender
+    // address (alphanumeric sender IDs such as PARSIANBANK must render verbatim),
+    // else any participant representation, else "Unknown conversation".
+    const participant = typeof value.participant === "string" ? value.participant
+      : Array.isArray(value.participants) && typeof value.participants[0] === "string"
+        ? value.participants[0] : "";
+    const title = displayName || address || participant || "Unknown conversation";
+    items.push({ aggregateId: row.conversationId, title,
       ...(displayName && address && displayName !== address ? { subtitle: address } : {}),
       preview: typeof value.lastMessagePreview === "string" ? value.lastMessagePreview : "",
       lastAt: Number(value.lastMessageAt) || row.sortKey,

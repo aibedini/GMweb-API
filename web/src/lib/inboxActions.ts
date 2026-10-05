@@ -1,5 +1,6 @@
 import type { ConversationProjection } from "./inbox.ts";
 import { androidError } from "../../../shared/smsStatus.ts";
+import { isPhoneSender } from "./senderIdentity.ts";
 
 export function phoneKey(value: string): string {
   const digits = value.replace(/[۰-۹]/g, char => String(char.charCodeAt(0) - 1776))
@@ -10,6 +11,11 @@ export function phoneKey(value: string): string {
 
 export function contactTitle(row: ConversationProjection, names: Map<string, string>): ConversationProjection {
   const phone = row.subtitle || row.title;
+  // PRODUCTION BUG: contact lookup ran for EVERY sender, so a branded sender was
+  // reduced by phoneKey() before the lookup. "Ssh3-652" became "3652" and could
+  // falsely match an unrelated contact; "PARSIANBANK" became "" and could match a
+  // blank-keyed entry. Only a real phone number may be contact-matched.
+  if (!isPhoneSender(phone)) return row;
   const title = names.get(phoneKey(phone));
   return title ? { ...row, title, subtitle: phone } : row;
 }

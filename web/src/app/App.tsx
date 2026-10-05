@@ -12,6 +12,7 @@ import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
 import { collectWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnostics";
 import { MessageComposer } from "./MessageComposer";
 import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActions";
+import { senderSearchText } from "../lib/senderIdentity";
 import { commandSubscriptionId, defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress, assertHistoryMergeProgress } from "../lib/threadHistory";
@@ -469,7 +470,11 @@ export default function App() {
       ? conversations.filter(item => item.unreadCount > 0)
       : conversations;
     if (!query) return base;
-    return base.filter((item) => `${item.title}\n${item.preview}`.toLocaleLowerCase().includes(query));
+    // Search must find branded senders. The conversation title may be a contact
+    // name or a placeholder, so the RAW sender address is searched too:
+    // "parsian" / "PARSIANBANK" / "Resalat" / "Ssh3" must all match.
+    return base.filter((item) => [...senderSearchText(item.subtitle || item.title),
+      ...`${item.title}\n${item.preview}`.toLocaleLowerCase()].join("\n").includes(query));
   }, [conversations, search, conversationFilter]);
 
   useEffect(() => {
@@ -1010,7 +1015,8 @@ export default function App() {
   // ONE deterministic send-readiness model owns composer gating (replaces the
   // legacy simHelp() string, which blocked every send on stale telemetry).
   const readiness = deriveSendReadiness({
-    draft, hasRecipient: Boolean(selectedRecipient), canSend: capabilities.includes("SEND_MESSAGES"),
+    draft, hasRecipient: Boolean(selectedRecipient), recipientAddress: selectedRecipient,
+    canSend: capabilities.includes("SEND_MESSAGES"),
     sending, phonePresence, telemetryFreshness, sim: simTelemetry, selectedSubscriptionId,
   });
   const sendBlockedNow = sendBlocked(readiness);

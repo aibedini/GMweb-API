@@ -19,11 +19,13 @@
 import type { TelemetryFreshness } from "./deviceState.ts";
 import type { PhonePresence } from "./phonePresence.ts";
 import type { SimTelemetryState, SimTelemetryView } from "./simTelemetry.ts";
+import { classifySender } from "./senderIdentity.ts";
 
 export type SendReadiness =
   | { state: "SENDING" }
   | { state: "EMPTY_BODY" }
   | { state: "NO_RECIPIENT" }
+  | { state: "NOT_REPLYABLE"; senderKind: "ALPHANUMERIC" | "UNKNOWN" }
   | { state: "SEND_CAPABILITY_MISSING" }
   | { state: "PHONE_NEVER_SEEN" }
   | { state: "READY_DEFAULT" }
@@ -35,6 +37,12 @@ export type SendReadiness =
 export interface SendReadinessInput {
   draft: string;
   hasRecipient: boolean;
+  /**
+   * The raw sender address being replied to. An alphanumeric sender ID such as
+   * PARSIANBANK is NOT a dialable destination: GMweb must never issue
+   * SEND_SMS recipient="PARSIANBANK" merely because it is a visible title.
+   */
+  recipientAddress?: string | null;
   canSend: boolean;
   sending: boolean;
   phonePresence: PhonePresence;
@@ -56,6 +64,15 @@ export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
   if (input.sending) return { state: "SENDING" };
   if (input.draft.trim().length === 0) return { state: "EMPTY_BODY" };
   if (!input.hasRecipient) return { state: "NO_RECIPIENT" };
+  // Replyability is a property of the SENDER, not of the UI. An alphanumeric
+  // sender ID is displayable but not addressable, so it must block sending
+  // rather than silently dispatch an undeliverable SMS.
+  if (input.recipientAddress !== undefined && input.recipientAddress !== null) {
+    const identity = classifySender(input.recipientAddress);
+    if (identity.kind === "ALPHANUMERIC" || identity.kind === "UNKNOWN") {
+      return { state: "NOT_REPLYABLE", senderKind: identity.kind };
+    }
+  }
   if (!input.canSend) return { state: "SEND_CAPABILITY_MISSING" };
   // Only a phone that has never authenticated at all is unusable. OFFLINE and
   // STALE still allow a durable command to be queued for later claim.
@@ -135,6 +152,12 @@ export function sendReadinessNotice(readiness: SendReadiness): SendNotice | null
     case "EMPTY_BODY":
     case "NO_RECIPIENT":
       return null;
+    // The sender is displayable but not addressable. This is a RECIPIENT
+    // problem, not a SIM or phone problem, so it gets its own honest notice.
+    case "NOT_REPLYABLE":
+      return { kind: "COMPOSER", title: "Replies unavailable", tone: "info",
+        message: "This sender ID is not a phone number, so it cannot receive a reply.",
+        blocking: true, offersSimRefresh: false };
     // The composer already renders a dedicated, security-worded alert for a
     // missing SEND_MESSAGES capability; do not duplicate it here.
     case "SEND_CAPABILITY_MISSING":
