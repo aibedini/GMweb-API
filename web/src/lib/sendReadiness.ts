@@ -19,6 +19,7 @@
 import type { TelemetryFreshness } from "./deviceState.ts";
 import type { PhonePresence } from "./phonePresence.ts";
 import type { SimTelemetryState, SimTelemetryView } from "./simTelemetry.ts";
+import { simKey } from "./simSelection.ts";
 import { classifySender } from "./senderIdentity.ts";
 
 export type SendReadiness =
@@ -29,9 +30,18 @@ export type SendReadiness =
   | { state: "SEND_CAPABILITY_MISSING" }
   | { state: "PHONE_NEVER_SEEN" }
   | { state: "READY_DEFAULT" }
-  | { state: "READY_EXPLICIT"; subscriptionId: number }
-  | { state: "EXPLICIT_SIM_TELEMETRY_STALE"; subscriptionId: number }
-  | { state: "EXPLICIT_SIM_MISSING"; subscriptionId: number }
+  | { state: "READY_EXPLICIT"; simKey: string }
+  | { state: "EXPLICIT_SIM_TELEMETRY_STALE"; simKey: string }
+  | { state: "EXPLICIT_SIM_MISSING"; simKey: string }
+  /**
+   * A line was chosen but the phone published no `simRef` for it.
+   *
+   * Blocking on purpose. The phone can only resolve a `simRef`, so without one the command would have
+   * to name the line by subscription id — which current Android builds deliberately do not publish and
+   * would ignore. Sending anyway would dispatch on whatever line the phone considers default, i.e. a
+   * different line than the one the user selected, silently. Refusing is the only reversible option.
+   */
+  | { state: "EXPLICIT_SIM_UNROUTABLE"; simKey: string }
   | { state: "NO_ACTIVE_SIM" };
 
 export interface SendReadinessInput {
@@ -48,16 +58,37 @@ export interface SendReadinessInput {
   phonePresence: PhonePresence;
   telemetryFreshness: TelemetryFreshness;
   sim: Pick<SimTelemetryView, "state" | "active">;
-  /** null === PHONE_DEFAULT. */
-  selectedSubscriptionId: number | null;
+  /**
+   * The chosen line's selection key (see `simKey`), or null for PHONE_DEFAULT.
+   *
+   * A KEY rather than a subscription id: the durable identity is the opaque `simRef`, and an unnamespaced
+   * number could collide with one.
+   */
+  selectedSimKey: string | null;
 }
 
-/** The explicit subscription id to put in the command, if any. */
-export function commandSubscriptionId(selectedSubscriptionId: number | null): number | undefined {
-  // PHONE_DEFAULT must OMIT subscriptionId so Android resolves the CURRENT
-  // system default at execution time. Resolving it in Web to a cached id would
-  // silently change the command's semantics.
-  return selectedSubscriptionId === null ? undefined : selectedSubscriptionId;
+/**
+ * The routing target to put in a `SEND_SMS` command, or undefined for the phone's own default.
+ *
+ * PHONE_DEFAULT MUST omit any target so Android resolves the CURRENT system default at execution time:
+ * resolving it in the browser to a cached value would silently change the command's meaning.
+ *
+ * A `simRef` is sent as `simRef`, the opaque cross-system identity Android resolves against its live
+ * inventory. A legacy `sub:` key is sent as `subscriptionId`, which only an older phone will act on.
+ */
+export function commandSimTarget(
+  selectedSimKey: string | null,
+): { simRef: string } | { subscriptionId: number } | undefined {
+  if (selectedSimKey === null) return undefined;
+  if (selectedSimKey.startsWith("ref:")) {
+    const simRef = selectedSimKey.slice("ref:".length);
+    return simRef.length > 0 ? { simRef } : undefined;
+  }
+  if (selectedSimKey.startsWith("sub:")) {
+    const value = Number(selectedSimKey.slice("sub:".length));
+    return Number.isSafeInteger(value) ? { subscriptionId: value } : undefined;
+  }
+  return undefined;
 }
 
 export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
@@ -78,7 +109,7 @@ export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
   // STALE still allow a durable command to be queued for later claim.
   if (input.phonePresence === "NEVER_SEEN") return { state: "PHONE_NEVER_SEEN" };
 
-  const selected = input.selectedSubscriptionId;
+  const selected = input.selectedSimKey;
   if (selected === null) {
     // PHONE_DEFAULT: a stale SIM snapshot must NOT block sending.
     if (input.telemetryFreshness === "FRESH"
@@ -89,14 +120,20 @@ export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
     return { state: "READY_DEFAULT" };
   }
 
-  // EXPLICIT: strict. Fresh telemetry, subscription still present.
+  // A chosen line can only be routed by a handle the phone understands. Without one there is nothing
+  // to send, and falling through to the default would dispatch on a line the user did not pick.
+  if (commandSimTarget(selected) === undefined) {
+    return { state: "EXPLICIT_SIM_UNROUTABLE", simKey: selected };
+  }
+
+  // EXPLICIT: strict. Fresh telemetry, chosen line still present.
   if (input.telemetryFreshness !== "FRESH") {
-    return { state: "EXPLICIT_SIM_TELEMETRY_STALE", subscriptionId: selected };
+    return { state: "EXPLICIT_SIM_TELEMETRY_STALE", simKey: selected };
   }
-  if (!input.sim.active.some(sim => sim.subscriptionId === selected)) {
-    return { state: "EXPLICIT_SIM_MISSING", subscriptionId: selected };
+  if (!input.sim.active.some(sim => simKey(sim) === selected)) {
+    return { state: "EXPLICIT_SIM_MISSING", simKey: selected };
   }
-  return { state: "READY_EXPLICIT", subscriptionId: selected };
+  return { state: "READY_EXPLICIT", simKey: selected };
 }
 
 /** Blocking states. Everything else may send. */
@@ -178,6 +215,13 @@ export function sendReadinessNotice(readiness: SendReadiness): SendNotice | null
     case "EXPLICIT_SIM_MISSING":
       return { kind: "SIM", title: "SIM needs attention", tone: "warning",
         message: "Previously selected SIM is no longer active. Choose another SIM or use Phone default.",
+        blocking: true, offersSimRefresh: true };
+    case "EXPLICIT_SIM_UNROUTABLE":
+      // Blocking, and explicit about why: sending would otherwise leave on a line the user did not
+      // choose, since the phone cannot be told which one they meant.
+      return { kind: "SIM", title: "SIM cannot be addressed", tone: "danger",
+        message: "The phone did not publish an addressable identity for the selected SIM, so it cannot "
+          + "be told which line to use. Refresh SIM information, or use Phone default.",
         blocking: true, offersSimRefresh: true };
   }
 }

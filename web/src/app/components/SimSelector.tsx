@@ -1,6 +1,6 @@
 import { ListBox, Select } from "@heroui/react";
 import type { DeviceTelemetry } from "../../lib/api";
-import { DEFAULT_SIM_KEY, simSelectChoice, simSelectValue } from "../../lib/simSelection";
+import { DEFAULT_SIM_KEY, simKey, simSelectChoice, simSelectValue } from "../../lib/simSelection";
 
 type Sim = NonNullable<DeviceTelemetry["smsSubscriptions"]>["items"][number];
 
@@ -34,7 +34,8 @@ export function SimSelector({
 }: {
   sims: Sim[];
   selected?: Sim;
-  onSim: (id: number | null) => void;
+  /** Emits the chosen identity, or null for "let the phone choose". */
+  onSim: (choice: { simRef: string } | { subscriptionId: number } | null) => void;
   useDefault: boolean;
   /** True when the list is not current; entries are labelled "Last reported". */
   historical?: boolean;
@@ -67,7 +68,7 @@ export function SimSelector({
             <ListBox.ItemIndicator />
           </ListBox.Item>
           {sims.map((sim) => (
-            <ListBox.Item key={sim.subscriptionId} id={String(sim.subscriptionId)} textValue={simLabel(sim)}>
+            <ListBox.Item key={simKey(sim) ?? simLabel(sim)} id={simKey(sim) ?? ""} textValue={simLabel(sim)}>
               <SimOption
                 name={simLabel(sim)}
                 carrier={`${sim.carrierName || sim.displayName || "Carrier unavailable"}${

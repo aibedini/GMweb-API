@@ -1,6 +1,7 @@
 import type { StoredEvent } from "./sync";
 import { acceptsContentCrypto, isContentBearingEvent } from "./eventCryptoPolicy.ts";
 import { classifySender } from "./senderIdentity.ts";
+import { preferredSimFromEvents, type PreferredSim } from "./sync/preferred-sim.ts";
 
 export interface MessagePayload {  messageId: string;
   direction: "in" | "out";
@@ -62,6 +63,18 @@ export interface ConversationProjection extends ConversationSummary {
    * Android resending historical messages.
    */
   metadataSequence?: number;
+  /**
+   * The conversation's sticky SIM, decrypted from the Android-controlled encrypted payload.
+   *
+   * `undefined` means "no preference is known" — plainly no preference, or a locked conversation whose
+   * payload we cannot read. It does NOT mean "cleared": Android distinguishes an absent field from an
+   * explicit `null` precisely so that a message-driven upsert cannot silently unpin a conversation, and
+   * a browser that collapsed the two would undo the user's choice on every incoming message.
+   *
+   * Never sent to the server in plaintext, and never persisted server-side: it lives inside the same
+   * encrypted envelope as the rest of the conversation state.
+   */
+  preferredSim?: PreferredSim;
 }
 
 /** The opened thread may arrive before its encrypted conversation summary. */
@@ -276,11 +289,16 @@ export function conversationProjectionFromEvents(
     const decodeState: "ready" | "locked" = last
       ? eventDecodeState(last.event).startsWith("Locked") ? "locked" : "ready"
       : "ready";
+    // The sticky SIM is folded over the conversation's ordered history, not read from the newest
+    // envelope: "newest" is a message-driven upsert as often as not, and an event that does not mention
+    // the field must leave the previous answer standing rather than clearing it.
+    const simState = preferredSimFromEvents(forAggregate, aggregateId);
     return {
       ...summary,
       lastMessageId: last?.payload.messageId ?? summary.aggregateId,
       lastSequence: last?.event.sequence ?? 0,
       decodeState,
+      ...(simState.kind === "set" ? { preferredSim: simState.value } : {}),
     };
   }
   // Nothing decodable yet — but if the aggregate still holds ciphertext that

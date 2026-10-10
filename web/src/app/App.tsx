@@ -14,7 +14,7 @@ import { MessageComposer } from "./MessageComposer";
 import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActions";
 import { senderSearchText } from "../lib/senderIdentity";
 import { resolveSendStatus, detectSendDivergence, diagnosticHash } from "../lib/sendEvidence";
-import { commandSubscriptionId, defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
+import { commandSimTarget, defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress, assertHistoryMergeProgress } from "../lib/threadHistory";
 import {
@@ -141,9 +141,14 @@ export default function App() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [draft, setDraft] = useState("");
-  const [selectedSubscriptionId, setSelectedSubscriptionId] = useState<number | null>(() => {
-    const saved = window.localStorage.getItem("gmweb:selected-sms-subscription");
-    return saved !== null && Number.isSafeInteger(Number(saved)) ? Number(saved) : null;
+  // The chosen line, as a SELECTION KEY (see `simKey`), not a subscription id.
+  //
+  // `simRef` is the durable, opaque identity Android can resolve at send time; a subscription id is
+  // reassigned when SIMs move and is no longer published by current builds, so it cannot be the key a
+  // choice is stored under.
+  const [selectedSimKey, setSelectedSimKey] = useState<string | null>(() => {
+    const saved = window.localStorage.getItem("gmweb:selected-sms-sim-key");
+    return saved && saved.length > 0 ? saved : null;
   });
   const [composeRecipient, setComposeRecipient] = useState("");
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
@@ -622,11 +627,16 @@ export default function App() {
   // DISPLAY vs COMMAND: `chosenSim` is only ever for rendering. The command
   // subscription is derived separately so a display fallback can never silently
   // change what the phone is told to do.
-  const displayResolvedSim = selectSmsSim(activeSims, selectedSubscriptionId);
-  const chooseSim = (id: number | null) => {
-    setSelectedSubscriptionId(id);
-    if (id === null) window.localStorage.removeItem("gmweb:selected-sms-subscription");
-    else window.localStorage.setItem("gmweb:selected-sms-subscription", String(id));
+  const displayResolvedSim = selectSmsSim(activeSims, selectedSimKey);
+  const chooseSim = (choice: { simRef: string } | { subscriptionId: number } | null) => {
+    // Store the choice as a KEY so a reload restores the same physical line rather than a number that
+    // may since have been reassigned to a different card.
+    const key = choice === null
+      ? null
+      : "simRef" in choice ? `ref:${choice.simRef}` : `sub:${choice.subscriptionId}`;
+    setSelectedSimKey(key);
+    if (key === null) window.localStorage.removeItem("gmweb:selected-sms-sim-key");
+    else window.localStorage.setItem("gmweb:selected-sms-sim-key", key);
   };
 
   useEffect(() => {
@@ -844,9 +854,10 @@ export default function App() {
         // Canonical crypto path — identical to READ and REFRESH.
         const prepared = await prepareEncryptedCommand("SEND_SMS", {
           phone: selectedRecipient, body, clientMessageId,
-          // PHONE_DEFAULT omits subscriptionId entirely so Android resolves the
-          // CURRENT default at execution time. Only an explicit selection is sent.
-          ...(commandSubscriptionId === undefined ? {} : { subscriptionId: commandSubscriptionId }),
+          // PHONE_DEFAULT omits any routing target entirely so Android resolves the CURRENT default at
+          // execution time. An explicit choice sends the opaque `simRef` the phone can resolve against
+          // its live inventory; a legacy phone gets its subscription id instead.
+          ...(commandSimTarget(selectedSimKey) ?? {}),
         });
         pending = { browserDeviceId: identity.deviceId, clientMessageId,
           idempotencyKey: prepared.idempotencyKey, payload: prepared.encrypted,
@@ -1049,7 +1060,7 @@ export default function App() {
   const readiness = deriveSendReadiness({
     draft, hasRecipient: Boolean(selectedRecipient), recipientAddress: selectedRecipient,
     canSend: capabilities.includes("SEND_MESSAGES"),
-    sending, phonePresence, telemetryFreshness, sim: simTelemetry, selectedSubscriptionId,
+    sending, phonePresence, telemetryFreshness, sim: simTelemetry, selectedSimKey,
   });
   const sendBlockedNow = sendBlocked(readiness);
   const simInstructions = sendReadinessNotice(readiness);
@@ -1143,7 +1154,7 @@ export default function App() {
       sending={sending}
       canSend={capabilities.includes("SEND_MESSAGES")}
       status={resolvedSendStatus.text}
-      useDefault={selectedSubscriptionId === null}
+      useDefault={selectedSimKey === null}
     />
   );
 
