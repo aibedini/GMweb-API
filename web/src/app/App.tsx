@@ -633,6 +633,30 @@ export default function App() {
   };
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
   const selectedRecipient = composeRecipient || messages.map(item => item.payload.address).find(Boolean);
+  /**
+   * The Android Telephony thread id for the OPEN conversation, taken from the
+   * decrypted payloads Android already publishes (`GatewayEventFactory` emits
+   * `androidThreadId` whenever it is > 0).
+   *
+   * WHY THIS IS SENT WITH SEND_SMS: Android's `SmsSender.chooseSim()` returns
+   * `UseRequestOrDefault` when `threadId <= 0`, which BYPASSES the conversation's
+   * sticky preferred-SIM check entirely. Because GMweb never sent
+   * `androidThreadId`, every web-originated send took that bypass, so the
+   * per-conversation preference was never enforced. Supplying the decrypted id
+   * is what lets Android apply the preference it already stores.
+   *
+   * Never guessed: an absent value stays absent and Android behaves as before.
+   */
+  const selectedAndroidThreadId = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const value = messages[index]?.payload?.androidThreadId;
+      if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
+    }
+    const projected = selectedConversationCache?.aggregateId === selected
+      ? selectedConversationCache?.androidThreadId : undefined;
+    return typeof projected === "number" && Number.isSafeInteger(projected) && projected > 0
+      ? projected : null;
+  }, [messages, selectedConversationCache, selected]);
   const activeSims = telemetry?.smsSubscriptions?.items.filter(sim => sim.isActive && sim.sendCapable !== false) ?? [];
   // DISPLAY vs COMMAND: `chosenSim` is only ever for rendering. The command
   // subscription is derived separately so a display fallback can never silently
@@ -909,6 +933,9 @@ export default function App() {
           // here would reintroduce a second source of truth and allow a
           // conversation pinned to SIM A to be sent from another line.
           ...(simRouting.commandTarget ?? {}),
+          // Thread identity is what makes Android enforce the conversation's
+          // sticky preferred SIM. Omitting it silently disables that check.
+          ...(selectedAndroidThreadId ? { androidThreadId: selectedAndroidThreadId } : {}),
         });
         pending = { browserDeviceId: identity.deviceId, clientMessageId,
           idempotencyKey: prepared.idempotencyKey, payload: prepared.encrypted,
