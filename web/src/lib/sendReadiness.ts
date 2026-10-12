@@ -20,6 +20,7 @@ import type { TelemetryFreshness } from "./deviceState.ts";
 import type { PhonePresence } from "./phonePresence.ts";
 import type { SimTelemetryState, SimTelemetryView } from "./simTelemetry.ts";
 import { simKey } from "./simSelection.ts";
+import { simRoutingNotice, type SimRoutingBlock } from "./simSelection.ts";
 import { classifySender } from "./senderIdentity.ts";
 
 export type SendReadiness =
@@ -42,7 +43,12 @@ export type SendReadiness =
    * different line than the one the user selected, silently. Refusing is the only reversible option.
    */
   | { state: "EXPLICIT_SIM_UNROUTABLE"; simKey: string }
-  | { state: "NO_ACTIVE_SIM" };
+  | { state: "NO_ACTIVE_SIM" }
+  /**
+   * SIM routing refused for THIS conversation, carrying the real reason so the
+   * Composer shows the actual problem rather than a generic SIM hint.
+   */
+  | { state: "SIM_ROUTING_BLOCKED"; reason: SimRoutingBlock };
 
 export interface SendReadinessInput {
   draft: string;
@@ -65,6 +71,17 @@ export interface SendReadinessInput {
    * number could collide with one.
    */
   selectedSimKey: string | null;
+  /**
+   * The canonical routing decision's block reason, when this conversation's
+   * preferred SIM cannot be used.
+   *
+   * DEFECT this fixes: readiness consumed the GLOBAL composer key while the send
+   * payload consumed the conversation's preferred SIM, so the two could
+   * disagree — a conversation whose own line was ready could still show Send
+   * disabled because an unrelated global selection failed to resolve. There is
+   * now ONE decision, and readiness consumes it instead of re-deriving it.
+   */
+  simRoutingBlocked?: SimRoutingBlock | null;
 }
 
 /**
@@ -108,6 +125,11 @@ export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
     }
   }
   if (!input.canSend) return { state: "SEND_CAPABILITY_MISSING" };
+  // Routing refusal outranks the SIM telemetry states: the SIM list can look
+  // perfectly healthy while THIS conversation's own line is the problem.
+  if (input.simRoutingBlocked) {
+    return { state: "SIM_ROUTING_BLOCKED", reason: input.simRoutingBlocked };
+  }
   // Only a phone that has never authenticated at all is unusable. OFFLINE and
   // STALE still allow a durable command to be queued for later claim.
   if (input.phonePresence === "NEVER_SEEN") return { state: "PHONE_NEVER_SEEN" };
@@ -209,6 +231,12 @@ export function sendReadinessNotice(readiness: SendReadiness): SendNotice | null
       return { kind: "PHONE", title: "Phone unavailable", tone: "danger",
         message: "No Primary phone has connected yet. Pair your phone, then retry.",
         blocking: true, offersSimRefresh: false };
+    // The REAL routing reason, taken from the same decision that builds the
+    // payload, so the banner cannot name a different problem than the block.
+    case "SIM_ROUTING_BLOCKED":
+      return { kind: "SIM", title: "Preferred SIM unavailable", tone: "warning",
+        message: simRoutingNotice(readiness.reason) ?? "This conversation's preferred SIM cannot be used.",
+        blocking: true, offersSimRefresh: true };
     case "NO_ACTIVE_SIM":
       return { kind: "SIM", title: "SIM needs attention", tone: "danger",
         message: "No active SMS SIM was detected. Insert an active SIM or check Phone permission.",

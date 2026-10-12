@@ -14,7 +14,7 @@ import { MessageComposer } from "./MessageComposer";
 import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActions";
 import { senderSearchText } from "../lib/senderIdentity";
 import { resolveSendStatus, detectSendDivergence, diagnosticHash } from "../lib/sendEvidence";
-import { commandSimTarget, defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
+import { defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
 import { supportsPreferredSim } from "../lib/simRefresh";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress, assertHistoryMergeProgress } from "../lib/threadHistory";
@@ -654,6 +654,16 @@ export default function App() {
     composerKey: selectedSimKey,
   });
   const displayResolvedSim = simRouting.sim ?? selectSmsSim(activeSims, selectedSimKey);
+  /**
+   * The canonical selection key implied by the routing decision. Display,
+   * readiness, the disabled Send state and the command payload all derive from
+   * this single value, so they cannot contradict one another.
+   */
+  const canonicalSimKey: string | null = simRouting.commandTarget === null
+    ? null
+    : "simRef" in simRouting.commandTarget
+      ? `ref:${simRouting.commandTarget.simRef}`
+      : `sub:${simRouting.commandTarget.subscriptionId}`;
   const chooseSim = (choice: { simRef: string } | { subscriptionId: number } | null) => {
     // Store the choice as a KEY so a reload restores the same physical line rather than a number that
     // may since have been reassigned to a different card.
@@ -894,10 +904,11 @@ export default function App() {
           // execution time. An explicit choice sends the opaque `simRef` the phone can resolve against
           // its live inventory; a legacy phone gets its subscription id instead.
           //
-          // The target comes from `simRouting`, NOT from the raw global key, so a conversation pinned to
-          // a preferred SIM always sends from that SIM. `send()` is separately guarded on
-          // `simRouting.blocked`, which makes a fallback to another line unrepresentable.
-          ...(simRouting.commandTarget ?? commandSimTarget(selectedSimKey) ?? {}),
+          // The target comes from `simRouting` alone — the canonical decision —
+          // with NO independent fallback to the global composer key. A fallback
+          // here would reintroduce a second source of truth and allow a
+          // conversation pinned to SIM A to be sent from another line.
+          ...(simRouting.commandTarget ?? {}),
         });
         pending = { browserDeviceId: identity.deviceId, clientMessageId,
           idempotencyKey: prepared.idempotencyKey, payload: prepared.encrypted,
@@ -1103,7 +1114,12 @@ export default function App() {
   const readiness = deriveSendReadiness({
     draft, hasRecipient: Boolean(selectedRecipient), recipientAddress: selectedRecipient,
     canSend: capabilities.includes("SEND_MESSAGES"),
-    sending, phonePresence, telemetryFreshness, sim: simTelemetry, selectedSimKey,
+    // ONE decision: readiness consumes the CANONICAL routing result rather than
+    // the raw global composer key, so the banner, the disabled Send button and
+    // the encrypted payload can never disagree about which line is in play.
+    selectedSimKey: canonicalSimKey,
+    simRoutingBlocked: simRouting.blocked,
+    sending, phonePresence, telemetryFreshness, sim: simTelemetry,
   });
   const sendBlockedNow = sendBlocked(readiness);
   const simInstructions = sendReadinessNotice(readiness);
