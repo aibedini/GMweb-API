@@ -23,7 +23,7 @@ import {
   isValidCursor, pagingFailed, pagingFromPage, pagingLoading, showLoadOlder,
   type HistoryPagingState, type HistoryTrace,
 } from "../lib/threadPaging";
-import { selectSmsSim } from "../lib/simSelection";
+import { selectSmsSim, resolveSimRouting } from "../lib/simSelection";
 import { describeSimTelemetry } from "../lib/simTelemetry";
 import { authoritativePhonePresence, authoritativeTelemetryFreshness } from "../lib/deviceState";
 import {
@@ -160,6 +160,15 @@ export default function App() {
   // above is not reactive, so a footer that only read it could keep showing the
   // low-truth command view after true delivery evidence had arrived.
   const [evidenceStatus, setEvidenceStatus] = useState<number | null>(null);
+  // A preferred-SIM change is PENDING between the user's choice and Android's
+  // confirmation. While pending, sending in that conversation is blocked so no
+  // message can ever be submitted from the PREVIOUS line.
+  //
+  // The setter is intentionally NOT taken yet: the SET_CONVERSATION_PREFERRED_SIM
+  // command workflow that would drive this transition is NOT implemented, so
+  // nothing may pretend a change is pending. The routing guard below already
+  // honours the flag the moment that workflow lands.
+  const [simPreferencePending] = useState(false);
   // Privacy-safe divergence record: carrier evidence settled while the command
   // lifecycle still claimed the send was queued/in flight.
   const sendDivergenceSeen = useRef<string | null>(null);
@@ -628,7 +637,23 @@ export default function App() {
   // DISPLAY vs COMMAND: `chosenSim` is only ever for rendering. The command
   // subscription is derived separately so a display fallback can never silently
   // change what the phone is told to do.
-  const displayResolvedSim = selectSmsSim(activeSims, selectedSimKey);
+  //
+  // SIM ROUTING PRECEDENCE: a conversation with an Android-confirmed preferred
+  // SIM sends from THAT line. The composer's global selection (and localStorage)
+  // applies only where the conversation has no preference, so new-message
+  // behaviour is unchanged and no conversation can be silently misrouted.
+  const selectedPreferredRef = selectedConversationCache?.aggregateId === selected
+    ? selectedConversationCache?.preferredSim?.simRef ?? null
+    : null;
+  const simRouting = resolveSimRouting({
+    sims: telemetry?.smsSubscriptions?.items ?? [],
+    conversationPreferredRef: selectedPreferredRef,
+    // A change is only ever pending once the command workflow exists; today the
+    // flag is driven by that state and defaults to false.
+    preferencePending: simPreferencePending,
+    composerKey: selectedSimKey,
+  });
+  const displayResolvedSim = simRouting.sim ?? selectSmsSim(activeSims, selectedSimKey);
   const chooseSim = (choice: { simRef: string } | { subscriptionId: number } | null) => {
     // Store the choice as a KEY so a reload restores the same physical line rather than a number that
     // may since have been reassigned to a different card.
@@ -822,6 +847,16 @@ export default function App() {
     if (!body.trim()) { setCommandStatus("EMPTY_BODY"); return; }
     if (!selectedRecipient) { setCommandStatus("NO_RECIPIENT"); return; }
     if (!capabilities.includes("SEND_MESSAGES")) { setCommandStatus("SEND_CAPABILITY_MISSING"); return; }
+    // SEND-RACE PROTECTION. If this conversation's preferred SIM cannot be used
+    // right now — inactive, unresolvable, or awaiting Android confirmation of a
+    // change — the message must NOT be submitted on any other line. Blocking
+    // here is what makes "sent from the wrong SIM" unrepresentable, because the
+    // command target is derived from the same routing decision.
+    if (simRouting.blocked) {
+      commandFailureCode.current = `SIM_ROUTING_${simRouting.blocked}`;
+      setCommandStatus(`SIM_ROUTING_${simRouting.blocked}`);
+      return;
+    }
     // Structured readiness owns the gate. The old `simHelp()` string blocked
     // every send on stale telemetry, including PHONE_DEFAULT.
     if (sendBlockedNow) {
@@ -858,7 +893,11 @@ export default function App() {
           // PHONE_DEFAULT omits any routing target entirely so Android resolves the CURRENT default at
           // execution time. An explicit choice sends the opaque `simRef` the phone can resolve against
           // its live inventory; a legacy phone gets its subscription id instead.
-          ...(commandSimTarget(selectedSimKey) ?? {}),
+          //
+          // The target comes from `simRouting`, NOT from the raw global key, so a conversation pinned to
+          // a preferred SIM always sends from that SIM. `send()` is separately guarded on
+          // `simRouting.blocked`, which makes a fallback to another line unrepresentable.
+          ...(simRouting.commandTarget ?? commandSimTarget(selectedSimKey) ?? {}),
         });
         pending = { browserDeviceId: identity.deviceId, clientMessageId,
           idempotencyKey: prepared.idempotencyKey, payload: prepared.encrypted,
