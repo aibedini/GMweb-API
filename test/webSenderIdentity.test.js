@@ -14,7 +14,7 @@ import { deriveSendReadiness, sendBlocked, sendReadinessNotice } from "../web/sr
 const PHONE_READINESS = {
   draft: "hello", hasRecipient: true, canSend: true, sending: false,
   phonePresence: "ONLINE", telemetryFreshness: "FRESH",
-  sim: { state: "OK", active: true }, selectedSubscriptionId: null,
+  sim: { state: "OK", active: true }, selectedSimKey: null,
 };
 
 // ── §11 fixture matrix ──────────────────────────────────────────────────────

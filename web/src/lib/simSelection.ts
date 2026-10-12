@@ -15,6 +15,13 @@ export interface SmsSim {
   isActive: boolean;
   isDefaultSms: boolean;
   sendCapable?: boolean;
+  /**
+   * Display fields. Present on the wire item; declared here (rather than only on the API type) so the
+   * label helpers can be generic over anything that carries a SIM identity.
+   */
+  slotIndex: number;
+  displayName: string;
+  carrierName: string;
 }
 
 /**
@@ -46,6 +53,29 @@ export function simKey(sim: SmsSim | undefined | null): string | null {
 /** True when the SIM can be selected at all (it has an identity we can route by). */
 export function isSelectableSim(sim: SmsSim): boolean {
   return simKey(sim) !== null;
+}
+
+/** A human label for a SIM, used everywhere one is named. */
+export function simLabel(sim: Pick<SmsSim, "slotIndex" | "carrierName" | "displayName">): string {
+  const carrier = sim.carrierName || sim.displayName || "Carrier unavailable";
+  return `SIM ${sim.slotIndex + 1} · ${carrier}`;
+}
+
+/**
+ * The label for a STICKY preference, matched against the live SIM list by its opaque ref.
+ *
+ * Returns null when the pinned line is not currently present. The preference is real and still set on
+ * the phone, so the caller must say that rather than present it as unset — a preference that outlives
+ * the card is exactly the case worth showing, because the user replaced a SIM and still needs to know
+ * which line an older conversation is pinned to.
+ */
+export function simLabelForRef<T extends SmsSim>(
+  sims: T[],
+  simRef: string | undefined,
+): string | null {
+  if (!simRef) return null;
+  const match = sims.find(sim => sim.simRef === simRef);
+  return match ? simLabel(match) : null;
 }
 
 export function selectSmsSim<T extends SmsSim>(items: T[], savedKey: string | null): T | undefined {

@@ -18,6 +18,7 @@ export function ConversationDetailsDrawer({
   telemetry,
   lastOutgoingStatus,
   lastOutgoingAt,
+  canSetPreferredSim,
 }: {
   isOpen: boolean;
   onOpenChange: (open: boolean) => void;
@@ -27,6 +28,8 @@ export function ConversationDetailsDrawer({
   telemetry: DeviceTelemetry | null;
   lastOutgoingStatus: number | null;
   lastOutgoingAt: number | null;
+  /** Whether the phone advertises SET_CONVERSATION_PREFERRED_SIM. */
+  canSetPreferredSim?: boolean;
 }) {
   const isMobile = useMediaQuery("(max-width: 767px)", { defaultValue: false });
   if (!conversation) return null;
@@ -47,6 +50,7 @@ export function ConversationDetailsDrawer({
               telemetry={telemetry}
               lastOutgoingStatus={lastOutgoingStatus}
               lastOutgoingAt={lastOutgoingAt}
+              canSetPreferredSim={canSetPreferredSim}
             />
           </Drawer.Body>
         </Drawer.Dialog>

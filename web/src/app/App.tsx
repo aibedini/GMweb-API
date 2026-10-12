@@ -15,6 +15,7 @@ import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActio
 import { senderSearchText } from "../lib/senderIdentity";
 import { resolveSendStatus, detectSendDivergence, diagnosticHash } from "../lib/sendEvidence";
 import { commandSimTarget, defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
+import { supportsPreferredSim } from "../lib/simRefresh";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress, assertHistoryMergeProgress } from "../lib/threadHistory";
 import {
@@ -1048,6 +1049,9 @@ export default function App() {
   // Presence comes from the SERVER's view of authenticated phone activity.
   // Both the normal UI and the refresh flow use this ONE helper so there is
   // never a second liveness algorithm to drift out of sync.
+  // Capability, not a version guess: a phone that cannot execute SET_CONVERSATION_PREFERRED_SIM must
+  // not be shown a control for it.
+  const canSetPreferredSim = supportsPreferredSim(deviceStatus, telemetry);
   const phonePresence = authoritativePhonePresence(deviceStatus, telemetry);
   const telemetryFreshness = authoritativeTelemetryFreshness(deviceStatus, telemetry);
   const phoneLastActivityAt = deviceStatus
@@ -1443,6 +1447,7 @@ export default function App() {
         telemetry={telemetry}
         lastOutgoingStatus={lastOutgoing.status}
         lastOutgoingAt={lastOutgoing.at}
+        canSetPreferredSim={canSetPreferredSim}
       />
     </AppShell>
   );

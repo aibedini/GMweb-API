@@ -1,12 +1,8 @@
 import { ListBox, Select } from "@heroui/react";
 import type { DeviceTelemetry } from "../../lib/api";
-import { DEFAULT_SIM_KEY, simKey, simSelectChoice, simSelectValue } from "../../lib/simSelection";
+import { DEFAULT_SIM_KEY, simKey, simLabel, simSelectChoice, simSelectValue } from "../../lib/simSelection";
 
 type Sim = NonNullable<DeviceTelemetry["smsSubscriptions"]>["items"][number];
-
-function simLabel(sim: Sim): string {
-  return `SIM ${sim.slotIndex + 1}`;
-}
 
 function SimOption({ name, carrier }: { name: string; carrier: string }) {
   return (

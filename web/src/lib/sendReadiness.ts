@@ -77,9 +77,12 @@ export interface SendReadinessInput {
  * inventory. A legacy `sub:` key is sent as `subscriptionId`, which only an older phone will act on.
  */
 export function commandSimTarget(
-  selectedSimKey: string | null,
+  selectedSimKey: string | null | undefined,
 ): { simRef: string } | { subscriptionId: number } | undefined {
-  if (selectedSimKey === null) return undefined;
+  // `undefined` is tolerated for callers that predate the key and simply omit the field. It means the
+  // same as null — no explicit line — so the phone resolves its own default. Rejecting it would break
+  // every legacy caller for no safety gain: the dangerous direction is a WRONG target, not an absent one.
+  if (selectedSimKey === null || selectedSimKey === undefined) return undefined;
   if (selectedSimKey.startsWith("ref:")) {
     const simRef = selectedSimKey.slice("ref:".length);
     return simRef.length > 0 ? { simRef } : undefined;
@@ -109,7 +112,10 @@ export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
   // STALE still allow a durable command to be queued for later claim.
   if (input.phonePresence === "NEVER_SEEN") return { state: "PHONE_NEVER_SEEN" };
 
-  const selected = input.selectedSimKey;
+  // An omitted key is read as "no explicit line", which is the same as PHONE_DEFAULT. That is the safe
+  // reading: a missing field cannot be evidence that the user chose a SIM, and treating it as one would
+  // either block a send for no reason or, worse, let an unroutable selection fall through unnoticed.
+  const selected = input.selectedSimKey ?? null;
   if (selected === null) {
     // PHONE_DEFAULT: a stale SIM snapshot must NOT block sending.
     if (input.telemetryFreshness === "FRESH"
