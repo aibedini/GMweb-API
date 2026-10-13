@@ -1146,6 +1146,11 @@ export default function App() {
     // the encrypted payload can never disagree about which line is in play.
     selectedSimKey: canonicalSimKey,
     simRoutingBlocked: simRouting.blocked,
+    // An EXISTING conversation we can see history for must not be submitted
+    // without a verified thread identity: Android's chooseSim() bypasses the
+    // sticky preferred-SIM check when threadId <= 0. A genuinely new message has
+    // no thread yet and stays unaffected.
+    threadIdentityMissing: Boolean(selected) && messages.length > 0 && selectedAndroidThreadId === null,
     sending, phonePresence, telemetryFreshness, sim: simTelemetry,
   });
   const sendBlockedNow = sendBlocked(readiness);

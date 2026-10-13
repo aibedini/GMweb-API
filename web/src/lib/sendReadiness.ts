@@ -48,7 +48,20 @@ export type SendReadiness =
    * SIM routing refused for THIS conversation, carrying the real reason so the
    * Composer shows the actual problem rather than a generic SIM hint.
    */
-  | { state: "SIM_ROUTING_BLOCKED"; reason: SimRoutingBlock };
+  | { state: "SIM_ROUTING_BLOCKED"; reason: SimRoutingBlock }
+  /**
+   * An EXISTING conversation with no verified Android thread identity.
+   *
+   * Android's `SmsSender.chooseSim()` returns `UseRequestOrDefault` when
+   * `threadId <= 0`, which BYPASSES the conversation's sticky preferred-SIM
+   * check. Submitting an existing-thread reply without the identity therefore
+   * does not merely lose information — it silently disables the very
+   * enforcement that keeps the message on the conversation's line.
+   *
+   * Blocked on purpose. A genuinely NEW message has no thread yet and is
+   * unaffected; only a conversation we can see history for is refused.
+   */
+  | { state: "THREAD_IDENTITY_UNAVAILABLE" };
 
 export interface SendReadinessInput {
   draft: string;
@@ -82,6 +95,13 @@ export interface SendReadinessInput {
    * now ONE decision, and readiness consumes it instead of re-deriving it.
    */
   simRoutingBlocked?: SimRoutingBlock | null;
+  /**
+   * True when this send targets a conversation we already have history for, but
+   * no verified `androidThreadId` is available.
+   *
+   * Omitted/false for a NEW message, which legitimately has no thread yet.
+   */
+  threadIdentityMissing?: boolean;
 }
 
 /**
@@ -129,6 +149,11 @@ export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
   // perfectly healthy while THIS conversation's own line is the problem.
   if (input.simRoutingBlocked) {
     return { state: "SIM_ROUTING_BLOCKED", reason: input.simRoutingBlocked };
+  }
+  // Refuse an existing-conversation send with no thread identity, because that
+  // is precisely the input that makes Android skip the preference check.
+  if (input.threadIdentityMissing) {
+    return { state: "THREAD_IDENTITY_UNAVAILABLE" };
   }
   // Only a phone that has never authenticated at all is unusable. OFFLINE and
   // STALE still allow a durable command to be queued for later claim.
@@ -236,6 +261,12 @@ export function sendReadinessNotice(readiness: SendReadiness): SendNotice | null
     case "SIM_ROUTING_BLOCKED":
       return { kind: "SIM", title: "Preferred SIM unavailable", tone: "warning",
         message: simRoutingNotice(readiness.reason) ?? "This conversation's preferred SIM cannot be used.",
+        blocking: true, offersSimRefresh: true };
+    case "THREAD_IDENTITY_UNAVAILABLE":
+      return { kind: "SIM", title: "Conversation not linked to your phone", tone: "warning",
+        message: "This conversation has no verified phone thread yet, so sending is paused — "
+          + "without it your phone cannot honour this conversation's preferred SIM. "
+          + "Refresh SIM information, or wait for the next sync.",
         blocking: true, offersSimRefresh: true };
     case "NO_ACTIVE_SIM":
       return { kind: "SIM", title: "SIM needs attention", tone: "danger",
