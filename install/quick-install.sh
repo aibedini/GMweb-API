@@ -236,6 +236,12 @@ SEND_TIMEZONE=Asia/Tehran
 SEND_QUIET_START_HOUR=2
 SEND_QUIET_END_HOUR=8
 CONVERSATION_HISTORY_MAX_BATCHES=80
+
+# ADR-007 pairing origins. Both are required in production and the API refuses to start
+# without them. The preflight fills these in from the public HTTPS hostname; set them by hand
+# only if the web app and the API are served from two different hosts.
+PUBLIC_WEB_ORIGIN=
+PUBLIC_API_ORIGIN=
 ENV
   chown "$APP_USER:$APP_USER" "$APP_DIR/.env"; chmod 600 "$APP_DIR/.env"
   printf '%s' "$token" >"$STATE_DIR/api-token.txt"; chmod 600 "$STATE_DIR/api-token.txt"
@@ -291,6 +297,11 @@ User=$APP_USER
 WorkingDirectory=$APP_DIR
 Environment=NODE_ENV=production
 Environment=TZ=$SERVER_TIMEZONE
+# ADR-007 requires PUBLIC_WEB_ORIGIN / PUBLIC_API_ORIGIN in the process environment. Relying
+# on dotenv resolving `.env` from the working directory is what produced the production
+# restart loop, so systemd delivers the file directly. The leading '-' keeps the unit
+# startable before .env exists.
+EnvironmentFile=-$APP_DIR/.env
 ExecStart=/usr/bin/npm start
 CPUAccounting=true
 MemoryAccounting=true
@@ -374,12 +385,80 @@ S
   ok "Services installed (chrome, api, vnc, novnc, monitor.timer)"
 }
 
+# ── ADR-007 preflight ─────────────────────────────────────────────────────────
+#
+# PUBLIC_WEB_ORIGIN and PUBLIC_API_ORIGIN are both fail-closed in production: the API throws
+# while registering pairing routes when either is missing or not an explicit HTTPS origin.
+# Persisting them in .env is not enough — the value has to reach the PROCESS. This is the
+# single gate every activation path calls, so a missing origin is a clear installer failure
+# instead of a systemd restart loop.
+#
+# MUST be called after .env exists and BEFORE `systemctl restart gmweb-api`.
+preflight_public_origin() {
+  local mode=(--non-interactive)
+  # Prompt only on a real terminal, so an unattended install fails fast instead of hanging.
+  [[ -t 0 ]] && mode=(--interactive)
+
+  step "Validating public origins (ADR-007)"
+  local out rc
+  out="$(node "$APP_DIR/scripts/publicOriginPreflight.js" "${mode[@]}" --app-dir "$APP_DIR" 2>&1)"; rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /' >>"$INSTALL_LOG"
+  if (( rc != 0 )); then
+    err "PUBLIC_WEB_ORIGIN could not be established — refusing to start the API."
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    warn "The API is NOT restarted when this check fails. Starting it would produce a"
+    warn "guaranteed restart loop because ADR-007 refuses to boot without an HTTPS origin."
+    return 1
+  fi
+  # The preflight may have installed an EnvironmentFile drop-in, and `systemctl restart`
+  # alone does NOT re-read unit definitions.
+  systemctl daemon-reload >>"$INSTALL_LOG" 2>&1 || true
+  return 0
+}
+
 start_core() {
   step "Starting core services"
   systemctl restart gmweb-chrome.service; sleep 4
+  preflight_public_origin || return 1
   systemctl restart gmweb-api.service;    sleep 6
   systemctl start gmweb-monitor.timer
-  curl -fsS -m 8 "http://127.0.0.1:$APP_PORT/health" >/dev/null 2>&1 && ok "API healthy on :$APP_PORT" || warn "API not answering yet — check: gmweb-install → Logs"
+  if curl -fsS -m 8 "http://127.0.0.1:$APP_PORT/health" >/dev/null 2>&1; then
+    ok "API healthy on :$APP_PORT"
+  else
+    warn "API not answering on :$APP_PORT after restart."
+    verify_service_health || true
+  fi
+}
+
+# Post-restart verification. A restart loop is a FAILURE, not a warning: the previous
+# behaviour reported nothing while systemd restarted the unit every 5 seconds.
+verify_service_health() {
+  local active restarts
+  active="$(systemctl is-active gmweb-api.service 2>/dev/null || true)"
+  restarts="$(systemctl show -p NRestarts --value gmweb-api.service 2>/dev/null || echo '')"
+  printf '    gmweb-api: active=%s NRestarts=%s\n' "$active" "${restarts:-?}"
+  if [[ "$active" != "active" ]]; then
+    err "gmweb-api.service is not active (state: $active)."
+    warn "Recent journal:"
+    journalctl -u gmweb-api.service -n 15 --no-pager 2>/dev/null | sed 's/^/    /' >&2 || true
+    return 1
+  fi
+  if [[ -n "$restarts" && "$restarts" != "0" ]]; then
+    warn "gmweb-api has restarted $restarts time(s) since it was started; its environment or"
+    warn "dependencies may be failing. Inspect: journalctl -u gmweb-api.service -n 50"
+  fi
+  # Verify the RUNNING process really received the value, not just the file on disk.
+  local pid running
+  pid="$(systemctl show -p MainPID --value gmweb-api.service 2>/dev/null || echo 0)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) && [[ -r "/proc/$pid/environ" ]]; then
+    running="$(tr '\0' '\n' <"/proc/$pid/environ" | sed -n 's/^PUBLIC_WEB_ORIGIN=//p' | head -1)"
+    if [[ -n "$running" ]]; then
+      ok "running process has PUBLIC_WEB_ORIGIN=$running"
+    else
+      warn "the running process (pid $pid) has no PUBLIC_WEB_ORIGIN in its environment"
+    fi
+  fi
+  return 0
 }
 
 show_credentials() {
@@ -614,8 +693,26 @@ update_app() {
     warn "$APP_DIR is not a git checkout; re-run install to refresh files."
   fi
   runuser -u "$APP_USER" -- bash -lc "cd '$APP_DIR' && (npm ci --omit=dev || npm install --omit=dev)" >>"$INSTALL_LOG" 2>&1
+
+  # The new revision may require configuration the running one did not (this is exactly how
+  # a missing PUBLIC_WEB_ORIGIN reached production), so the preflight runs BEFORE the
+  # restart and the previous version keeps serving if it fails.
+  if ! preflight_public_origin; then
+    err "Update stopped: the API was NOT restarted and the previous version is still running."
+    warn "Fix the configuration, then: systemctl restart gmweb-api"
+    pause
+    return 1
+  fi
+
   systemctl restart gmweb-api
-  ok "Updated and restarted."
+  sleep 5
+  if verify_service_health; then
+    ok "Updated and restarted."
+  else
+    err "Update restarted the API but it is not healthy."
+    warn "Roll back with:  git -C $APP_DIR log --oneline -5   then   git -C $APP_DIR reset --hard <previous>"
+    warn "and:             systemctl restart gmweb-api"
+  fi
   pause
 }
 

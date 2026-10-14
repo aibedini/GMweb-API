@@ -2,7 +2,19 @@ const path = require("node:path");
 const fs = require("node:fs");
 const dotenv = require("dotenv");
 
-dotenv.config();
+// Resolve .env relative to the PROJECT ROOT, not the process working directory.
+//
+// `dotenv.config()` defaults to `${cwd}/.env`, which silently loads nothing whenever the
+// service is started from anywhere else (a manual `node /opt/gmweb-api/src/server.js`, a
+// process manager without WorkingDirectory, a root-owned shell). ADR-007 fails closed on a
+// missing PUBLIC_WEB_ORIGIN, so a CWD-dependent lookup turns "loaded from the wrong
+// directory" into a production restart loop that looks like a configuration error.
+//
+// `override: false` is deliberate and unchanged from dotenv's default: a value systemd
+// places in the process environment (now via EnvironmentFile) must win over the file, so
+// that the unit remains the authoritative source for a running service.
+const rootDir = path.resolve(__dirname, "..");
+dotenv.config({ path: path.join(rootDir, ".env"), override: false });
 
 function boolFromEnv(value, fallback) {
   if (value === undefined || value === "") return fallback;
@@ -26,8 +38,6 @@ function intListFromEnv(value, fallback) {
     .filter((item) => Number.isFinite(item) && item >= 0);
   return parsed.length ? parsed : fallback;
 }
-
-const rootDir = path.resolve(__dirname, "..");
 
 function findChromeExecutable() {
   if (process.env.CHROME_EXECUTABLE_PATH) return process.env.CHROME_EXECUTABLE_PATH;
@@ -93,5 +103,12 @@ module.exports = {
   dashboardLoginMax: intFromEnv(process.env.DASHBOARD_LOGIN_MAX, 20),
   adminActionWindowMs: intFromEnv(process.env.ADMIN_ACTION_WINDOW_MS, 60000),
   adminActionMax: intFromEnv(process.env.ADMIN_ACTION_MAX, 60),
-  vncProxyTarget: process.env.VNC_PROXY_TARGET || "http://127.0.0.1:6080"
+  vncProxyTarget: process.env.VNC_PROXY_TARGET || "http://127.0.0.1:6080",
+  // ADR-007 pairing origins. These are read through `process.env` first at every call site
+  // (`pairingRoutes.serverOrigin`, `apiOrigin`, `connectionDiagnostics`), with `config.*` as
+  // the documented fallback — but the fallback never existed here, so a caller that passed a
+  // config object got `undefined`. Exposing them makes the fallback real and gives one place
+  // to see the contract.
+  publicWebOrigin: process.env.PUBLIC_WEB_ORIGIN || "",
+  publicApiOrigin: process.env.PUBLIC_API_ORIGIN || ""
 };

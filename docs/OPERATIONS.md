@@ -1,5 +1,50 @@
 # GMweb API Operations
 
+## Production pairing origins (`PUBLIC_WEB_ORIGIN` / `PUBLIC_API_ORIGIN`)
+
+Production refuses to boot without both origins as explicit HTTPS origins. This is
+deliberate (ADR-007 BLOCKER 7): both are bound into pairing transcripts, certificates
+and challenges, so a header-derived or guessed origin would let an untrusted hop decide
+the root of trust. The failure mode to avoid is not the refusal — it is *when* it fires.
+If the API is restarted without a valid origin, systemd restarts it every 5 seconds and
+the service never becomes healthy.
+
+The preflight is the single gate every activation path calls. Run it by hand as:
+
+```bash
+node scripts/publicOriginPreflight.js --app-dir /opt/gmweb-api          # resolve + persist
+node scripts/publicOriginPreflight.js --app-dir /opt/gmweb-api --check-only   # report only
+```
+
+It resolves the origin in this order, and never silently replaces an explicit valid
+configuration:
+
+1. `GMWEB_PUBLIC_WEB_ORIGIN` or `--web-origin`
+2. the value systemd actually hands the service (unit + drop-ins + `EnvironmentFile`)
+3. the canonical `.env`
+4. the authoritative public virtual host (an nginx `server_name` on a `listen 443`
+   block, or a Caddyfile site)
+5. `PUBLIC_API_ORIGIN` — **only** when this deployment is known to serve the web app and
+   the API from one origin, and only when it names the same host as an unusable value
+
+If nothing can be established it asks, when interactive, and otherwise fails with a
+nonzero status. It writes the resolved value to `.env`, ensures systemd loads that file
+(adding an `EnvironmentFile=-…` drop-in via `10-gmweb-public-origin.conf` when the unit
+does not already reference it), and verifies that the value systemd will pass to the
+process matches. Installing a drop-in requires `systemctl daemon-reload`; `systemctl
+restart` alone does **not** re-read unit definitions, and the installer does this for you.
+
+Do not "fix" a missing origin by disabling the check, adding an HTTP exception, or
+hardcoding a hostname. Set the value.
+
+To diagnose a unit that is already looping:
+
+```bash
+systemctl show -p ActiveState -p NRestarts --value gmweb-api.service
+journalctl -u gmweb-api.service -n 50 --no-pager
+tr '\0' '\n' </proc/$(systemctl show -p MainPID --value gmweb-api.service)/environ | grep '^PUBLIC_'
+```
+
 ## Tehran timezone and quiet hours
 
 Installers set the Linux server timezone to `Asia/Tehran`. The send worker also

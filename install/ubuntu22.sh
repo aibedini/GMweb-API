@@ -205,6 +205,12 @@ VNC_PROXY_TARGET=http://127.0.0.1:6080
 SEND_TIMEZONE=Asia/Tehran
 SEND_QUIET_START_HOUR=2
 SEND_QUIET_END_HOUR=8
+
+# ADR-007 pairing origins. Both are required in production and the API refuses to start
+# without them. The installer's preflight fills these in from the public HTTPS hostname it
+# configures; set them by hand only if the web app and the API are served from two hosts.
+PUBLIC_WEB_ORIGIN=
+PUBLIC_API_ORIGIN=
 ENV
   chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
   chmod 600 "$APP_DIR/.env"
@@ -314,6 +320,11 @@ User=$APP_USER
 WorkingDirectory=$APP_DIR
 Environment=NODE_ENV=production
 Environment=TZ=$SERVER_TIMEZONE
+# ADR-007 requires PUBLIC_WEB_ORIGIN / PUBLIC_API_ORIGIN in the process environment, and
+# `npm start` may be re-executed from anywhere. Relying on dotenv resolving `.env` from the
+# working directory is what put production into a restart loop, so systemd delivers the file
+# directly. The leading '-' keeps the unit startable before .env exists (first boot).
+EnvironmentFile=-$APP_DIR/.env
 ExecStart=/usr/bin/npm start
 CPUAccounting=true
 MemoryAccounting=true
@@ -365,7 +376,9 @@ SERVICE
 systemctl daemon-reload
 systemctl enable gmweb-chrome.service gmweb-api.service
 systemctl restart gmweb-chrome.service
-systemctl restart gmweb-api.service
+# gmweb-api is deliberately NOT restarted here. ADR-007 refuses to start without an HTTPS
+# PUBLIC_WEB_ORIGIN, so the service is activated only AFTER the public origin below is known
+# and validated. Restarting first is what produced a restart loop on a clean install.
 systemctl disable gmweb-vnc.service gmweb-novnc.service 2>/dev/null || true
 
 PUBLIC_URL=""
@@ -386,11 +399,41 @@ if [[ "$PUBLIC_DASHBOARD" != "0" && "$PUBLIC_DASHBOARD" != "false" && "$PUBLIC_D
     else
       echo "Warning: HTTPS setup could not complete. Ensure ports 80 and 443 are open in the VPS/provider firewall, then run:"
       echo "  gmweb public-dashboard install $PUBLIC_DOMAIN ${LETSENCRYPT_EMAIL:-admin@example.com}"
+      # The hostname is still the authoritative public name for this deployment, so it is
+      # offered to the preflight even though the certificate step failed.
+      PUBLIC_ORIGIN_CANDIDATE="https://$PUBLIC_DOMAIN"
     fi
   else
     echo "Warning: public IPv4 could not be detected; HTTPS setup skipped. Set PUBLIC_DOMAIN and run the installer again."
   fi
 fi
+
+# ADR-007 preflight — MUST run before gmweb-api is activated.
+#
+# This is the gate that turns a missing origin from a production restart loop into a clear
+# installer failure. It resolves PUBLIC_WEB_ORIGIN from the .env, the discovered public
+# vhost, or an explicit value; writes it to the canonical file when it is safe to do so;
+# makes systemd deliver it to the process; and refuses to continue otherwise.
+echo "==> Validating public origins (ADR-007)"
+PREFLIGHT_ARGS=(--app-dir "$APP_DIR" --non-interactive)
+if [[ -n "${PUBLIC_URL:-}" ]]; then
+  PREFLIGHT_ARGS+=(--web-origin "$PUBLIC_URL")
+elif [[ -n "${PUBLIC_ORIGIN_CANDIDATE:-}" ]]; then
+  PREFLIGHT_ARGS+=(--web-origin "$PUBLIC_ORIGIN_CANDIDATE")
+fi
+if ! node "$APP_DIR/scripts/publicOriginPreflight.js" "${PREFLIGHT_ARGS[@]}"; then
+  echo
+  echo "Installation stopped BEFORE activating gmweb-api.service." >&2
+  echo "ADR-007 requires an HTTPS PUBLIC_WEB_ORIGIN, and starting the API without one" >&2
+  echo "produces a guaranteed restart loop. Fix the configuration, then run:" >&2
+  echo "  sudo node $APP_DIR/scripts/publicOriginPreflight.js --app-dir $APP_DIR" >&2
+  echo "  sudo systemctl restart gmweb-api.service" >&2
+  exit 1
+fi
+# The preflight may have installed an EnvironmentFile drop-in, and `systemctl restart`
+# alone does NOT re-read unit definitions.
+systemctl daemon-reload
+systemctl restart gmweb-api.service
 
 echo
 echo "==> Installed $APP_NAME"
