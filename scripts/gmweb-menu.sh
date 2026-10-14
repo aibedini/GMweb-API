@@ -212,7 +212,10 @@ rotate_api_token() {
 
   save_api_token_file "$new_token"
   echo "${C_GREEN}API token rotated and verified.${C_RESET}"
-  echo "API token: $new_token"
+  # The token is deliberately NOT echoed: it would land in the terminal, in shell
+  # history, and in any captured log. It is available to root at
+  # $API_TOKEN_FILE (mode 600).
+  echo "The new token is stored in: $API_TOKEN_FILE (root-readable, mode 600)"
   echo
   echo "${C_YELLOW}Existing dashboard sessions and API clients must use this new token.${C_RESET}"
 }
@@ -447,11 +450,71 @@ logs() {
   journalctl -u "$service" -n 120 -f
 }
 
+# Why the last queue_snapshot() failed. Written to a FILE because callers use
+# `snapshot="$(queue_snapshot)"`, which runs the function in a SUBSHELL — a plain
+# variable assignment would be discarded.
+QUEUE_ERROR_FILE="${TMPDIR:-/tmp}/gmweb-queue-error.$$"
+queue_snapshot_error() { cat "$QUEUE_ERROR_FILE" 2>/dev/null || true; }
+
+# Distinguishes "the API is not running" from "the queue is genuinely unreadable".
+#
+# THE INCIDENT THIS PREVENTS: a crash-looping API (see scripts/preflight-env.js)
+# made this fail for five hours, and the operator was told
+#   "Cannot inspect the queue; refusing a migration without send-safety checks."
+# which blamed the QUEUE for a SERVICE-START problem. The reason is now explicit,
+# and a service that is still starting is retried instead of instantly condemned.
 queue_snapshot() {
-  local api_token
+  local api_token attempt raw code body
+  : > "$QUEUE_ERROR_FILE"
   api_token="$(token || true)"
-  [[ -n "$api_token" ]] || return 1
-  curl -fsS --max-time 10 -H "Authorization: Bearer $api_token" "$API_URL/admin/queue"
+  if [[ -z "$api_token" ]]; then
+    printf 'NO_TOKEN' > "$QUEUE_ERROR_FILE"; return 1
+  fi
+  for attempt in 1 2 3 4 5; do
+    raw="$(curl -sS --max-time 10 -w $'\n%{http_code}' \
+      -H "Authorization: Bearer $api_token" "$API_URL/admin/queue" 2>/dev/null)" || raw=""
+    code="${raw##*$'\n'}"
+    body="${raw%$'\n'*}"
+    case "$code" in
+      200)
+        # A 200 that is not a queue snapshot must never be read as "queue empty":
+        # a captive proxy or a half-started service could answer instead.
+        if printf '%s' "$body" | grep -q '"counts"'; then
+          printf '%s' "$body"; return 0
+        fi
+        printf 'BAD_RESPONSE' > "$QUEUE_ERROR_FILE"; return 1 ;;
+      401|403) printf 'UNAUTHORIZED' > "$QUEUE_ERROR_FILE"; return 1 ;;
+      ''|000) : ;;  # not listening yet — worth retrying
+      *) printf 'HTTP_%s' "$code" > "$QUEUE_ERROR_FILE"; return 1 ;;
+    esac
+    sleep 1
+  done
+  printf 'API_UNREACHABLE' > "$QUEUE_ERROR_FILE"
+  return 1
+}
+
+# Operator-facing explanation. Never says "queue" when the real problem is that
+# the service is down.
+queue_snapshot_diagnosis() {
+  case "$(queue_snapshot_error)" in
+    API_UNREACHABLE)
+      echo "The API is not reachable at $API_URL, so the send queue cannot be inspected."
+      echo "This is a SERVICE problem, not a queue problem."
+      echo "  systemctl status $API_SERVICE"
+      echo "  journalctl -u $API_SERVICE -n 50 --no-pager" ;;
+    NO_TOKEN)
+      echo "No API_TOKEN could be read from $APP_DIR/.env, so the queue cannot be inspected." ;;
+    UNAUTHORIZED)
+      echo "The API rejected API_TOKEN from $APP_DIR/.env (401/403): the .env token and the"
+      echo "token the service loaded disagree." ;;
+    BAD_RESPONSE)
+      echo "The API answered 200 but not with a queue snapshot (no \"counts\" field)."
+      echo "A proxy or a partially started service may be answering on $API_URL." ;;
+    HTTP_*)
+      echo "The API returned $(queue_snapshot_error) for $API_URL/admin/queue." ;;
+    *)
+      echo "The send queue could not be inspected." ;;
+  esac
 }
 
 queue_snapshot_value() {
@@ -463,7 +526,11 @@ queue_snapshot_value() {
       try {
         const data = JSON.parse(raw);
         if (process.argv[1] === "paused") process.stdout.write(data.paused ? "true" : "false");
-        else process.stdout.write(String(Number(data.counts?.active || 0)));
+        // `waiting` previously had NO branch and silently returned the ACTIVE
+        // count, so every drain progress line reported the wrong number.
+        else if (process.argv[1] === "waiting") process.stdout.write(String(Number(data.counts?.waiting || 0)));
+        else if (process.argv[1] === "active") process.stdout.write(String(Number(data.counts?.active || 0)));
+        else process.exit(1);
       } catch { process.exit(1); }
     });
   ' "$expression"
@@ -483,6 +550,8 @@ pause_and_drain_queue() {
   local snapshot active waiting last_active="" waited=0
   snapshot="$(queue_snapshot)" || {
     echo "${C_RED}Cannot inspect the queue; refusing a migration without send-safety checks.${C_RESET}"
+    queue_snapshot_diagnosis
+    echo "${C_YELLOW}Nothing was promoted and the live version is unchanged.${C_RESET}"
     return 1
   }
   UPDATE_QUEUE_WAS_PAUSED="$(printf '%s' "$snapshot" | queue_snapshot_value paused)"
@@ -782,6 +851,17 @@ update_app() {
     return 1
   fi
   t_artifact=$(( $(gmweb_now_ms) - t_artifact ))
+  # ENVIRONMENT CONTRACT — the gate that would have prevented the 5-hour outage.
+  #
+  # A candidate whose startup guard cannot be satisfied by the CURRENT environment
+  # must be rejected BEFORE the live service is ever restarted. Previously the new
+  # code was promoted, refused to start (ADR-007 HTTPS origin), and systemd
+  # crash-looped it 2581 times; every later update then failed at the queue gate
+  # with a message that blamed the queue.
+  if ! node "$stage/scripts/preflight-env.js" --app-dir "$APP_DIR" --service "$API_SERVICE"; then
+    echo "${C_RED}Candidate is not compatible with the current environment. No promotion and no restart.${C_RESET}"
+    return 1
+  fi
   for script in gmweb-menu.sh gmweb-backup.sh gmweb-lib.sh; do
     if [[ -f "$stage/scripts/$script" ]] && ! bash -n "$stage/scripts/$script"; then
       echo "${C_RED}Candidate scripts/$script has a syntax error. No promotion.${C_RESET}"
