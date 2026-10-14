@@ -216,6 +216,11 @@ const activityBackfilled = agentActivityStore.backfillFromEvents();
 // the authenticated command poll — deliberately NOT from device telemetry.
 const { AgentRuntimeStore } = require("./agentRuntime");
 const agentRuntimeStore = new AgentRuntimeStore(controlDb);
+// Domain management (Phase 1: verification only — this process has no privilege
+// to write /etc/nginx or run certbot, and the API says so explicitly).
+const { DomainStore } = require("./domainStore");
+const { registerDomainRoutes } = require("./domainRoutes");
+const domainStore = new DomainStore(controlDb);
 controlDb.pragma("journal_mode = WAL");
 const trustRegistry = new TrustRegistry(controlDb);
 const commandEngine = new CommandEngine(controlDb);
@@ -2298,6 +2303,8 @@ if (config.dashboardEnabled) {
 // loaded its onRoute hook. Routes added before that hook attaches are invisible to
 // the generated OpenAPI spec (/docs would only show the proxy routes otherwise).
 app.after(() => {
+
+registerDomainRoutes(app, { domainStore, checkRateLimit });
 
 function parseLimit(value, fallback, max) {
   const parsed = Number.parseInt(value, 10);
