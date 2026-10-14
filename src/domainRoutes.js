@@ -79,7 +79,13 @@ function registerDomainRoutes(app, deps = {}) {
       tags: ["Admin"],
       response: { 200: { type: "object", additionalProperties: true } },
     },
-  }, async () => {
+    // codeql[js/missing-rate-limiting]
+  }, async (request, reply) => {
+    // Also limited inline, not only by the prefix hook above, so this read path
+    // is self-evidently bounded at the point it touches the database.
+    if (!limit(request, "admin-domains-read", 120, 60_000)) {
+      return reply.code(429).send({ error: "rate_limited" });
+    }
     const domains = domainStore.list().map(present);
     return { enabled, capability: capability(), domains };
   });
