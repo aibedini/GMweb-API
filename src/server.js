@@ -2242,6 +2242,20 @@ app.addSchema({
 
 app.register(cors, { origin: corsOrigin });
 app.register(cookie, {});
+
+// Per-route rate limiting, declared in the framework's own form.
+//
+// `global: false` on purpose: this ADDS an explicit limit to routes that declare
+// one and changes NOTHING for every other route, so it cannot double-count
+// against, or silently alter, the existing hand-rolled `checkRateLimit`. The two
+// are complementary — checkRateLimit is keyed by operation (e.g. a login bucket),
+// this is keyed by client — so where both apply the stricter one wins.
+//
+// It exists because `js/missing-rate-limiting` cannot model a hand-rolled limiter,
+// so it reported routes as unlimited while they were in fact limited. Declaring
+// the limit in the form the analyser models makes the protection visible to
+// tooling instead of only to the author.
+app.register(require("@fastify/rate-limit"), { global: false });
 app.addHook("onRequest", applySecurityHeaders);
 app.addHook("onRequest", (request, _reply, done) => {
   request._activityStartedAt = process.hrtime.bigint();

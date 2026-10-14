@@ -173,6 +173,9 @@ function registerDomainRoutes(app, deps = {}) {
     schema: { summary: "Resolve the domain and compare it with this server", tags: ["Admin"],
       response: { 200: { type: "object", additionalProperties: true },
         404: { type: "object", properties: { error: { type: "string" } } } } },
+    // Framework-level limit, sibling of `schema`. Complements (does not replace)
+    // the operation-keyed `limit()` in the handler.
+    config: { rateLimit: { max: 120, timeWindow: "1 minute" } },
   }, async (request, reply) => {
     if (!limit(request, "admin-domains-verify", 60, 60_000)) {
       return reply.code(429).send({ error: "rate_limited" });
@@ -198,6 +201,8 @@ function registerDomainRoutes(app, deps = {}) {
     schema: { summary: "Verify TLS/SNI and HTTP reachability for the assigned service", tags: ["Admin"],
       response: { 200: { type: "object", additionalProperties: true },
         404: { type: "object", properties: { error: { type: "string" } } } } },
+    // Framework-level limit, sibling of `schema`.
+    config: { rateLimit: { max: 120, timeWindow: "1 minute" } },
   }, async (request, reply) => {
     if (!limit(request, "admin-domains-verify", 60, 60_000)) {
       return reply.code(429).send({ error: "rate_limited" });
