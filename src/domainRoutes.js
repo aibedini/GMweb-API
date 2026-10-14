@@ -45,6 +45,24 @@ function registerDomainRoutes(app, deps = {}) {
     return result === undefined ? true : result;
   };
 
+  // EVERY /admin/domains route is rate-limited here, in one place, so a newly
+  // added route cannot forget it. Previously only create/verify were limited and
+  // the list/detail/delete routes were not — a real gap that a security scan
+  // correctly reported.
+  //
+  // codeql[js/missing-rate-limiting] — CodeQL does not model this repository's
+  // hand-rolled `checkRateLimit` (there is no @fastify/rate-limit here), so it
+  // cannot see the limiting below. This hook is the limiting; it fires before any
+  // handler on this prefix. The project already carries the same unmodelled
+  // pattern in gatewayRoutes/controlPlaneRoutes.
+  app.addHook("onRequest", async (request, reply) => {
+    const path = String(request.url || "").split("?")[0];
+    if (!path.startsWith("/admin/domains")) return;
+    if (!limit(request, "admin-domains", 120, 60_000)) {
+      return reply.code(429).send({ error: "rate_limited" });
+    }
+  });
+
   app.get("/admin/domains/services", {
     schema: {
       summary: "Services a domain may be assigned to",

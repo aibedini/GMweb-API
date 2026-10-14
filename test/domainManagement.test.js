@@ -402,3 +402,80 @@ test("resolveHost tolerates a missing record type without failing the lookup", a
   assert.deepEqual(records.ipv6, []);
   assert.deepEqual(records.errors, []);
 });
+
+// ── certificate validation must stay ENABLED ────────────────────────────────
+
+test("the TLS probe never disables certificate validation", async () => {
+  // REGRESSION GUARD. An earlier revision passed `rejectUnauthorized: false` so it
+  // could inspect an invalid certificate; a security scanner flagged that as
+  // "disabling certificate validation" and it was the wrong trade. The precise
+  // reason is now derived from the TLS error code instead.
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "..", "src", "domainVerification.js"), "utf8");
+  // Strip comments first: the file legitimately MENTIONS rejectUnauthorized in the
+  // comment documenting its removal, and that must not trip the guard.
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  assert.equal(code.includes("rejectUnauthorized"), false,
+    "the probe must rely on the secure default rather than override it");
+
+  let seen = null;
+  const { probeCertificate } = require("../src/domainVerification");
+  const { EventEmitter } = require("node:events");
+  const spy = (options) => {
+    seen = options;
+    const socket = new EventEmitter();
+    socket.setTimeout = () => {}; socket.end = () => {}; socket.destroy = () => {};
+    process.nextTick(() => { socket.getPeerCertificate = () => CERT(); socket.emit("secureConnect"); });
+    return socket;
+  };
+  await probeCertificate({ hostname: "a.example.com", connect: spy });
+  assert.equal(seen.servername, "a.example.com", "SNI must be requested");
+  assert.notEqual(seen.rejectUnauthorized, false);
+});
+
+test("TLS failures are mapped to precise reasons instead of a generic error", () => {
+  const { classifyTlsError } = require("../src/domainVerification");
+  const cases = [
+    ["CERT_HAS_EXPIRED", "EXPIRED", "CERT_EXPIRED"],
+    ["ERR_TLS_CERT_ALTNAME_INVALID", "INVALID", "CERT_HOSTNAME_MISMATCH"],
+    ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNTRUSTED", "CERT_UNTRUSTED"],
+    ["DEPTH_ZERO_SELF_SIGNED_CERT", "UNTRUSTED", "CERT_UNTRUSTED"],
+    ["ECONNREFUSED", "NONE", "ROUTING_TLS_FAILED"],
+  ];
+  for (const [code, sslStatus, errorCode] of cases) {
+    const result = classifyTlsError(Object.assign(new Error("x"), { code }));
+    assert.equal(result.sslStatus, sslStatus, code);
+    assert.equal(result.errorCode, errorCode, code);
+    assert.ok(result.message.length > 0, code);
+  }
+});
+
+test("an untrusted certificate is UNTRUSTED, never reported as healthy", async () => {
+  const result = await verifyRouting({ hostname: "a.example.com", service: getService("main-web"),
+    connect: fakeConnect(Object.assign(new Error("untrusted"), { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" })),
+    fetchImpl: okFetch(200) });
+  assert.equal(result.sslStatus, "UNTRUSTED");
+  assert.equal(result.errorCode, "CERT_UNTRUSTED");
+  assert.equal(result.routingStatus, "ERROR");
+});
+
+test("every /admin/domains route is rate-limited by one shared hook", async () => {
+  const seen = [];
+  const instance = app(store(), { checkRateLimit: (request, bucket) => { seen.push(bucket); return true; } });
+  await instance.inject({ method: "GET", url: "/admin/domains" });
+  await instance.inject({ method: "GET", url: "/admin/domains/services" });
+  await instance.inject({ method: "POST", url: "/admin/domains",
+    payload: { hostname: "rl.example.com", serviceId: "main-web" } });
+  assert.ok(seen.includes("admin-domains"),
+    "the shared hook must limit every domains route, including list and services");
+  await instance.close();
+});
+
+test("a rate-limited caller is refused with 429", async () => {
+  const instance = app(store(), { checkRateLimit: () => false });
+  const response = await instance.inject({ method: "GET", url: "/admin/domains" });
+  assert.equal(response.statusCode, 429);
+  assert.equal(response.json().error, "rate_limited");
+  await instance.close();
+});

@@ -82,9 +82,13 @@ async function verifyDns({ hostname, expectedIpv4 = [], expectedIpv6 = [], resol
 /**
  * Read the certificate a server presents for a given SNI hostname.
  *
- * Rejects rather than resolving when the handshake fails. `rejectUnauthorized`
- * is left at its secure default: this probe must never learn to ignore a bad
- * certificate, or it would report a broken endpoint as healthy.
+ * SECURITY: certificate validation is left ENABLED (the secure default). An
+ * earlier version passed `rejectUnauthorized: false` so it could inspect an
+ * invalid certificate; a security scanner correctly flagged that as "disabling
+ * certificate validation", and it was the wrong trade. Instead, a failed
+ * handshake is mapped to a PRECISE reason from the TLS error code, so the
+ * operator still learns *why* (expired, wrong hostname, untrusted issuer)
+ * without this probe ever trusting a bad certificate.
  */
 function probeCertificate({ hostname, port = 443, timeoutMs = 10_000, connect = tls.connect }) {
   return new Promise((resolve, reject) => {
@@ -92,7 +96,7 @@ function probeCertificate({ hostname, port = 443, timeoutMs = 10_000, connect = 
     const finish = (fn, value) => { if (!settled) { settled = true; fn(value); } };
     let socket;
     try {
-      socket = connect({ host: hostname, port, servername: hostname, rejectUnauthorized: false });
+      socket = connect({ host: hostname, port, servername: hostname });
     } catch (error) {
       reject(error); return;
     }
@@ -118,6 +122,36 @@ function probeCertificate({ hostname, port = 443, timeoutMs = 10_000, connect = 
       });
     });
   });
+}
+
+/**
+ * Map a TLS handshake failure to a precise, actionable reason.
+ *
+ * This is what replaces inspecting an untrusted certificate: the same
+ * information, obtained without ever accepting an invalid certificate.
+ */
+function classifyTlsError(error) {
+  const code = String(error?.code || "");
+  switch (code) {
+    case "CERT_HAS_EXPIRED":
+      return { sslStatus: "EXPIRED", errorCode: "CERT_EXPIRED",
+        message: "The certificate presented by this host has expired." };
+    case "ERR_TLS_CERT_ALTNAME_INVALID":
+      return { sslStatus: "INVALID", errorCode: "CERT_HOSTNAME_MISMATCH",
+        message: "The certificate presented by this host does not cover this hostname." };
+    case "UNABLE_TO_VERIFY_LEAF_SIGNATURE":
+    case "SELF_SIGNED_CERT_IN_CHAIN":
+    case "DEPTH_ZERO_SELF_SIGNED_CERT":
+    case "CERT_UNTRUSTED":
+      return { sslStatus: "UNTRUSTED", errorCode: "CERT_UNTRUSTED",
+        message: "The certificate is not trusted by this server's trust store." };
+    case "ERR_TLS_CERT_SIGNATURE_ALGORITHM_UNSUPPORTED":
+      return { sslStatus: "INVALID", errorCode: "CERT_UNSUPPORTED_ALGORITHM",
+        message: "The certificate uses a signature algorithm this server does not support." };
+    default:
+      return { sslStatus: "NONE", errorCode: "ROUTING_TLS_FAILED",
+        message: `TLS handshake failed: ${code || error?.message || "unknown error"}` };
+  }
 }
 
 /** Does the certificate actually cover this hostname? */
@@ -153,8 +187,12 @@ async function verifyRouting({ hostname, service, fetchImpl = globalThis.fetch, 
   try {
     certificate = await probeCertificate({ hostname, connect, timeoutMs });
   } catch (error) {
-    return { routingStatus: "ERROR", sslStatus: "NONE", errorCode: "ROUTING_TLS_FAILED",
-      message: `TLS handshake with ${hostname}:443 failed: ${error.code || error.message}` };
+    // The handshake failed. Certificate validation stayed ENABLED, so the TLS
+    // error code tells us precisely why — report that rather than a generic
+    // failure, and never by re-probing with validation disabled.
+    const classified = classifyTlsError(error);
+    return { routingStatus: "ERROR", sslStatus: classified.sslStatus,
+      errorCode: classified.errorCode, message: `${hostname}:443 — ${classified.message}` };
   }
   if (!certificateCovers(certificate, hostname)) {
     return { routingStatus: "ERROR", sslStatus: "INVALID", errorCode: "CERT_HOSTNAME_MISMATCH",
@@ -201,4 +239,4 @@ async function verifyRouting({ hostname, service, fetchImpl = globalThis.fetch, 
 }
 
 module.exports = { resolveHost, verifyDns, probeCertificate, certificateCovers,
-  verifyRouting, RENEWAL_WINDOW_DAYS };
+  verifyRouting, classifyTlsError, RENEWAL_WINDOW_DAYS };
