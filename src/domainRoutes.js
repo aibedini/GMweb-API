@@ -174,7 +174,9 @@ function registerDomainRoutes(app, deps = {}) {
       response: { 200: { type: "object", additionalProperties: true },
         404: { type: "object", properties: { error: { type: "string" } } } } },
   }, async (request, reply) => {
-    if (!limit(request, "admin-domains-verify", 60, 60_000)) return reply.code(429).send({ error: "rate_limited" });
+    if (!limit(request, "admin-domains-verify", 60, 60_000)) {
+      return reply.code(429).send({ error: "rate_limited" });
+    }
     const row = domainStore.byId(request.params.id);
     if (!row) return reply.code(404).send({ error: "not_found" });
     const expected = localAddresses();
@@ -197,7 +199,9 @@ function registerDomainRoutes(app, deps = {}) {
       response: { 200: { type: "object", additionalProperties: true },
         404: { type: "object", properties: { error: { type: "string" } } } } },
   }, async (request, reply) => {
-    if (!limit(request, "admin-domains-verify", 60, 60_000)) return reply.code(429).send({ error: "rate_limited" });
+    if (!limit(request, "admin-domains-verify", 60, 60_000)) {
+      return reply.code(429).send({ error: "rate_limited" });
+    }
     const row = domainStore.byId(request.params.id);
     if (!row) return reply.code(404).send({ error: "not_found" });
     const service = getService(row.service_id);
