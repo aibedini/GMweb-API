@@ -18,6 +18,38 @@ import type { PhonePresence } from "./phonePresence.ts";
 /** The protocol name. It carries device + SIM + permission state, not just SIM. */
 export const REFRESH_COMMAND_TYPE = "REFRESH_DEVICE_TELEMETRY";
 
+/**
+ * The command that pins a conversation to one SIM.
+ *
+ * Capability-gated exactly like [REFRESH_COMMAND_TYPE], and for the same reason: the browser must not
+ * offer a control the phone cannot execute. A phone that does not advertise this command would fail the
+ * request terminally, and the user would have seen a preference "change" that never happened.
+ */
+export const SET_PREFERRED_SIM_COMMAND_TYPE = "SET_CONVERSATION_PREFERRED_SIM";
+
+/**
+ * Whether the linked phone can accept a sticky-SIM change.
+ *
+ * PRIORITY: live runtime metadata first, telemetry only as a fallback — the same ordering as
+ * [supportsRemoteRefresh], and for the same bootstrap reason. Stale telemetry must not be used to claim
+ * support either way.
+ */
+export function supportsPreferredSim(
+  deviceStatus?: LinkedDeviceStatus | null,
+  telemetry?: DeviceTelemetry | null,
+): boolean {
+  const live = deviceStatus?.runtime?.commandTypes;
+  if (Array.isArray(live)) {
+    // An explicit live answer is authoritative, including "no".
+    if (live.includes(SET_PREFERRED_SIM_COMMAND_TYPE)) return true;
+    if (deviceStatus?.runtime?.receivedAt) return false;
+  }
+  if (deviceStatus?.telemetry?.state && deviceStatus.telemetry.state !== "FRESH") return false;
+  const list = telemetry?.capabilities?.commandTypes;
+  if (!Array.isArray(list)) return false;
+  return list.includes(SET_PREFERRED_SIM_COMMAND_TYPE);
+}
+
 export const TELEMETRY_POLL_INTERVAL_MS = 500;
 /** Max wait for a NEW telemetry row after the command completes. */
 export const TELEMETRY_POLL_TIMEOUT_MS = 10_000;

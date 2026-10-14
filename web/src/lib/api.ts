@@ -304,7 +304,25 @@ export interface DeviceTelemetry {
   app?: { versionName?: string; versionCode?: number; uptimeMs?: number };
   device?: { manufacturer?: string; model?: string; androidVersion?: string };
   smsSubscriptions?: { available: boolean; items: Array<{
-    subscriptionId: number; slotIndex: number; displayName: string; carrierName: string;
+    /**
+     * The opaque, keyed cross-system SIM identity minted by Android (`sim:v1:<32 hex>`).
+     *
+     * This is the DURABLE handle: it is stable for a given install and subscription, cannot be inverted
+     * into a platform id, and is what the sticky per-conversation preference is stored and routed by.
+     */
+    simRef?: string;
+    /**
+     * The platform subscription id, when this build still reports one.
+     *
+     * OPTIONAL ON PURPOSE. Current Android builds deliberately do NOT publish it: a subscription id is
+     * reassigned when SIMs are inserted or removed, and its tiny domain is enumerable, so it is not a
+     * safe cross-system identity. Treat it as an EPHEMERAL local handle for the in-memory composer
+     * selection within one page session — never as a value that can be persisted and trusted later, and
+     * never as the durable per-conversation preference. Anything that must survive a refresh or be sent
+     * to the phone as a routing preference uses `simRef`.
+     */
+    subscriptionId?: number;
+    slotIndex: number; displayName: string; carrierName: string;
     isDefaultSms: boolean; isActive: boolean; sendCapable?: boolean;
   }> };
   /**

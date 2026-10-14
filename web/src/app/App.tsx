@@ -14,7 +14,8 @@ import { MessageComposer } from "./MessageComposer";
 import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActions";
 import { senderSearchText } from "../lib/senderIdentity";
 import { resolveSendStatus, detectSendDivergence, diagnosticHash } from "../lib/sendEvidence";
-import { commandSubscriptionId, defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
+import { defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
+import { supportsPreferredSim } from "../lib/simRefresh";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
 import { mergeThreadEvents, assertHistoryProgress, assertHistoryMergeProgress } from "../lib/threadHistory";
 import {
@@ -22,7 +23,7 @@ import {
   isValidCursor, pagingFailed, pagingFromPage, pagingLoading, showLoadOlder,
   type HistoryPagingState, type HistoryTrace,
 } from "../lib/threadPaging";
-import { selectSmsSim } from "../lib/simSelection";
+import { selectSmsSim, resolveSimRouting } from "../lib/simSelection";
 import { describeSimTelemetry } from "../lib/simTelemetry";
 import { authoritativePhonePresence, authoritativeTelemetryFreshness } from "../lib/deviceState";
 import {
@@ -141,9 +142,14 @@ export default function App() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [draft, setDraft] = useState("");
-  const [selectedSubscriptionId, setSelectedSubscriptionId] = useState<number | null>(() => {
-    const saved = window.localStorage.getItem("gmweb:selected-sms-subscription");
-    return saved !== null && Number.isSafeInteger(Number(saved)) ? Number(saved) : null;
+  // The chosen line, as a SELECTION KEY (see `simKey`), not a subscription id.
+  //
+  // `simRef` is the durable, opaque identity Android can resolve at send time; a subscription id is
+  // reassigned when SIMs move and is no longer published by current builds, so it cannot be the key a
+  // choice is stored under.
+  const [selectedSimKey, setSelectedSimKey] = useState<string | null>(() => {
+    const saved = window.localStorage.getItem("gmweb:selected-sms-sim-key");
+    return saved && saved.length > 0 ? saved : null;
   });
   const [composeRecipient, setComposeRecipient] = useState("");
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
@@ -154,6 +160,15 @@ export default function App() {
   // above is not reactive, so a footer that only read it could keep showing the
   // low-truth command view after true delivery evidence had arrived.
   const [evidenceStatus, setEvidenceStatus] = useState<number | null>(null);
+  // A preferred-SIM change is PENDING between the user's choice and Android's
+  // confirmation. While pending, sending in that conversation is blocked so no
+  // message can ever be submitted from the PREVIOUS line.
+  //
+  // The setter is intentionally NOT taken yet: the SET_CONVERSATION_PREFERRED_SIM
+  // command workflow that would drive this transition is NOT implemented, so
+  // nothing may pretend a change is pending. The routing guard below already
+  // honours the flag the moment that workflow lands.
+  const [simPreferencePending] = useState(false);
   // Privacy-safe divergence record: carrier evidence settled while the command
   // lifecycle still claimed the send was queued/in flight.
   const sendDivergenceSeen = useRef<string | null>(null);
@@ -618,15 +633,70 @@ export default function App() {
   };
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
   const selectedRecipient = composeRecipient || messages.map(item => item.payload.address).find(Boolean);
+  /**
+   * The Android Telephony thread id for the OPEN conversation, taken from the
+   * decrypted payloads Android already publishes (`GatewayEventFactory` emits
+   * `androidThreadId` whenever it is > 0).
+   *
+   * WHY THIS IS SENT WITH SEND_SMS: Android's `SmsSender.chooseSim()` returns
+   * `UseRequestOrDefault` when `threadId <= 0`, which BYPASSES the conversation's
+   * sticky preferred-SIM check entirely. Because GMweb never sent
+   * `androidThreadId`, every web-originated send took that bypass, so the
+   * per-conversation preference was never enforced. Supplying the decrypted id
+   * is what lets Android apply the preference it already stores.
+   *
+   * Never guessed: an absent value stays absent and Android behaves as before.
+   */
+  const selectedAndroidThreadId = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const value = messages[index]?.payload?.androidThreadId;
+      if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
+    }
+    const projected = selectedConversationCache?.aggregateId === selected
+      ? selectedConversationCache?.androidThreadId : undefined;
+    return typeof projected === "number" && Number.isSafeInteger(projected) && projected > 0
+      ? projected : null;
+  }, [messages, selectedConversationCache, selected]);
   const activeSims = telemetry?.smsSubscriptions?.items.filter(sim => sim.isActive && sim.sendCapable !== false) ?? [];
   // DISPLAY vs COMMAND: `chosenSim` is only ever for rendering. The command
   // subscription is derived separately so a display fallback can never silently
   // change what the phone is told to do.
-  const displayResolvedSim = selectSmsSim(activeSims, selectedSubscriptionId);
-  const chooseSim = (id: number | null) => {
-    setSelectedSubscriptionId(id);
-    if (id === null) window.localStorage.removeItem("gmweb:selected-sms-subscription");
-    else window.localStorage.setItem("gmweb:selected-sms-subscription", String(id));
+  //
+  // SIM ROUTING PRECEDENCE: a conversation with an Android-confirmed preferred
+  // SIM sends from THAT line. The composer's global selection (and localStorage)
+  // applies only where the conversation has no preference, so new-message
+  // behaviour is unchanged and no conversation can be silently misrouted.
+  const selectedPreferredRef = selectedConversationCache?.aggregateId === selected
+    ? selectedConversationCache?.preferredSim?.simRef ?? null
+    : null;
+  const simRouting = resolveSimRouting({
+    sims: telemetry?.smsSubscriptions?.items ?? [],
+    conversationPreferredRef: selectedPreferredRef,
+    // A change is only ever pending once the command workflow exists; today the
+    // flag is driven by that state and defaults to false.
+    preferencePending: simPreferencePending,
+    composerKey: selectedSimKey,
+  });
+  const displayResolvedSim = simRouting.sim ?? selectSmsSim(activeSims, selectedSimKey);
+  /**
+   * The canonical selection key implied by the routing decision. Display,
+   * readiness, the disabled Send state and the command payload all derive from
+   * this single value, so they cannot contradict one another.
+   */
+  const canonicalSimKey: string | null = simRouting.commandTarget === null
+    ? null
+    : "simRef" in simRouting.commandTarget
+      ? `ref:${simRouting.commandTarget.simRef}`
+      : `sub:${simRouting.commandTarget.subscriptionId}`;
+  const chooseSim = (choice: { simRef: string } | { subscriptionId: number } | null) => {
+    // Store the choice as a KEY so a reload restores the same physical line rather than a number that
+    // may since have been reassigned to a different card.
+    const key = choice === null
+      ? null
+      : "simRef" in choice ? `ref:${choice.simRef}` : `sub:${choice.subscriptionId}`;
+    setSelectedSimKey(key);
+    if (key === null) window.localStorage.removeItem("gmweb:selected-sms-sim-key");
+    else window.localStorage.setItem("gmweb:selected-sms-sim-key", key);
   };
 
   useEffect(() => {
@@ -811,6 +881,16 @@ export default function App() {
     if (!body.trim()) { setCommandStatus("EMPTY_BODY"); return; }
     if (!selectedRecipient) { setCommandStatus("NO_RECIPIENT"); return; }
     if (!capabilities.includes("SEND_MESSAGES")) { setCommandStatus("SEND_CAPABILITY_MISSING"); return; }
+    // SEND-RACE PROTECTION. If this conversation's preferred SIM cannot be used
+    // right now — inactive, unresolvable, or awaiting Android confirmation of a
+    // change — the message must NOT be submitted on any other line. Blocking
+    // here is what makes "sent from the wrong SIM" unrepresentable, because the
+    // command target is derived from the same routing decision.
+    if (simRouting.blocked) {
+      commandFailureCode.current = `SIM_ROUTING_${simRouting.blocked}`;
+      setCommandStatus(`SIM_ROUTING_${simRouting.blocked}`);
+      return;
+    }
     // Structured readiness owns the gate. The old `simHelp()` string blocked
     // every send on stale telemetry, including PHONE_DEFAULT.
     if (sendBlockedNow) {
@@ -844,9 +924,18 @@ export default function App() {
         // Canonical crypto path — identical to READ and REFRESH.
         const prepared = await prepareEncryptedCommand("SEND_SMS", {
           phone: selectedRecipient, body, clientMessageId,
-          // PHONE_DEFAULT omits subscriptionId entirely so Android resolves the
-          // CURRENT default at execution time. Only an explicit selection is sent.
-          ...(commandSubscriptionId === undefined ? {} : { subscriptionId: commandSubscriptionId }),
+          // PHONE_DEFAULT omits any routing target entirely so Android resolves the CURRENT default at
+          // execution time. An explicit choice sends the opaque `simRef` the phone can resolve against
+          // its live inventory; a legacy phone gets its subscription id instead.
+          //
+          // The target comes from `simRouting` alone — the canonical decision —
+          // with NO independent fallback to the global composer key. A fallback
+          // here would reintroduce a second source of truth and allow a
+          // conversation pinned to SIM A to be sent from another line.
+          ...(simRouting.commandTarget ?? {}),
+          // Thread identity is what makes Android enforce the conversation's
+          // sticky preferred SIM. Omitting it silently disables that check.
+          ...(selectedAndroidThreadId ? { androidThreadId: selectedAndroidThreadId } : {}),
         });
         pending = { browserDeviceId: identity.deviceId, clientMessageId,
           idempotencyKey: prepared.idempotencyKey, payload: prepared.encrypted,
@@ -1037,6 +1126,9 @@ export default function App() {
   // Presence comes from the SERVER's view of authenticated phone activity.
   // Both the normal UI and the refresh flow use this ONE helper so there is
   // never a second liveness algorithm to drift out of sync.
+  // Capability, not a version guess: a phone that cannot execute SET_CONVERSATION_PREFERRED_SIM must
+  // not be shown a control for it.
+  const canSetPreferredSim = supportsPreferredSim(deviceStatus, telemetry);
   const phonePresence = authoritativePhonePresence(deviceStatus, telemetry);
   const telemetryFreshness = authoritativeTelemetryFreshness(deviceStatus, telemetry);
   const phoneLastActivityAt = deviceStatus
@@ -1049,7 +1141,17 @@ export default function App() {
   const readiness = deriveSendReadiness({
     draft, hasRecipient: Boolean(selectedRecipient), recipientAddress: selectedRecipient,
     canSend: capabilities.includes("SEND_MESSAGES"),
-    sending, phonePresence, telemetryFreshness, sim: simTelemetry, selectedSubscriptionId,
+    // ONE decision: readiness consumes the CANONICAL routing result rather than
+    // the raw global composer key, so the banner, the disabled Send button and
+    // the encrypted payload can never disagree about which line is in play.
+    selectedSimKey: canonicalSimKey,
+    simRoutingBlocked: simRouting.blocked,
+    // An EXISTING conversation we can see history for must not be submitted
+    // without a verified thread identity: Android's chooseSim() bypasses the
+    // sticky preferred-SIM check when threadId <= 0. A genuinely new message has
+    // no thread yet and stays unaffected.
+    threadIdentityMissing: Boolean(selected) && messages.length > 0 && selectedAndroidThreadId === null,
+    sending, phonePresence, telemetryFreshness, sim: simTelemetry,
   });
   const sendBlockedNow = sendBlocked(readiness);
   const simInstructions = sendReadinessNotice(readiness);
@@ -1143,7 +1245,7 @@ export default function App() {
       sending={sending}
       canSend={capabilities.includes("SEND_MESSAGES")}
       status={resolvedSendStatus.text}
-      useDefault={selectedSubscriptionId === null}
+      useDefault={selectedSimKey === null}
     />
   );
 
@@ -1432,6 +1534,7 @@ export default function App() {
         telemetry={telemetry}
         lastOutgoingStatus={lastOutgoing.status}
         lastOutgoingAt={lastOutgoing.at}
+        canSetPreferredSim={canSetPreferredSim}
       />
     </AppShell>
   );

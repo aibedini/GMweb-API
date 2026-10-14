@@ -3,6 +3,7 @@ import type { ConversationProjection } from "../../lib/inbox";
 import type { BrowserSyncStatus } from "../../lib/sync/sync-state";
 import type { DeviceTelemetry } from "../../lib/api";
 import { formatFullTimestamp, formatListTime, initialsFor, messageStatusLabel, shortId } from "./format";
+import { simLabelForRef } from "../../lib/simSelection";
 import { syncLabel } from "./SyncIndicator";
 
 /**
@@ -18,6 +19,7 @@ export function ConversationDetails({
   telemetry,
   lastOutgoingStatus,
   lastOutgoingAt,
+  canSetPreferredSim = false,
 }: {
   conversation: ConversationProjection;
   capabilities: string[];
@@ -25,6 +27,13 @@ export function ConversationDetails({
   telemetry: DeviceTelemetry | null;
   lastOutgoingStatus: number | null;
   lastOutgoingAt: number | null;
+  /**
+   * Whether the linked phone advertises SET_CONVERSATION_PREFERRED_SIM.
+   *
+   * A capability, not a version check: a phone that cannot execute the command must not be shown a
+   * control for it.
+   */
+  canSetPreferredSim?: boolean;
 }) {
   const activeSims = telemetry?.smsSubscriptions?.items.filter((sim) => sim.isActive) ?? [];
   const canSend = capabilities.includes("SEND_MESSAGES");
@@ -78,6 +87,33 @@ export function ConversationDetails({
           <dt>Telemetry received</dt>
           <dd>{telemetry?.receivedAt ? formatListTime(telemetry.receivedAt) : "Never"}</dd>
         </dl>
+      </section>
+
+      <section className="details-section">
+        <span className="details-section__label">Preferred SIM</span>
+        <dl className="details-list">
+          <dt>Sticky line</dt>
+          <dd>
+            {conversation.preferredSim
+              // The label comes from the LIVE SIM list, matched by the opaque ref. When the line is no
+              // longer present the preference is still shown as set, because it IS still set on the
+              // phone — the SIM is simply not installed right now. Hiding it would look like Android
+              // had forgotten the choice.
+              ? simLabelForRef(activeSims, conversation.preferredSim?.simRef) ?? "A SIM that is not currently active"
+              : "Phone default"}
+          </dd>
+          {conversation.preferredSim?.carrierName ? (
+            <>
+              <dt>Carrier</dt>
+              <dd>{conversation.preferredSim.carrierName}</dd>
+            </>
+          ) : null}
+        </dl>
+        {!canSetPreferredSim ? (
+          <p className="details-section__label" style={{ textTransform: "none", letterSpacing: 0 }}>
+            This phone does not support pinning a conversation to one SIM.
+          </p>
+        ) : null}
       </section>
 
       <section className="details-section">

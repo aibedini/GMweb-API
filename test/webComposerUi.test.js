@@ -41,7 +41,7 @@ test("only SIM problems may render a SIM alert or offer Refresh SIMs", async () 
   const base = {
     draft: "hello", hasRecipient: true, canSend: true, sending: false,
     phonePresence: "ONLINE", telemetryFreshness: "FRESH",
-    sim: { state: "OK", active: [SIM_A] }, selectedSubscriptionId: null,
+    sim: { state: "OK", active: [SIM_A] }, selectedSimKey: null,
   };
 
   // PRODUCTION BUG: an empty draft rendered "SIM needs attention /
@@ -62,8 +62,8 @@ test("only SIM problems may render a SIM alert or offer Refresh SIMs", async () 
   // Only these three may claim a SIM problem, and only they offer a refresh.
   const simStates = [
     deriveSendReadiness({ ...base, sim: { state: "NO_ACTIVE_SUBSCRIPTIONS", active: [] } }),
-    deriveSendReadiness({ ...base, telemetryFreshness: "OLD", selectedSubscriptionId: 7 }),
-    deriveSendReadiness({ ...base, selectedSubscriptionId: 999 }),
+    deriveSendReadiness({ ...base, telemetryFreshness: "OLD", selectedSimKey: "sub:7" }),
+    deriveSendReadiness({ ...base, selectedSimKey: "sub:999" }),
   ];
   for (const readiness of simStates) {
     const notice = sendReadinessNotice(readiness);
@@ -81,7 +81,7 @@ test("only SIM problems may render a SIM alert or offer Refresh SIMs", async () 
 });
 
 test("structured send readiness replaces the legacy simHelp gating", async () => {
-  const { deriveSendReadiness, sendBlocked, sendReadinessNotice, commandSubscriptionId, defaultModeFreshnessNotice } =
+  const { deriveSendReadiness, sendBlocked, sendReadinessNotice, commandSimTarget, defaultModeFreshnessNotice } =
     await import("../web/src/lib/sendReadiness.ts");
 
   const SIM_A = { subscriptionId: 7, slotIndex: 0, displayName: "SIM 1", carrierName: "Irancell",
@@ -92,7 +92,7 @@ test("structured send readiness replaces the legacy simHelp gating", async () =>
   const base = {
     draft: "hello", hasRecipient: true, canSend: true, sending: false,
     phonePresence: "ONLINE", telemetryFreshness: "FRESH",
-    sim: sim(), selectedSubscriptionId: null,
+    sim: sim(), selectedSimKey: null,
   };
 
   // PHONE_DEFAULT with stale telemetry is ALLOWED — this was the production bug.
@@ -106,17 +106,17 @@ test("structured send readiness replaces the legacy simHelp gating", async () =>
   assert.match(note.message, /outdated/i);
 
   // EXPLICIT SIM with stale telemetry is BLOCKED, with a truthful reason.
-  const staleExplicit = deriveSendReadiness({ ...base, telemetryFreshness: "OLD", selectedSubscriptionId: 9 });
+  const staleExplicit = deriveSendReadiness({ ...base, telemetryFreshness: "OLD", selectedSimKey: "sub:9" });
   assert.equal(staleExplicit.state, "EXPLICIT_SIM_TELEMETRY_STALE");
   assert.equal(sendBlocked(staleExplicit), true);
   assert.match(sendReadinessNotice(staleExplicit).message, /outdated/i);
   assert.doesNotMatch(sendReadinessNotice(staleExplicit).message, /offline/i);
 
   // Fresh + still-active explicit SIM is ready.
-  assert.deepEqual(deriveSendReadiness({ ...base, selectedSubscriptionId: 9 }),
-    { state: "READY_EXPLICIT", subscriptionId: 9 });
+  assert.deepEqual(deriveSendReadiness({ ...base, selectedSimKey: "sub:9" }),
+    { state: "READY_EXPLICIT", simKey: "sub:9" });
   // Fresh + vanished explicit SIM fails closed (no silent fallback).
-  assert.equal(deriveSendReadiness({ ...base, selectedSubscriptionId: 999 }).state, "EXPLICIT_SIM_MISSING");
+  assert.equal(deriveSendReadiness({ ...base, selectedSimKey: "sub:999" }).state, "EXPLICIT_SIM_MISSING");
 
   // A live phone is never "offline" just because telemetry is old.
   for (const presence of ["ONLINE", "STALE", "OFFLINE"]) {
@@ -132,9 +132,20 @@ test("structured send readiness replaces the legacy simHelp gating", async () =>
     sim: sim({ state: "NO_ACTIVE_SUBSCRIPTIONS", active: [] }) }).state,
     "READY_DEFAULT", "a stale empty list must not block Phone default");
 
-  // PHONE_DEFAULT must OMIT subscriptionId; EXPLICIT must carry it exactly.
-  assert.equal(commandSubscriptionId(null), undefined);
-  assert.equal(commandSubscriptionId(9), 9);
+  // PHONE_DEFAULT must OMIT any routing target; EXPLICIT must carry the identity the phone can resolve.
+  assert.equal(commandSimTarget(null), undefined);
+  assert.equal(commandSimTarget(undefined), undefined, "an omitted key means Phone default");
+  assert.deepEqual(commandSimTarget("sub:9"), { subscriptionId: 9 });
+  // A simRef is the durable identity and is what a current phone is told to use.
+  const REF = "sim:v1:0123456789abcdef0123456789abcdef";
+  assert.deepEqual(commandSimTarget(`ref:${REF}`), { simRef: REF });
+  // A chosen line whose identity cannot be routed must NOT silently become Phone default.
+  assert.equal(commandSimTarget("garbage"), undefined);
+  assert.equal(
+    deriveSendReadiness({ ...base, selectedSimKey: "ref:" }).state,
+    "EXPLICIT_SIM_UNROUTABLE",
+    "an unroutable choice must block rather than send on a different line"
+  );
 
   // Precondition ordering.
   assert.equal(deriveSendReadiness({ ...base, draft: "   " }).state, "EMPTY_BODY");
@@ -144,40 +155,42 @@ test("structured send readiness replaces the legacy simHelp gating", async () =>
 });
 
 test("single SIM, dual SIM and default SIM keep the null-subscription sentinel", async () => {
-  const { selectSmsSim, simSelectValue, simSelectChoice, DEFAULT_SIM_KEY } =
+  const { selectSmsSim, simKey, simSelectValue, simSelectChoice, DEFAULT_SIM_KEY } =
     await import("../web/src/lib/simSelection.ts");
-  const single = [{ subscriptionId: 7, isActive: true, isDefaultSms: true, sendCapable: true }];
+  // Display fields are part of the SIM shape so the shared label helper stays generic.
+  const s = (extra) => ({ slotIndex: 0, displayName: "Line", carrierName: "Carrier", ...extra });
+  const single = [s({ subscriptionId: 7, isActive: true, isDefaultSms: true, sendCapable: true })];
   const dual = [
-    { subscriptionId: 7, isActive: true, isDefaultSms: true, sendCapable: true },
-    { subscriptionId: 9, isActive: true, isDefaultSms: false, sendCapable: true },
+    s({ subscriptionId: 7, isActive: true, isDefaultSms: true, sendCapable: true }),
+    s({ subscriptionId: 9, isActive: true, isDefaultSms: false, sendCapable: true, slotIndex: 1 }),
   ];
   const nodefault = [
-    { subscriptionId: 7, isActive: true, isDefaultSms: false, sendCapable: true },
-    { subscriptionId: 9, isActive: true, isDefaultSms: false, sendCapable: true },
+    s({ subscriptionId: 7, isActive: true, isDefaultSms: false, sendCapable: true }),
+    s({ subscriptionId: 9, isActive: true, isDefaultSms: false, sendCapable: true, slotIndex: 1 }),
   ];
 
-  // Single SIM, nothing saved: the default is resolved and sent explicitly.
+  // Single SIM, nothing saved: the default is resolved and shown as "Phone default".
   assert.equal(selectSmsSim(single, null)?.subscriptionId, 7);
   assert.equal(simSelectValue(single, selectSmsSim(single, null), true), DEFAULT_SIM_KEY);
-  assert.equal(simSelectChoice(DEFAULT_SIM_KEY), null, "Default maps back to a null subscriptionId");
+  assert.equal(simSelectChoice(DEFAULT_SIM_KEY), null, "Default maps back to no routing target");
 
-  // Dual SIM with an explicit choice.
-  assert.equal(selectSmsSim(dual, 9)?.subscriptionId, 9);
-  assert.equal(simSelectValue(dual, selectSmsSim(dual, 9), false), "9");
-  assert.equal(simSelectChoice("9"), 9);
+  // Dual SIM with an explicit choice, keyed by the durable identity.
+  assert.equal(selectSmsSim(dual, simKey(dual[1]))?.subscriptionId, 9);
+  assert.equal(simSelectValue(dual, selectSmsSim(dual, simKey(dual[1])), false), "sub:9");
+  assert.deepEqual(simSelectChoice("sub:9"), { subscriptionId: 9 });
 
   // Dual SIM with no default reported: show the resolved SIM, never "Default".
   assert.equal(selectSmsSim(nodefault, null)?.subscriptionId, 7);
-  assert.equal(simSelectValue(nodefault, selectSmsSim(nodefault, null), true), "7");
+  assert.equal(simSelectValue(nodefault, selectSmsSim(nodefault, null), true), "sub:7");
 
   // A saved SIM that no longer exists resolves to nothing -> placeholder.
-  assert.equal(selectSmsSim(dual, 999), undefined);
+  assert.equal(selectSmsSim(dual, "sub:999"), undefined);
   assert.equal(simSelectValue(dual, undefined, false), null);
   assert.equal(simSelectChoice(null), null);
 
   // Inactive / send-incapable SIMs are rejected by selectSmsSim, so no draft
   // can be sent through a SIM the phone cannot use.
-  const stale = [{ subscriptionId: 5, isActive: false, isDefaultSms: false }];
+  const stale = [s({ subscriptionId: 5, isActive: false, isDefaultSms: false })];
   assert.equal(selectSmsSim(stale, null), undefined);
   assert.equal(simSelectChoice(undefined), null);
 });
@@ -193,7 +206,7 @@ test("no SIM telemetry keeps the selector showing Phone default and reports no S
   assert.equal(deriveSendReadiness({
     draft: "x", hasRecipient: true, canSend: true, sending: false,
     phonePresence: "ONLINE", telemetryFreshness: "NEVER_REPORTED",
-    sim: { state: "NOT_REPORTED", active: [] }, selectedSubscriptionId: null,
+    sim: { state: "NOT_REPORTED", active: [] }, selectedSimKey: null,
   }).state, "READY_DEFAULT");
   assert.ok(telemetry.receivedAt);
 });

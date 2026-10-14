@@ -19,6 +19,8 @@
 import type { TelemetryFreshness } from "./deviceState.ts";
 import type { PhonePresence } from "./phonePresence.ts";
 import type { SimTelemetryState, SimTelemetryView } from "./simTelemetry.ts";
+import { simKey } from "./simSelection.ts";
+import { simRoutingNotice, type SimRoutingBlock } from "./simSelection.ts";
 import { classifySender } from "./senderIdentity.ts";
 
 export type SendReadiness =
@@ -29,10 +31,37 @@ export type SendReadiness =
   | { state: "SEND_CAPABILITY_MISSING" }
   | { state: "PHONE_NEVER_SEEN" }
   | { state: "READY_DEFAULT" }
-  | { state: "READY_EXPLICIT"; subscriptionId: number }
-  | { state: "EXPLICIT_SIM_TELEMETRY_STALE"; subscriptionId: number }
-  | { state: "EXPLICIT_SIM_MISSING"; subscriptionId: number }
-  | { state: "NO_ACTIVE_SIM" };
+  | { state: "READY_EXPLICIT"; simKey: string }
+  | { state: "EXPLICIT_SIM_TELEMETRY_STALE"; simKey: string }
+  | { state: "EXPLICIT_SIM_MISSING"; simKey: string }
+  /**
+   * A line was chosen but the phone published no `simRef` for it.
+   *
+   * Blocking on purpose. The phone can only resolve a `simRef`, so without one the command would have
+   * to name the line by subscription id — which current Android builds deliberately do not publish and
+   * would ignore. Sending anyway would dispatch on whatever line the phone considers default, i.e. a
+   * different line than the one the user selected, silently. Refusing is the only reversible option.
+   */
+  | { state: "EXPLICIT_SIM_UNROUTABLE"; simKey: string }
+  | { state: "NO_ACTIVE_SIM" }
+  /**
+   * SIM routing refused for THIS conversation, carrying the real reason so the
+   * Composer shows the actual problem rather than a generic SIM hint.
+   */
+  | { state: "SIM_ROUTING_BLOCKED"; reason: SimRoutingBlock }
+  /**
+   * An EXISTING conversation with no verified Android thread identity.
+   *
+   * Android's `SmsSender.chooseSim()` returns `UseRequestOrDefault` when
+   * `threadId <= 0`, which BYPASSES the conversation's sticky preferred-SIM
+   * check. Submitting an existing-thread reply without the identity therefore
+   * does not merely lose information — it silently disables the very
+   * enforcement that keeps the message on the conversation's line.
+   *
+   * Blocked on purpose. A genuinely NEW message has no thread yet and is
+   * unaffected; only a conversation we can see history for is refused.
+   */
+  | { state: "THREAD_IDENTITY_UNAVAILABLE" };
 
 export interface SendReadinessInput {
   draft: string;
@@ -48,16 +77,58 @@ export interface SendReadinessInput {
   phonePresence: PhonePresence;
   telemetryFreshness: TelemetryFreshness;
   sim: Pick<SimTelemetryView, "state" | "active">;
-  /** null === PHONE_DEFAULT. */
-  selectedSubscriptionId: number | null;
+  /**
+   * The chosen line's selection key (see `simKey`), or null for PHONE_DEFAULT.
+   *
+   * A KEY rather than a subscription id: the durable identity is the opaque `simRef`, and an unnamespaced
+   * number could collide with one.
+   */
+  selectedSimKey: string | null;
+  /**
+   * The canonical routing decision's block reason, when this conversation's
+   * preferred SIM cannot be used.
+   *
+   * DEFECT this fixes: readiness consumed the GLOBAL composer key while the send
+   * payload consumed the conversation's preferred SIM, so the two could
+   * disagree — a conversation whose own line was ready could still show Send
+   * disabled because an unrelated global selection failed to resolve. There is
+   * now ONE decision, and readiness consumes it instead of re-deriving it.
+   */
+  simRoutingBlocked?: SimRoutingBlock | null;
+  /**
+   * True when this send targets a conversation we already have history for, but
+   * no verified `androidThreadId` is available.
+   *
+   * Omitted/false for a NEW message, which legitimately has no thread yet.
+   */
+  threadIdentityMissing?: boolean;
 }
 
-/** The explicit subscription id to put in the command, if any. */
-export function commandSubscriptionId(selectedSubscriptionId: number | null): number | undefined {
-  // PHONE_DEFAULT must OMIT subscriptionId so Android resolves the CURRENT
-  // system default at execution time. Resolving it in Web to a cached id would
-  // silently change the command's semantics.
-  return selectedSubscriptionId === null ? undefined : selectedSubscriptionId;
+/**
+ * The routing target to put in a `SEND_SMS` command, or undefined for the phone's own default.
+ *
+ * PHONE_DEFAULT MUST omit any target so Android resolves the CURRENT system default at execution time:
+ * resolving it in the browser to a cached value would silently change the command's meaning.
+ *
+ * A `simRef` is sent as `simRef`, the opaque cross-system identity Android resolves against its live
+ * inventory. A legacy `sub:` key is sent as `subscriptionId`, which only an older phone will act on.
+ */
+export function commandSimTarget(
+  selectedSimKey: string | null | undefined,
+): { simRef: string } | { subscriptionId: number } | undefined {
+  // `undefined` is tolerated for callers that predate the key and simply omit the field. It means the
+  // same as null — no explicit line — so the phone resolves its own default. Rejecting it would break
+  // every legacy caller for no safety gain: the dangerous direction is a WRONG target, not an absent one.
+  if (selectedSimKey === null || selectedSimKey === undefined) return undefined;
+  if (selectedSimKey.startsWith("ref:")) {
+    const simRef = selectedSimKey.slice("ref:".length);
+    return simRef.length > 0 ? { simRef } : undefined;
+  }
+  if (selectedSimKey.startsWith("sub:")) {
+    const value = Number(selectedSimKey.slice("sub:".length));
+    return Number.isSafeInteger(value) ? { subscriptionId: value } : undefined;
+  }
+  return undefined;
 }
 
 export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
@@ -74,11 +145,24 @@ export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
     }
   }
   if (!input.canSend) return { state: "SEND_CAPABILITY_MISSING" };
+  // Routing refusal outranks the SIM telemetry states: the SIM list can look
+  // perfectly healthy while THIS conversation's own line is the problem.
+  if (input.simRoutingBlocked) {
+    return { state: "SIM_ROUTING_BLOCKED", reason: input.simRoutingBlocked };
+  }
+  // Refuse an existing-conversation send with no thread identity, because that
+  // is precisely the input that makes Android skip the preference check.
+  if (input.threadIdentityMissing) {
+    return { state: "THREAD_IDENTITY_UNAVAILABLE" };
+  }
   // Only a phone that has never authenticated at all is unusable. OFFLINE and
   // STALE still allow a durable command to be queued for later claim.
   if (input.phonePresence === "NEVER_SEEN") return { state: "PHONE_NEVER_SEEN" };
 
-  const selected = input.selectedSubscriptionId;
+  // An omitted key is read as "no explicit line", which is the same as PHONE_DEFAULT. That is the safe
+  // reading: a missing field cannot be evidence that the user chose a SIM, and treating it as one would
+  // either block a send for no reason or, worse, let an unroutable selection fall through unnoticed.
+  const selected = input.selectedSimKey ?? null;
   if (selected === null) {
     // PHONE_DEFAULT: a stale SIM snapshot must NOT block sending.
     if (input.telemetryFreshness === "FRESH"
@@ -89,14 +173,20 @@ export function deriveSendReadiness(input: SendReadinessInput): SendReadiness {
     return { state: "READY_DEFAULT" };
   }
 
-  // EXPLICIT: strict. Fresh telemetry, subscription still present.
+  // A chosen line can only be routed by a handle the phone understands. Without one there is nothing
+  // to send, and falling through to the default would dispatch on a line the user did not pick.
+  if (commandSimTarget(selected) === undefined) {
+    return { state: "EXPLICIT_SIM_UNROUTABLE", simKey: selected };
+  }
+
+  // EXPLICIT: strict. Fresh telemetry, chosen line still present.
   if (input.telemetryFreshness !== "FRESH") {
-    return { state: "EXPLICIT_SIM_TELEMETRY_STALE", subscriptionId: selected };
+    return { state: "EXPLICIT_SIM_TELEMETRY_STALE", simKey: selected };
   }
-  if (!input.sim.active.some(sim => sim.subscriptionId === selected)) {
-    return { state: "EXPLICIT_SIM_MISSING", subscriptionId: selected };
+  if (!input.sim.active.some(sim => simKey(sim) === selected)) {
+    return { state: "EXPLICIT_SIM_MISSING", simKey: selected };
   }
-  return { state: "READY_EXPLICIT", subscriptionId: selected };
+  return { state: "READY_EXPLICIT", simKey: selected };
 }
 
 /** Blocking states. Everything else may send. */
@@ -166,6 +256,18 @@ export function sendReadinessNotice(readiness: SendReadiness): SendNotice | null
       return { kind: "PHONE", title: "Phone unavailable", tone: "danger",
         message: "No Primary phone has connected yet. Pair your phone, then retry.",
         blocking: true, offersSimRefresh: false };
+    // The REAL routing reason, taken from the same decision that builds the
+    // payload, so the banner cannot name a different problem than the block.
+    case "SIM_ROUTING_BLOCKED":
+      return { kind: "SIM", title: "Preferred SIM unavailable", tone: "warning",
+        message: simRoutingNotice(readiness.reason) ?? "This conversation's preferred SIM cannot be used.",
+        blocking: true, offersSimRefresh: true };
+    case "THREAD_IDENTITY_UNAVAILABLE":
+      return { kind: "SIM", title: "Conversation not linked to your phone", tone: "warning",
+        message: "This conversation has no verified phone thread yet, so sending is paused — "
+          + "without it your phone cannot honour this conversation's preferred SIM. "
+          + "Refresh SIM information, or wait for the next sync.",
+        blocking: true, offersSimRefresh: true };
     case "NO_ACTIVE_SIM":
       return { kind: "SIM", title: "SIM needs attention", tone: "danger",
         message: "No active SMS SIM was detected. Insert an active SIM or check Phone permission.",
@@ -178,6 +280,13 @@ export function sendReadinessNotice(readiness: SendReadiness): SendNotice | null
     case "EXPLICIT_SIM_MISSING":
       return { kind: "SIM", title: "SIM needs attention", tone: "warning",
         message: "Previously selected SIM is no longer active. Choose another SIM or use Phone default.",
+        blocking: true, offersSimRefresh: true };
+    case "EXPLICIT_SIM_UNROUTABLE":
+      // Blocking, and explicit about why: sending would otherwise leave on a line the user did not
+      // choose, since the phone cannot be told which one they meant.
+      return { kind: "SIM", title: "SIM cannot be addressed", tone: "danger",
+        message: "The phone did not publish an addressable identity for the selected SIM, so it cannot "
+          + "be told which line to use. Refresh SIM information, or use Phone default.",
         blocking: true, offersSimRefresh: true };
   }
 }

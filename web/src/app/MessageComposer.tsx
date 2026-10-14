@@ -46,7 +46,8 @@ export function MessageComposer({
   onDraft: (value: string) => void;
   sims: Sim[];
   selected?: Sim;
-  onSim: (id: number | null) => void;
+  /** Emits the chosen SIM identity, or null for let the phone choose. */
+  onSim: (choice: { simRef: string } | { subscriptionId: number } | null) => void;
   /** Blocking or informational notice from the structured readiness model. */
   notice: SendNotice | null;
   retry: () => void;
