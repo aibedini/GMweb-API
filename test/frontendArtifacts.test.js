@@ -88,8 +88,14 @@ test("the release pipeline runs the verifier before promoting", () => {
   assert.ok(verifyAt !== -1, "the deploy must run the verifier");
   assert.ok(promoteAt !== -1, "the promote step must exist");
   assert.ok(deploy.indexOf("build:frontends") < verifyAt, "it builds before verifying");
-  const restartAt = deploy.indexOf("systemctl restart gmweb-api.service");
+  // Search from the verifier onwards: deploy-gmweb.sh also restarts the service inside its
+  // rollback() helper, which is defined earlier and is not the activation restart. The
+  // ordering that matters is "verify, then activate".
+  const restartAt = deploy.indexOf("systemctl restart gmweb-api.service", verifyAt);
+  assert.ok(restartAt !== -1, "the deploy must restart the service after verifying");
   assert.ok(verifyAt < restartAt, "and verifies BEFORE restarting the service");
+  // The rollback path remains a separate, earlier restart and must not be the one measured.
+  assert.ok(deploy.indexOf("rollback()") < verifyAt, "rollback is defined before the release steps");
   const manager = fs.readFileSync(path.join(__dirname, "..", "scripts", "gmweb-menu.sh"), "utf8");
   assert.ok(manager.includes("npm run build:frontends"), "the manager update path builds too");
   assert.ok(manager.includes("verify-frontend-artifacts.mjs"), "...and verifies before restarting");
