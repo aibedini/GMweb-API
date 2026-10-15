@@ -219,3 +219,17 @@ test("a bare exec with a trailing 2>/dev/null really does silence later stderr",
   assert.equal(bad.stderr, "", "the old form hides stderr");
   assert.match(good.stderr, /oops/, "the grouped form keeps stderr");
 });
+
+// ── domain helper is installed/refreshed by the updater, never fatally ───────
+
+test("the updater installs the domain helper after a healthy promotion and never fails on it", () => {
+  const fn = menu.slice(menu.indexOf("ensure_domain_helper() {"), menu.indexOf("update_app() {"));
+  assert.match(fn, /GMWEB_DOMAIN_HELPER:-auto/, "has an opt-out");
+  assert.match(fn, /install-domain-helper\.sh/);
+  assert.match(fn, /--with-packages/, "first install also brings nginx and certbot");
+  assert.match(fn, /cmp -s/, "an installed but outdated helper is refreshed");
+  assert.match(fn, /return 0\s*\n\}/, "always succeeds");
+  const call = menu.indexOf("ensure_domain_helper || true");
+  assert.ok(call > menu.indexOf("Updated to $candidate_short"), "runs only after the post-deploy version check passed");
+  assert.ok(call < menu.indexOf("Post-deploy version check failed"), "inside the success branch, before any rollback path");
+});
