@@ -744,6 +744,33 @@ adopt_git_checkout() {
   fi
 }
 
+# Install (or refresh) the privileged domain helper that Settings -> Domains & SSL
+# needs. Best effort by design: a failure here must NEVER fail or roll back an update
+# that already passed its health checks. Opt out with GMWEB_DOMAIN_HELPER=off.
+ensure_domain_helper() {
+  [[ "${GMWEB_DOMAIN_HELPER:-auto}" != "off" ]] || return 0
+  local installer="$APP_DIR/scripts/install-domain-helper.sh"
+  local source="$APP_DIR/scripts/gmweb-domain-helper.sh"
+  local installed=/usr/local/sbin/gmweb-domain-helper
+  [[ -f "$installer" && -f "$source" ]] || return 0
+  local args=(--app-user "$APP_USER") why=""
+  if [[ ! -x "$installed" ]]; then
+    args+=(--with-packages); why="not installed (also installing nginx and certbot)"
+  elif ! cmp -s "$source" "$installed"; then
+    why="out of date (refreshing)"
+  else
+    return 0
+  fi
+  echo "Domain helper: $why"
+  if timeout 900 bash "$installer" "${args[@]}"; then
+    echo "${C_GREEN}Domain helper ready. Settings -> Domains & SSL can now apply domains and issue certificates.${C_RESET}"
+    echo "Open ports 80 and 443 in the firewall before requesting a certificate."
+  else
+    echo "${C_YELLOW}Domain helper install did not complete (the update itself is fine). Retry: sudo bash $installer --with-packages${C_RESET}"
+  fi
+  return 0
+}
+
 update_app() {
   need_root "$@"
   if [[ ! -d "$APP_DIR/.git" ]]; then
@@ -966,6 +993,7 @@ update_app() {
       pwa_version="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/web/version.json" 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
       if [[ "$api_version" == "$stage_version" && "$pwa_version" == "$stage_version" ]]; then
         echo "${C_GREEN}Updated to $candidate_short. API and /web are both $api_version.${C_RESET}"
+        ensure_domain_helper || true
         [[ "$UPDATE_QUEUE_WAS_PAUSED" == "true" ]] || queue_control resume || true
         return 0
       fi
