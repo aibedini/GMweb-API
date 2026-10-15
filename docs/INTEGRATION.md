@@ -1,5 +1,13 @@
 ## GMweb 0.18.0 / Messages 3.3.0: fail-closed encrypted replication
 
+### GMweb 0.19.30: linked inbox actions (`linked-inbox-actions-v1`)
+
+`DELETE /api/v1/linked-session` requires the linked browser cookie and removes all server sessions and pending pairing challenges for that browser identity. The response clears the cookie. The PWA then clears its replica, pending commands and local identity keys. Other browsers remain linked; Android Primary remains the authority for revoking another device's trust. A new approval is required to link this cleared browser again.
+
+Browsers with either `MARK_READ` or `SEND_MESSAGES` can retrieve the Primary command key. Opening a ready, visible unread thread submits encrypted `MARK_THREAD_READ`; its source browser is recorded in the durable command row. After durable acceptance the browser clears its own viewed badge, while phone confirmation stays pending until executor completion. Newer message sequences are not hidden by an older completion. Operator activity records include content-free `read_requested`, `read_status` and `read_completed` references with command ID, reader device ID and target agent ID. No message text or recipient is logged in these read details.
+
+Inbox contacts reconstruct in the background without requiring a Contacts-tab visit. National and international Iranian phone formats match the same contact. The composer requires current SIM telemetry and a selected active subscription; older Android telemetry or missing Phone permission needs correction on the Primary phone. GMweb never substitutes an unknown SIM or infers physical SMS success. Linked telemetry now selects the currently enrolled Primary identity rather than a former Primary's latest snapshot.
+
 GMweb 0.19.14 rate-limits signed-agent replication capabilities (60/min/IP),
 V2 command claims (60/min/IP), and V2 command status (120/min/IP) before
 authorization. Exhausted requests return `429 agent_rate_limit` with
@@ -384,7 +392,7 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `GET /api/v1/linked-device/contacts/events?beforeSequence=&limit=` | Reverse pages of opaque `CONTACTS_SNAPSHOT`/`CONTACTS_CHANGED` events, at most 100 per request. Returns `{events,nextBeforeSequence,hasMore}`. The browser decrypts pages locally until a complete snapshot is found; the Inbox does not fetch contact pages. | Linked session with `CONTACTS_READ` |
 | `GET /api/v1/linked-device/sessions` | Lists active linked browser sessions with observed IP, browser user agent, last request, last content read, and last durable sync acknowledgement. No session token or message content is returned. `onlineNow` means a request was observed in the past 90 seconds; it does not prove a human is viewing the page. | Linked session with `READ_MESSAGES` |
 | `POST /api/v1/agent/trust/statements` | Returns 200 only when a signed statement was applied or the exact statement was already stored. A sequence gap or conflicting stale statement returns 409 with a stable `reason`; Android must not mark these rows published. | Primary agent signature |
-| `GET /api/v1/sse` | Realtime **invalidation signal only** (`{type:"sync.available"}` — zero content, §44). The lazy PWA refreshes bounded current-state conversation and selected-thread pages; full-replica consumers re-pull `/api/v1/sync`. The PWA uses its HttpOnly linked-session cookie. Query-token compatibility is disabled by default and requires the temporary `ALLOW_LEGACY_SSE_QUERY_TOKEN=true` flag. | Linked-session cookie |
+| `GET /api/v1/sse` | Realtime **invalidation signal only** (`{type:"sync.available"}` — zero content, §44). The lazy PWA refreshes bounded current-state conversation and selected-thread pages; full-replica consumers re-pull `/api/v1/sync`. The PWA uses its HttpOnly linked-session cookie. Query-token compatibility is disabled by default and requires the temporary `ALLOW_LEGACY_SSE_QUERY_TOKEN=true` flag. **Transport contract (0.19.32):** the response sets `X-Accel-Buffering: no` with `Cache-Control: no-cache, no-transform`, and emits a `retry: 3000` hint plus a `data: {"type":"heartbeat"}` frame every 20s. The heartbeat is a `data:` frame rather than a comment because comment frames are invisible to `EventSource`, which would leave a black-holed stream looking healthy; it carries no identifiers and performs no database work. Clients MUST ignore unknown `type` values and MUST NOT treat a heartbeat as an invalidation. A reverse proxy that buffers `text/event-stream` (nginx's `proxy_buffering` defaults to `on`) withholds every frame while the browser still sees `onopen` — the header above prevents that per-response, and `proxy_buffering off;` on the SSE location is the equivalent proxy-side fix. | Linked-session cookie |
 | `GET /api/v1/push/public-key` | VAPID public key for Web Push subscription. | Bearer |
 | `POST /api/v1/push/subscribe` / `unsubscribe` | Register/remove a push subscription (§89). **Content-less wake-ups only** (§30): notifications never carry message content. | Bearer |
 | `GET /api/v1/push/subscriptions` | List subscriptions (endpoint hashes truncated for privacy). This dashboard-only route is not called by the linked PWA. | Dashboard/bearer |
@@ -774,3 +782,396 @@ active subscription IDs, slots, bounded labels, and default-SMS status. Linked
 browser send commands carry the chosen `subscriptionId` inside the encrypted
 `SEND_SMS` payload. Android refuses an unavailable explicitly chosen SIM with
 `SIM_NOT_AVAILABLE` and does not substitute another line.
+
+## Composer, SIM and browser send identity (0.19.31)
+
+All browser composers preserve exact message text, including leading/trailing whitespace and newlines. Empty-draft validation may trim; transmission does not. Enter inserts a newline. Ctrl+Enter or Cmd+Enter sends outside IME composition. Segment counts include newlines, GSM extension septets and UTF-16 surrogate pairs.
+
+`POST /send` accepts optional `subscriptionId` (non-negative integer) and `clientMessageId` (1-128 ASCII letters, digits, underscore or hyphen). A browser keeps the same message identity when retrying an uncertain request. Changing recipient, exact body or SIM for the same identity returns 409. The identity has a per-project unique SQLite index and is retained with the selected SIM during queue reconstruction. Explicit SIM selection requires Android transport and fresh enrolled-Primary SIM telemetry; absent legacy fields remain compatible. Both `/gateway/pull` task serialization and Android push `/send` forward these fields. Push also forwards the durable request ID as Idempotency-Key; consumption by older Android versions remains NOT VERIFIED.
+
+`GET /admin/sms-capabilities` uses existing admin authentication and the enrolled Primary identity. It reports availability, freshness, SIM subscription/slot/carrier/active/default state and send capability. Unreported send capability, SEND_SMS permission and default-app status are null, never assumed true.
+
+`GET /send/status/:reference` returns durable clientMessageId and subscriptionId. Dashboard SSE send-stage and carrier events carry the request/message identity; clients requery durable status on reconnect. Sent requires a send outcome, Delivered requires a carrier report. Command COMPLETED alone is not delivery evidence. Android errors are displayed with their actual reason. The encrypted PWA uses its existing cursor/SSE replica for incoming/outgoing/read/reorder changes and exact clientMessageId reconciliation. Mark as read remains a linked-browser encrypted command with reader/target device audit.
+
+The dashboard Android conversation archive now exposes correlated outbound ledger rows and uses SSE invalidation instead of six-second thread polling. It is still an outbound archive, not the encrypted Android inbox; phone unread/incoming/read authority belongs to the linked PWA. Browser/phone/carrier production acceptance is NOT RUN for this change.
+
+Android pull clients may POST `/gateway/progress` with `{requestId, stage:"submitting", clientMessageId?}` using the gateway device key. GMweb validates the durable task/correlation and rejects revoked or terminal tasks, persists the stage and emits SSE. This endpoint cannot assert Sent or Delivered. Older clients that do not publish progress skip the Submitting transition; GMweb never invents it. Real Android progress publication is NOT VERIFIED in this repository-only change.
+
+## Phone liveness vs telemetry freshness (0.19.33)
+
+These are **two independent facts** and the API reports them separately. Do not
+derive one from the other.
+
+- **Liveness** answers "is the Primary phone running and reachable?". It comes
+  only from server-observed **authenticated agent activity** — any successful
+  `/api/v1/agent/*` request (command poll, event batch, trust, telemetry).
+  GMweb stamps this with its own clock on every authenticated request; the
+  phone's clock is never consulted.
+- **Telemetry freshness** answers "how old is the last device/SIM report?".
+  It is the server receipt time of the newest row in
+  `device_telemetry_history`.
+
+`GET /api/v1/linked-device/status` (linked session, `READ_MESSAGES`) returns:
+
+```json
+{
+  "phone":     { "state": "ONLINE|STALE|OFFLINE|NEVER_SEEN",
+                 "lastActivityAt": 1760000000000, "lastActivitySource": "COMMAND_POLL",
+                 "ageMs": 3200, "model": "SM-G998B", "appVersion": "3.4.21" },
+  "telemetry": { "state": "FRESH|STALE|OLD|NEVER_REPORTED",
+                 "receivedAt": 1759900000000, "ageMs": 174000000, "clockSkewMs": -120 },
+  "now": 1760000003200
+}
+```
+
+Thresholds: activity age `<= 90s` is `ONLINE`, `<= 180s` is `STALE`, beyond is
+`OFFLINE`; no accepted activity is `NEVER_SEEN`. Telemetry is `FRESH` within the
+same 90s, then `STALE`, then `OLD` beyond 24h.
+
+**Why this exists.** GMweb previously derived phone presence from
+`telemetry.receivedAt`. When the Android telemetry upload stalled, every other
+channel kept working, yet the UI reported
+`Phone Offline · Samsung SM-G998B · last seen 2 days ago`. Liveness and
+telemetry freshness must never be collapsed into one signal.
+
+**Ordering.** The newest telemetry row is selected by `received_at`
+(**server** receipt), never by `observed_at` (phone-supplied clock). A phone
+whose clock was ever ahead would otherwise write a future-dated row that
+permanently shadowed newer reports. `observed_at` is retained for diagnostics
+and exposed as `clockSkewMs`; it never influences presence or freshness.
+
+Consumers that only need SIM/device facts may keep using
+`GET /api/v1/linked-device/telemetry`; anything that renders "is the phone
+online?" must use `GET /api/v1/linked-device/status`.
+## Refresh SIMs — remote device telemetry refresh (0.19.34)
+
+`Refresh SIMs` is a **real remote request**, not a re-read of cached telemetry.
+Re-reading what the server already has can never discover a newly inserted SIM.
+
+### Command type
+
+`REFRESH_DEVICE_TELEMETRY` (the report carries device + SIM + permission state,
+so it is not named for SIM alone). Encrypted plaintext:
+
+```json
+{ "type": "REFRESH_DEVICE_TELEMETRY", "reason": "SIM_REFRESH", "requestedAt": 1760000000000 }
+```
+
+It uses the **existing** `POST /api/v1/commands` durable encrypted channel —
+there is no parallel endpoint, and no plaintext downgrade. A linked browser
+must send `cryptoVersion === 1`, `encoding === "envelope.v1"`,
+`schemaVersion === 1`, or it receives `400 encrypted_command_required`. It
+needs the `READ_MESSAGES` capability (a browser may refresh exactly what it may
+read); otherwise `403 read_messages_capability_required`.
+
+### Capability negotiation
+
+Android advertises support in device telemetry — **never** inferred from
+`versionName`:
+
+```json
+{ "capabilities": { "commandTypes": ["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY"] } }
+```
+
+Validated defensively on ingest (optional array, strings only, max 32 types,
+max 64 chars each, duplicates dropped). Absent or malformed means "remote
+refresh unsupported" — which is **not** an error and **not** an offline phone;
+the ordinary telemetry display keeps working. Capabilities are feature
+negotiation only and never grant authorization.
+
+### Client flow and success rule
+
+1. read `GET /api/v1/linked-device/status` (authoritative liveness)
+2. read `GET /api/v1/linked-device/telemetry` → `baselineReceivedAt`
+3. `OFFLINE`/`NEVER_SEEN` ⇒ do **not** enqueue; `STALE` may proceed but is labelled
+4. require `capabilities.commandTypes` to include `REFRESH_DEVICE_TELEMETRY`
+5. submit the encrypted command
+6. observe the durable lifecycle (`QUEUED` → `…` → `COMPLETED`, or `FAILED`/`EXPIRED`)
+7. after `COMPLETED`, poll telemetry (500 ms, ≤10 s) until
+   **`receivedAt > baselineReceivedAt`**
+8. only then report updated; total budget 15 s
+
+**`COMPLETED` does not mean refreshed.** It only means Android believes its POST
+succeeded. A new server `receivedAt` is the sole proof. If the baseline is
+`null`, any non-null `receivedAt` counts.
+
+### Liveness vs freshness invariant
+
+Phone liveness comes from server-observed **authenticated activity**; telemetry
+freshness comes from server **`received_at`**. Neither is ever derived from the
+other, and `refreshSims` must not re-derive liveness from telemetry age — a
+3-day-old report with a live phone means "online, SIM information is outdated",
+never "phone offline".
+## Live Android runtime metadata (0.19.35)
+
+Phone liveness, Android runtime metadata and device telemetry are **three
+separate facts**. They are reported in separate sections and never derived from
+one another.
+
+### Why
+
+The Android app version used to be learned only from device telemetry. When the
+telemetry upload stalled, GMweb kept reporting the version from the last
+telemetry row (`3.4.17`, Sep 30) while a newer APK was actually running — while
+presence correctly said ONLINE.
+
+It also caused a **bootstrap deadlock**: the PWA refused to send
+`REFRESH_DEVICE_TELEMETRY` unless *telemetry* advertised the capability, but
+stale telemetry is exactly what that command exists to repair. A phone that
+genuinely supported the command could never be asked.
+
+### Transport
+
+Runtime metadata rides on the command poll the phone already performs — no new
+endpoint and no extra traffic. The signed body is extended **additively**;
+older clients that omit `runtime` keep working unchanged:
+
+```json
+{ "agentId": "...", "limit": 25,
+  "runtime": { "protocolVersion": 1, "appVersionName": "3.4.22", "appVersionCode": 129,
+               "commandTypes": ["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY"] } }
+```
+
+Recorded **only** after AgentAuth succeeds, and keyed by the **authenticated**
+device id — a body-supplied `agentId` cannot write another device's runtime.
+It is runtime/feature **evidence only** and never grants authorization.
+
+### Validation and storage
+
+`appVersionName` (string, ≤64), `appVersionCode` (safe non-negative integer),
+`protocolVersion` (bounded integer), `commandTypes` (array, ≤32 entries, strings
+only, ≤64 chars each, de-duplicated). A block with nothing usable creates no row.
+
+Stored in a dedicated `agent_runtime` table (`device_id` primary key). Server
+receipt time is authoritative. Changed metadata persists immediately; unchanged
+repeated polls are coalesced (`RUNTIME_WRITE_INTERVAL_MS`, 15s) while the
+in-memory view stays exact. No SIM, battery or message content is stored here.
+
+### `GET /api/v1/linked-device/status`
+
+```json
+{
+  "phone":     { "state": "ONLINE", "lastActivityAt": 0, "lastActivitySource": "COMMAND_POLL", "ageMs": 0 },
+  "runtime":   { "appVersionName": "3.4.22", "appVersionCode": 129, "protocolVersion": 1,
+                 "commandTypes": ["REFRESH_DEVICE_TELEMETRY"], "receivedAt": 0, "source": "COMMAND_POLL", "ageMs": 0 },
+  "telemetry": { "state": "OLD", "receivedAt": 0, "ageMs": 0, "clockSkewMs": 0, "reportedAppVersion": "3.4.17" },
+  "now": 0
+}
+```
+
+`phone.appVersion` is retained for older clients but is **derived** and
+self-describing: `runtime.appVersionName ?? telemetry.app.versionName ?? null`,
+with `appVersionSource` (`RUNTIME` | `TELEMETRY_FALLBACK`) and
+`appVersionIsFallback`. A telemetry fallback must be presented as a historical
+value, never as the running APK.
+
+### Capability negotiation priority
+
+`deviceStatus.runtime.commandTypes` **first**; telemetry capability is a
+fallback only while that telemetry is still `FRESH`. Therefore:
+
+- live runtime advertises `REFRESH_DEVICE_TELEMETRY` ⇒ refresh **ALLOWED**, even
+  with old / missing / pre-capability telemetry (the production recovery path);
+- no live runtime, no (fresh) telemetry capability ⇒ `UNSUPPORTED`;
+- a stale telemetry capability is **not** evidence of support.
+
+Support is always determined by advertised command name — never by guessing from
+`versionName`.
+
+### Success rule (unchanged)
+
+`command COMPLETED` is still **not** success. A strictly newer
+`telemetry.receivedAt` than the baseline is required before showing
+"SIM information updated."
+## Command public-key wire format (0.19.36)
+
+### The bug (confirmed against production)
+
+Android v3.4.x registers its identity keys as **DER SubjectPublicKeyInfo**
+(`toSpkiB64`). `web/src/lib/commandCrypto.ts` imported the command encryption
+key with WebCrypto `"raw"`, which expects an **uncompressed point**
+(`0x04||X||Y`). The browser therefore raised `DataError: Invalid keyData` and
+the composer reported "Could not encrypt this message."
+
+Measured on the live Primary identity:
+
+```
+signing:    91 bytes, firstByte 0x30, DER_SPKI_P256
+encryption: 91 bytes, firstByte 0x30, DER_SPKI_P256
+GET /api/v1/linked-device/command-key served it unchanged (same fingerprint)
+importKey("raw")  => DataError: Invalid keyData
+importKey("spki") => OK
+```
+
+`agentAuth.js` had already accepted **both** formats for the **signing** key —
+the migration was simply only half applied. Web `SEND_SMS` was broken while the
+EVE path kept working because EVE uses `LEGACY_PULL` (`AndroidOutbox` →
+`OutboxPoller` → `SmsSender`) and never performs browser-side ECDH. **EVE
+success is not evidence that Web command encryption works.**
+
+### Contract
+
+`GET /api/v1/linked-device/command-key` now declares the format explicitly:
+
+```json
+{ "deviceId": "...", "encryptionPublicKey": "...", "encryptionPublicKeyFormat": "spki-p256" }
+```
+
+Supported values: `spki-p256`, `raw-p256`. The field is **optional** for
+backward compatibility: when absent the client sniffs — 65 bytes starting
+`0x04` is `raw-p256`, otherwise `spki-p256` is attempted.
+
+Status codes: `404 primary_command_key_unavailable` (no key),
+`409 invalid_primary_command_key` with a `reason` (stored key is not a usable
+P-256 key), `403 command_capability_required`. A malformed stored key is
+**never** served as if valid.
+
+### Client behaviour
+
+`importCommandPublicKey(publicKeyB64, format?)` decodes once, honours an
+explicit format, rejects a format that contradicts the bytes, and imports with
+`"spki"` or `"raw"` accordingly. Non-P-256 curves and malformed DER are
+rejected with a machine-readable code rather than silently accepted.
+
+Failure taxonomy (never a blanket `ENCRYPTION_FAILED`):
+
+| code | user copy |
+| --- | --- |
+| `COMMAND_KEY_UNAVAILABLE` | Phone encryption key is unavailable. |
+| `COMMAND_KEY_INVALID` | Phone encryption key is invalid. Reconnect the Primary phone. |
+| `COMMAND_KEY_FORMAT_UNSUPPORTED` | Phone encryption key format is not supported. Update Messages and retry. |
+| `COMMAND_CRYPTO_IMPORT_FAILED` / `COMMAND_CRYPTO_FAILED` | Could not securely prepare this message. |
+
+Errors carry **safe** diagnostics only — `code`, `stage` (`FETCH_COMMAND_KEY`,
+`IMPORT_RECIPIENT_KEY`, `GENERATE_EPHEMERAL`, `ECDH_DERIVE`, `HKDF_DERIVE`,
+`AES_GCM_ENCRYPT`, `EXPORT_EPHEMERAL`), `format`, `decodedLength` and
+`errorName`. Never the message body, key material, ciphertext or recipient.
+
+### Unchanged
+
+The **envelope format is untouched**: `v`, `kind: "command"`,
+`ephemeralPublicKey` (still a raw uncompressed point), `iv`, `ciphertext`. Only
+the *recipient* key import was wrong. The success rule still requires a strictly
+newer `telemetry.receivedAt` — `COMPLETED` alone is not success. Android private
+keys remain non-exportable in the Keystore; no private material leaves the phone.
+
+Shared helpers moved to `web/src/lib/binary.ts` so `commandCrypto.ts` no longer
+pulls in the HPKE suite and device-key storage — that dependency is why this
+path had no isolated test.
+
+### Separately: the nginx 502
+
+The screenshot's `502 Bad Gateway` was **not** this bug. All 502s fall in
+00:04–01:04 and align exactly with `systemd` restart cycles of GMweb (~6-minute
+loop, 6 s with no upstream); every endpoint was hit equally and
+`/command-key` received **zero** 502s.
+## Integration hardening (0.19.37)
+
+Four integration/state gaps closed. **No change to the command envelope, the ECDH
+algorithm, or the Tauri/SPKI recipient-key compatibility** added in 0.19.36.
+
+### 1. One canonical command-crypto path
+
+`SEND_SMS` used to encrypt separately from `MARK_THREAD_READ` and
+`REFRESH_DEVICE_TELEMETRY`, and only `SEND_SMS` passed
+`encryptionPublicKeyFormat`. READ/REFRESH worked only by lucky format sniffing —
+two contracts for one wire format. All three now go through
+`prepareEncryptedCommand()` / `submitEncryptedCommand()`, which fetch the key,
+validate the target device, pass the explicit format and produce a safe staged
+diagnostic (`commandType`, `stage`, `code`, `format`, `decodedLength`,
+`errorName`). Diagnostics never contain the body, recipient, key bytes,
+ciphertext or plaintext payload.
+
+### 2. Pending read is not a failure
+
+`MARK_THREAD_READ` was observed for a fixed ~30 s and then reported as
+`FAILED` / "Read sync failed" while the command was still `QUEUED`. Pending is
+not failure.
+
+`ReadSyncState` is now: `IDLE`, `READ_LOCAL`, `PREPARING_COMMAND`, `QUEUED`,
+`WAITING_FOR_PHONE`, `PHONE_ACCEPTED`, `EXECUTING`, `CONFIRMED`, `FAILED`,
+`EXPIRED`. `QUEUED`, `DELIVERED_TO_AGENT`, `ACCEPTED_BY_AGENT` and `EXECUTING`
+map to waiting states and are never alarm-styled or offered as Retry. Only
+`FAILED` and `EXPIRED` are terminal. When the observation window closes, the
+command is retained so it can be re-observed on resume instead of being
+misreported.
+
+Read failures now carry `READ_*` machine codes (`READ_COMMAND_KEY_UNAVAILABLE`,
+`READ_COMMAND_CRYPTO_INVALID`, `READ_COMMAND_CREATE_FAILED`,
+`READ_COMMAND_EXPIRED`, `READ_PHONE_REJECTED`, `READ_PHONE_OFFLINE`, …) so
+diagnostics answer *why*.
+
+### 3. Structured send readiness replaces `simHelp()`
+
+`simHelp()` returned one blocking string and treated telemetry older than 180 s
+as a global blocker — including for **Phone default**, which does not depend on
+the SIM list. That produced the contradictory UI (selector showing "SIM 2 ·
+IR-MCI" next to "SIM needs attention / Reconnect the Primary phone" for a phone
+that was ONLINE).
+
+`deriveSendReadiness()` now owns composer gating, keeping four independent facts
+apart: phone presence, telemetry freshness, SIM discovery, selection mode.
+
+| mode | stale telemetry | behaviour |
+| --- | --- | --- |
+| `PHONE_DEFAULT` (`selectedSubscriptionId === null`) | any | **send allowed**; informational note only |
+| `EXPLICIT_SIM` | not `FRESH` | blocked — `EXPLICIT_SIM_TELEMETRY_STALE` |
+| `EXPLICIT_SIM` | `FRESH`, subscription gone | blocked — `EXPLICIT_SIM_MISSING`, never falls back |
+
+**Phone default omits `subscriptionId` entirely** so Android resolves the
+CURRENT system default at execution time; only an explicit selection is sent.
+Display resolution (`displayResolvedSim`, via `selectSmsSim`) is kept separate
+from command semantics (`commandSubscriptionId`) so a display fallback can never
+change what the phone is told to do. A yellow "last reported" label is not a
+fault: the SIM selector always offers "Phone default" first and marks stale
+entries as `Last reported`.
+
+### 4. Transport shutdown no longer throws
+
+`server.js` called `client.detachForShutdown()`. `client` is the
+TransportSelector Proxy, whose `get` trap falls through to the **active**
+transport — which in pull mode is the outbox, with no such method. The
+resulting `TypeError: client.detachForShutdown is not a function` aborted
+shutdown before `app.close()`, and correlated with restart cycles and the nginx
+502 windows.
+
+`TransportSelector` now defines `detachForShutdown()` and `stop()` explicitly.
+Every step is optional-safe (a missing method is skipped, not called),
+idempotent, and safe during partial initialization. `detachForShutdown()`
+detaches the Chrome client without killing an externally managed browser, and
+**stops** the outbox and direct-push client because they are in-process workers
+holding timers and sockets. `server.js` additionally guards the call so one
+failure cannot skip the remaining cleanup.
+## Composer notice classification (0.19.38)
+
+`MessageComposer` rendered **every** readiness notice inside a hard-coded
+`Alert` titled "SIM needs attention" with a "Refresh SIMs" button. Because
+`sendReadinessNotice()` returned a message for `EMPTY_BODY`, an empty draft
+produced:
+
+```
+SIM needs attention
+Write a message first.
+[ Refresh SIMs ]
+```
+
+a composer-validation state presented as a SIM fault, with a refresh action that
+could not possibly help.
+
+Notices now carry an explicit `kind` (`COMPOSER | PERMISSION | PHONE | SIM`),
+a `title`, and `offersSimRefresh`:
+
+| state | alert | Refresh SIMs |
+| --- | --- | --- |
+| `EMPTY_BODY`, `NO_RECIPIENT` | **none** (Send is simply disabled) | no |
+| `SEND_CAPABILITY_MISSING` | the composer's existing, security-worded alert | no |
+| `PHONE_NEVER_SEEN` | "Phone unavailable" | no |
+| `NO_ACTIVE_SIM`, `EXPLICIT_SIM_TELEMETRY_STALE`, `EXPLICIT_SIM_MISSING` | "SIM needs attention" | **yes** |
+
+Only a SIM problem may claim a SIM problem, and "Refresh SIMs" appears only
+where refreshing SIM data can actually help. The informational
+`PHONE_DEFAULT` freshness note is `kind: "SIM"` but `blocking: false` and never
+reads as "phone offline".
+
+`sendDisabled()` takes `noticeBlocks: boolean` instead of the legacy
+`simInstructions` string.

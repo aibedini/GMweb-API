@@ -1,54 +1,45 @@
 import { useState } from "react";
 import { Send, Loader2, Zap } from "lucide-react";
-import { api } from "@/lib/api";
+import { useSmsOptions, useSmsSend } from "@/hooks/useSmsSend";
+import { SmsOptions } from "@/components/SmsOptions";
+import { MessageTextarea } from "@/components/MessageTextarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 
 export function SendPage() {
   const [to, setTo] = useState("");
   const [text, setText] = useState("");
   const [critical, setCritical] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const options = useSmsOptions();
+  const { send, busy, status } = useSmsSend();
 
-  async function submit(e: React.FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    setResult(null);
-    try {
-      const r = await api<{ jobId: string; status: string; priority?: string }>("/send", {
-        method: "POST",
-        body: { to: to.trim(), text, priority: critical ? "critical" : "expiring" },
-      });
-      setResult({ ok: true, msg: `Queued · job ${r.jobId} · ${r.priority ?? "expiring"}` });
-      setText("");
-    } catch (err) {
-      setResult({ ok: false, msg: err instanceof Error ? err.message : "Send failed" });
-    } finally {
-      setBusy(false);
-    }
+  async function submit() {
+    if (options.problem || busy || !to.trim() || !text.trim()) return;
+    const body = text;
+    if (await send(to.trim(), body, { priority: critical ? "critical" : "expiring",
+      ...(options.android ? { subscriptionId: options.sim?.subscriptionId } : {}) }))
+      setText(current => current === body ? "" : current);
   }
 
   return (
     <Card className="max-w-xl">
       <CardHeader>
         <CardTitle>Send a message</CardTitle>
-        {result && <Badge variant={result.ok ? "success" : "destructive"}>{result.ok ? "queued" : "error"}</Badge>}
       </CardHeader>
       <CardContent>
-        <form onSubmit={submit} className="space-y-4">
+        <form onSubmit={event => { event.preventDefault(); void submit(); }} className="space-y-4">
           <div className="space-y-1">
             <Label>To</Label>
             <Input value={to} onChange={(e) => setTo(e.target.value)} placeholder="+989121234567" />
           </div>
           <div className="space-y-1">
             <Label>Text</Label>
-            <Textarea rows={5} value={text} onChange={(e) => setText(e.target.value)} placeholder="Message text" />
+            <MessageTextarea value={text} onChange={setText} onSend={() => void submit()} disabled={busy}
+              placeholder="Message text" className="w-full rounded-md border border-input bg-background p-3 text-sm" />
+            <SmsOptions text={text} options={options} />
           </div>
           <button
             type="button"
@@ -66,9 +57,9 @@ export function SendPage() {
             </span>
           </button>
 
-          {result && <p className={cn("text-xs", result.ok ? "text-emerald-400" : "text-red-400")}>{result.msg}</p>}
+          <p role="status" className="text-xs">{status}</p>
 
-          <Button type="submit" className="w-full" disabled={busy || !to || !text}>
+          <Button type="submit" className="w-full" disabled={busy || !to.trim() || !text.trim() || Boolean(options.problem)}>
             {busy ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}
             Send
           </Button>

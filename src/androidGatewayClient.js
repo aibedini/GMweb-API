@@ -57,16 +57,15 @@ class AndroidGatewayClient {
   // The phone accepts fast (202, its own persistent queue) — returning at 202
   // would report success before the radio fires, so we wait for the terminal
   // status here, streaming progress through onStage like the browser client.
-  async sendMessage({ to, text, onStage, shouldCancel }) {
+  async sendMessage({ to, text, subscriptionId, clientMessageId, requestId: logicalRequestId, onStage, shouldCancel }) {
     if (!to || !text) throw new Error("Both 'to' and 'text' are required.");
     onStage?.("phone_submitting");
-    // ponytail: worker retries submit a fresh phone request (no Idempotency-Key
-    // reuse across BullMQ attempts) — an ambiguous timeout can duplicate a send,
-    // the same exposure the Chrome path has when it times out after Enter.
+    // Reuse the durable GMweb identity on retries; the phone must enforce its
+    // Idempotency-Key contract. A legacy phone ignoring it remains unverified.
     const accepted = await this.#fetchJson(`${this.baseUrl}/send`, {
       method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ to, text })
+      headers: { ...this.headers(), ...(logicalRequestId ? { "Idempotency-Key": logicalRequestId } : {}) },
+      body: JSON.stringify({ to, text, subscriptionId, clientMessageId })
     });
     const requestId = accepted.requestId;
     if (!requestId) {

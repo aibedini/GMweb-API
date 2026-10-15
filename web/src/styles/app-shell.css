@@ -1,0 +1,285 @@
+/*
+ * Application shell: rail + top bar + content + mobile bottom navigation.
+ *
+ * §35: the shell never scrolls. Only the explicitly marked scroll regions
+ * (`.scroll-region`) do, and every flex/grid ancestor of a scroll region
+ * declares `min-height: 0` so the browser is allowed to shrink it.
+ */
+
+.app-shell {
+  height: 100dvh;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.app-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+
+.app-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.scroll-region {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* --------------------------------------------------------------- nav rail */
+
+.app-rail {
+  flex: 0 0 var(--gmweb-rail-width);
+  width: var(--gmweb-rail-width);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding-block: 10px;
+  padding-inline: 8px;
+  border-inline-end: 1px solid var(--border);
+  background: var(--surface);
+  z-index: 2;
+}
+
+.app-rail__brand {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  margin-block-end: 6px;
+  border-radius: 13px;
+  background: var(--accent);
+  color: var(--accent-foreground);
+  font-size: 15px;
+  font-weight: 750;
+  letter-spacing: -0.04em;
+  user-select: none;
+}
+
+.app-rail__nav {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+}
+
+.app-rail__spacer {
+  flex: 1 1 auto;
+  min-height: 8px;
+}
+
+.app-rail__footer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+}
+
+.app-rail__item {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 44px;
+  border-radius: 12px;
+  color: var(--muted);
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.app-rail__item:hover {
+  background: var(--default-soft);
+  color: var(--foreground);
+}
+
+.app-rail__item[aria-current="page"] {
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
+}
+
+/* Active marker: a 3px accent bar on the inline-start edge. */
+.app-rail__item[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  inset-inline-start: -8px;
+  inset-block: 10px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+}
+
+.app-rail__badge {
+  position: absolute;
+  inset-block-start: 4px;
+  inset-inline-end: 3px;
+  min-width: 16px;
+  height: 16px;
+  padding-inline: 4px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-foreground);
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------- top bar */
+
+.app-topbar {
+  flex: 0 0 auto;
+  min-height: var(--gmweb-topbar-height);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding-inline: 14px;
+  padding-block-start: env(safe-area-inset-top);
+  border-block-end: 1px solid var(--border);
+  background: var(--surface);
+  z-index: 3;
+}
+
+.app-topbar__title {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  line-height: 1.2;
+}
+
+.app-topbar__title strong {
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.app-topbar__title span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.app-topbar__actions {
+  margin-inline-start: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Custom (non-Button) Dropdown trigger for the account/app menu. HeroUI's
+   `.dropdown__trigger` supplies focus/active behaviour; sizing is ours. */
+.account-trigger {
+  display: grid;
+  place-items: center;
+  min-width: 36px;
+  min-height: 36px;
+  border-radius: 11px;
+  color: var(--muted);
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.account-trigger:hover {
+  background: var(--default-soft);
+  color: var(--foreground);
+}
+
+/* ------------------------------------------------------------------ alerts */
+
+.app-alerts {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px 0;
+}
+
+/* ------------------------------------------------------- mobile bottom nav */
+
+.mobile-nav {
+  flex: 0 0 auto;
+  display: none;
+  align-items: stretch;
+  justify-content: space-around;
+  gap: 2px;
+  min-height: var(--gmweb-mobile-nav-height);
+  padding-block-end: env(safe-area-inset-bottom);
+  padding-inline: env(safe-area-inset-left) env(safe-area-inset-right);
+  border-block-start: 1px solid var(--border);
+  background: var(--surface);
+  z-index: 4;
+}
+
+.mobile-nav__item {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+
+.mobile-nav__item[aria-current="page"] {
+  color: var(--accent);
+}
+
+.mobile-nav__item:active {
+  background: var(--default-soft);
+}
+
+.mobile-nav__badge {
+  position: absolute;
+  inset-block-start: 4px;
+  inset-inline-start: 50%;
+  transform: translateX(8px);
+  min-width: 16px;
+  height: 16px;
+  padding-inline: 4px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-foreground);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+/* --------------------------------------------------------------- utilities */
+
+.row {
+  display: flex;
+  align-items: center;
+}

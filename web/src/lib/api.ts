@@ -225,13 +225,64 @@ export async function health(): Promise<{ ok: boolean; version: string }> {
   return jsonOrThrow<{ ok: boolean; version: string }>(res);
 }
 
-export async function fetchPrimaryCommandKey(): Promise<{ deviceId: string; encryptionPublicKey: string }> {
+export type CommandPublicKeyFormat = "spki-p256" | "raw-p256";
+
+export interface PrimaryCommandKey {
+  deviceId: string;
+  encryptionPublicKey: string;
+  /** Optional for backward compatibility with older servers. */
+  encryptionPublicKeyFormat?: CommandPublicKeyFormat;
+}
+
+/** Typed failure so the composer can distinguish "missing" from "malformed". */
+export class CommandKeyError extends Error {
+  readonly code: "COMMAND_KEY_UNAVAILABLE" | "COMMAND_KEY_INVALID";
+  readonly reason: string | null;
+
+  constructor(code: "COMMAND_KEY_UNAVAILABLE" | "COMMAND_KEY_INVALID", reason: string | null = null) {
+    super(code === "COMMAND_KEY_UNAVAILABLE"
+      ? "Phone encryption key is unavailable."
+      : "Phone encryption key is invalid. Reconnect the Primary phone.");
+    this.name = "CommandKeyError";
+    this.code = code;
+    this.reason = reason;
+  }
+}
+
+export async function fetchPrimaryCommandKey(): Promise<PrimaryCommandKey> {
   const res = await fetch(`${API}/linked-device/command-key`, { credentials: "include" });
-  return jsonOrThrow(res);
+  if (res.status === 404) throw new CommandKeyError("COMMAND_KEY_UNAVAILABLE");
+  if (res.status === 409) {
+    let reason: string | null = null;
+    try { reason = (await res.json())?.reason ?? null; } catch { /* body may be empty */ }
+    throw new CommandKeyError("COMMAND_KEY_INVALID", reason);
+  }
+  return jsonOrThrow<PrimaryCommandKey>(res);
+}
+
+/** Command types a linked browser may submit (always encrypted). */
+export type EncryptedCommandType = "SEND_SMS" | "MARK_THREAD_READ" | "REFRESH_DEVICE_TELEMETRY"
+  | "FETCH_THREAD_HISTORY";
+
+/**
+ * Ask the Primary phone for one page of older provider history.
+ *
+ * The payload is encrypted to the phone; the server only sees ciphertext. The
+ * thread is addressed by the Android Telephony thread id taken from the
+ * DECRYPTED conversation payload — never guessed from a phone number, title,
+ * contact name or sender string.
+ */
+export interface FetchThreadHistoryPayload {
+  type: "FETCH_THREAD_HISTORY";
+  requestId: string;
+  conversationId: string;
+  androidThreadId: number;
+  before?: { dateMs: number; providerId: number } | null;
+  limit: number;
 }
 
 export async function createCommand(body: {
-  type: "SEND_SMS" | "MARK_THREAD_READ";
+  type: EncryptedCommandType;
   payload: string;
   idempotencyKey: string;
   targetAgentId: string;
@@ -253,14 +304,90 @@ export interface DeviceTelemetry {
   app?: { versionName?: string; versionCode?: number; uptimeMs?: number };
   device?: { manufacturer?: string; model?: string; androidVersion?: string };
   smsSubscriptions?: { available: boolean; items: Array<{
-    subscriptionId: number; slotIndex: number; displayName: string; carrierName: string;
-    isDefaultSms: boolean; isActive: boolean;
+    /**
+     * The opaque, keyed cross-system SIM identity minted by Android (`sim:v1:<32 hex>`).
+     *
+     * This is the DURABLE handle: it is stable for a given install and subscription, cannot be inverted
+     * into a platform id, and is what the sticky per-conversation preference is stored and routed by.
+     */
+    simRef?: string;
+    /**
+     * The platform subscription id, when this build still reports one.
+     *
+     * OPTIONAL ON PURPOSE. Current Android builds deliberately do NOT publish it: a subscription id is
+     * reassigned when SIMs are inserted or removed, and its tiny domain is enumerable, so it is not a
+     * safe cross-system identity. Treat it as an EPHEMERAL local handle for the in-memory composer
+     * selection within one page session — never as a value that can be persisted and trusted later, and
+     * never as the durable per-conversation preference. Anything that must survive a refresh or be sent
+     * to the phone as a routing preference uses `simRef`.
+     */
+    subscriptionId?: number;
+    slotIndex: number; displayName: string; carrierName: string;
+    isDefaultSms: boolean; isActive: boolean; sendCapable?: boolean;
   }> };
+  /**
+   * Feature negotiation only — never authorization. An older build that omits
+   * this must be treated as "remote refresh unsupported", not as broken.
+   * Contract shared with Android: `capabilities.commandTypes: string[]`.
+   */
+  capabilities?: { commandTypes?: string[] };
 }
 
 export async function fetchPrimaryTelemetry(): Promise<DeviceTelemetry | null> {
   const res = await fetch(`${API}/linked-device/telemetry`, { credentials: "include" });
   return (await jsonOrThrow<{ telemetry: DeviceTelemetry | null }>(res)).telemetry;
+}
+
+/**
+ * Phone liveness and telemetry freshness are SEPARATE facts, and only the
+ * server can decide the first one (it observes authenticated activity).
+ *
+ * Deriving presence from `telemetry.receivedAt` in the browser is what produced
+ * a false "Phone Offline · last seen 2 days ago" while the phone was polling
+ * every few seconds.
+ */
+export interface LinkedDeviceStatus {
+  phone: {
+    state: "ONLINE" | "STALE" | "OFFLINE" | "NEVER_SEEN";
+    lastActivityAt: number | null;
+    lastActivitySource: string | null;
+    ageMs: number | null;
+    /** Deprecated: prefer `runtime`. Derived, and may be a stale telemetry value. */
+    appVersion?: string | null;
+    appVersionSource?: "RUNTIME" | "TELEMETRY_FALLBACK" | null;
+    appVersionIsFallback?: boolean;
+    model: string | null;
+    manufacturer: string | null;
+    androidVersion: string | null;
+  };
+  /**
+   * Live Android runtime metadata, from the authenticated command poll. This is
+   * the CURRENT running APK — never sourced from device telemetry.
+   */
+  runtime: {
+    appVersionName: string | null;
+    appVersionCode: number | null;
+    protocolVersion: number | null;
+    commandTypes: string[];
+    receivedAt: number | null;
+    source: string | null;
+    ageMs: number | null;
+  };
+  telemetry: {
+    state: "FRESH" | "STALE" | "OLD" | "NEVER_REPORTED";
+    receivedAt: number | null;
+    ageMs: number | null;
+    clockSkewMs: number | null;
+    /** The version the last telemetry row carried. Historical, not current. */
+    reportedAppVersion?: string | null;
+  };
+  now: number;
+}
+
+export async function fetchLinkedDeviceStatus(): Promise<LinkedDeviceStatus | null> {
+  const res = await fetch(`${API}/linked-device/status`, { credentials: "include" });
+  if (!res.ok) return null;
+  return jsonOrThrow<LinkedDeviceStatus>(res);
 }
 
 export interface LinkedBrowserSession {

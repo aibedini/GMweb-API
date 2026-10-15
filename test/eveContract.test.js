@@ -61,6 +61,13 @@ test("production Fastify accepts Eve /send and denies unscoped commands", async 
   const { app, __testing } = require("../src/server");
   assert.equal(require("../src/config").apiToken, "contract-master-token");
   const { apiKeyStore, sendQueue, sendStore, rateBuckets } = __testing;
+  const linkedSessions = require("../src/linkedSessions");
+  const readToken = linkedSessions.issue("read-only-contract-browser", ["MARK_READ"]);
+  const readCookie = { cookie: `${linkedSessions.COOKIE_NAME}=${readToken}` };
+  const readKey = await app.inject({ method: "GET", url: "/api/v1/linked-device/command-key", headers: readCookie });
+  assert.equal(readKey.statusCode, 404, "MARK_READ-only session reaches the key handler; Primary absent in fixture");
+  assert.equal((await app.inject({ method: "DELETE", url: "/api/v1/linked-session", headers: readCookie })).statusCode, 200);
+  assert.equal((await app.inject({ method: "GET", url: "/api/v1/linked-device/command-key", headers: readCookie })).statusCode, 401);
   apiKeyStore.save = () => Promise.resolve();
   const key = apiKeyStore.create({
     name: "eve-runtime-contract",

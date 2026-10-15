@@ -42,3 +42,20 @@ test("telemetry ingestion requires the bound agent and matching device id", asyn
   assert.equal(ok.statusCode, 200, ok.payload);
   assert.equal(store.get("phone").sync.outboxDepth, 27);
 });
+
+test("linked telemetry uses the currently enrolled Primary, never a formerly promoted device", async t => {
+  const db = new Database(":memory:");
+  const store = new DeviceTelemetryStore(db);
+  const app = Fastify();
+  app.addHook("preHandler", (request, _reply, done) => { request.linkedDevice = { deviceId: "browser" }; done(); });
+  registerControlPlaneRoutes(app, { trustRegistry: new TrustRegistry(db), commandEngine: {}, eventStore: {},
+    accountId: "default", authorizeAgent: () => null, linkedSessions: null, deviceTelemetryStore: store,
+    agentAuthService: { getPrimaryIdentity: () => ({ device_id: "current" }) } });
+  t.after(async () => { await app.close(); db.close(); });
+  store.upsert({ deviceId: "old", timestamp: 900, smsSubscriptions: { available: true, items: [{ subscriptionId: 99 }] } }, "PRIMARY_TRUST_AGENT");
+  assert.equal((await app.inject({ url: "/api/v1/linked-device/telemetry" })).json().telemetry, null);
+  store.upsert({ deviceId: "current", timestamp: 100, smsSubscriptions: { available: true, items: [{ subscriptionId: 10 }] } }, "PRIMARY_TRUST_AGENT");
+  const result = (await app.inject({ url: "/api/v1/linked-device/telemetry" })).json().telemetry;
+  assert.equal(result.deviceId, "current");
+  assert.equal(result.smsSubscriptions.items[0].subscriptionId, 10);
+});

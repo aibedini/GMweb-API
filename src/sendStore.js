@@ -13,8 +13,8 @@ const path = require("node:path");
 //
 // WAL mode + synchronous=NORMAL gives crash-safe durability with good throughput.
 
-function dedupeKey(to, text) {
-  return crypto.createHash("sha256").update(`${to}\n${text}`).digest("hex");
+function dedupeKey(to, text, subscriptionId = null) {
+  return crypto.createHash("sha256").update(subscriptionId == null ? `${to}\n${text}` : JSON.stringify([to, text, subscriptionId])).digest("hex");
 }
 
 // Consumer notification identity (lifecycle invalidation). The allowlist,
@@ -32,6 +32,52 @@ const {
   isSupersededNotification,
   isTerminalSendStatus
 } = require("./notificationMeta");
+
+/** Maximum segments we will accept from a device for one message. */
+const MAX_CARRIER_SEGMENTS = 64;
+/** Android subscription ids are small non-negative integers. */
+const MAX_SUBSCRIPTION_ID = 1_000_000;
+
+/**
+ * Normalize the additive Android v3.4.27 carrier metadata.
+ *
+ * Every field is optional. ABSENT must stay `null` — it must never be coerced
+ * to 0/false, because `carrierResultCode: 0` (RESULT_OK) and
+ * `subscriptionId: 0` are meaningful and distinct from "not reported".
+ */
+function normalizeCarrierMeta(meta) {
+  const out = {
+    segmentIndex: null, segmentCount: null, allSegmentsDelivered: null,
+    receivedAtDevice: null, subscriptionId: null, carrierResultCode: null
+  };
+  if (!meta || typeof meta !== "object") return out;
+  const int = (value, min, max) =>
+    Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
+  out.segmentIndex = int(meta.segmentIndex, 0, MAX_CARRIER_SEGMENTS - 1);
+  out.segmentCount = int(meta.segmentCount, 1, MAX_CARRIER_SEGMENTS);
+  out.allSegmentsDelivered = typeof meta.allSegmentsDelivered === "boolean"
+    ? (meta.allSegmentsDelivered ? 1 : 0) : null;
+  // A device clock may be slightly off; allow a day of skew like occurredAt.
+  out.receivedAtDevice = Number.isSafeInteger(meta.receivedAtDevice)
+    && meta.receivedAtDevice >= 1577836800000 ? meta.receivedAtDevice : null;
+  out.subscriptionId = int(meta.subscriptionId, 0, MAX_SUBSCRIPTION_ID);
+  out.carrierResultCode = int(meta.carrierResultCode, -1_000_000, 1_000_000);
+  return out;
+}
+
+/** Only two DIFFERENT non-null values for the same event are a real conflict. */
+function carrierMetaConflicts(previous, incoming) {
+  const pairs = [
+    [previous.segment_index, incoming.segmentIndex],
+    [previous.segment_count, incoming.segmentCount],
+    [previous.all_segments_delivered, incoming.allSegmentsDelivered],
+    [previous.received_at_device, incoming.receivedAtDevice],
+    [previous.subscription_id, incoming.subscriptionId],
+    [previous.carrier_result_code, incoming.carrierResultCode]
+  ];
+  return pairs.some(([before, after]) =>
+    before !== null && before !== undefined && after !== null && Number(before) !== Number(after));
+}
 
 class SendStore {
   constructor(dbPath) {
@@ -133,6 +179,8 @@ class SendStore {
       // operation, which can set status=sent without device evidence.
       "ALTER TABLE sends ADD COLUMN physical_submitted INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE sends ADD COLUMN eve_notification_id TEXT",
+      "ALTER TABLE sends ADD COLUMN subscription_id INTEGER",
+      "ALTER TABLE sends ADD COLUMN client_message_id TEXT",
       // Which notification KINDS the recorded watermark invalidated. A renewal
       // that only revoked "volume_ended" must not silently block an "expired"
       // reminder the consumer still considers valid.
@@ -202,7 +250,16 @@ class SendStore {
         event_id TEXT PRIMARY KEY, send_id INTEGER NOT NULL,
         gateway_request_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('delivered','failed')),
         occurred_at INTEGER NOT NULL, received_at INTEGER NOT NULL,
-        device_id TEXT
+        device_id TEXT,
+        -- Android v3.4.27 additive carrier metadata. All nullable: a legacy
+        -- client that sends only the original four fields stays valid, and a
+        -- missing value must never be fabricated as 0/false.
+        segment_index INTEGER,
+        segment_count INTEGER,
+        all_segments_delivered INTEGER,
+        received_at_device INTEGER,
+        subscription_id INTEGER,
+        carrier_result_code INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_carrier_reports_send
         ON carrier_delivery_reports(send_id, occurred_at);
@@ -268,10 +325,26 @@ class SendStore {
       END;
     `);
     try { this.db.exec("ALTER TABLE carrier_delivery_reports ADD COLUMN device_id TEXT"); } catch { /* already present */ }
+    // Android v3.4.27 carrier contract, additive and nullable. Matching the
+    // existing ALTER-TABLE migration style; historical rows keep NULL.
+    for (const clause of [
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN segment_index INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN segment_count INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN all_segments_delivered INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN received_at_device INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN subscription_id INTEGER",
+      "ALTER TABLE carrier_delivery_reports ADD COLUMN carrier_result_code INTEGER"
+    ]) {
+      try { this.db.exec(clause); } catch { /* already present */ }
+    }
     this._carrierByEvent = this.db.prepare("SELECT * FROM carrier_delivery_reports WHERE event_id=?");
     this._carrierDelivered = this.db.prepare("SELECT status, occurred_at FROM carrier_delivery_reports WHERE send_id=? AND status='delivered' ORDER BY occurred_at DESC LIMIT 1");
     this._carrierLatest = this.db.prepare("SELECT status, occurred_at FROM carrier_delivery_reports WHERE send_id=? ORDER BY occurred_at DESC LIMIT 1");
-    this._insertCarrier = this.db.prepare("INSERT INTO carrier_delivery_reports (event_id,send_id,gateway_request_id,status,occurred_at,received_at,device_id) VALUES (@eventId,@sendId,@requestId,@status,@occurredAt,@receivedAt,@deviceId)");
+    this._insertCarrier = this.db.prepare(`INSERT INTO carrier_delivery_reports
+      (event_id,send_id,gateway_request_id,status,occurred_at,received_at,device_id,
+       segment_index,segment_count,all_segments_delivered,received_at_device,subscription_id,carrier_result_code)
+      VALUES (@eventId,@sendId,@requestId,@status,@occurredAt,@receivedAt,@deviceId,
+       @segmentIndex,@segmentCount,@allSegmentsDelivered,@receivedAtDevice,@subscriptionId,@carrierResultCode)`);
     this._insertCarrierCallback = this.db.prepare("INSERT INTO eve_sms_outbox (event_id,delivery_id,send_id,event_type,body,next_attempt_at,created_at) VALUES (@eventId,@eventId,@sendId,@eventType,@body,@receivedAt,@receivedAt)");
     for (const sql of [
       "CREATE INDEX IF NOT EXISTS idx_sends_service ON sends (source, service_key, status)",
@@ -293,12 +366,13 @@ class SendStore {
 
     this._insert = this.db.prepare(
       `INSERT INTO sends
-         (dedupe_key, to_number, text, key_name, priority, idempotency_key,
+         (dedupe_key, to_number, text, key_name, priority, idempotency_key, subscription_id, client_message_id,
           status, created_at, updated_at, queued_at)
        VALUES
-         (@dedupe_key, @to_number, @text, @key_name, @priority, @idempotency_key,
+         (@dedupe_key, @to_number, @text, @key_name, @priority, @idempotency_key, @subscription_id, @client_message_id,
           'queued', @now, @now, @now)`
     );
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sends_client_message ON sends(key_name, client_message_id) WHERE client_message_id IS NOT NULL");
     this._lastSent = this.db.prepare(
       `SELECT * FROM sends
        WHERE dedupe_key=? AND status IN ('sent','unverified')
@@ -472,15 +546,15 @@ class SendStore {
 
     // Claim runs in a transaction so two concurrent identical requests can't both
     // pass the de-dupe check and double-send.
-    this._claimTxn = this.db.transaction((to, text, keyName, priority, windowMs, now, notification) => {
-      const key = dedupeKey(to, text);
+    this._claimTxn = this.db.transaction((to, text, keyName, priority, windowMs, now, notification, subscriptionId) => {
+      const key = dedupeKey(to, text, subscriptionId);
       const sent = this._lastSent.get(key, now - windowMs);
       if (sent) return { action: "duplicate_suppressed", row: sent };
       const inflight = this._inflight.get(key);
       if (inflight) return { action: "duplicate_inflight", row: inflight };
       const info = this._insert.run({
         dedupe_key: key, to_number: to, text, key_name: keyName || null,
-        priority: priority || "normal", idempotency_key: null, now
+        priority: priority || "normal", idempotency_key: null, subscription_id: subscriptionId, client_message_id: null, now
       });
       const id = Number(info.lastInsertRowid);
       // Same transaction as the insert: there is no instant where a
@@ -495,9 +569,9 @@ class SendStore {
   //   { action:"new", id }                       -> caller should enqueue
   //   { action:"duplicate_suppressed", row }      -> identical sent within window
   //   { action:"duplicate_inflight", row }        -> identical already queued/active
-  claim({ to, text, keyName, priority = "normal", windowMs, notification = null }) {
+  claim({ to, text, keyName, priority = "normal", windowMs, notification = null, subscriptionId = null }) {
     return this._claimTxn(to, text, keyName, priority, windowMs, Date.now(),
-      notification ? normalizeNotificationMeta(notification) : null);
+      notification ? normalizeNotificationMeta(notification) : null, subscriptionId);
   }
 
   _notificationParams(id, meta, now) {
@@ -630,15 +704,31 @@ class SendStore {
     return this._byGatewayRequest.get(value) || null;
   }
 
-  /** Commit a carrier receipt and its Eve callback in one SQLite transaction. */
-  recordCarrierReport({ eventId, requestId, status, occurredAt, deviceId = null }, { fault = null } = {}) {
+  /**
+   * Commit a carrier receipt and its Eve callback in one SQLite transaction.
+   *
+   * `meta` carries the additive Android v3.4.27 carrier metadata. Every field is
+   * OPTIONAL and may be null: a legacy client sending only the original four
+   * fields must remain valid, and absent must never be stored as 0/false.
+   */
+  recordCarrierReport({ eventId, requestId, status, occurredAt, deviceId = null, meta = null }, { fault = null } = {}) {
     const receivedAt = Date.now();
     const safeDeviceId = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(String(deviceId || "")) ? String(deviceId) : null;
+    const optional = normalizeCarrierMeta(meta);
     const commit = this.db.transaction(() => {
       const previous = this._carrierByEvent.get(eventId);
       if (previous) {
+        // Core identity fields are immutable evidence: any disagreement is a
+        // genuine conflict.
         if (previous.gateway_request_id !== requestId || previous.status !== status ||
             Number(previous.occurred_at) !== occurredAt) {
+          this._bumpCounter.run({ name: "sms_carrier_conflicts_total", delta: 1, now: receivedAt });
+          return { error: "event_id_conflict" };
+        }
+        // Optional metadata is additive. A retry that omits it (legacy client,
+        // or a later re-send that simply carries less) is NOT a conflict. Only
+        // two DIFFERENT non-null values contradict each other.
+        if (carrierMetaConflicts(previous, optional)) {
           this._bumpCounter.run({ name: "sms_carrier_conflicts_total", delta: 1, now: receivedAt });
           return { error: "event_id_conflict" };
         }
@@ -654,7 +744,8 @@ class SendStore {
       if (recipientDigits.length >= 10 && eventId.includes(recipientDigits)) {
         return { error: "invalid_delivery_report" };
       }
-      this._insertCarrier.run({ eventId, sendId: row.id, requestId, status, occurredAt, receivedAt, deviceId: safeDeviceId });
+      this._insertCarrier.run({ eventId, sendId: row.id, requestId, status, occurredAt, receivedAt,
+        deviceId: safeDeviceId, ...optional });
       this._bumpCounter.run({ name: "sms_carrier_reports_total", delta: 1, now: receivedAt });
       this._bumpCounter.run({ name: status === "delivered" ? "sms_carrier_delivered_total" : "sms_carrier_failed_total", delta: 1, now: receivedAt });
       if (fault === "afterReportInsert") throw new Error("injected_carrier_report_failure");
@@ -677,8 +768,26 @@ class SendStore {
           trace_id: `send_${row.id}`,
           message_id: `send_${row.id}`,
           type: status === "delivered" ? "sms.delivered" : "sms.delivery_failed",
-          occurred_at: new Date(occurredAt).toISOString()
+          occurred_at: new Date(occurredAt).toISOString(),
+          // Additive carrier diagnostics EVE already understands. Snake_case,
+          // ISO-8601 UTC for timestamps. Never the phone number or SMS body.
+          gateway_request_id: requestId,
+          carrier_status: status,
+          evidence: "android_delivery_report"
         };
+        // Android's callback timestamp and GMweb's own receipt timestamp are
+        // DIFFERENT facts and must stay distinct.
+        if (optional.receivedAtDevice !== null) {
+          body.android_delivery_received_at = new Date(optional.receivedAtDevice).toISOString();
+        }
+        body.gmweb_delivery_received_at = new Date(receivedAt).toISOString();
+        if (optional.carrierResultCode !== null) body.carrier_result_code = optional.carrierResultCode;
+        if (optional.segmentIndex !== null) body.segment_index = optional.segmentIndex;
+        if (optional.segmentCount !== null) body.segment_count = optional.segmentCount;
+        if (optional.allSegmentsDelivered !== null) {
+          // Stored as 0/1 in SQLite; Eve expects a real boolean.
+          body.all_segments_delivered = Boolean(optional.allSegmentsDelivered);
+        }
         if (row.eve_notification_id && !row.eve_notification_id.includes(String(row.to_number).replace(/\D/g, "")) &&
             !/^\+?\d{10,15}$/.test(row.eve_notification_id)) body.eve_notification_id = row.eve_notification_id;
         if (safeDeviceId && !safeDeviceId.includes(recipientDigits)) body.device_id = safeDeviceId;
@@ -708,14 +817,24 @@ class SendStore {
   }
 
   carrierTimeline(sendId, limit = 50) {
-    const rows = this.db.prepare(`SELECT event_id, status, occurred_at, received_at
+    const rows = this.db.prepare(`SELECT event_id, status, occurred_at, received_at,
+      segment_index, segment_count, all_segments_delivered, received_at_device,
+      subscription_id, carrier_result_code
       FROM carrier_delivery_reports WHERE send_id=?
       ORDER BY occurred_at DESC, event_id DESC LIMIT ?`).all(Number(sendId), Math.max(1, Math.min(Number(limit) || 50, 100)));
     return rows.reverse().map((row) => ({
       eventId: row.event_id, status: row.status,
       occurredAt: new Date(Number(row.occurred_at)).toISOString(),
       receivedAt: new Date(Number(row.received_at)).toISOString(),
-      evidence: "android_delivery_report"
+      evidence: "android_delivery_report",
+      segmentIndex: row.segment_index ?? null,
+      segmentCount: row.segment_count ?? null,
+      allSegmentsDelivered: row.all_segments_delivered === null
+        || row.all_segments_delivered === undefined ? null : Boolean(row.all_segments_delivered),
+      receivedAtDevice: row.received_at_device === null || row.received_at_device === undefined
+        ? null : new Date(Number(row.received_at_device)).toISOString(),
+      subscriptionId: row.subscription_id ?? null,
+      carrierResultCode: row.carrier_result_code ?? null
     }));
   }
 
@@ -738,7 +857,9 @@ class SendStore {
     params.push(Math.max(1, Math.min(Number(limit) || 50, 100)));
     const sql = `SELECT d.event_id, d.status, d.occurred_at, d.received_at,
       d.gateway_request_id, d.device_id, s.id AS send_id, s.job_id, s.to_number,
-      s.eve_notification_id, o.state AS callback_state
+      s.eve_notification_id, o.state AS callback_state,
+      d.segment_index, d.segment_count, d.all_segments_delivered,
+      d.received_at_device, d.subscription_id, d.carrier_result_code
       FROM carrier_delivery_reports d
       JOIN sends s ON s.id=d.send_id
       LEFT JOIN eve_sms_outbox o ON o.event_id=d.event_id
@@ -756,7 +877,17 @@ class SendStore {
       status: row.status,
       occurredAt: new Date(Number(row.occurred_at)).toISOString(),
       receivedAt: new Date(Number(row.received_at)).toISOString(),
-      callbackState: row.callback_state || null
+      callbackState: row.callback_state || null,
+      // Additive Android v3.4.27 diagnostics. Null means "not reported" and is
+      // never fabricated; 0 is a real value (RESULT_OK, subscription id 0).
+      segmentIndex: row.segment_index ?? null,
+      segmentCount: row.segment_count ?? null,
+      allSegmentsDelivered: row.all_segments_delivered === null
+        || row.all_segments_delivered === undefined ? null : Boolean(row.all_segments_delivered),
+      receivedAtDevice: row.received_at_device === null || row.received_at_device === undefined
+        ? null : new Date(Number(row.received_at_device)).toISOString(),
+      subscriptionId: row.subscription_id ?? null,
+      carrierResultCode: row.carrier_result_code ?? null
     }));
   }
 
@@ -919,17 +1050,32 @@ class SendStore {
 
   // Explicit-idempotency sends still need a durable observability row. The
   // idempotency reservation happens in Redis first, so retries never call this.
-  create({ to, text, keyName, priority = "normal", idempotencyKey = null, notification = null }) {
+  create({ to, text, keyName, priority = "normal", idempotencyKey = null, notification = null, subscriptionId = null, clientMessageId = null }) {
     const now = Date.now();
     return this.db.transaction(() => {
+      if (clientMessageId) {
+        const existing = this.byClientMessageId(clientMessageId, keyName || "master");
+        if (existing) {
+          if (existing.to_number !== to || existing.text !== text || existing.subscription_id !== subscriptionId)
+            throw new Error("client_message_id_reused");
+          const conflict = new Error("client_message_already_exists");
+          conflict.row = existing;
+          throw conflict;
+        }
+      }
       const info = this._insert.run({
-        dedupe_key: dedupeKey(to, text), to_number: to, text,
-        key_name: keyName || null, priority, idempotency_key: idempotencyKey, now
+        dedupe_key: dedupeKey(to, text, subscriptionId), to_number: to, text,
+        key_name: keyName || (clientMessageId ? "master" : null), priority, idempotency_key: idempotencyKey,
+        subscription_id: subscriptionId, client_message_id: clientMessageId, now
       });
       const id = Number(info.lastInsertRowid);
       if (notification) this._setNotification.run(this._notificationParams(id, notification, now));
       return id;
     })();
+  }
+
+  byClientMessageId(clientMessageId, keyName) {
+    return this.db.prepare("SELECT * FROM sends WHERE client_message_id=? AND key_name=? ORDER BY id DESC LIMIT 1").get(clientMessageId, keyName);
   }
 
   backfillPending(job) {

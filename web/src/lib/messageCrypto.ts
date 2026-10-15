@@ -2,16 +2,12 @@ import { Aes256Gcm, CipherSuite, DhkemP256HkdfSha256, HkdfSha256 } from "@hpke/c
 import { getOrCreateDeviceKeys, loadCryptoRecord, saveCryptoRecords } from "./deviceKeys.ts";
 import { derEcdsaToP1363 } from "./trustRoot.ts";
 import type { SyncEvent } from "./api.ts";
+// Shared with commandCrypto.ts: the AEAD binding must be byte-identical on both
+// paths, so it lives in exactly one place.
+import { b64, binding, unb64 } from "./binary.ts";
+export { b64, binding, unb64 };
 
 const suite = new CipherSuite({ kem: new DhkemP256HkdfSha256(), kdf: new HkdfSha256(), aead: new Aes256Gcm() });
-const encoder = new TextEncoder();
-export function unb64(value: string): Uint8Array<ArrayBuffer> {
-  return Uint8Array.from(atob(value), c => c.charCodeAt(0));
-}
-function b64(value: Uint8Array): string { return btoa(Array.from(value, b => String.fromCharCode(b)).join("")); }
-export function binding(domain: string, ...fields: string[]): Uint8Array<ArrayBuffer> {
-  return encoder.encode([domain, ...fields.map(v => b64(encoder.encode(v)))].join("\n"));
-}
 function envelope(event: SyncEvent): Record<string, unknown> {
   const supported = event.schemaVersion === 1 && (
     (event.cryptoVersion === 1 && event.encoding === "envelope.v1") ||

@@ -189,16 +189,14 @@ class AgentAuthService {
 
     try {
       // FIX 4 (wire format): Android v1 sent the RAW uncompressed P-256 point
-      // (0x04||X||Y, 65 bytes); tests/SPKI migration use DER SPKI. Accept both:
-      // raw points are wrapped into a SubjectPublicKeyInfo before import.
+      // (0x04||X||Y, 65 bytes); the SPKI migration sends DER SubjectPublicKeyInfo.
+      // Accept both: raw points are wrapped into a SubjectPublicKeyInfo before
+      // import. Shared with the command-key path via src/publicKeyFormat.js.
+      const { toSpkiDer } = require("./publicKeyFormat");
       const keyBytes = Buffer.from(identity.signing_public_key, "base64");
       let keyObject;
       if (keyBytes.length === 65 && keyBytes[0] === 0x04) {
-        const spki = Buffer.concat([
-          Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex"),
-          keyBytes,
-        ]);
-        keyObject = crypto.createPublicKey({ key: spki, format: "der", type: "spki" });
+        keyObject = crypto.createPublicKey({ key: toSpkiDer(keyBytes), format: "der", type: "spki" });
       } else {
         keyObject = crypto.createPublicKey({ key: keyBytes, format: "der", type: "spki" });
       }

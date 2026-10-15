@@ -248,6 +248,13 @@ export interface Message {
   type: "message" | "timestamp";
   direction?: "in" | "out";
   text: string;
+  clientMessageId?: string;
+  requestId?: string;
+  status?: string;
+  stage?: string;
+  failedReason?: string;
+  carrierStatus?: { status: string };
+  submittedOnce?: boolean;
 }
 
 export interface ApiKey {

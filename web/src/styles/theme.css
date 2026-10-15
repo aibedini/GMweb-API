@@ -1,0 +1,123 @@
+/*
+ * GMweb theme.
+ *
+ * Every token below is part of the HeroUI v3.2.6 token contract declared in
+ * `@heroui/styles/dist/themes/default/variables.css`; nothing is invented.
+ * GMweb re-tints the neutral ramp slightly green and replaces HeroUI's default
+ * blue accent with a restrained emerald.
+ *
+ * Selector strategy:
+ *   - Light is scoped with `:not(.dark):not([data-theme="dark"])` so the
+ *     higher-specificity light block can never win on a dark document.
+ *   - Dark matches the class AND the data attribute that HeroUI's `useTheme`
+ *     writes (`applyThemeToDOM` sets both).
+ *   - These rules are unlayered, so they always beat HeroUI's layered theme
+ *     defaults regardless of HeroUI's internal sub-layer ordering.
+ *
+ * Foreground values are chosen so accent/success/warning surfaces keep a
+ * WCAG AA contrast ratio against their own background.
+ */
+
+/* ------------------------------------------------------------------ light */
+
+:root:not(.dark):not([data-theme="dark"]),
+[data-theme="light"] {
+  color-scheme: light;
+
+  --background: oklch(0.982 0.004 155);
+  --foreground: oklch(0.205 0.012 155);
+
+  --surface: oklch(0.995 0.002 155);
+  --surface-foreground: var(--foreground);
+  --surface-secondary: oklch(0.968 0.005 155);
+  --surface-secondary-foreground: var(--foreground);
+  --surface-tertiary: oklch(0.949 0.007 155);
+  --surface-tertiary-foreground: var(--foreground);
+
+  --overlay: oklch(1 0 0);
+  --overlay-foreground: var(--foreground);
+
+  --muted: oklch(0.505 0.018 155);
+
+  --default: oklch(0.945 0.006 155);
+  --default-foreground: var(--foreground);
+
+  /* GMweb emerald: deep enough for near-white text (≈5.5:1). */
+  --accent: oklch(0.52 0.12 160);
+  --accent-foreground: oklch(0.985 0.005 160);
+
+  --success: oklch(0.72 0.15 155);
+  --success-foreground: oklch(0.18 0.02 155);
+  --warning: oklch(0.78 0.15 78);
+  --warning-foreground: oklch(0.2 0.02 78);
+  --danger: oklch(0.6 0.21 25);
+  --danger-foreground: oklch(0.99 0.004 25);
+
+  --separator: oklch(0.918 0.007 155);
+  --border: oklch(0.894 0.009 155);
+
+  --field-background: oklch(0.962 0.006 155);
+  --field-foreground: var(--foreground);
+  --field-placeholder: var(--muted);
+
+  --focus: var(--accent);
+
+  --radius: 0.75rem;
+}
+
+/* ------------------------------------------------------------------- dark */
+
+.dark,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --background: oklch(0.145 0.008 155);
+  --foreground: oklch(0.965 0.006 155);
+
+  --surface: oklch(0.185 0.01 155);
+  --surface-foreground: var(--foreground);
+  --surface-secondary: oklch(0.216 0.011 155);
+  --surface-secondary-foreground: var(--foreground);
+  --surface-tertiary: oklch(0.246 0.012 155);
+  --surface-tertiary-foreground: var(--foreground);
+
+  --overlay: oklch(0.226 0.012 155);
+  --overlay-foreground: var(--foreground);
+
+  --muted: oklch(0.682 0.018 155);
+
+  --default: oklch(0.262 0.011 155);
+  --default-foreground: var(--foreground);
+
+  /* Fresh emerald with a near-black foreground (≈9:1) — accessible on the
+     bright dark-mode accent without going fluorescent. */
+  --accent: oklch(0.78 0.14 158);
+  --accent-foreground: oklch(0.17 0.03 158);
+
+  --success: oklch(0.74 0.15 155);
+  --success-foreground: oklch(0.16 0.02 155);
+  --warning: oklch(0.82 0.14 80);
+  --warning-foreground: oklch(0.18 0.02 80);
+  --danger: oklch(0.62 0.2 25);
+  --danger-foreground: oklch(0.99 0.004 25);
+
+  --separator: oklch(0.272 0.012 155);
+  --border: oklch(0.3 0.014 155);
+
+  --field-background: oklch(0.216 0.012 155);
+  --field-foreground: var(--foreground);
+  --field-placeholder: var(--muted);
+
+  --focus: var(--accent);
+
+  --radius: 0.75rem;
+}
+
+/* GMweb-only tokens (not part of HeroUI's contract). */
+:root {
+  --gmweb-rail-width: 72px;
+  --gmweb-topbar-height: 56px;
+  --gmweb-mobile-nav-height: 56px;
+  --gmweb-conversation-width: 320px;
+  --gmweb-details-width: 304px;
+}

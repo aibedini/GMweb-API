@@ -14,7 +14,46 @@ API_TOKEN_FILE="${API_TOKEN_FILE:-$STATE_DIR/api-token.txt}"
 DASHBOARD_PASSWORD_FILE="${DASHBOARD_PASSWORD_FILE:-$STATE_DIR/dashboard-password.txt}"
 DASHBOARD_CREDENTIALS_FILE="${DASHBOARD_CREDENTIALS_FILE:-/root/gmweb-api-dashboard-login.txt}"
 REPO_URL="${REPO_URL:-https://github.com/aibedini/GMweb-API.git}"
-UPDATE_DRAIN_TIMEOUT_SECONDS="${UPDATE_DRAIN_TIMEOUT_SECONDS:-300}"
+UPDATE_DRAIN_TIMEOUT_SECONDS="${UPDATE_DRAIN_TIMEOUT_SECONDS:-20}"
+# FAST is the production default: trust protected-main CI for tests/builds and
+# verify the committed release artifacts instead of rebuilding on the server.
+GMWEB_UPDATE_MODE="${GMWEB_UPDATE_MODE:-fast}"
+# auto: back up only when persistent schema may change. always/never override.
+GMWEB_UPDATE_BACKUP="${GMWEB_UPDATE_BACKUP:-auto}"
+# 0 = disabled. When >0 and the browser profile exceeds it, safe regenerable
+# Chrome caches are cleared AFTER a successful deploy.
+GMWEB_AUTO_CACHE_CLEANUP_MB="${GMWEB_AUTO_CACHE_CLEANUP_MB:-0}"
+
+# Shared helpers (timing, size formatting, zstd bootstrap). When installed to
+# /usr/local/bin/gmweb this resolves next to the script; the repo copy sources
+# it from scripts/.
+#
+# This script runs under `set -u`, so EVERY referenced variable must be set.
+# SCRIPT_DIR is only defined when the backup script sources the same lib, so it
+# must be defaulted here (an unbound reference aborted the whole update).
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo /nonexistent)}"
+for _lib in "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")")/gmweb-lib.sh" \
+            "$APP_DIR/scripts/gmweb-lib.sh" "${SCRIPT_DIR:-/nonexistent}/gmweb-lib.sh"; do
+  if [[ -n "${_lib:-}" && -f "$_lib" ]]; then
+    # shellcheck source=/dev/null
+    source "$_lib"
+    break
+  fi
+done
+unset _lib
+# Never let a missing helper break the updater.
+if ! declare -F gmweb_now_ms >/dev/null 2>&1; then
+  gmweb_now_ms() { echo $(( $(date +%s) * 1000 )); }
+fi
+if ! declare -F gmweb_fmt_ms >/dev/null 2>&1; then
+  gmweb_fmt_ms() { printf '%sms' "$1"; }
+fi
+if ! declare -F ensure_zstd >/dev/null 2>&1; then
+  ensure_zstd() { command -v zstd >/dev/null 2>&1; }
+fi
+if ! declare -F gmweb_disk_used_bytes >/dev/null 2>&1; then
+  gmweb_disk_used_bytes() { df -B1 --output=used / 2>/dev/null | tail -1 | tr -d ' '; }
+fi
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -173,7 +212,10 @@ rotate_api_token() {
 
   save_api_token_file "$new_token"
   echo "${C_GREEN}API token rotated and verified.${C_RESET}"
-  echo "API token: $new_token"
+  # The token is deliberately NOT echoed: it would land in the terminal, in shell
+  # history, and in any captured log. It is available to root at
+  # $API_TOKEN_FILE (mode 600).
+  echo "The new token is stored in: $API_TOKEN_FILE (root-readable, mode 600)"
   echo
   echo "${C_YELLOW}Existing dashboard sessions and API clients must use this new token.${C_RESET}"
 }
@@ -408,11 +450,71 @@ logs() {
   journalctl -u "$service" -n 120 -f
 }
 
+# Why the last queue_snapshot() failed. Written to a FILE because callers use
+# `snapshot="$(queue_snapshot)"`, which runs the function in a SUBSHELL — a plain
+# variable assignment would be discarded.
+QUEUE_ERROR_FILE="${TMPDIR:-/tmp}/gmweb-queue-error.$$"
+queue_snapshot_error() { cat "$QUEUE_ERROR_FILE" 2>/dev/null || true; }
+
+# Distinguishes "the API is not running" from "the queue is genuinely unreadable".
+#
+# THE INCIDENT THIS PREVENTS: a crash-looping API (see scripts/preflight-env.js)
+# made this fail for five hours, and the operator was told
+#   "Cannot inspect the queue; refusing a migration without send-safety checks."
+# which blamed the QUEUE for a SERVICE-START problem. The reason is now explicit,
+# and a service that is still starting is retried instead of instantly condemned.
 queue_snapshot() {
-  local api_token
+  local api_token attempt raw code body
+  : > "$QUEUE_ERROR_FILE"
   api_token="$(token || true)"
-  [[ -n "$api_token" ]] || return 1
-  curl -fsS --max-time 10 -H "Authorization: Bearer $api_token" "$API_URL/admin/queue"
+  if [[ -z "$api_token" ]]; then
+    printf 'NO_TOKEN' > "$QUEUE_ERROR_FILE"; return 1
+  fi
+  for attempt in 1 2 3 4 5; do
+    raw="$(curl -sS --max-time 10 -w $'\n%{http_code}' \
+      -H "Authorization: Bearer $api_token" "$API_URL/admin/queue" 2>/dev/null)" || raw=""
+    code="${raw##*$'\n'}"
+    body="${raw%$'\n'*}"
+    case "$code" in
+      200)
+        # A 200 that is not a queue snapshot must never be read as "queue empty":
+        # a captive proxy or a half-started service could answer instead.
+        if printf '%s' "$body" | grep -q '"counts"'; then
+          printf '%s' "$body"; return 0
+        fi
+        printf 'BAD_RESPONSE' > "$QUEUE_ERROR_FILE"; return 1 ;;
+      401|403) printf 'UNAUTHORIZED' > "$QUEUE_ERROR_FILE"; return 1 ;;
+      ''|000) : ;;  # not listening yet — worth retrying
+      *) printf 'HTTP_%s' "$code" > "$QUEUE_ERROR_FILE"; return 1 ;;
+    esac
+    sleep 1
+  done
+  printf 'API_UNREACHABLE' > "$QUEUE_ERROR_FILE"
+  return 1
+}
+
+# Operator-facing explanation. Never says "queue" when the real problem is that
+# the service is down.
+queue_snapshot_diagnosis() {
+  case "$(queue_snapshot_error)" in
+    API_UNREACHABLE)
+      echo "The API is not reachable at $API_URL, so the send queue cannot be inspected."
+      echo "This is a SERVICE problem, not a queue problem."
+      echo "  systemctl status $API_SERVICE"
+      echo "  journalctl -u $API_SERVICE -n 50 --no-pager" ;;
+    NO_TOKEN)
+      echo "No API_TOKEN could be read from $APP_DIR/.env, so the queue cannot be inspected." ;;
+    UNAUTHORIZED)
+      echo "The API rejected API_TOKEN from $APP_DIR/.env (401/403): the .env token and the"
+      echo "token the service loaded disagree." ;;
+    BAD_RESPONSE)
+      echo "The API answered 200 but not with a queue snapshot (no \"counts\" field)."
+      echo "A proxy or a partially started service may be answering on $API_URL." ;;
+    HTTP_*)
+      echo "The API returned $(queue_snapshot_error) for $API_URL/admin/queue." ;;
+    *)
+      echo "The send queue could not be inspected." ;;
+  esac
 }
 
 queue_snapshot_value() {
@@ -424,7 +526,11 @@ queue_snapshot_value() {
       try {
         const data = JSON.parse(raw);
         if (process.argv[1] === "paused") process.stdout.write(data.paused ? "true" : "false");
-        else process.stdout.write(String(Number(data.counts?.active || 0)));
+        // `waiting` previously had NO branch and silently returned the ACTIVE
+        // count, so every drain progress line reported the wrong number.
+        else if (process.argv[1] === "waiting") process.stdout.write(String(Number(data.counts?.waiting || 0)));
+        else if (process.argv[1] === "active") process.stdout.write(String(Number(data.counts?.active || 0)));
+        else process.exit(1);
       } catch { process.exit(1); }
     });
   ' "$expression"
@@ -441,27 +547,37 @@ queue_control() {
 }
 
 pause_and_drain_queue() {
-  local snapshot active waited=0
+  local snapshot active waiting last_active="" waited=0
   snapshot="$(queue_snapshot)" || {
     echo "${C_RED}Cannot inspect the queue; refusing a migration without send-safety checks.${C_RESET}"
+    queue_snapshot_diagnosis
+    echo "${C_YELLOW}Nothing was promoted and the live version is unchanged.${C_RESET}"
     return 1
   }
   UPDATE_QUEUE_WAS_PAUSED="$(printf '%s' "$snapshot" | queue_snapshot_value paused)"
   queue_control pause
-  echo "Queue paused; waiting for the active send to finish..."
-
+  echo "Queue paused"
+  local last_active=""
   while (( waited < UPDATE_DRAIN_TIMEOUT_SECONDS )); do
     snapshot="$(queue_snapshot)" || return 1
     active="$(printf '%s' "$snapshot" | queue_snapshot_value active)"
+    waiting="$(printf '%s' "$snapshot" | queue_snapshot_value waiting)"
     if (( active == 0 )); then
-      echo "${C_GREEN}Queue drained safely.${C_RESET}"
+      echo "${C_GREEN}Queue drained safely in ${waited}s.${C_RESET}"
       return 0
     fi
-    sleep 2
-    waited=$((waited + 2))
+    # Only the ACTIVE send must finish; WAITING jobs stay durable.
+    if (( waited == 0 )) || [[ "$active:$waiting" != "$last_active" ]]; then
+      echo "Drain ${waited}s — active=$active waiting=$waiting"
+      last_active="$active:$waiting"
+    fi
+    sleep 1
+    waited=$((waited + 1))
   done
 
-  echo "${C_RED}Active send did not finish within ${UPDATE_DRAIN_TIMEOUT_SECONDS}s; migration cancelled.${C_RESET}"
+  echo "${C_YELLOW}Update postponed: active send still running after ${UPDATE_DRAIN_TIMEOUT_SECONDS}s.${C_RESET}"
+  echo "The live checkout is unchanged. Re-run 'gmweb update' when the send completes,"
+  echo "or raise UPDATE_DRAIN_TIMEOUT_SECONDS if you intend to wait longer."
   [[ "$UPDATE_QUEUE_WAS_PAUSED" == "true" ]] || queue_control resume || true
   return 1
 }
@@ -534,17 +650,30 @@ adopt_git_checkout() {
   # EVERY gate runs BEFORE the queue is drained and before the live install is
   # replaced. This migration used to activate a candidate whose PWA and console
   # had never been built, because it only ran --omit=dev + check.
-  if ! run_as_app "cd '$stage' && GMWEB_BUILD_REVISION='$CANDIDATE_SHA' npm ci --include=dev" ||
-     ! run_as_app "cd '$stage' && npm run check" ||
-     ! run_as_app "cd '$stage' && npm test" ||
-     ! run_as_app "cd '$stage' && npm run build:frontends" ||
-     ! run_as_app "cd '$stage' && node scripts/verify-frontend-artifacts.mjs" ||
-     ! bash -n "$stage/scripts/gmweb-menu.sh"; then
+  #
+  # Honours GMWEB_UPDATE_MODE: the one-time archive->Git conversion is still a
+  # production update, so it must not turn the server into the CI machine either.
+  local migration_ok=1
+  if [[ "$GMWEB_UPDATE_MODE" == "full" ]]; then
+    run_as_app "cd '$stage' && GMWEB_BUILD_REVISION='$CANDIDATE_SHA' npm ci --include=dev" &&
+      run_as_app "cd '$stage' && npm run check" &&
+      run_as_app "cd '$stage' && npm test" &&
+      run_as_app "cd '$stage' && npm run build:frontends" || migration_ok=0
+  else
+    # FAST: committed frontend artifacts are the release artifact; verify them.
+    run_as_app "cd '$stage' && npm run check" || migration_ok=0
+  fi
+  if (( migration_ok == 1 )); then
+    run_as_app "cd '$stage' && node scripts/verify-frontend-artifacts.mjs" &&
+      bash -n "$stage/scripts/gmweb-menu.sh" &&
+      bash -n "$stage/scripts/gmweb-backup.sh" || migration_ok=0
+  fi
+  if (( migration_ok == 0 )); then
     echo "${C_RED}The new release failed validation; the existing installation was not changed and the queue was never paused.${C_RESET}"
     case "$stage" in "$app_parent"/.gmweb-update-stage-*) rm -rf -- "$stage" ;; esac
     return 1
   fi
-  echo "${C_GREEN}Staged release ${CANDIDATE_SHA:0:7} validated (build + tests + artifact verification).${C_RESET}"
+  echo "${C_GREEN}Staged release ${CANDIDATE_SHA:0:7} validated ($([[ "$GMWEB_UPDATE_MODE" == "full" ]] && echo "build + tests" || echo "syntax") + artifact verification).${C_RESET}"
 
   data_kb="$(du -sk "$APP_DIR/data" | awk '{print $1}')"
   free_kb="$(df -Pk "$app_parent" | awk 'NR==2 {print $4}')"
@@ -679,6 +808,8 @@ update_app() {
 
   # ── 2. Stage and validate OUTSIDE the live checkout ───────────────────────
   # INVARIANT A: an unvalidated candidate can never become the live checkout.
+  # Prune only our OWN stale staging dirs (older than 2h) while holding the lock.
+  find /tmp -maxdepth 1 -type d -name 'gmweb-update.*' -mmin +120 -exec rm -rf -- {} + 2>/dev/null || true
   stage="$(mktemp -d /tmp/gmweb-update.XXXXXXXX)"
   cleanup_stage() { case "$stage" in /tmp/gmweb-update.*) rm -rf -- "$stage" ;; esac; }
   trap cleanup_stage RETURN
@@ -693,33 +824,106 @@ update_app() {
   chmod 755 "$stage"
   chown -R "$APP_USER:$APP_USER" "$stage"
 
-  echo "Validating the candidate in $stage (live service keeps running, queue NOT paused yet)..."
-  if ! run_as_app "cd '$stage' && GMWEB_BUILD_REVISION='$candidate' npm ci --include=dev && npm run check && npm test && npm run build:frontends"; then
-    echo "${C_RED}Candidate validation FAILED. The live checkout is unchanged at ${old_sha:0:7} and was not restarted.${C_RESET}"
-    return 1
+  echo "Validating the candidate in $stage (mode=${GMWEB_UPDATE_MODE}, queue NOT paused yet)..."
+  local t_check t_artifact
+  t_check="$(gmweb_now_ms)"
+  if [[ "$GMWEB_UPDATE_MODE" == "full" ]]; then
+    # Explicit exhaustive validation for troubleshooting/emergency. This is NOT
+    # the production default: the server must not act as the CI machine.
+    if ! run_as_app "cd '$stage' && GMWEB_BUILD_REVISION='$candidate' npm ci --include=dev && npm run check && npm test && npm run build:frontends"; then
+      echo "${C_RED}Candidate validation FAILED (full mode). The live checkout is unchanged at ${old_sha:0:7} and was not restarted.${C_RESET}"
+      return 1
+    fi
+  else
+    # FAST: `npm run check` is `node --check` syntax validation and needs no
+    # dependency tree. Committed frontend artifacts ARE the release artifact, so
+    # we verify them instead of rebuilding. Expensive validation is trusted to
+    # protected-main CI, which already ran on this exact commit.
+    if ! run_as_app "cd '$stage' && npm run check"; then
+      echo "${C_RED}Candidate syntax check FAILED. The live checkout is unchanged at ${old_sha:0:7} and was not restarted.${C_RESET}"
+      return 1
+    fi
   fi
+  t_check=$(( $(gmweb_now_ms) - t_check ))
+  t_artifact="$(gmweb_now_ms)"
   if ! run_as_app "cd '$stage' && node scripts/verify-frontend-artifacts.mjs"; then
     echo "${C_RED}Candidate front-ends do not match its package version. No promotion.${C_RESET}"
     return 1
   fi
-  if ! bash -n "$stage/scripts/gmweb-menu.sh"; then
-    echo "${C_RED}Candidate manager script has a syntax error. No promotion.${C_RESET}"
+  t_artifact=$(( $(gmweb_now_ms) - t_artifact ))
+  # ENVIRONMENT CONTRACT — the gate that would have prevented the 5-hour outage.
+  #
+  # A candidate whose startup guard cannot be satisfied by the CURRENT environment
+  # must be rejected BEFORE the live service is ever restarted. Previously the new
+  # code was promoted, refused to start (ADR-007 HTTPS origin), and systemd
+  # crash-looped it 2581 times; every later update then failed at the queue gate
+  # with a message that blamed the queue.
+  if ! node "$stage/scripts/preflight-env.js" --app-dir "$APP_DIR" --service "$API_SERVICE"; then
+    echo "${C_RED}Candidate is not compatible with the current environment. No promotion and no restart.${C_RESET}"
     return 1
   fi
+  for script in gmweb-menu.sh gmweb-backup.sh gmweb-lib.sh; do
+    if [[ -f "$stage/scripts/$script" ]] && ! bash -n "$stage/scripts/$script"; then
+      echo "${C_RED}Candidate scripts/$script has a syntax error. No promotion.${C_RESET}"
+      return 1
+    fi
+  done
   stage_version="$(node -e "console.log(require('$stage/package.json').version)")"
   echo "${C_GREEN}Candidate $candidate_short ($stage_version) validated.${C_RESET}"
 
-  # ── 3. Pause/drain only now (minutes of building already happened) ────────
+  # ── 2b. Decide what is actually needed ────────────────────────────────────
+  local changed root_deps_changed=0 backup_decision backup_reason
+  changed="$(git -C "$APP_DIR" diff --name-only "$old_sha" "$candidate" 2>/dev/null || true)"
+
+  # Reinstalling ~90 MB of node_modules for a source-only change is waste.
+  if printf '%s\n' "$changed" | grep -qxE 'package\.json|package-lock\.json|npm-shrinkwrap\.json'; then
+    root_deps_changed=1
+  fi
+
+  # A DB backup is ~1 GB and only matters when persistent data can change.
+  local schema_old schema_new
+  schema_old="$(git -C "$APP_DIR" show "$old_sha:schema/data-schema.version" 2>/dev/null | tr -d '[:space:]' || true)"
+  schema_new="$(git -C "$APP_DIR" show "$candidate:schema/data-schema.version" 2>/dev/null | tr -d '[:space:]' || true)"
+  case "$GMWEB_UPDATE_BACKUP" in
+    always) backup_decision=yes; backup_reason="GMWEB_UPDATE_BACKUP=always" ;;
+    never)  backup_decision=no;  backup_reason="GMWEB_UPDATE_BACKUP=never" ;;
+    *)
+      if [[ -z "$schema_old" ]]; then
+        backup_decision=yes; backup_reason="old release has no schema marker"
+      elif [[ "$schema_old" != "$schema_new" ]]; then
+        backup_decision=yes; backup_reason="data-schema.version $schema_old -> ${schema_new:-absent}"
+      elif printf '%s\n' "$changed" | grep -qE '(^|/)([^/]*(store|Store|database|Database|migration|schema)[^/]*)$'; then
+        # Conservative: a persistence/schema-looking file changed without a
+        # marker bump is treated as risky. A false-positive backup is cheap; a
+        # missed migration is not.
+        backup_decision=yes; backup_reason="persistence-sensitive file changed without a schema bump"
+      else
+        backup_decision=no; backup_reason="no data-schema change"
+      fi
+      ;;
+  esac
+  [[ "$backup_decision" == "no" && "$GMWEB_UPDATE_BACKUP" == "never" ]] && \
+    echo "${C_YELLOW}Warning: GMWEB_UPDATE_BACKUP=never — skipping a required backup.${C_RESET}"
+
+  # ── 3. Pause/drain only now ───────────────────────────────────────────────
   if ! pause_and_drain_queue; then
     echo "${C_RED}Could not pause/drain the queue; nothing was promoted.${C_RESET}"
     return 1
   fi
 
   # ── 4. Promote the exact validated revision and artifacts ─────────────────
-  # Pre-promotion safety state. The backup helper needs ROOT (it writes to
-  # /root/gmweb-backup), so it must NOT go through run_as_app.
-  if ! bash "$APP_DIR/scripts/gmweb-backup.sh" >/dev/null 2>&1; then
-    echo "${C_YELLOW}Pre-promotion backup did not complete; continuing (an update never touches the ledger).${C_RESET}"
+  local t_backup=0
+  if [[ "$backup_decision" == "yes" ]]; then
+    echo "Backing up mutable state (${backup_reason})..."
+    t_backup="$(gmweb_now_ms)"
+    # The backup helper needs ROOT (it writes to /root/gmweb-backup), so it must
+    # NOT go through run_as_app.
+    if ! bash "$APP_DIR/scripts/gmweb-backup.sh"; then
+      echo "${C_YELLOW}Pre-promotion backup did not complete; continuing (an update never touches the ledger).${C_RESET}"
+    fi
+    t_backup=$(( $(gmweb_now_ms) - t_backup ))
+  else
+    echo "DB backup: SKIPPED — ${backup_reason}"
   fi
 
   local promoted=0
@@ -729,8 +933,16 @@ update_app() {
       rsync -a --delete "$stage/public/$app/" "$APP_DIR/public/$app/"
     done
     chown -R "$APP_USER:$APP_USER" "$APP_DIR/public"
-    if run_as_app "cd '$APP_DIR' && npm ci --omit=dev" &&
-       bash -n "$APP_DIR/scripts/gmweb-menu.sh" &&
+    local t_deps=0
+    if (( root_deps_changed == 1 )); then
+      echo "Production dependencies changed — installing"
+      t_deps="$(gmweb_now_ms)"
+      run_as_app "cd '$APP_DIR' && npm ci --omit=dev" || true
+      t_deps=$(( $(gmweb_now_ms) - t_deps ))
+    else
+      echo "Dependencies unchanged — skipped npm ci"
+    fi
+    if bash -n "$APP_DIR/scripts/gmweb-menu.sh" &&
        install -m 0755 "$APP_DIR/scripts/gmweb-menu.sh" /usr/local/bin/gmweb; then
       promoted=1
     fi

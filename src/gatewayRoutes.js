@@ -23,6 +23,8 @@ function registerGatewayRoutes(app, deps = {}) {
     sendStore,
     checkDeviceKey,
     revocation = null,
+    onCarrierReport = null,
+    onSendProgress = null,
     isPullModeActive = () => true,
     checkRateLimit = null,
     diagnosticLimit = { max: 120, windowMs: 60000 },
@@ -185,6 +187,8 @@ function registerGatewayRoutes(app, deps = {}) {
                 requestId: { type: "string" },
                 to: { type: "string" },
                 text: { type: "string" },
+                subscriptionId: { type: "integer", minimum: 0 },
+                clientMessageId: { type: "string", maxLength: 128 },
                 priority: { type: "string" },
                 meta: {
                   type: ["object", "null"],
@@ -347,7 +351,16 @@ function registerGatewayRoutes(app, deps = {}) {
           eventId: { type: "string", pattern: "^dlr_[A-Za-z0-9_-]{1,192}$", maxLength: 196 },
           requestId: { type: "string", minLength: 1, maxLength: MAX_REQUEST_ID },
           status: { type: "string", enum: ["delivered", "failed"] },
-          occurredAt: { type: "integer", minimum: 1577836800000 }
+          occurredAt: { type: "integer", minimum: 1577836800000 },
+          // ── Android v3.4.27 additive carrier metadata (all OPTIONAL) ──────
+          // A legacy client sending only the four fields above stays valid.
+          eventType: { type: "string", enum: ["carrier_delivery"] },
+          segmentIndex: { type: "integer", minimum: 0, maximum: 63 },
+          segmentCount: { type: "integer", minimum: 1, maximum: 64 },
+          allSegmentsDelivered: { type: "boolean" },
+          receivedAtDevice: { type: "integer", minimum: 1577836800000 },
+          subscriptionId: { type: "integer", minimum: 0, maximum: 1000000 },
+          carrierResultCode: { type: "integer", minimum: -1000000, maximum: 1000000 }
         }
       },
       response: {
@@ -366,19 +379,84 @@ function registerGatewayRoutes(app, deps = {}) {
   }, async (request, reply) => {
     if (!checkDeviceKey(request)) return unauthorized(request, reply);
     if (!enforceRateLimit(request, reply, "gateway-delivery-report", operationalLimit)) return;
-    const { eventId, requestId, status, occurredAt } = request.body || {};
+    const { eventId, requestId, status, occurredAt, eventType,
+      segmentIndex, segmentCount, allSegmentsDelivered, receivedAtDevice,
+      subscriptionId, carrierResultCode } = request.body || {};
     if (!/^dlr_[A-Za-z0-9_-]{1,192}$/.test(eventId || "") ||
         !/^[\x21-\x7e]{1,120}$/.test(requestId || "") ||
         !["delivered", "failed"].includes(status) ||
         !Number.isSafeInteger(occurredAt) || occurredAt > Date.now() + 86_400_000) {
       return reply.code(400).send({ error: "invalid_delivery_report" });
     }
+    // Additive v3.4.27 validation. Absent stays absent; only a SUPPLIED invalid
+    // value is rejected, so an older client is never penalised.
+    const hasSegments = segmentIndex !== undefined || segmentCount !== undefined;
+    if (eventType !== undefined && eventType !== "carrier_delivery") {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (segmentIndex !== undefined && (!Number.isSafeInteger(segmentIndex) || segmentIndex < 0)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (segmentCount !== undefined && (!Number.isSafeInteger(segmentCount) || segmentCount < 1)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (hasSegments && segmentIndex !== undefined && segmentCount !== undefined &&
+        segmentIndex >= segmentCount) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (allSegmentsDelivered !== undefined && typeof allSegmentsDelivered !== "boolean") {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (receivedAtDevice !== undefined &&
+        (!Number.isSafeInteger(receivedAtDevice) || receivedAtDevice < 1577836800000 ||
+         receivedAtDevice > Date.now() + 86_400_000)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (subscriptionId !== undefined && (!Number.isSafeInteger(subscriptionId) || subscriptionId < 0)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
+    if (carrierResultCode !== undefined && !Number.isSafeInteger(carrierResultCode)) {
+      return reply.code(400).send({ error: "invalid_delivery_report" });
+    }
     const result = sendStore.recordCarrierReport({ eventId, requestId, status, occurredAt,
-      deviceId: request.headers["x-gateway-device-id"] || null });
+      deviceId: request.headers["x-gateway-device-id"] || null,
+      // `undefined` stays `undefined` here; sendStore's normalizer turns only
+      // genuinely-supplied values into numbers, so 0 is preserved as 0.
+      meta: { segmentIndex, segmentCount, allSegmentsDelivered, receivedAtDevice,
+        subscriptionId, carrierResultCode } });
     if (result.error) return reply.code(result.error === "unknown_request_id" ? 404 : result.error === "invalid_delivery_report" ? 400 : 409).send({ error: result.error });
+    if (!result.duplicate) {
+      const row = sendStore.byGatewayRequest(requestId);
+      if (row) onCarrierReport?.({ type: status === "delivered" ? "sms.delivered" : "sms.delivery_failed",
+        requestId: sendStore.requestId(row.id), jobId: row.job_id,
+        at: new Date(occurredAt).toISOString() });
+    }
     log?.info?.({ event: result.duplicate ? "carrier_dlr_duplicate" : status === "delivered" ? "carrier_delivered" : "carrier_failed",
       gatewayRequestId: requestId, status, duplicate: result.duplicate }, "carrier report recorded");
     return { ...result, eventId, requestId };
+  });
+
+  app.post("/gateway/progress", {
+    schema: { summary: "Android reports modem submission in progress", tags: ["Gateway"],
+      body: { type: "object", required: ["requestId", "stage"], properties: {
+        requestId: { type: "string", minLength: 1, maxLength: MAX_REQUEST_ID },
+        stage: { type: "string", enum: ["submitting"] },
+        clientMessageId: { type: "string", maxLength: 128 }
+      } } },
+  }, async (request, reply) => {
+    if (!checkDeviceKey(request)) return unauthorized(request, reply);
+    if (!enforceRateLimit(request, reply, "gateway-progress", operationalLimit)) return;
+    if (!isPullModeActive()) return reply.code(409).send({ error: "pull_mode_inactive" });
+    const row = sendStore?.byGatewayRequest(request.body.requestId);
+    if (!row) return reply.code(404).send({ error: "unknown_request_id" });
+    if (!["active", "queued"].includes(row.status) || row.revoked_at)
+      return reply.code(409).send({ error: "task_not_active" });
+    if (request.body.clientMessageId && row.client_message_id !== request.body.clientMessageId)
+      return reply.code(409).send({ error: "client_message_id_mismatch" });
+    sendStore.markStage(row.job_id, "phone_submitting");
+    onSendProgress?.({ type: "send_stage", requestId: sendStore.requestId(row.id), jobId: row.job_id,
+      stage: "phone_submitting", at: new Date().toISOString() });
+    return { ok: true, requestId: sendStore.requestId(row.id), stage: "submitting" };
   });
 
   app.post("/gateway/ack", {

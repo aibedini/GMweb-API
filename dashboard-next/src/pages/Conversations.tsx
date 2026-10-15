@@ -4,6 +4,10 @@ import { api } from "@/lib/api";
 import type { Conversation, Message } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { MessageTextarea } from "@/components/MessageTextarea";
+import { SmsOptions } from "@/components/SmsOptions";
+import { useSmsOptions, useSmsSend } from "@/hooks/useSmsSend";
+import { sendStatusLabel } from "../../../shared/smsStatus";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 const AVATAR_COLORS = [
@@ -43,10 +47,17 @@ export function ConversationsPage() {
   const [loadingMsg, setLoadingMsg] = useState(false);
   const [filter, setFilter] = useState("");
   const [draft, setDraft] = useState("");
-  const [sending, setSending] = useState(false);
+  const options = useSmsOptions();
+  const { send: submitSms, busy: sending, status, outgoing } = useSmsSend(undefined, event => {
+    if (event.type === "connected" || event.type === "conversation_changed" || event.type.startsWith("send_") || event.type.startsWith("sms.")) {
+      void load(limit);
+      if (open) void loadThread(open, true);
+    }
+  });
   const [limit, setLimit] = useState(40);
   const [hasMore, setHasMore] = useState(true);
   const threadEnd = useRef<HTMLDivElement>(null);
+  const openHref = useRef<string | null>(null);
 
   // Infinite scroll: each load asks the API for `n` rows (the GM sidebar is
   // lazy-loaded server-side). Scrolling near the bottom bumps `n` and refetches,
@@ -81,25 +92,20 @@ export function ConversationsPage() {
         method: "POST",
         body: { href: c.href, limit: 80 },
       });
-      setMessages(d.messages);
+      if (openHref.current === c.href) setMessages(d.messages);
     } finally {
-      setLoadingMsg(false);
+      if (openHref.current === c.href) setLoadingMsg(false);
     }
   }
 
   function openConv(c: Conversation) {
+    openHref.current = c.href;
     setOpen(c);
     setMessages([]);
     setDraft("");
     loadThread(c);
   }
 
-  // live-refresh the open thread every 6s (like GM web syncing)
-  useEffect(() => {
-    if (!open) return;
-    const t = setInterval(() => loadThread(open, true), 6000);
-    return () => clearInterval(t);
-  }, [open]);
 
   useEffect(() => {
     threadEnd.current?.scrollIntoView({ behavior: "smooth" });
@@ -107,18 +113,11 @@ export function ConversationsPage() {
 
   const number = open ? dialNumber(open.title) : null;
 
-  async function send(e: React.FormEvent) {
-    e.preventDefault();
-    if (!number || !draft.trim()) return;
-    setSending(true);
-    try {
-      await api("/send", { method: "POST", body: { to: number, text: draft.trim() } });
-      setDraft("");
-      // optimistic — refetch shortly after the worker sends
-      setTimeout(() => open && loadThread(open, true), 2500);
-    } finally {
-      setSending(false);
-    }
+  async function send() {
+    if (!number || !draft.trim() || sending || options.problem) return;
+    const body = draft;
+    if (await submitSms(number, body, options.android ? { subscriptionId: options.sim?.subscriptionId } : {}))
+      setDraft(current => current === body ? "" : current);
   }
 
   const shown = list.filter((c) => c.title.toLowerCase().includes(filter.toLowerCase()));
@@ -201,7 +200,7 @@ export function ConversationsPage() {
           <>
             {/* thread header */}
             <div className="flex items-center gap-3 border-b border-border px-4 py-3">
-              <button className="text-muted-foreground md:hidden" onClick={() => setOpen(null)}>←</button>
+              <button className="text-muted-foreground md:hidden" onClick={() => { openHref.current = null; setOpen(null); }}>←</button>
               <Avatar title={open.title} size="h-9 w-9" />
               <div className="min-w-0">
                 <div className="truncate text-sm font-semibold">{open.title}</div>
@@ -227,6 +226,7 @@ export function ConversationsPage() {
                       )}
                     >
                       {m.text}
+                      {m.status && <span className="mt-1 block text-[11px] opacity-80">{sendStatusLabel({ ...m, status: m.status })}</span>}
                     </div>
                   </div>
                 )
@@ -234,20 +234,24 @@ export function ConversationsPage() {
               {!loadingMsg && messages.length === 0 && (
                 <div className="py-10 text-center text-sm text-muted-foreground">No messages.</div>
               )}
+              {options.android && outgoing?.to === number && !messages.some(message => message.clientMessageId === outgoing.clientMessageId) &&
+                <div className="flex justify-end"><div dir="auto" className="max-w-[78%] whitespace-pre-wrap break-words rounded-2xl bg-primary px-3.5 py-2 text-sm text-primary-foreground">
+                  {outgoing.text}<span className="mt-1 block text-[11px] opacity-80">{status}</span>
+                </div></div>}
               <div ref={threadEnd} />
             </div>
 
             {/* composer */}
-            <form onSubmit={send} className="flex items-center gap-2 border-t border-border p-3">
-              <input
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
+            <form onSubmit={event => { event.preventDefault(); void send(); }} className="space-y-2 border-t border-border p-3">
+              <MessageTextarea
+                value={draft} onChange={setDraft} onSend={() => void send()}
                 placeholder={number ? "Text message" : "Can only reply to numeric conversations"}
                 disabled={!number || sending}
-                dir="auto"
-                className="h-10 flex-1 rounded-full border border-input bg-background/60 px-4 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                className="w-full rounded-xl border border-input bg-background/60 px-4 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
               />
-              <Button type="submit" size="icon" className="rounded-full" disabled={!number || !draft.trim() || sending}>
+              <SmsOptions text={draft} options={options} />
+              <p role="status" className="text-xs">{status}</p>
+              <Button type="submit" size="icon" className="rounded-full" aria-label="Send message" disabled={!number || !draft.trim() || sending || Boolean(options.problem)}>
                 {sending ? <Loader2 className="size-4 animate-spin" /> : <SendIcon className="size-4" />}
               </Button>
             </form>

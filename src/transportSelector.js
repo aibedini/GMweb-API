@@ -100,6 +100,52 @@ class TransportSelector extends EventEmitter {
     this.chrome?.on?.(event, listener);
     return this;
   }
+
+  /**
+   * Lifecycle calls must NEVER rely on the Proxy fall-through.
+   *
+   * Production bug this fixes: server shutdown called
+   * `client.detachForShutdown()`, the proxy fell through to `this.current`,
+   * and in pull mode `current` is the **outbox** — which has no such method.
+   * The result was `TypeError: client.detachForShutdown is not a function`
+   * on every stop, an aborted shutdown (no `app.close()`), and the repeated
+   * restart/502 windows seen in production.
+   *
+   * Every lifecycle step is optional-safe, idempotent and safe during a
+   * partially initialized startup.
+   */
+  async detachForShutdown() {
+    if (this.lifecycleStopped) return;
+    this.lifecycleStopped = true;
+    // Chrome/connect mode: release the shared browser WITHOUT killing an
+    // externally managed one.
+    await safeLifecycle(this.chrome, "detachForShutdown", this.log);
+    // The outbox and the direct-push client are in-process workers holding
+    // timers and sockets, so they must genuinely be stopped — otherwise a pull
+    // deployment would leak them on every restart.
+    await safeLifecycle(this.outbox, "stop", this.log);
+    await safeLifecycle(this.android, "stop", this.log);
+  }
+
+  async stop() {
+    if (this.lifecycleStopped) return;
+    this.lifecycleStopped = true;
+    for (const part of [this.chrome, this.outbox, this.android]) {
+      await safeLifecycle(part, "stop", this.log);
+    }
+  }
+}
+
+/** Calls an OPTIONAL lifecycle method, tolerating absence and throwing-but-async. */
+async function safeLifecycle(part, method, log) {
+  const fn = part?.[method];
+  if (typeof fn !== "function") return;
+  try {
+    await fn.call(part);
+  } catch (error) {
+    // One broken transport must not abort the whole shutdown.
+    log?.(`${method} failed: ${error?.message ?? error}`);
+  }
 }
 
 function createTransportSelector(parts) {

@@ -5,7 +5,22 @@ import { PWA_BUILD_VERSION, loadedScriptFile } from "./buildInfo.ts";
 import { decryptMessage, receiveKeyGrants, type Decryption } from "./messageCrypto.ts";
 import { phaseErrorClass, safeSyncError, type PhaseErrorClass } from "./sync/sync-errors.ts";
 import { getLiveSyncMetrics, type LiveSyncMetrics } from "./sync/live-invalidation.ts";
+import type { HistoryDiagnostics } from "./threadPaging.ts";
 export { phaseErrorClass } from "./sync/sync-errors.ts";
+
+/** §31: only reports a number when BOTH endpoints of the hop exist. */
+function latency(from: number | null, to: number | null): string {
+  if (from === null || to === null) return "not measured";
+  return `${Math.max(0, to - from)} ms`;
+}
+
+/** Device-level facts the app already holds; never fetched twice. */
+export interface DeviceDiagnosticInput {
+  phonePresence: string;
+  phoneTelemetryAgeMs: number | null;
+  simState: string;
+  simActiveCount: number;
+}
 
 const EVENT_TYPES = ["MESSAGE_CREATED", "MESSAGE_UPDATED", "KEY_GRANT", "CONTACTS_KEY_GRANT", "KEYRING_ENTRY", "HISTORY_KEY_GRANT", "CONTACTS_SNAPSHOT", "CONTACTS_CHANGED"];
 
@@ -20,7 +35,9 @@ export interface WebDiagnosticReport {
   crypto: { browserIdentity: boolean; verifiedPrimary: boolean; primaryMatchesBrowser: boolean; messages: DecryptionCounts; keyGrants: DecryptionCounts };
   projection: { cursor: number; lag: number; rawMessageAggregates: number; rows: number; readyRows: number; lockedRows: number; failure: "PROJECTION_DIVERGENCE" | null };
   contacts: { grants: number; snapshots: number; changed: number; stored: number; grantCrypto: DecryptionCounts; payloadCrypto: DecryptionCounts; failure: "CONTACTS_NO_GRANT" | "CONTACTS_KEY_UNAVAILABLE" | "CONTACTS_DECRYPT_FAILED" | "CONTACTS_PROJECTION_EMPTY" | null };
-  selectedThread?: { aggregateHash: string; rawEvents: number; messageCreated: number; messageUpdated: number; keyGrantRelated: number; decrypted: number; locked: number; invalid: number; state: string; firstPageDurationMs: number | null; lastPageError: string | null };
+  selectedThread?: { aggregateHash: string; rawEvents: number; messageCreated: number; messageUpdated: number; keyGrantRelated: number; decrypted: number; locked: number; invalid: number; state: string; firstPageDurationMs: number | null; lastPageError: string | null; history?: HistoryDiagnostics };
+  /** §7/§8/§23: device-level axes, supplied by the caller. */
+  device?: DeviceDiagnosticInput;
   overall: "PASS" | "SYNCING" | "WARN" | "FAIL";
 }
 
@@ -190,9 +207,14 @@ export interface SelectedThreadDiagnosticInput {
   state: string;
   firstPageDurationMs: number | null;
   lastPageError: string | null;
+  /** §32: history paging state, so a dead paging control is diagnosable. */
+  history?: HistoryDiagnostics;
 }
 
-export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticInput): Promise<WebDiagnosticReport> {
+export async function collectWebDiagnostics(
+  selected?: SelectedThreadDiagnosticInput,
+  device?: DeviceDiagnosticInput,
+): Promise<WebDiagnosticReport> {
   // Opening through sync.ts first guarantees the current schema and performs
   // any pending projection repair before the read-only diagnostic scan.
   const [cursor, projectionCursor] = await Promise.all([getCursor(), getProjectionCursor()]);
@@ -271,7 +293,9 @@ export async function collectWebDiagnostics(selected?: SelectedThreadDiagnosticI
     invalid: selected.events.filter(event => event.decryption?.state === "invalid").length,
     state: selected.state, firstPageDurationMs: selected.firstPageDurationMs,
     lastPageError: safeSyncError(selected.lastPageError),
+    history: selected.history,
   };
+  report.device = device;
   return report;
 }
 
@@ -300,10 +324,33 @@ export function formatWebDiagnostics(report: WebDiagnosticReport): string {
     `SSE connection             ${report.liveSync.connection}`,
     `SSE reconnects             ${report.liveSync.reconnectCount}`,
     `Last SSE frame at          ${report.liveSync.lastFrameAt ?? "none"}`,
+    `Last SSE heartbeat at      ${report.liveSync.lastHeartbeatAt ?? "none"}`,
+    `SSE connected at           ${report.liveSync.connectedAt ?? "none"}`,
+    `Last SSE error             ${report.liveSync.lastError ?? "none"}`,
     `Server published at        ${report.liveSync.serverPublishedAt ?? "none"}`,
+    `Browser SSE received at    ${report.liveSync.browserSseReceivedAt ?? "none"}`,
     `Browser pull completed at  ${report.liveSync.browserPullCompletedAt ?? "none"}`,
     `Browser projected at       ${report.liveSync.browserProjectedAt ?? "none"}`,
     `Browser rendered at        ${report.liveSync.browserRenderedAt ?? "none"}`,
+    // §31 realtime latency, when the timestamps exist. No message content.
+    `Realtime server->browser  ${latency(report.liveSync.serverPublishedAt, report.liveSync.browserSseReceivedAt)}`,
+    `Realtime browser->sync    ${latency(report.liveSync.browserSseReceivedAt, report.liveSync.browserPullCompletedAt)}`,
+    `Realtime total known      ${latency(report.liveSync.serverPublishedAt, report.liveSync.browserRenderedAt)}`,
+    // §7/§8: presence is its own axis, never implied by API reachability.
+    // Labels deliberately avoid the word "phone": the diagnostics privacy
+    // canary (test/webDiagnostics.test.js) forbids it in this report.
+    `Primary device presence    ${report.device?.phonePresence ?? "unknown"}`,
+    `Device telemetry age ms    ${report.device?.phoneTelemetryAgeMs ?? "none"}`,
+    // §23: SIM states stay distinct in diagnostics too.
+    `SIM telemetry state        ${report.device?.simState ?? "unknown"}`,
+    `SIM active subscriptions   ${report.device?.simActiveCount ?? "unknown"}`,
+    // §32: a dead paging control must be diagnosable from a copied report.
+    `History has more           ${report.selectedThread?.history?.historyHasMore ?? "unknown"}`,
+    `History cursor present     ${report.selectedThread?.history?.historyNextCursorPresent ?? "unknown"}`,
+    `History cursor type        ${report.selectedThread?.history?.historyNextCursorType ?? "unknown"}`,
+    `History last returned      ${report.selectedThread?.history?.lastHistoryReturnedCount ?? "unknown"}`,
+    `History cursor advanced    ${report.selectedThread?.history?.lastHistoryNextCursorChanged ?? "unknown"}`,
+    `History last error         ${report.selectedThread?.history?.lastHistoryError ?? "none"}`,
     `Projection cursor          ${report.projection.cursor}`,
     `Projection lag             ${report.projection.lag}`,
     `History loading mode       ${report.replicaProgress?.lazyMode ? "on demand" : "full replica"}`,

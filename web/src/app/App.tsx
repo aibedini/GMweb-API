@@ -1,46 +1,73 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Card, CardContent, Chip, Spinner, Tab, TabList, TabPanel, Tabs } from "@heroui/react";
+import { Alert, Button, useMediaQuery } from "@heroui/react";
 import { syncVisibleInbox, loadContactsOnDemand, listRecentEvents, listAggregateEventsPage, listContacts, listConversations, listChangedConversationHeads, getCursor, getBrowserSyncStatus, resetLocal, subscribeSyncAvailable, subscribeKeyMaintenance, type BrowserSyncStatus, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, reconcileConversationHead, type ConversationProjection } from "../lib/inbox";
-import { createCommand, fetchCommand, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, type DeviceTelemetry, type LinkedBrowserSession, type TrustSnapshot } from "../lib/api";
-import { encryptCommand } from "../lib/commandCrypto";
-import { getStoredDeviceIdentity } from "../lib/deviceKeys";
+import { createCommand, fetchCommand, fetchLinkedDeviceStatus, fetchLinkedSessions, fetchPrimaryCommandKey, fetchPrimaryTelemetry, fetchTrustSnapshot, health, CommandKeyError, type DeviceTelemetry, type EncryptedCommandType, type LinkedBrowserSession, type LinkedDeviceStatus, type PrimaryCommandKey, type TrustSnapshot } from "../lib/api";
+import { encryptCommand, CommandCryptoError } from "../lib/commandCrypto";
+import { getStoredDeviceIdentity, wipeDeviceKeys } from "../lib/deviceKeys";
 import { clearPendingSend, loadPendingSends, savePendingSend, type PendingEncryptedSend } from "../lib/commandOutbox";
 import { completeLinkedSession } from "../lib/pairing";
 import { PairingScreen } from "../screens/PairingScreen";
 import { PWA_BUILD_VERSION, loadedScriptFile } from "../lib/buildInfo";
-import { collectWebDiagnostics, formatWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnostics";
-import { useVirtualizer } from "@tanstack/react-virtual";
-import { calculateSmsSegments } from "../lib/smsSegments";
+import { collectWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnostics";
+import { MessageComposer } from "./MessageComposer";
+import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActions";
+import { senderSearchText } from "../lib/senderIdentity";
+import { resolveSendStatus, detectSendDivergence, diagnosticHash } from "../lib/sendEvidence";
+import { defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
+import { supportsPreferredSim } from "../lib/simRefresh";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
-import { mergeThreadEvents, assertHistoryProgress } from "../lib/threadHistory";
-import { selectSmsSim } from "../lib/simSelection";
+import { mergeThreadEvents, assertHistoryProgress, assertHistoryMergeProgress } from "../lib/threadHistory";
+import {
+  EMPTY_HISTORY_TRACE, IDLE_HISTORY, canLoadOlder, describeHistory, historyErrorMessage,
+  isValidCursor, pagingFailed, pagingFromPage, pagingLoading, showLoadOlder,
+  type HistoryPagingState, type HistoryTrace,
+} from "../lib/threadPaging";
+import { selectSmsSim, resolveSimRouting } from "../lib/simSelection";
+import { describeSimTelemetry } from "../lib/simTelemetry";
+import { authoritativePhonePresence, authoritativeTelemetryFreshness } from "../lib/deviceState";
+import {
+  IDLE_SIM_REFRESH, REFRESH_COMMAND_TYPE, REFRESH_TIMEOUT_MS, TELEMETRY_POLL_INTERVAL_MS,
+  TELEMETRY_POLL_TIMEOUT_MS, planSimRefresh, refreshFailureForCommand, simRefreshCopy,
+  simRefreshInFlight, telemetryAdvanced, type SimRefreshState,
+} from "../lib/simRefresh";
+import {
+  IDLE_READ, readFailureCode, readStateForCommand, readStateKey, readSyncLabel, readSyncRetryable,
+  readSyncTone, shouldAutoRead, type ReadSyncState,
+} from "../lib/readSync";
+import { androidError } from "../../../shared/smsStatus";
 
-type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug";
-type ThreadState = "IDLE" | "LOADING" | "READY" | "LOCKED" | "EMPTY" | "FAILED";
+import { AppShell } from "./components/AppShell";
+import { AppSidebar } from "./components/AppSidebar";
+import { AppTopbar } from "./components/AppTopbar";
+import { MobileBottomNav } from "./components/MobileBottomNav";
+import { ConversationPane } from "./components/ConversationPane";
+import { ConversationDetails } from "./components/ConversationDetails";
+import { ConversationDetailsDrawer } from "./components/ConversationDetailsDrawer";
+import { DeliveryDetailsDrawer } from "./components/DeliveryDetailsDrawer";
+import { LinkedBrowsersDrawer } from "./components/LinkedBrowsersDrawer";
+import { NewMessageView } from "./components/NewMessageView";
+import { ThreadHeader } from "./components/ThreadHeader";
+import { ThreadPane } from "./components/ThreadPane";
+import { ThreadPlaceholder } from "./components/ThreadEmptyState";
+import { SyncAlerts } from "./components/SyncAlerts";
+import { DESTINATION_TITLES } from "./components/destinations";
+import { withDaySeparators } from "./components/format";
+import type { ConnectionState, ConversationFilter, ThreadItem, ThreadState } from "./components/types";
+import { ContactsView } from "./views/ContactsView";
+import { DeviceView } from "./views/DeviceView";
+import { DiagnosticsView } from "./views/DiagnosticsView";
+import { SecurityView } from "./views/SecurityView";
+import { SettingsView } from "./views/SettingsView";
 
-function shortId(value: string | null | undefined) {
-  return value ? `${value.slice(0, 8)}…` : "—";
-}
+type TabKey = "inbox" | "contacts" | "connection" | "security" | "debug" | "settings";
 
-function formatTime(value: number) {
-  const date = new Date(value);
-  const today = new Date();
-  return date.toDateString() === today.toDateString()
-    ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : date.toLocaleDateString([], { month: "short", day: "numeric" });
-}
-
+/** Existing projection status mapping — unchanged (§15/§23). */
 function messageStatus(status: number): string {
   if (status === 64) return "failed";
   if (status === 32) return "queued";
   if (status === 0) return "delivered";
   return "sent";
-}
-
-function Avatar({ title }: { title: string }) {
-  const initials = title.replace(/^Conversation\s+/, "").slice(0, 2).toUpperCase();
-  return <div className="avatar" aria-hidden="true">{initials}</div>;
 }
 
 async function ensurePendingCommandId(pending: PendingEncryptedSend): Promise<string> {
@@ -55,10 +82,13 @@ export default function App() {
   const [tab, setTab] = useState<TabKey>("inbox");
   const [events, setEvents] = useState<StoredEvent[]>([]);
   const [threadEvents, setThreadEvents] = useState<StoredEvent[]>([]);
-  const [threadNext, setThreadNext] = useState<number | string | undefined>();
-  const [threadHasMore, setThreadHasMore] = useState(false);
-  const [loadingOlderThread, setLoadingOlderThread] = useState(false);
-  const [historyError, setHistoryError] = useState<string | null>(null);
+  // History paging is ONE value so `hasMore` and its cursor can never drift
+  // apart (see lib/threadPaging.ts for the invariant).
+  const [history, setHistory] = useState<HistoryPagingState>(IDLE_HISTORY);
+  const historyTrace = useRef<HistoryTrace>(EMPTY_HISTORY_TRACE);
+  // Counts clicks on a visible Load Older control that could not proceed, so a
+  // dead control is observable in diagnostics instead of vanishing silently.
+  const LOAD_OLDER_VIOLATIONS = useRef(0);
   const historyLoadingRef = useRef(false);
   const [cursor, setCursor] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -68,9 +98,17 @@ export default function App() {
   const [version, setVersion] = useState("");
   const [online, setOnline] = useState(navigator.onLine);
   const [authed, setAuthed] = useState<boolean | null>(null);
+  const [browserDeviceId, setBrowserDeviceId] = useState<string | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
+  const [readSync, setReadSync] = useState<ReadSyncState>(IDLE_READ);
+  const [readRetry, setReadRetry] = useState(0);
+  const [readConfirmations, setReadConfirmations] = useState<Record<string, number>>({});
+  const [viewedReadThrough, setViewedReadThrough] = useState<Record<string, number>>({});
+  const [pageVisible, setPageVisible] = useState(document.visibilityState === "visible");
   const [bootstrapState, setBootstrapState] = useState<string | null>(null);
   const [syncStatus, setSyncStatus] = useState<BrowserSyncStatus>(getBrowserSyncStatus());
   const [threadState, setThreadState] = useState<ThreadState>("IDLE");
+  const [readyThreadId, setReadyThreadId] = useState<string | null>(null);
   const [threadFirstPageMs, setThreadFirstPageMs] = useState<number | null>(null);
   const [threadError, setThreadError] = useState<string | null>(null);
   const [threadReload, setThreadReload] = useState(0);
@@ -78,11 +116,16 @@ export default function App() {
   const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const [conversationFilter, setConversationFilter] = useState<ConversationFilter>("all");
   const [composeOpen, setComposeOpen] = useState(false);
   const [recipientSearch, setRecipientSearch] = useState("");
   const [telemetry, setTelemetry] = useState<DeviceTelemetry | null>(null);
+  const [deviceStatus, setDeviceStatus] = useState<LinkedDeviceStatus | null>(null);
   const [linkedBrowsers, setLinkedBrowsers] = useState<LinkedBrowserSession[]>([]);
   const [showLinkedBrowsers, setShowLinkedBrowsers] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const [deliveryOpen, setDeliveryOpen] = useState(false);
+  const [deliveryItem, setDeliveryItem] = useState<ThreadItem | null>(null);
   const [contacts, setContacts] = useState<StoredContact[]>([]);
   const [contactSearch, setContactSearch] = useState("");
   const [contactsBusy, setContactsBusy] = useState(false);
@@ -99,24 +142,144 @@ export default function App() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [capabilities, setCapabilities] = useState<string[]>([]);
   const [draft, setDraft] = useState("");
-  const [selectedSubscriptionId, setSelectedSubscriptionId] = useState<number | null>(() => {
-    const saved = window.localStorage.getItem("gmweb:selected-sms-subscription");
-    return saved !== null && Number.isSafeInteger(Number(saved)) ? Number(saved) : null;
+  // The chosen line, as a SELECTION KEY (see `simKey`), not a subscription id.
+  //
+  // `simRef` is the durable, opaque identity Android can resolve at send time; a subscription id is
+  // reassigned when SIMs move and is no longer published by current builds, so it cannot be the key a
+  // choice is stored under.
+  const [selectedSimKey, setSelectedSimKey] = useState<string | null>(() => {
+    const saved = window.localStorage.getItem("gmweb:selected-sms-sim-key");
+    return saved && saved.length > 0 ? saved : null;
   });
   const [composeRecipient, setComposeRecipient] = useState("");
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
-  const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; recipient: string; at: number } | null>(null);
-  const markReadSent = useRef(new Set<string>());
+  const [sending, setSending] = useState(false);
+  const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; recipient: string; at: number; failure?: string } | null>(null);
+  const sendEvidence = useRef<{ clientMessageId: string; status: string } | null>(null);
+  // Carrier/message evidence for the in-flight send as REACTIVE state. The ref
+  // above is not reactive, so a footer that only read it could keep showing the
+  // low-truth command view after true delivery evidence had arrived.
+  const [evidenceStatus, setEvidenceStatus] = useState<number | null>(null);
+  // A preferred-SIM change is PENDING between the user's choice and Android's
+  // confirmation. While pending, sending in that conversation is blocked so no
+  // message can ever be submitted from the PREVIOUS line.
+  //
+  // The setter is intentionally NOT taken yet: the SET_CONVERSATION_PREFERRED_SIM
+  // command workflow that would drive this transition is NOT implemented, so
+  // nothing may pretend a change is pending. The routing guard below already
+  // honours the flag the moment that workflow lands.
+  const [simPreferencePending] = useState(false);
+  // Privacy-safe divergence record: carrier evidence settled while the command
+  // lifecycle still claimed the send was queued/in flight.
+  const sendDivergenceSeen = useRef<string | null>(null);
+  // Safe crypto failure diagnostics (code/stage/format/errorName) — never key
+  // material, ciphertext, message body or recipient.
+  const cryptoDiagnostic = useRef<string | null>(null);
+  // Machine-readable reason for the last encrypted-command failure, set by the
+  // canonical prepare helper so every command type reports the same way.
+  const commandFailureCode = useRef<string | null>(null);
+  const observedSendStatus = (id: string) => sendEvidence.current?.clientMessageId === id ? sendEvidence.current.status : null;
+  // Keyed by `conversationId:readThroughSequence`: at most ONE live
+  // MARK_THREAD_READ observation per read-through, so switching threads
+  // rapidly cannot produce a command storm.
+  const readInFlight = useRef(new Set<string>());
+  // Durable read commands awaiting phone confirmation, keyed the same way, so
+  // a still-pending read can be re-observed on resume instead of being lost.
+  const pendingReadCommands = useRef(new Map<string, { commandId: string; state: string }>());
+  const contactsLoading = useRef(false);
   const lastThreadSelection = useRef<string | null>(null);
   const recoveringSend = useRef(false);
-  const conversationScrollRef = useRef<HTMLDivElement>(null);
   const loadingOlderRef = useRef(false);
   const hasLoadedOlderConversations = useRef(false);
   const messageScrollRef = useRef<HTMLDivElement>(null);
+  const conversationSearchRef = useRef<HTMLInputElement>(null);
   const scriptFile = useMemo(() => loadedScriptFile(), []);
+
+  // Layout capability only. Visual breakpoints live in CSS (§38) so the shell
+  // never depends on a JS breakpoint for correctness.
+  const isWideViewport = useMediaQuery("(min-width: 768px)", { defaultValue: true });
+
+  const [simRefresh, setSimRefresh] = useState<SimRefreshState>(IDLE_SIM_REFRESH);
+
   const refreshTelemetry = () => void fetchPrimaryTelemetry().then(value => {
     setTelemetry(value);
   }).catch(() => setTelemetry(null));
+
+  // Guard against double-click enqueueing two concurrent refresh commands.
+  const simRefreshInFlightRef = useRef(false);
+
+  /**
+   * "Refresh SIMs" asks the PHONE to re-report device telemetry through the
+   * existing durable encrypted command channel, then PROVES the server stored a
+   * newer report. Re-reading the telemetry we already have is not a refresh.
+   */
+  const refreshSims = async () => {
+    if (simRefreshInFlightRef.current) return;
+    simRefreshInFlightRef.current = true;
+    setSimRefresh({ state: "REQUESTING" });
+    try {
+      // STEP 1/2: authoritative liveness + current telemetry.
+      const [status, current] = await Promise.all([
+        fetchLinkedDeviceStatus().catch(() => null),
+        fetchPrimaryTelemetry().catch(() => null),
+      ]);
+      if (status) setDeviceStatus(status);
+      if (current) setTelemetry(current);
+
+      // STEP 3/4: one testable decision — can the phone receive it, and does
+      // it advertise the capability?
+      const plan = planSimRefresh(status, current);
+      if (plan.action === "OFFLINE") { setSimRefresh({ state: "PHONE_OFFLINE" }); return; }
+      if (plan.action === "UNSUPPORTED") { setSimRefresh({ state: "UNSUPPORTED" }); return; }
+      if (plan.presence === "STALE") setSimRefresh({ state: "PHONE_STALE" });
+      const baselineReceivedAt = plan.baselineReceivedAt;
+
+      // STEP 5: durable encrypted command on the existing channel.
+      const command = await submitEncryptedCommand(REFRESH_COMMAND_TYPE, {
+        reason: "SIM_REFRESH", requestedAt: Date.now(),
+      });
+      setSimRefresh({ state: "WAITING_FOR_PHONE", commandId: command.commandId });
+
+      // STEP 6: observe the real lifecycle. CREATE/ACCEPTED/COMPLETED are NOT
+      // proof of a refresh on their own.
+      const deadline = Date.now() + REFRESH_TIMEOUT_MS;
+      let completed = false;
+      while (Date.now() < deadline) {
+        await new Promise(resolve => window.setTimeout(resolve, 500));
+        const view = await fetchCommand(command.commandId);
+        const failure = refreshFailureForCommand(view?.state);
+        if (failure === "EXPIRED") { setSimRefresh({ state: "TIMED_OUT" }); return; }
+        if (failure) {
+          setSimRefresh({ state: "COMMAND_FAILED", errorCode: view?.result || view?.state || "FAILED" });
+          return;
+        }
+        if (view?.state === "COMPLETED") { completed = true; break; }
+      }
+      if (!completed) { setSimRefresh({ state: "TIMED_OUT" }); return; }
+
+      // STEP 7: COMPLETED only means Android says its POST succeeded. Prove a
+      // NEW server receipt time actually exists.
+      setSimRefresh({ state: "WAITING_FOR_TELEMETRY", commandId: command.commandId, baselineReceivedAt });
+      const pollDeadline = Date.now() + TELEMETRY_POLL_TIMEOUT_MS;
+      while (Date.now() < pollDeadline) {
+        const next = await fetchPrimaryTelemetry().catch(() => null);
+        if (telemetryAdvanced(baselineReceivedAt, next)) {
+          // STEP 8: only now is this an update.
+          setTelemetry(next);
+          setSimRefresh({ state: "UPDATED", receivedAt: Number(next?.receivedAt) });
+          return;
+        }
+        await new Promise(resolve => window.setTimeout(resolve, TELEMETRY_POLL_INTERVAL_MS));
+      }
+      setSimRefresh({ state: "TIMED_OUT" });
+    } catch (cause) {
+      setSimRefresh({ state: "COMMAND_FAILED", errorCode: readFailureCode(cause) });
+    } finally {
+      // STEP 9: presence/freshness must be current either way.
+      void fetchLinkedDeviceStatus().then(setDeviceStatus).catch(() => {});
+      simRefreshInFlightRef.current = false;
+    }
+  };
 
   const refresh = async () => {
     const [nextCursor, nextEvents, nextTrust, nextContacts] = await Promise.all([
@@ -187,7 +350,8 @@ export default function App() {
   };
 
   const refreshContacts = async () => {
-    if (contactsBusy) return;
+    if (contactsLoading.current || !capabilities.includes("CONTACTS_READ")) return;
+    contactsLoading.current = true;
     setContactsBusy(true);
     setContactsError(null);
     setContactsProgress(0);
@@ -197,14 +361,14 @@ export default function App() {
       setContactsCheckedAt(Date.now());
     } catch (cause) {
       setContactsError(cause instanceof Error ? cause.message : String(cause));
-    } finally { setContactsBusy(false); }
+    } finally { contactsLoading.current = false; setContactsBusy(false); }
   };
 
   useEffect(() => {
     void health().then((value) => setVersion(value.version)).catch(() => setVersion("unreachable"));
     void fetch("/api/v1/linked-session", { credentials: "include" })
       .then((response) => response.json())
-      .then((session) => { setAuthed(session.authenticated === true); setCapabilities(session.capabilities || []); })
+      .then((session) => { setAuthed(session.authenticated === true); setCapabilities(session.capabilities || []); setBrowserDeviceId(session.deviceId || null); })
       .catch(() => setAuthed(false));
   }, []);
 
@@ -231,6 +395,11 @@ export default function App() {
       });
     refreshTelemetry();
     const telemetryTimer = window.setInterval(refreshTelemetry, 60_000);
+    // Presence transitions on a 90s/180s scale, so a 20s poll is responsive
+    // without hammering the API.
+    const refreshDeviceStatus = () => void fetchLinkedDeviceStatus().then(setDeviceStatus).catch(() => {});
+    refreshDeviceStatus();
+    const deviceStatusTimer = window.setInterval(refreshDeviceStatus, 20_000);
     const refreshLinkedBrowsers = () => void fetchLinkedSessions().then(setLinkedBrowsers).catch(() => setLinkedBrowsers([]));
     refreshLinkedBrowsers();
     const linkedBrowsersTimer = window.setInterval(refreshLinkedBrowsers, 60_000);
@@ -247,6 +416,7 @@ export default function App() {
       setSyncStatus(getBrowserSyncStatus());
       setThreadReload(value => value + 1);
       void (ids?.length ? refreshChanged(ids) : refresh());
+      void refreshContacts();
     }, () => {
       setAuthed(false);
       setEvents([]);
@@ -260,19 +430,44 @@ export default function App() {
       setSyncStatus(getBrowserSyncStatus());
       setThreadReload(value => value + 1);
       void refresh();
+      void refreshContacts();
     });
-    return () => { window.clearInterval(telemetryTimer); window.clearInterval(linkedBrowsersTimer); window.clearInterval(visibleTimer); unsubscribe(); unsubscribeKeys(); };
+    return () => { window.clearInterval(telemetryTimer); window.clearInterval(deviceStatusTimer); window.clearInterval(linkedBrowsersTimer); window.clearInterval(visibleTimer); unsubscribe(); unsubscribeKeys(); };
   }, [authed]);
 
   useEffect(() => {
-    if (!authed || tab !== "contacts") return;
+    if (!authed || !capabilities.includes("CONTACTS_READ")) return;
     void refreshContacts();
-  }, [authed, tab]);
+  }, [authed, capabilities, tab]);
 
-  const contactNames = useMemo(() => new Map(contacts.map(contact => [contact.normalizedPhone, contact.displayName])), [contacts]);
+  useEffect(() => {
+    const visible = () => setPageVisible(document.visibilityState === "visible");
+    document.addEventListener("visibilitychange", visible);
+    return () => document.removeEventListener("visibilitychange", visible);
+  }, []);
+
+  // §31: Ctrl/Cmd+K focuses conversation search. Never hijacks a text field,
+  // textarea, select or contenteditable region.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "k" || !(event.ctrlKey || event.metaKey)) return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) return;
+      if (tab !== "inbox") return;
+      event.preventDefault();
+      conversationSearchRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [tab]);
+
+  const contactNames = useMemo(() => new Map(contacts.map(contact => [phoneKey(contact.normalizedPhone), contact.displayName])), [contacts]);
   const conversations = useMemo(() => reconcileConversationHead(conversationPage, selected,
-    selected ? messagesForAggregate(threadEvents, selected).at(-1) : undefined),
-    [conversationPage, selected, threadEvents]);
+    selected ? messagesForAggregate(threadEvents, selected).at(-1) : undefined)
+      .map(row => contactTitle(applyReadConfirmation(row, Math.max(readConfirmations[row.aggregateId] ?? -1,
+        viewedReadThrough[row.aggregateId] ?? -1)), contactNames)),
+    [conversationPage, selected, threadEvents, contactNames, readConfirmations, viewedReadThrough]);
   const filteredContacts = useMemo(() => {
     const query = contactSearch.trim().toLocaleLowerCase();
     return query ? contacts.filter(contact => `${contact.displayName}\n${contact.normalizedPhone}`.toLocaleLowerCase().includes(query)) : contacts;
@@ -291,18 +486,30 @@ export default function App() {
     setRecipientSearch("");
     setTab("inbox");
   };
+  const unreadTotal = useMemo(() => conversations.reduce((sum, item) => sum + item.unreadCount, 0), [conversations]);
   const filteredConversations = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
-    if (!query) return conversations;
-    return conversations.filter((item) => `${item.title}\n${item.preview}`.toLocaleLowerCase().includes(query));
-  }, [conversations, search]);
+    const base = conversationFilter === "unread"
+      ? conversations.filter(item => item.unreadCount > 0)
+      : conversations;
+    if (!query) return base;
+    // Search must find branded senders. The conversation title may be a contact
+    // name or a placeholder, so the RAW sender address is searched too:
+    // "parsian" / "PARSIANBANK" / "Resalat" / "Ssh3" must all match.
+    return base.filter((item) => [...senderSearchText(item.subtitle || item.title),
+      ...`${item.title}\n${item.preview}`.toLocaleLowerCase()].join("\n").includes(query));
+  }, [conversations, search, conversationFilter]);
 
   useEffect(() => {
-    if (window.innerWidth > 720 && !selected && !composeRecipient && !composeOpen && conversations[0]) setSelected(conversations[0].aggregateId);
-  }, [conversations, selected, composeRecipient, composeOpen]);
+    if (isWideViewport && !selected && !composeRecipient && !composeOpen && conversations[0]) setSelected(conversations[0].aggregateId);
+  }, [conversations, selected, composeRecipient, composeOpen, isWideViewport]);
 
   const selectedConversation = conversations.find((item) => item.aggregateId === selected) ||
+    (selectedConversationCache?.aggregateId === selected ? contactTitle(selectedConversationCache, contactNames) : null);
+  const rawSelectedConversation = conversationPage.find(row => row.aggregateId === selected) ||
     (selectedConversationCache?.aggregateId === selected ? selectedConversationCache : null);
+  const needsPhoneRead = Boolean(selectedConversation && rawSelectedConversation && !rawSelectedConversation.read &&
+    (readConfirmations[selectedConversation.aggregateId] ?? -1) < selectedConversation.lastSequence);
   useEffect(() => {
     const changed = () => setOnline(navigator.onLine);
     window.addEventListener("online", changed);
@@ -316,10 +523,14 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     setThreadError(null);
-    if (lastThreadSelection.current !== selected) setHistoryError(null);
+    if (lastThreadSelection.current !== selected) {
+      setHistory(IDLE_HISTORY);
+      historyTrace.current = EMPTY_HISTORY_TRACE;
+    }
     if (!selected || !authed) {
       lastThreadSelection.current = null;
       setThreadEvents([]);
+      setHistory(IDLE_HISTORY);
       setThreadState("IDLE");
       return () => { cancelled = true; };
     }
@@ -332,17 +543,19 @@ export default function App() {
     const startedAt = performance.now();
     void listAggregateEventsPage(selected, { limit: 10 }).then(page => {
       if (cancelled) return;
-      if (page.hasMore && page.next === undefined) {
-        setHistoryError("PAGINATION_STALLED");
-        setThreadHasMore(false);
-      }
+      setReadyThreadId(selected);
       setThreadFirstPageMs(Math.round(performance.now() - startedAt));
       if (sameThread && !stickToBottom) {
+        // Merging newer arrivals must NOT rewind the user's deep history
+        // cursor, but the invariant still has to hold afterwards.
         setThreadEvents(previous => mergeThreadEvents(previous, page.items));
+        setHistory(previous => (!previous.hasMore || isValidCursor(previous.next)
+          ? previous
+          : pagingFromPage({ hasMore: false })));
       } else {
         setThreadEvents(page.items);
-        setThreadHasMore(page.hasMore && page.next !== undefined);
-        setThreadNext(page.next);
+        // One atomic derivation for the whole (hasMore, next) pair.
+        setHistory(pagingFromPage(page));
         requestAnimationFrame(() => {
           const pane = messageScrollRef.current;
           if (pane) pane.scrollTop = pane.scrollHeight;
@@ -365,94 +578,337 @@ export default function App() {
     return () => { cancelled = true; };
   }, [selected, events, authed, threadReload]);
   const loadOlderThread = async () => {
-    if (!selected || threadNext === undefined || historyLoadingRef.current) return;
+    const cursor = history.next;
+    // A VISIBLE control must never be a silent no-op. If the button rendered but
+    // the handler cannot proceed, record which predicate failed and surface it
+    // instead of returning with no feedback at all.
+    const guardFailure = !selected ? "no_selection"
+      : !canLoadOlder(history, threadState) ? (history.loading ? "already_loading" : "not_actionable")
+        : !isValidCursor(cursor) ? "cursor_invalid"
+          : historyLoadingRef.current ? "ref_locked" : null;
+    if (guardFailure) {
+      LOAD_OLDER_VIOLATIONS.current += 1;
+      historyTrace.current = { ...historyTrace.current, lastRequestAt: Date.now(),
+        lastReturnedCount: 0, lastNextCursorChanged: false };
+      setHistory(previous => pagingFailed(previous, `LOAD_OLDER_INVARIANT_VIOLATION:${guardFailure}`));
+      return;
+    }
     historyLoadingRef.current = true;
-    setLoadingOlderThread(true);
-    setHistoryError(null);
+    setHistory(pagingLoading);
     try {
-      const requestedCursor = threadNext;
-      const page = await listAggregateEventsPage(selected, {
+      // The guard above already returned unless BOTH are usable, so these are
+      // narrowed here for the type system without a second runtime check.
+      const conversationId = selected!;
+      const requestedCursor = cursor!;
+      const page = await listAggregateEventsPage(conversationId, {
         limit: 20,
         ...(typeof requestedCursor === "string" ? { beforeState: requestedCursor } : { beforeSequence: requestedCursor }),
       });
       if (page.items.some(event => event.decryption?.state === "invalid")) throw new Error("DECRYPTION_FAILED");
       assertHistoryProgress(requestedCursor, page);
+      // Prove progress by the MERGE, not by the cursor. A duplicate-only page
+      // advanced the cursor while adding nothing, which rendered as a dead
+      // button. Compute the merge first so it can be asserted.
+      const merged = mergeThreadEvents(threadEvents, page.items);
+      const mergedNewCount = merged.length - threadEvents.length;
+      assertHistoryMergeProgress(requestedCursor, page, mergedNewCount);
       const scroll = messageScrollRef.current;
       const previousHeight = scroll?.scrollHeight ?? 0;
-      setThreadEvents(prev => mergeThreadEvents(prev, page.items));
+      setThreadEvents(merged);
       requestAnimationFrame(() => {
         if (scroll) scroll.scrollTop += scroll.scrollHeight - previousHeight;
       });
-      setThreadHasMore(page.hasMore);
-      setThreadNext(page.next);
+      historyTrace.current = {
+        lastRequestAt: Date.now(),
+        lastReturnedCount: page.items.length,
+        lastNextCursorChanged: page.next !== requestedCursor,
+      };
+      setHistory(pagingFromPage(page));
     } catch (cause) {
-      setHistoryError(cause instanceof Error ? cause.message : "HISTORY_PAGE_FAILED");
-    } finally { historyLoadingRef.current = false; setLoadingOlderThread(false); }
+      historyTrace.current = {
+        ...historyTrace.current, lastRequestAt: Date.now(), lastReturnedCount: 0, lastNextCursorChanged: false,
+      };
+      setHistory(previous => pagingFailed(previous, cause instanceof Error ? cause.message : "HISTORY_PAGE_FAILED"));
+    } finally { historyLoadingRef.current = false; }
   };
   const messages = useMemo(() => selected ? messagesForAggregate(threadEvents, selected) : [], [threadEvents, selected]);
-  const conversationVirtualizer = useVirtualizer({
-    count: filteredConversations.length,
-    getScrollElement: () => conversationScrollRef.current,
-    estimateSize: () => 76,
-    overscan: 8,
-    getItemKey: index => filteredConversations[index]?.aggregateId ?? index,
-  });
-  const messageVirtualizer = useVirtualizer({
-    count: messages.length,
-    getScrollElement: () => messageScrollRef.current,
-    estimateSize: () => 72,
-    overscan: 12,
-    getItemKey: index => messages[index]?.payload.messageId ?? messages[index]?.event.eventId ?? index,
-  });
   const selectedRecipient = composeRecipient || messages.map(item => item.payload.address).find(Boolean);
-  const smsSegments = useMemo(() => calculateSmsSegments(draft), [draft]);
-  const activeSims = telemetry?.smsSubscriptions?.items.filter(sim => sim.isActive) ?? [];
-  const chosenSim = selectSmsSim(activeSims, selectedSubscriptionId);
-  const simAvailable = Boolean(telemetry?.smsSubscriptions?.available && chosenSim);
-  const showSimSelector = activeSims.length > 1 ||
-    (selectedSubscriptionId !== null && !chosenSim && activeSims.length > 0);
-  const chooseSim = (id: number) => {
-    setSelectedSubscriptionId(id);
-    window.localStorage.setItem("gmweb:selected-sms-subscription", String(id));
+  /**
+   * The Android Telephony thread id for the OPEN conversation, taken from the
+   * decrypted payloads Android already publishes (`GatewayEventFactory` emits
+   * `androidThreadId` whenever it is > 0).
+   *
+   * WHY THIS IS SENT WITH SEND_SMS: Android's `SmsSender.chooseSim()` returns
+   * `UseRequestOrDefault` when `threadId <= 0`, which BYPASSES the conversation's
+   * sticky preferred-SIM check entirely. Because GMweb never sent
+   * `androidThreadId`, every web-originated send took that bypass, so the
+   * per-conversation preference was never enforced. Supplying the decrypted id
+   * is what lets Android apply the preference it already stores.
+   *
+   * Never guessed: an absent value stays absent and Android behaves as before.
+   */
+  const selectedAndroidThreadId = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const value = messages[index]?.payload?.androidThreadId;
+      if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
+    }
+    const projected = selectedConversationCache?.aggregateId === selected
+      ? selectedConversationCache?.androidThreadId : undefined;
+    return typeof projected === "number" && Number.isSafeInteger(projected) && projected > 0
+      ? projected : null;
+  }, [messages, selectedConversationCache, selected]);
+  const activeSims = telemetry?.smsSubscriptions?.items.filter(sim => sim.isActive && sim.sendCapable !== false) ?? [];
+  // DISPLAY vs COMMAND: `chosenSim` is only ever for rendering. The command
+  // subscription is derived separately so a display fallback can never silently
+  // change what the phone is told to do.
+  //
+  // SIM ROUTING PRECEDENCE: a conversation with an Android-confirmed preferred
+  // SIM sends from THAT line. The composer's global selection (and localStorage)
+  // applies only where the conversation has no preference, so new-message
+  // behaviour is unchanged and no conversation can be silently misrouted.
+  const selectedPreferredRef = selectedConversationCache?.aggregateId === selected
+    ? selectedConversationCache?.preferredSim?.simRef ?? null
+    : null;
+  const simRouting = resolveSimRouting({
+    sims: telemetry?.smsSubscriptions?.items ?? [],
+    conversationPreferredRef: selectedPreferredRef,
+    // A change is only ever pending once the command workflow exists; today the
+    // flag is driven by that state and defaults to false.
+    preferencePending: simPreferencePending,
+    composerKey: selectedSimKey,
+  });
+  const displayResolvedSim = simRouting.sim ?? selectSmsSim(activeSims, selectedSimKey);
+  /**
+   * The canonical selection key implied by the routing decision. Display,
+   * readiness, the disabled Send state and the command payload all derive from
+   * this single value, so they cannot contradict one another.
+   */
+  const canonicalSimKey: string | null = simRouting.commandTarget === null
+    ? null
+    : "simRef" in simRouting.commandTarget
+      ? `ref:${simRouting.commandTarget.simRef}`
+      : `sub:${simRouting.commandTarget.subscriptionId}`;
+  const chooseSim = (choice: { simRef: string } | { subscriptionId: number } | null) => {
+    // Store the choice as a KEY so a reload restores the same physical line rather than a number that
+    // may since have been reassigned to a different card.
+    const key = choice === null
+      ? null
+      : "simRef" in choice ? `ref:${choice.simRef}` : `sub:${choice.subscriptionId}`;
+    setSelectedSimKey(key);
+    if (key === null) window.localStorage.removeItem("gmweb:selected-sms-sim-key");
+    else window.localStorage.setItem("gmweb:selected-sms-sim-key", key);
   };
 
   useEffect(() => {
-    if (pendingMessage && messages.some(item =>
-      item.payload.clientMessageId === pendingMessage.clientMessageId)) {
-      setPendingMessage(null);
+    const clientId = pendingMessage?.clientMessageId || sendEvidence.current?.clientMessageId;
+    const matched = clientId && messages.find(item => item.payload.clientMessageId === clientId);
+    if (matched) {
+      const status = messageStatus(matched.payload.status);
+      sendEvidence.current = { clientMessageId: clientId, status };
+      // Carrier evidence is delivery truth and must be reactive, not only a ref,
+      // so the footer re-renders the moment evidence lands.
+      setEvidenceStatus(matched.payload.status ?? null);
+      setCommandStatus(status);
+      if (pendingMessage) setPendingMessage(null);
     }
   }, [messages, pendingMessage]);
 
-  const submitCommand = async (type: "SEND_SMS" | "MARK_THREAD_READ", payload: Record<string, unknown>) => {
-    const idempotencyKey = crypto.randomUUID();
-    const target = await fetchPrimaryCommandKey();
-    const encrypted = await encryptCommand(target.encryptionPublicKey, type, idempotencyKey, { type, ...payload });
-    return createCommand({ type, payload: encrypted, idempotencyKey, targetAgentId: target.deviceId });
+  /**
+   * THE canonical encrypted-command preparation.
+   *
+   * Every encrypted command type — SEND_SMS, MARK_THREAD_READ,
+   * REFRESH_DEVICE_TELEMETRY — MUST go through this. Having SEND_SMS encrypt
+   * separately (and forget to pass `encryptionPublicKeyFormat`) created two
+   * crypto contracts; the READ and REFRESH paths only worked by lucky
+   * format sniffing. One helper, one contract.
+   *
+   * Records a SAFE diagnostic (command type, stage, code) and the failure code
+   * so the caller can surface a precise reason without duplicating this logic.
+   */
+  const prepareEncryptedCommand = async (
+    type: EncryptedCommandType,
+    payload: Record<string, unknown>,
+    idempotencyKey: string = crypto.randomUUID(),
+  ): Promise<{ idempotencyKey: string; targetAgentId: string; encrypted: string }> => {
+    let target: PrimaryCommandKey;
+    try {
+      target = await fetchPrimaryCommandKey();
+    } catch (cause) {
+      const code = cause instanceof CommandKeyError ? cause.code : "COMMAND_KEY_UNAVAILABLE";
+      commandFailureCode.current = code;
+      cryptoDiagnostic.current = `commandType=${type} stage=FETCH_COMMAND_KEY code=${code}`;
+      throw cause;
+    }
+    // Never encrypt to a stale/absent target agent.
+    if (!target.deviceId) {
+      commandFailureCode.current = "COMMAND_KEY_UNAVAILABLE";
+      cryptoDiagnostic.current = `commandType=${type} stage=FETCH_COMMAND_KEY code=COMMAND_KEY_UNAVAILABLE reason=no_device_id`;
+      throw new CommandCryptoError({ code: "COMMAND_KEY_UNAVAILABLE", stage: "FETCH_COMMAND_KEY" });
+    }
+    try {
+      const encrypted = await encryptCommand(
+        target.encryptionPublicKey, type, idempotencyKey, { type, ...payload },
+        target.encryptionPublicKeyFormat,
+      );
+      return { idempotencyKey, targetAgentId: target.deviceId, encrypted };
+    } catch (cause) {
+      if (cause instanceof CommandCryptoError) {
+        commandFailureCode.current = cause.code;
+        cryptoDiagnostic.current = `commandType=${type} ${cause.diagnostics()}`;
+      } else {
+        commandFailureCode.current = "ENCRYPTION_FAILED";
+        cryptoDiagnostic.current = `commandType=${type} stage=ENCRYPT code=ENCRYPTION_FAILED error=${
+          cause instanceof Error ? cause.name : "unknown"}`;
+      }
+      throw cause;
+    }
   };
 
+  /** Encrypt + create the durable command in one step (READ, REFRESH). */
+  const submitEncryptedCommand = async (type: EncryptedCommandType, payload: Record<string, unknown>) => {
+    const prepared = await prepareEncryptedCommand(type, payload);
+    try {
+      return await createCommand({
+        type, payload: prepared.encrypted,
+        idempotencyKey: prepared.idempotencyKey, targetAgentId: prepared.targetAgentId,
+      });
+    } catch (cause) {
+      commandFailureCode.current = "COMMAND_CREATE_FAILED";
+      throw cause;
+    }
+  };
+
+  // §12.1: opening an unread conversation clears the Web unread UI FIRST, then
+  // the phone is asked to confirm in the background.
   useEffect(() => {
-    if (!selectedConversation || selectedConversation.read || !capabilities.includes("MARK_READ") || markReadSent.current.has(selectedConversation.aggregateId)) return;
-    markReadSent.current.add(selectedConversation.aggregateId);
-    void submitCommand("MARK_THREAD_READ", { conversationId: selectedConversation.aggregateId })
-      .catch(() => markReadSent.current.delete(selectedConversation.aggregateId));
-  }, [selectedConversation, capabilities]);
+    if (!selectedConversation) { setReadSync(IDLE_READ); return; }
+    const { aggregateId, lastSequence } = selectedConversation;
+    const confirmedSequence = Math.max(
+      readConfirmations[aggregateId] ?? -1,
+      viewedReadThrough[aggregateId] ?? -1,
+    );
+    const key = readStateKey(aggregateId, lastSequence);
+    const auto = shouldAutoRead({
+      tabActive: tab === "inbox",
+      hasSelection: Boolean(selected),
+      threadReady: threadState === "READY",
+      readyThreadIdMatches: readyThreadId === selected,
+      documentVisible: pageVisible,
+      canMarkRead: capabilities.includes("MARK_READ"),
+      lastSequence,
+      confirmedSequence,
+      alreadyInFlight: readInFlight.current.has(key),
+    });
+    if (!auto) {
+      // Already read (locally or confirmed) -> reflect the authoritative state
+      // instead of leaving a stale "syncing" label behind.
+      if (lastSequence <= confirmedSequence && !readInFlight.current.has(key)) {
+        setReadSync({ state: "CONFIRMED", sequence: lastSequence });
+      }
+      return;
+    }
+
+    // Optimistic local read-through happens BEFORE any network work, so the
+    // badge, the row styling and the global unread total clear immediately.
+    setViewedReadThrough(previous => ({
+      ...previous, [aggregateId]: Math.max(previous[aggregateId] ?? -1, lastSequence),
+    }));
+    readInFlight.current.add(key);
+    setReadSync({ state: "PREPARING_COMMAND", sequence: lastSequence });
+
+    void (async () => {
+      let commandId: string | null = null;
+      try {
+        const command = await submitEncryptedCommand("MARK_THREAD_READ", { conversationId: aggregateId });
+        commandId = command.commandId;
+        // Durable on the server: from here on the phone owns confirmation.
+        setReadSync(readStateForCommand(command.state, lastSequence, command.commandId));
+        // Observe the real lifecycle. A NON-TERMINAL command is never a failure:
+        // the command is durable and may complete later, so after the window we
+        // simply keep waiting instead of reporting "Read sync failed".
+        let observed = command.state;
+        for (let i = 0; i < 30; i++) {
+          await new Promise(resolve => window.setTimeout(resolve, 1000));
+          const view = await fetchCommand(command.commandId);
+          if (view?.state) observed = view.state;
+          if (observed === "COMPLETED") {
+            setReadConfirmations(previous => ({
+              ...previous, [aggregateId]: Math.max(previous[aggregateId] ?? -1, lastSequence),
+            }));
+            readInFlight.current.delete(key);
+            pendingReadCommands.current.set(key, { commandId: command.commandId, state: observed });
+            setReadSync({ state: "CONFIRMED", sequence: lastSequence });
+            return;
+          }
+          if (observed === "FAILED" || observed === "EXPIRED") break;
+          setReadSync(readStateForCommand(observed, lastSequence, command.commandId));
+        }
+        // Keep the command for resume re-observation; do NOT report failure.
+        pendingReadCommands.current.set(key, { commandId: command.commandId, state: observed });
+        if (observed === "FAILED" || observed === "EXPIRED") {
+          readInFlight.current.delete(key);
+          setReadSync(readStateForCommand(observed, lastSequence, command.commandId));
+          return;
+        }
+        setReadSync(readStateForCommand(observed, lastSequence, command.commandId));
+      } catch (cause) {
+        readInFlight.current.delete(key);
+        const errorCode = cause instanceof CommandCryptoError || cause instanceof CommandKeyError
+          ? readFailureCode(cause.code)
+          : readFailureCode(cause);
+        setReadSync({ state: "FAILED", sequence: lastSequence, errorCode, commandId });
+      }
+    })();
+  }, [selected, selectedConversation?.lastSequence, needsPhoneRead, readyThreadId, threadState,
+      tab, capabilities, readRetry, pageVisible]);
+
+  const signOut = async () => {
+    setSigningOut(true);
+    try {
+      const response = await fetch("/api/v1/linked-session", { method: "DELETE", credentials: "include" });
+      if (!response.ok && response.status !== 401) throw new Error("Could not unlink this browser. Check your connection and retry.");
+      setAuthed(false);
+      await resetLocal();
+      await wipeDeviceKeys();
+      window.localStorage.removeItem("gmweb:selected-sms-subscription");
+      window.location.reload();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Sign out failed. Retry."); }
+    finally { setSigningOut(false); }
+  };
 
   const send = async () => {
-    const body = draft.trim();
-    if (!body) { setCommandStatus("EMPTY_BODY"); return; }
+    const body = draft;
+    if (!body.trim()) { setCommandStatus("EMPTY_BODY"); return; }
     if (!selectedRecipient) { setCommandStatus("NO_RECIPIENT"); return; }
     if (!capabilities.includes("SEND_MESSAGES")) { setCommandStatus("SEND_CAPABILITY_MISSING"); return; }
-    if (!simAvailable) { setCommandStatus(!telemetry?.smsSubscriptions ? "SIM_STATE_UNAVAILABLE" : "SELECTED_SIM_UNAVAILABLE"); return; }
-    if (recoveringSend.current) return;
+    // SEND-RACE PROTECTION. If this conversation's preferred SIM cannot be used
+    // right now — inactive, unresolvable, or awaiting Android confirmation of a
+    // change — the message must NOT be submitted on any other line. Blocking
+    // here is what makes "sent from the wrong SIM" unrepresentable, because the
+    // command target is derived from the same routing decision.
+    if (simRouting.blocked) {
+      commandFailureCode.current = `SIM_ROUTING_${simRouting.blocked}`;
+      setCommandStatus(`SIM_ROUTING_${simRouting.blocked}`);
+      return;
+    }
+    // Structured readiness owns the gate. The old `simHelp()` string blocked
+    // every send on stale telemetry, including PHONE_DEFAULT.
+    if (sendBlockedNow) {
+      commandFailureCode.current = readiness.state;
+      setCommandStatus(readiness.state);
+      return;
+    }
+    if (recoveringSend.current || sending) return;
     recoveringSend.current = true;
+    setSending(true);
     const clientMessageId = commandStatus !== "COMPLETED" && !commandStatus?.startsWith("Command completed") &&
-      pendingMessage?.body === body && pendingMessage.recipient === selectedRecipient
+      pendingMessage?.body === body && !pendingMessage.failure && pendingMessage.recipient === selectedRecipient
       ? pendingMessage.clientMessageId : crypto.randomUUID();
     setCommandStatus("Preparing send…");
+    sendEvidence.current = null;
     setPendingMessage({ clientMessageId, body, recipient: selectedRecipient, at: Date.now() });
     let failureCode = "COMMAND_CREATE_FAILED";
-    try {
-      const identity = await getStoredDeviceIdentity();
+    try {      const identity = await getStoredDeviceIdentity();
       if (!identity) { failureCode = "BROWSER_IDENTITY_UNAVAILABLE"; throw new Error(failureCode); }
       const pendingRows = (await loadPendingSends()).filter(row => row.browserDeviceId === identity.deviceId);
       const existing = pendingRows.find(row =>
@@ -464,16 +920,26 @@ export default function App() {
       }
       let pending: PendingEncryptedSend | undefined = existing;
       if (!pending) {
-        const idempotencyKey = crypto.randomUUID();
-        failureCode = "DEVICE_COMMAND_KEY_UNAVAILABLE";
-        const target = await fetchPrimaryCommandKey();
         setCommandStatus("Encrypting…");
-        failureCode = "ENCRYPTION_FAILED";
-        const payload = await encryptCommand(target.encryptionPublicKey, "SEND_SMS", idempotencyKey,
-          { type: "SEND_SMS", phone: selectedRecipient, body, clientMessageId,
-            ...(chosenSim ? { subscriptionId: chosenSim.subscriptionId } : {}) });
-        pending = { browserDeviceId: identity.deviceId, clientMessageId, idempotencyKey, payload,
-          targetAgentId: target.deviceId, createdAt: Date.now() };
+        // Canonical crypto path — identical to READ and REFRESH.
+        const prepared = await prepareEncryptedCommand("SEND_SMS", {
+          phone: selectedRecipient, body, clientMessageId,
+          // PHONE_DEFAULT omits any routing target entirely so Android resolves the CURRENT default at
+          // execution time. An explicit choice sends the opaque `simRef` the phone can resolve against
+          // its live inventory; a legacy phone gets its subscription id instead.
+          //
+          // The target comes from `simRouting` alone — the canonical decision —
+          // with NO independent fallback to the global composer key. A fallback
+          // here would reintroduce a second source of truth and allow a
+          // conversation pinned to SIM A to be sent from another line.
+          ...(simRouting.commandTarget ?? {}),
+          // Thread identity is what makes Android enforce the conversation's
+          // sticky preferred SIM. Omitting it silently disables that check.
+          ...(selectedAndroidThreadId ? { androidThreadId: selectedAndroidThreadId } : {}),
+        });
+        pending = { browserDeviceId: identity.deviceId, clientMessageId,
+          idempotencyKey: prepared.idempotencyKey, payload: prepared.encrypted,
+          targetAgentId: prepared.targetAgentId, createdAt: Date.now() };
         failureCode = "LOCAL_OUTBOX_FAILED";
         await savePendingSend(pending); // durable encrypted retry identity before HTTP
         setCommandStatus("Queued locally");
@@ -481,17 +947,18 @@ export default function App() {
       failureCode = "COMMAND_CREATE_FAILED";
       const commandId = await ensurePendingCommandId(pending);
       setCommandStatus("Accepted by GMweb; waiting for phone");
-      if (!existing) setDraft("");
+      if (!existing) setDraft(current => current === body ? "" : current);
       for (let attempt = 0; attempt < 20; attempt += 1) {
         await new Promise(resolve => setTimeout(resolve, 1_000));
         failureCode = "COMMAND_POLL_FAILED";
         const state = await fetchCommand(commandId);
-        setCommandStatus(state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
-          state?.state === "FAILED" ? "COMMAND_FAILED" : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
-          "Waiting for phone");
+        setCommandStatus(observedSendStatus(clientMessageId) || (state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
+          state?.state === "FAILED" ? (state.result || "COMMAND_FAILED") : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
+    state?.state === "DELIVERED_TO_AGENT" ? "Pulled by phone" : ["ACCEPTED_BY_AGENT", "EXECUTING"].includes(state?.state || "") ? "Submitting" : "Queued"));
         if (state && ["FAILED", "EXPIRED"].includes(state.state)) {
           if (!existing) setDraft(body);
-          setPendingMessage(null);
+          setPendingMessage(current => current?.clientMessageId === clientMessageId ? { ...current,
+            failure: state.state === "FAILED" ? `Failed · ${androidError(state.result || "Phone did not report a reason")}` : "Request expired; phone outcome unconfirmed" } : current);
           await clearPendingSend(pending.clientMessageId);
           break;
         }
@@ -503,9 +970,11 @@ export default function App() {
     } catch {
       // A lost response may follow a committed command. Retain the encrypted
       // envelope and identity so the next retry cannot create a second SMS.
-      setCommandStatus(failureCode);
+      // The canonical prepare helper records the precise crypto/command reason.
+      setCommandStatus(observedSendStatus(clientMessageId) || commandFailureCode.current || failureCode);
     } finally {
       recoveringSend.current = false;
+      setSending(false);
     }
   };
 
@@ -523,9 +992,9 @@ export default function App() {
           try {
             const commandId = await ensurePendingCommandId(pending);
             const state = await fetchCommand(commandId);
-          setCommandStatus(state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
-            state?.state === "FAILED" ? "COMMAND_FAILED" : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
-            "Waiting for phone");
+          setCommandStatus(observedSendStatus(pending.clientMessageId) || (state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
+            state?.state === "FAILED" ? (state.result || "COMMAND_FAILED") : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
+    state?.state === "DELIVERED_TO_AGENT" ? "Pulled by phone" : ["ACCEPTED_BY_AGENT", "EXECUTING"].includes(state?.state || "") ? "Submitting" : "Queued"));
             if (state && ["COMPLETED", "FAILED", "EXPIRED"].includes(state.state))
               await clearPendingSend(pending.clientMessageId);
           } catch {
@@ -565,8 +1034,16 @@ export default function App() {
         events: threadEvents,
         state: threadState,
         firstPageDurationMs: threadFirstPageMs,
-        lastPageError: historyError || threadError,
-      } : undefined));
+        lastPageError: history.error || threadError,
+        // §32: enough to tell "no deeper history on the phone" apart from
+        // "the client lost its cursor" in the field.
+        history: describeHistory(history, historyTrace.current),
+      } : undefined, {
+        phonePresence,
+        phoneTelemetryAgeMs: telemetry?.receivedAt == null ? null : Math.max(0, Date.now() - telemetry.receivedAt),
+        simState: simTelemetry.state,
+        simActiveCount: simTelemetry.active.length,
+      }));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -574,11 +1051,127 @@ export default function App() {
     }
   };
 
-  let syncBanner = "Refreshing recent conversations…";
-  if (syncStatus.state === "UP_TO_DATE") syncBanner = "Recent conversations are up to date";
-  if (syncStatus.state === "DEGRADED") syncBanner = "Recent conversations need attention";
-  if (syncStatus.state === "FAILED") syncBanner = "Conversation refresh paused";
-  const emptyInboxMessage = "No recent conversations are available yet.";
+  /* ------------------------------------------------------------ view model */
+
+  // ONE model for the send status. Precedence is explicit and total, so message
+  // evidence (carrier truth) can never be overwritten by the command lifecycle:
+  // "Delivered bubble + Queued footer" is unrepresentable by construction.
+  const resolvedSendStatus = resolveSendStatus({ evidenceStatus, commandStatus });
+  useEffect(() => {
+    const divergence = detectSendDivergence({ evidenceStatus, commandStatus });
+    if (!divergence) return;
+    const key = `${divergence.evidenceState}:${divergence.commandState ?? "none"}`;
+    if (sendDivergenceSeen.current === key) return;
+    sendDivergenceSeen.current = key;
+    // Never downgrade true delivery evidence; record it instead so the command
+    // ACK path can be investigated separately. Ids are hashed, never raw.
+    console.warn(divergence.code, {
+      clientMessageIdHash: diagnosticHash(sendEvidence.current?.clientMessageId),
+      commandState: divergence.commandState,
+      evidenceState: divergence.evidenceState,
+      commandStatus: divergence.commandStatus,
+    });
+  }, [evidenceStatus, commandStatus]);
+
+  const connection: ConnectionState = !online
+    ? "offline"
+    : version === "unreachable"
+      ? "unreachable"
+      : version
+        ? "connected"
+        : "checking";
+  const connectionDetail = `GMweb API ${version || "checking"} · browser ${online ? "online" : "offline"}`;
+
+  const threadItems = useMemo<ThreadItem[]>(() => {
+    const items: ThreadItem[] = messages.map(item => ({
+      key: item.payload.messageId || item.event.eventId,
+      direction: item.payload.direction,
+      body: item.payload.body,
+      dateMs: item.payload.dateMs,
+      status: item.payload.status,
+      clientMessageId: item.payload.clientMessageId ?? null,
+    }));
+    if (pendingMessage && pendingMessage.recipient === selectedRecipient) {
+      items.push({
+        key: `pending-${pendingMessage.clientMessageId}`,
+        direction: "out",
+        body: pendingMessage.body,
+        dateMs: pendingMessage.at,
+        pending: true,
+        failure: pendingMessage.failure ?? null,
+        progress: resolvedSendStatus.text,
+        clientMessageId: pendingMessage.clientMessageId,
+      });
+    }
+    return items;
+  }, [messages, pendingMessage, selectedRecipient, resolvedSendStatus.text]);
+
+  const threadRows = useMemo(() => withDaySeparators(threadItems), [threadItems]);
+
+  const lastOutgoing = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].payload.direction === "out") {
+        return { status: messages[index].payload.status, at: messages[index].payload.dateMs };
+      }
+    }
+    return { status: null, at: null };
+  }, [messages]);
+
+  const payloadState = events.some(event => event.decryption?.state === "decrypted")
+    ? "E2EE locally decrypted"
+    : events.length
+      ? "See payload diagnostics"
+      : "No payloads received";
+
+  // Presence comes from the SERVER's view of authenticated phone activity.
+  // Both the normal UI and the refresh flow use this ONE helper so there is
+  // never a second liveness algorithm to drift out of sync.
+  // Capability, not a version guess: a phone that cannot execute SET_CONVERSATION_PREFERRED_SIM must
+  // not be shown a control for it.
+  const canSetPreferredSim = supportsPreferredSim(deviceStatus, telemetry);
+  const phonePresence = authoritativePhonePresence(deviceStatus, telemetry);
+  const telemetryFreshness = authoritativeTelemetryFreshness(deviceStatus, telemetry);
+  const phoneLastActivityAt = deviceStatus
+    ? deviceStatus.phone.lastActivityAt
+    : telemetry?.receivedAt ?? null;
+  const simTelemetry = describeSimTelemetry(telemetry, Date.now(), phonePresence, telemetryFreshness);
+
+  // ONE deterministic send-readiness model owns composer gating (replaces the
+  // legacy simHelp() string, which blocked every send on stale telemetry).
+  const readiness = deriveSendReadiness({
+    draft, hasRecipient: Boolean(selectedRecipient), recipientAddress: selectedRecipient,
+    canSend: capabilities.includes("SEND_MESSAGES"),
+    // ONE decision: readiness consumes the CANONICAL routing result rather than
+    // the raw global composer key, so the banner, the disabled Send button and
+    // the encrypted payload can never disagree about which line is in play.
+    selectedSimKey: canonicalSimKey,
+    simRoutingBlocked: simRouting.blocked,
+    // An EXISTING conversation we can see history for must not be submitted
+    // without a verified thread identity: Android's chooseSim() bypasses the
+    // sticky preferred-SIM check when threadId <= 0. A genuinely new message has
+    // no thread yet and stays unaffected.
+    threadIdentityMissing: Boolean(selected) && messages.length > 0 && selectedAndroidThreadId === null,
+    sending, phonePresence, telemetryFreshness, sim: simTelemetry,
+  });
+  const sendBlockedNow = sendBlocked(readiness);
+  const simInstructions = sendReadinessNotice(readiness);
+  // Informational only; never gates PHONE_DEFAULT sending.
+  const freshnessNotice = readiness.state === "READY_DEFAULT"
+    ? defaultModeFreshnessNotice(telemetryFreshness,
+      displayResolvedSim ? `${displayResolvedSim.displayName} · ${displayResolvedSim.carrierName}` : null)
+    : null;
+
+  const conversationsLoading = conversationPage.length === 0 && bootstrapState === "BOOTSTRAPPING_SYNC";
+  const emptyInboxMessage = conversations.length === 0 ? "No conversations yet" : "No matching conversations";
+  const mobileView = selected || composeOpen || composeRecipient ? "thread" : "list";
+  // §6/§40: the bottom navigation is only dropped on a TRUE phone-sized
+  // viewport, where the full-screen thread genuinely needs the room. On a
+  // tablet the list and thread are side by side and navigation stays.
+  const hideBottomNav = !isWideViewport && tab === "inbox" && mobileView === "thread";
+  const destination = DESTINATION_TITLES[tab];
+  const linkedOnlineCount = linkedBrowsers.filter(row => row.onlineNow).length;
+
+  const navigate = (key: TabKey) => setTab(key);
 
   if (authed === false || authed === null) {
     return (
@@ -593,219 +1186,356 @@ export default function App() {
           const probe = await fetch("/api/v1/linked-session", { credentials: "include" });
           const session = await probe.json().catch(() => ({}));
           if (!probe.ok || session.authenticated !== true) throw new Error("Linked session cookie was not established");
+          setCapabilities(session.capabilities || []);
+          setBrowserDeviceId(session.deviceId || null);
           setAuthed(true);
         }}
         onRecoveryLinked={async () => {
           const probe = await fetch("/api/v1/linked-session", { credentials: "include" });
           const session = await probe.json().catch(() => ({}));
           if (!probe.ok || session.authenticated !== true) throw new Error("Restricted PWA session cookie was not established");
+          setCapabilities(session.capabilities || []);
+          setBrowserDeviceId(session.deviceId || null);
           setAuthed(true);
         }}
       />
     );
   }
 
-  return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div className="brand-mark">M</div>
-        <div className="brand-copy"><strong>Messages</strong><span>GMweb companion</span></div>
-        <div className="topbar-actions">
-          <span className="version-pill" title={`${scriptFile} · cursor ${cursor}`}>v{version || "…"}</span>
-          <span className={`connection-dot ${!online || version === "unreachable" ? "offline" : ""}`} />
-          <span className="connection-label">{!online || version === "unreachable" ? "Offline" : version ? "Connected" : "Checking"}</span>
-          <Button className="topbar-button" size="sm" variant="ghost" aria-label="Linked browsers" onPress={() => setShowLinkedBrowsers(value => !value)}>👁 {linkedBrowsers.filter(row => row.onlineNow).length}</Button>
-          <Button className="topbar-button" size="sm" variant="ghost" onPress={() => void pull()} isDisabled={busy}>{busy ? <Spinner size="sm" /> : "Sync"}</Button>
-          <Button className="topbar-button" size="sm" variant="ghost" onPress={() => setAuthed(false)}>Lock</Button>
-        </div>
-      </header>
-      {showLinkedBrowsers && <section className="linked-browser-panel" aria-label="Linked browser sessions">
-        <div className="linked-browser-title"><strong>Linked browsers</strong><Button size="sm" variant="ghost" onPress={() => setShowLinkedBrowsers(false)}>Close</Button></div>
-        {linkedBrowsers.length === 0 && <p>No linked browsers are currently visible.</p>}
-        {linkedBrowsers.map((row, index) => <div className="linked-browser-row" key={`${row.deviceId}-${index}`}><strong>{row.onlineNow ? "● Online" : "○ Inactive"} · {shortId(row.deviceId)}</strong><span>{row.ip || "IP unavailable"}</span><small>{row.userAgent || "Browser unknown"}</small><small>Last seen: {new Date(row.lastSeenAt).toLocaleString()}</small><small>Last data request: {row.lastDataAt ? new Date(row.lastDataAt).toLocaleString() : "No data request observed"}</small><small>Last durable sync: {row.lastSyncAt ? new Date(row.lastSyncAt).toLocaleString() : "No sync acknowledgement"}</small></div>)}
-      </section>}
+  /* --------------------------------------------------------------- actions */
 
-      <Tabs selectedKey={tab} onSelectionChange={(key) => setTab(key as TabKey)} className="app-tabs">
-        <TabList className="tab-list" aria-label="Messages navigation">
-          <Tab id="inbox">Messages{conversations.reduce((sum, item) => sum + item.unreadCount, 0) ? ` (${conversations.reduce((sum, item) => sum + item.unreadCount, 0)})` : ""}</Tab>
-          <Tab id="contacts">Contacts</Tab>
-          <Tab id="connection">Connection</Tab>
-          <Tab id="security">Security</Tab>
-          <Tab id="debug">Debug</Tab>
-        </TabList>
+  const openConversation = (conversation: ConversationProjection) => {
+    setComposeOpen(false);
+    setComposeRecipient("");
+    setSelected(conversation.aggregateId);
+    setSelectedConversationCache(conversation);
+  };
 
-        <TabPanel id="inbox" className="inbox-panel">
-          <div className={`notice ${syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED" ? "danger" : ""}`} role="status">
-            <span>{syncBanner}</span>
-            {(syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED") &&
-              <Button size="sm" variant="ghost" onPress={() => void pull()}>Retry</Button>}
-          </div>
-          {syncStatus.keyState === "FAILED" && <div className="key-sync-note" role="status">Encryption keys need a retry. Recent messages remain available. <Button size="sm" variant="ghost" onPress={() => void pull()}>Retry</Button></div>}
-          <div className={`inbox-layout ${selected || composeRecipient || composeOpen ? "mobile-thread" : "mobile-list"}`}>
-            <aside className="conversation-pane">
-              <div className="pane-heading"><div><p className="eyebrow">Inbox</p><h1>Conversations</h1></div><Chip size="sm" variant="soft">{conversations.length} loaded</Chip></div>
-              <Button className="compose-button" size="sm" onPress={() => { setComposeOpen(true); setSelected(null); setComposeRecipient(""); setRecipientSearch(""); }}>＋ Compose</Button>
-              <label className="search-box"><span aria-hidden="true">⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search messages" aria-label="Search messages" /></label>
-              <div ref={conversationScrollRef} className="conversation-list" onScroll={(event) => {
-                const element = event.currentTarget;
-                if (conversationHasMore && !loadingOlder &&
-                    element.scrollHeight - element.scrollTop - element.clientHeight < 180) void loadOlderConversations();
-              }}>
-                <div style={{ height: conversationVirtualizer.getTotalSize(), position: "relative" }}>
-                  {conversationVirtualizer.getVirtualItems().map(virtualRow => {
-                    const item = filteredConversations[virtualRow.index];
-                    return <button key={item.aggregateId} ref={conversationVirtualizer.measureElement} data-index={virtualRow.index}
-                      style={{ position: "absolute", width: "100%", transform: "translateY(" + virtualRow.start + "px)" }}
-                      className={`conversation-row ${selected === item.aggregateId ? "selected" : ""}`} onClick={() => { setComposeOpen(false); setComposeRecipient(""); setSelected(item.aggregateId); setSelectedConversationCache(item); }}>
-                        <Avatar title={item.title} />
-                        <span className="conversation-copy"><span className="conversation-title">{item.title}{item.subtitle ? ` · ${item.subtitle}` : ""}</span><span className="conversation-preview">{item.preview}</span></span>
-                        <span className="conversation-meta"><time>{formatTime(item.lastAt)}</time>{item.unreadCount > 0 && <Chip size="sm">{item.unreadCount}</Chip>}</span>
-                      </button>;
-                  })}
-                </div>
-                {filteredConversations.length === 0 && <div className="empty-list"><span>✦</span><p>{conversations.length ? "No matching conversations" : emptyInboxMessage}</p></div>}
-              </div>
-              {conversationHasMore && (
-                <Button size="sm" variant="ghost" className="load-older" onPress={() => void loadOlderConversations()} isDisabled={loadingOlder}>
-                  {loadingOlder ? "Loading…" : "Load older conversations"}
-                </Button>
-              )}
-            </aside>
+  const openComposer = () => {
+    setComposeOpen(true);
+    setSelected(null);
+    setComposeRecipient("");
+    setRecipientSearch("");
+  };
 
-            <main className="message-pane">
-              {composeOpen ? (
-                <><div className="message-header"><button className="mobile-back" onClick={() => { setComposeOpen(false); setSelected(null); }}>←</button><div><h2>New message</h2><p>Choose a contact or enter a phone number</p></div></div>
-                  <div className="recipient-picker">
-                    <label className="search-box"><span aria-hidden="true">⌕</span><input autoFocus value={recipientSearch} onChange={event => setRecipientSearch(event.target.value)} placeholder="Search contacts or type a number" aria-label="Recipient" /></label>
-                    {/^\+?[0-9\s()-]{3,}$/.test(recipientSearch.trim()) && <button className="recipient-row" onClick={() => selectRecipient(recipientSearch.replace(/[^+0-9]/g, ""))}>Send to {recipientSearch.trim()}</button>}
-                    <div className="recipient-results">{recipientMatches.map(contact => <button key={contact.normalizedPhone} className="recipient-row" onClick={() => selectRecipient(contact.normalizedPhone)}><Avatar title={contact.displayName} /><span><strong>{contact.displayName}</strong><small>{contact.normalizedPhone}</small></span><span aria-hidden="true">✉</span></button>)}</div>
-                  </div></>
-              ) : selectedConversation ? (
-                <>
-                  <div className="message-header"><button className="mobile-back" onClick={() => { setSelected(null); setComposeRecipient(""); }}>←</button><Avatar title={selectedConversation.title} /><div><h2>{selectedConversation.title}</h2><p>{selectedConversation.subtitle ? `${selectedConversation.subtitle} · ` : ""}Synced from Android · {shortId(selectedConversation.aggregateId)}</p></div></div>
-                  {threadHasMore && (
-                    <Button size="sm" variant="ghost" className="load-older-thread" onPress={() => void loadOlderThread()} isDisabled={loadingOlderThread}>
-                      {loadingOlderThread ? "Loading…" : "Load older messages"}
-                    </Button>
-                  )}
-                  {historyError && <div role="alert" className="history-error">{historyError} <Button size="sm" onPress={() => void loadOlderThread()}>Retry</Button></div>}
-                  <div ref={messageScrollRef} className="message-scroll" onScroll={(event) => {
-                    if (threadHasMore && !loadingOlderThread && event.currentTarget.scrollTop < 80) void loadOlderThread();
-                  }}>
-                    <div className="message-day"><span>Message history</span></div>
-                    <div style={{ height: messageVirtualizer.getTotalSize(), position: "relative" }}>
-                      {messageVirtualizer.getVirtualItems().map(virtualRow => {
-                        const { payload } = messages[virtualRow.index];
-                        return <div key={payload.messageId} ref={messageVirtualizer.measureElement} data-index={virtualRow.index}
-                          style={{ position: "absolute", width: "100%", transform: "translateY(" + virtualRow.start + "px)" }}
-                          className={`message-line ${payload.direction}`}>
-                            <div className="message-bubble"><p dir="auto">{payload.body}</p><span>{formatTime(payload.dateMs)}{payload.direction === "out" ? ` · ${messageStatus(payload.status)}` : ""}</span></div>
-                          </div>;
-                      })}
-                    </div>
-                    {pendingMessage && (
-                      <div className="message-line out">
-                        <div className="message-bubble"><p dir="auto">{pendingMessage.body}</p><span>{formatTime(pendingMessage.at)} · {commandStatus || "queued"}</span></div>
-                      </div>
-                    )}
-                    {threadState === "LOADING" && <div className="empty-conversation"><Spinner /><h3>Loading messages…</h3></div>}
-                    {threadState === "LOCKED" && <div className="empty-conversation"><div className="empty-icon">↻</div><h3>Messages are encrypted</h3><p>The browser is waiting for an authorized key.</p></div>}
-                    {threadState === "EMPTY" && <div className="empty-conversation"><div className="empty-icon">✦</div><h3>No messages in this conversation.</h3></div>}
-                    {threadState === "FAILED" && <div className="empty-conversation"><div className="empty-icon">!</div><h3>Unable to load messages</h3><p>{threadError || "Thread page read failed"}</p><Button size="sm" onPress={() => setThreadReload(value => value + 1)}>Retry</Button></div>}
-                  </div>
-                  <div className="composer-disabled">
-                    <input dir="auto" value={draft} onChange={event => setDraft(event.target.value)} placeholder={selectedRecipient ? "Text message" : "Choose a contact"} />
-                    <span className="sms-segments">{smsSegments.encoding} · {smsSegments.units} units · {smsSegments.segments} SMS · {smsSegments.remaining} left</span>
-                    {showSimSelector ? <select className="sim-select" aria-label="Send using SIM" value={chosenSim?.subscriptionId ?? ""} onChange={event => chooseSim(Number(event.target.value))}><option value="" disabled>Choose SIM</option>{activeSims.map(sim => <option key={sim.subscriptionId} value={sim.subscriptionId}>SIM {sim.slotIndex + 1} · {sim.displayName || sim.carrierName}</option>)}</select> : activeSims.length === 1 ? <span className="sim-label">SIM {activeSims[0].slotIndex + 1} · {activeSims[0].displayName || activeSims[0].carrierName}</span> : <span className="sim-label">{telemetry?.smsSubscriptions ? "No active SMS SIM available" : "SIM information unavailable"} <button onClick={refreshTelemetry}>Retry</button></span>}
-                    <Button size="sm" onPress={() => void send()} isDisabled={recoveringSend.current}>Send</Button>
-                    {commandStatus && <Chip size="sm" variant="soft">{commandStatus}</Chip>}
-                  </div>
-                </>
-              ) : (
-                <><div className="message-header"><button className="mobile-back" onClick={() => { setComposeRecipient(""); setSelected(null); }}>←</button><div><h2>{composeRecipient ? contactNames.get(composeRecipient) || composeRecipient : "New message"}</h2><p>{composeRecipient || "Choose a conversation or contact."}</p></div></div><div className="empty-conversation"><div className="empty-icon">✦</div><h3>{composeRecipient ? "Start a conversation" : "Choose a conversation or compose a message"}</h3></div>{composeRecipient && <div className="composer-disabled"><input dir="auto" value={draft} onChange={event => setDraft(event.target.value)} placeholder="Text message" /><span className="sms-segments">{smsSegments.encoding} · {smsSegments.units} units · {smsSegments.segments} SMS · {smsSegments.remaining} left</span>{showSimSelector ? <select className="sim-select" aria-label="Send using SIM" value={chosenSim?.subscriptionId ?? ""} onChange={event => chooseSim(Number(event.target.value))}><option value="" disabled>Choose SIM</option>{activeSims.map(sim => <option key={sim.subscriptionId} value={sim.subscriptionId}>SIM {sim.slotIndex + 1} · {sim.displayName || sim.carrierName}</option>)}</select> : activeSims.length === 1 ? <span className="sim-label">SIM {activeSims[0].slotIndex + 1} · {activeSims[0].displayName || activeSims[0].carrierName}</span> : <span className="sim-label">{telemetry?.smsSubscriptions ? "No active SMS SIM available" : "SIM information unavailable"} <button onClick={refreshTelemetry}>Retry</button></span>}<Button size="sm" onPress={() => void send()} isDisabled={recoveringSend.current}>Send</Button>{commandStatus && <Chip size="sm" variant="soft">{commandStatus}</Chip>}</div>}</>
-              )}
-            </main>
-          </div>
-        </TabPanel>
+  const leaveThread = () => {
+    setSelected(null);
+    setComposeRecipient("");
+    setComposeOpen(false);
+  };
 
-        <TabPanel id="contacts" className="content-panel" onScroll={(event) => {
-          const element = event.currentTarget;
-          if (element.scrollHeight - element.scrollTop - element.clientHeight < 240)
-            setVisibleContactCount(count => Math.min(count + 100, filteredContacts.length));
-        }}>
-          <div className="page-title"><p className="eyebrow">Phone book</p><h1>Contacts</h1><p>End-to-end encrypted contacts synced from the Primary Android device.</p></div>
-          <div className="contact-sync-status" role="status">
-            <span>{contactsBusy ? `Syncing encrypted contacts… ${contactsProgress} event(s) checked`
-              : contactsError ? contactsError : `${contacts.length} contacts ready${contactsCheckedAt ? ` · checked ${formatTime(contactsCheckedAt)}` : ""}`}</span>
-            <Button size="sm" variant="ghost" onPress={() => void refreshContacts()} isDisabled={contactsBusy}>
-              {contactsBusy ? <Spinner size="sm" /> : "Sync contacts"}
+  const syncAlerts = (
+    <SyncAlerts syncStatus={syncStatus} error={error} busy={busy} onRetry={() => void pull()} />
+  );
+
+  const composer = (
+    <MessageComposer
+      draft={draft}
+      onDraft={setDraft}
+      sims={activeSims}
+      selected={displayResolvedSim}
+      onSim={chooseSim}
+      notice={simInstructions}
+      freshnessNotice={freshnessNotice?.message ?? null}
+      simListHistorical={simListIsHistorical(telemetryFreshness)}
+      retry={() => void refreshSims()}
+      refreshNotice={simRefreshCopy(simRefresh)}
+      refreshing={simRefreshInFlight(simRefresh)}
+      send={() => void send()}
+      sending={sending}
+      canSend={capabilities.includes("SEND_MESSAGES")}
+      status={resolvedSendStatus.text}
+      useDefault={selectedSimKey === null}
+    />
+  );
+
+  const threadNotices = (
+    <>
+      {capabilities.includes("MARK_READ") && selectedConversation ? (
+        <div className="read-status-row" role="status">
+          <span className={`read-status-row__label read-status-row__label--${readSyncTone(readSync)}`}>
+            {readSyncLabel(readSync) ?? "Read"}
+          </span>
+          {readSyncRetryable(readSync) ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              onPress={() => {
+                readInFlight.current.delete(
+                  readStateKey(selectedConversation.aggregateId, selectedConversation.lastSequence),
+                );
+                setReadRetry(value => value + 1);
+              }}
+            >
+              Retry
             </Button>
-          </div>
-          <label className="search-box"><span aria-hidden="true">⌕</span><input value={contactSearch} onChange={(event) => setContactSearch(event.target.value)} placeholder="Search names or numbers" aria-label="Search contacts" /></label>
-          <div className="contact-list">
-            {filteredContacts.slice(0, visibleContactCount).map(contact => (
-              <button className="contact-row" key={contact.normalizedPhone} type="button" onClick={() => selectRecipient(contact.normalizedPhone)}><Avatar title={contact.displayName} /><span className="contact-copy"><strong>{contact.displayName}</strong><small>{contact.normalizedPhone}</small></span>{contact.starred && <span title="Starred">★</span>}<span className="contact-sms" aria-label="Send SMS" title="Send SMS">✉</span></button>
-            ))}
-            {filteredContacts.length > visibleContactCount && <Button size="sm" variant="ghost"
-              onPress={() => setVisibleContactCount(count => count + 100)}>Load more contacts</Button>}
-            {filteredContacts.length === 0 && <div className="empty-list"><span>✦</span><p>{contacts.length
-              ? "No matching contacts"
-              : !capabilities.includes("CONTACTS_READ")
-                ? "Contacts access was not approved for this linked browser. Re-link or re-approve this browser."
-                : "No contacts are available yet; phone sync or a contact key grant may be pending."}</p></div>}
-          </div>
-        </TabPanel>
+          ) : null}
+        </div>
+      ) : null}
 
-        <TabPanel id="connection" className="content-panel">
-          <div className="page-title"><p className="eyebrow">System</p><h1>Connection</h1><p>Live state of the PWA, Android sync and trust registry.</p></div>
-          <div className="status-grid">
-            <Card><CardContent className="status-card"><span>API</span><strong>{version}</strong><Chip size="sm" color={version === "unreachable" ? "danger" : "success"} variant="soft">{version === "unreachable" ? "offline" : "healthy"}</Chip></CardContent></Card>
-            <Card><CardContent className="status-card"><span>PWA build</span><strong>{PWA_BUILD_VERSION}</strong><small>{scriptFile}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Sync cursor</span><strong>{cursor}</strong><small>{applied === null ? "Ready" : `${applied} new event(s)`}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Trust sequence</span><strong>{trust?.trustSequence ?? "—"}</strong><small>{trust ? "Android-signed registry available" : "Waiting for first Android trust statement"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Payload protection</span><strong>{events.some(event => event.decryption?.state === "decrypted") ? "E2EE locally decrypted" : events.length ? "See payload diagnostics" : "No payloads received"}</strong><small>Encrypted messages require an authorized key grant. Missing keys stay locked; failed authentication is reported as corrupt.</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Linked session</span><strong>Authenticated</strong><small>Latest stored sequence: {events[0]?.sequence ?? 0}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Android battery</span><strong>{telemetry?.battery?.level == null ? "—" : `${telemetry.battery.level}%${telemetry.battery.isCharging ? " · charging" : ""}`}</strong><small>{telemetry?.device ? `${telemetry.device.manufacturer} ${telemetry.device.model}` : "Waiting for telemetry"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Android outbox</span><strong>{telemetry?.sync?.outboxDepth ?? "—"}</strong><small>{telemetry?.sync?.deadLetterCount ? `${telemetry.sync.deadLetterCount} dead letter` : "No dead letters"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Android network</span><strong>{telemetry?.network?.isConnected ? "Connected" : telemetry ? "Offline" : "—"}</strong><small>{telemetry?.network?.networkType || "Waiting for telemetry"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Android app</span><strong>{telemetry?.app?.versionName || "—"}</strong><small>{telemetry?.receivedAt ? `Last report ${formatTime(telemetry.receivedAt)}` : "Never reported"}</small></CardContent></Card>
-          </div>
-          {bootstrapState && syncStatus.state !== "UP_TO_DATE" && <div className="notice">Secure session: {bootstrapState}</div>}
-          {error && <div className="notice danger">{error}</div>}
-        </TabPanel>
+      {history.error ? (
+        <Alert status="danger">
+          <Alert.Indicator />
+          <Alert.Content>
+            <Alert.Title>Could not load older messages</Alert.Title>
+            <Alert.Description>{historyErrorMessage(history.error)}</Alert.Description>
+          </Alert.Content>
+          <Button
+            size="sm"
+            variant="ghost"
+            isDisabled={!canLoadOlder(history, threadState)}
+            onPress={() => void loadOlderThread()}
+          >
+            Retry
+          </Button>
+        </Alert>
+      ) : null}
+    </>
+  );
 
-        <TabPanel id="security" className="content-panel">
-          <div className="page-title"><p className="eyebrow">Protection</p><h1>Security</h1><p>Credentials and identities visible to this linked browser.</p></div>
-          <div className="security-list">
-            <Card><CardContent className="security-row"><div><strong>Message encryption</strong><p>{threadEvents.filter(event => event.decryption?.state === "decrypted").length} open-thread decrypted · {threadEvents.filter(event => event.decryption?.state === "locked").length} open-thread locked · {threadEvents.filter(event => event.decryption?.state === "invalid").length} open-thread invalid</p><p>Messages load when a conversation is opened. Key grants come from your primary phone.</p></div></CardContent></Card>
-            <Card><CardContent className="security-row"><div><strong>Passkeys</strong><p>Manage dashboard passkeys in the GMweb dashboard.</p></div></CardContent></Card>
-            <Card><CardContent className="security-row"><div><strong>Android trust registry</strong><p>{trust ? `Verified root published at sequence ${trust.trustSequence}` : "Waiting for the primary phone's first signed trust statement"}</p></div><Chip size="sm" variant="soft">{trust ? "Ready" : "Pending"}</Chip></CardContent></Card>
-            <Card><CardContent className="security-row"><div><strong>Private push</strong><p>Notifications contain no sender or message text.</p></div></CardContent></Card>
-          </div>
-        </TabPanel>
+  /* ---------------------------------------------------------------- views */
 
-        <TabPanel id="debug" className="content-panel">
-          <div className="page-title"><p className="eyebrow">Diagnostics</p><h1>Web message diagnostics</h1><p>Privacy-safe counts across server, browser storage, crypto and projection.</p></div>
-          <div className="debug-actions">
-            <Button variant="secondary" onPress={() => void runDiagnostics()} isDisabled={diagnosticsBusy}>{diagnosticsBusy ? "Collecting…" : "Run diagnostics"}</Button>
-            <Button variant="ghost" onPress={() => webDiagnostics && void navigator.clipboard.writeText(formatWebDiagnostics(webDiagnostics))} isDisabled={!webDiagnostics}>Copy diagnostic report</Button>
-            <Button variant="ghost" onPress={() => void pull()} isDisabled={busy}>Retry sync</Button>
+  const inboxView = (
+    <div
+      className={`messaging-layout${selectedConversation ? "" : " messaging-layout--no-details"}`}
+      data-mobile-view={mobileView}
+    >
+      <ConversationPane
+        conversations={filteredConversations}
+        totalConversations={conversations.length}
+        selectedId={selected}
+        onSelect={openConversation}
+        search={search}
+        onSearch={setSearch}
+        searchInputRef={conversationSearchRef}
+        filter={conversationFilter}
+        onFilter={setConversationFilter}
+        unreadTotal={unreadTotal}
+        loading={conversationsLoading}
+        emptyMessage={emptyInboxMessage}
+        hasMore={conversationHasMore}
+        loadingMore={loadingOlder}
+        onLoadMore={() => void loadOlderConversations()}
+        onCompose={openComposer}
+      />
+
+      {composeOpen ? (
+        <NewMessageView
+          recipientSearch={recipientSearch}
+          onRecipientSearch={setRecipientSearch}
+          matches={recipientMatches}
+          contactsAvailable={contacts.length > 0}
+          contactsAccessMissing={!capabilities.includes("CONTACTS_READ")}
+          onPickRecipient={selectRecipient}
+          onBack={leaveThread}
+        />
+      ) : selectedConversation ? (
+        <ThreadPane
+          scrollRef={messageScrollRef}
+          rows={threadRows}
+          state={threadState}
+          error={threadError}
+          onRetryThread={() => setThreadReload(value => value + 1)}
+          header={
+            <ThreadHeader
+              title={selectedConversation.title}
+              subtitle={[
+                selectedConversation.subtitle,
+                `Synced from Android · ${selectedConversation.aggregateId.slice(0, 8)}…`,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+              phone={selectedConversation.subtitle ?? selectedConversation.title}
+              onBack={leaveThread}
+              onDetails={() => setShowDetails(true)}
+            />
+          }
+          notices={threadNotices}
+          composer={composer}
+          hasMore={showLoadOlder(history, threadState)}
+          loadingOlder={history.loading}
+          onLoadOlder={() => void loadOlderThread()}
+          onOpenStatus={(item) => {
+            setDeliveryItem(item);
+            setDeliveryOpen(true);
+          }}
+        />
+      ) : (
+        <section className="thread-pane" aria-label="Conversation">
+          <ThreadHeader
+            title={composeRecipient ? contactNames.get(phoneKey(composeRecipient)) || composeRecipient : "New message"}
+            subtitle={composeRecipient || "Choose a conversation or contact."}
+            onBack={leaveThread}
+          />
+          <div className="thread-scroll scroll-region">
+            <ThreadPlaceholder composeRecipient={composeRecipient} />
           </div>
-          {webDiagnostics && <div className="status-grid">
-            <Card><CardContent className="status-card"><span>Server</span><strong>{webDiagnostics.session.linked && webDiagnostics.server ? "PASS" : "FAIL"}</strong><small>{webDiagnostics.server?.total ?? "Unavailable"} events · max sequence {webDiagnostics.server?.maxSequence ?? "—"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Browser Sync</span><strong>{webDiagnostics.browserSync.state === "UP_TO_DATE" ? "PASS" : webDiagnostics.browserSync.state === "FAILED" ? "FAIL" : webDiagnostics.browserSync.state === "DEGRADED" ? "WARN" : "SYNCING"}</strong><small>{webDiagnostics.replicaProgress?.lazyMode ? `on-demand · observed sequence ${webDiagnostics.browserSync.cursor}` : `cursor ${webDiagnostics.browserSync.cursor} · lag ${webDiagnostics.browserSync.syncLag ?? "unknown"} · snapshot ${webDiagnostics.replicaProgress?.snapshotComplete ? "complete" : `loading ${webDiagnostics.replicaProgress?.snapshotPosition ?? 0} rows / ${webDiagnostics.replicaProgress?.snapshotPageCount ?? 0} pages`}`} · keyring {webDiagnostics.replicaProgress?.keyringCursor ?? "unknown"} · grants {webDiagnostics.replicaProgress?.grantCursor ?? "unknown"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Encryption keys</span><strong>{webDiagnostics.browserSync.keyState}</strong><small>{webDiagnostics.browserSync.keyError || `Last successful refresh ${webDiagnostics.browserSync.lastKeySyncAt ? formatTime(webDiagnostics.browserSync.lastKeySyncAt) : "pending"}`}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Live updates</span><strong>{webDiagnostics.liveSync.connection}</strong><small>{webDiagnostics.liveSync.reconnectCount} reconnects · last frame {webDiagnostics.liveSync.lastFrameAt ? formatTime(webDiagnostics.liveSync.lastFrameAt) : "none"} · server → render {webDiagnostics.liveSync.serverPublishedAt && webDiagnostics.liveSync.browserRenderedAt ? `${Math.max(0, webDiagnostics.liveSync.browserRenderedAt - webDiagnostics.liveSync.serverPublishedAt)} ms` : "not measured"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>IndexedDB</span><strong>PASS</strong><small>{webDiagnostics.indexedDb.total} raw events · {webDiagnostics.indexedDb.distinctMessageAggregateCount} message aggregates</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Crypto</span><strong>{webDiagnostics.crypto.messages.invalid || webDiagnostics.crypto.keyGrants.invalid ? "FAIL" : webDiagnostics.crypto.messages.locked ? "WARN" : "PASS"}</strong><small>{webDiagnostics.crypto.messages.decrypted} decrypted · {webDiagnostics.crypto.messages.locked} locked · {webDiagnostics.crypto.messages.invalid} invalid<br />Grant probe: {webDiagnostics.crypto.keyGrants.accepted} accepted · {Object.keys(webDiagnostics.crypto.keyGrants.reasons).join(", ") || "no rejection"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Projection</span><strong>{webDiagnostics.projection.failure ? "FAIL" : webDiagnostics.projection.lag ? "SYNCING" : "PASS"}</strong><small>{webDiagnostics.projection.failure || `${webDiagnostics.projection.rows} rows`} · cursor {webDiagnostics.projection.cursor} · lag {webDiagnostics.projection.lag}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Contacts</span><strong>{webDiagnostics.contacts.failure ? "WARN" : "PASS"}</strong><small>{webDiagnostics.contacts.failure || `${webDiagnostics.contacts.stored} rows`} · {webDiagnostics.contacts.grants} grants · {webDiagnostics.contacts.snapshots} snapshots</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Selected Thread</span><strong>{!webDiagnostics.selectedThread ? "PASS" : webDiagnostics.selectedThread.state === "FAILED" ? "FAIL" : webDiagnostics.selectedThread.state === "LOADING" ? "SYNCING" : webDiagnostics.selectedThread.state === "LOCKED" ? "WARN" : "PASS"}</strong><small>{webDiagnostics.selectedThread ? `${webDiagnostics.selectedThread.state} · ${webDiagnostics.selectedThread.decrypted} decrypted · ${webDiagnostics.selectedThread.locked} locked` : "Select a conversation"}</small></CardContent></Card>
-            <Card><CardContent className="status-card"><span>Build / Service Worker</span><strong>{webDiagnostics.session.buildMismatch ? "BUILD_MISMATCH" : "PASS"}</strong><small>{webDiagnostics.session.pwaVersion} · loaded {webDiagnostics.session.loadedScript} · served {webDiagnostics.session.servedScript ?? "unknown"} · revision {webDiagnostics.session.buildRevision ?? "unknown"} · {webDiagnostics.session.serviceWorker}</small></CardContent></Card>
-          </div>}
-          {webDiagnostics && <div className={`notice ${webDiagnostics.overall === "FAIL" ? "danger" : ""}`}>Overall: {webDiagnostics.overall}</div>}
-        </TabPanel>
-      </Tabs>
+          {composeRecipient ? composer : null}
+        </section>
+      )}
+
+      {selectedConversation ? (
+        <aside className="details-pane" aria-label="Conversation details">
+          <div className="details-pane__head">
+            <span className="details-section__label">Conversation details</span>
+          </div>
+          <ConversationDetails
+            conversation={selectedConversation}
+            capabilities={capabilities}
+            syncStatus={syncStatus}
+            telemetry={telemetry}
+            lastOutgoingStatus={lastOutgoing.status}
+            lastOutgoingAt={lastOutgoing.at}
+          />
+        </aside>
+      ) : null}
     </div>
+  );
+
+  return (
+    <AppShell
+      sidebar={<AppSidebar active={tab} unreadTotal={unreadTotal} onNavigate={navigate} />}
+      topbar={
+        <AppTopbar
+          title={destination.title}
+          subtitle={destination.subtitle}
+          connection={connection}
+          connectionDetail={connectionDetail}
+          phonePresence={phonePresence}
+          // Last AUTHENTICATED ACTIVITY, not last telemetry: a stalled
+          // telemetry channel must not read as "phone gone".
+          phoneReceivedAt={phoneLastActivityAt}
+          phoneModel={
+            telemetry?.device
+              ? `${telemetry.device.manufacturer ?? ""} ${telemetry.device.model ?? ""}`.trim() || null
+              : null
+          }
+          syncStatus={syncStatus}
+          syncBusy={busy}
+          onSync={() => void pull()}
+          linkedOnlineCount={linkedOnlineCount}
+          onOpenLinkedBrowsers={() => setShowLinkedBrowsers(true)}
+          onOpenSettings={() => setTab("settings")}
+          onSignOut={() => void signOut()}
+          signingOut={signingOut}
+        />
+      }
+      alerts={syncAlerts}
+      bottomNav={
+        hideBottomNav ? undefined : (
+          <MobileBottomNav active={tab} unreadTotal={unreadTotal} onNavigate={navigate} />
+        )
+      }
+    >
+      {tab === "inbox" ? inboxView : null}
+
+      {tab === "contacts" ? (
+        <ContactsView
+          contacts={filteredContacts}
+          total={contacts.length}
+          search={contactSearch}
+          onSearch={setContactSearch}
+          visibleCount={visibleContactCount}
+          onShowMore={() => setVisibleContactCount(count => Math.min(count + 100, filteredContacts.length))}
+          busy={contactsBusy}
+          progress={contactsProgress}
+          checkedAt={contactsCheckedAt}
+          error={contactsError}
+          onRefresh={() => void refreshContacts()}
+          canReadContacts={capabilities.includes("CONTACTS_READ")}
+          onPick={selectRecipient}
+        />
+      ) : null}
+
+      {tab === "connection" ? (
+        <DeviceView
+          apiVersion={version || "checking"}
+          pwaVersion={PWA_BUILD_VERSION}
+          scriptFile={scriptFile}
+          cursor={cursor}
+          appliedEvents={applied}
+          latestSequence={events[0]?.sequence ?? 0}
+          trust={trust}
+          telemetry={telemetry}
+          syncStatus={syncStatus}
+          bootstrapState={bootstrapState}
+          error={error}
+          payloadState={payloadState}
+          phonePresence={phonePresence}
+          phoneLastActivityAt={phoneLastActivityAt}
+          lastActivitySource={deviceStatus?.phone.lastActivitySource ?? null}
+          runtimeAppVersion={deviceStatus?.runtime.appVersionName ?? null}
+          runtimeAppVersionCode={deviceStatus?.runtime.appVersionCode ?? null}
+          runtimeReceivedAt={deviceStatus?.runtime.receivedAt ?? null}
+          simView={simTelemetry}
+        />
+      ) : null}
+
+      {tab === "security" ? (
+        <SecurityView
+          decrypted={threadEvents.filter(event => event.decryption?.state === "decrypted").length}
+          locked={threadEvents.filter(event => event.decryption?.state === "locked").length}
+          invalid={threadEvents.filter(event => event.decryption?.state === "invalid").length}
+          trust={trust}
+          keyState={syncStatus.keyState}
+          keyError={syncStatus.keyError}
+          browserIdentity={webDiagnostics ? webDiagnostics.crypto.browserIdentity : null}
+          verifiedPrimary={webDiagnostics ? webDiagnostics.crypto.verifiedPrimary : null}
+        />
+      ) : null}
+
+      {tab === "debug" ? (
+        <DiagnosticsView
+          report={webDiagnostics}
+          busy={diagnosticsBusy}
+          syncBusy={busy}
+          onRun={() => void runDiagnostics()}
+          onRetrySync={() => void pull()}
+        />
+      ) : null}
+
+      {tab === "settings" ? (
+        <SettingsView
+          apiVersion={version || "checking"}
+          pwaVersion={PWA_BUILD_VERSION}
+          scriptFile={scriptFile}
+          buildRevision={webDiagnostics?.session.buildRevision ?? null}
+          linkedOnlineCount={linkedOnlineCount}
+          linkedTotal={linkedBrowsers.length}
+          onOpenLinkedBrowsers={() => setShowLinkedBrowsers(true)}
+          onOpenDiagnostics={() => setTab("debug")}
+          onSignOut={() => void signOut()}
+          signingOut={signingOut}
+        />
+      ) : null}
+
+      <LinkedBrowsersDrawer
+        isOpen={showLinkedBrowsers}
+        onOpenChange={setShowLinkedBrowsers}
+        sessions={linkedBrowsers}
+        browserDeviceId={browserDeviceId}
+        signingOut={signingOut}
+        onUnlink={() => void signOut()}
+      />
+
+      <DeliveryDetailsDrawer
+        isOpen={deliveryOpen}
+        onOpenChange={setDeliveryOpen}
+        item={deliveryItem}
+        messageId={deliveryItem?.key}
+      />
+
+      <ConversationDetailsDrawer
+        isOpen={showDetails}
+        onOpenChange={setShowDetails}
+        conversation={selectedConversation}
+        capabilities={capabilities}
+        syncStatus={syncStatus}
+        telemetry={telemetry}
+        lastOutgoingStatus={lastOutgoing.status}
+        lastOutgoingAt={lastOutgoing.at}
+        canSetPreferredSim={canSetPreferredSim}
+      />
+    </AppShell>
   );
 }

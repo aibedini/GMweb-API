@@ -207,6 +207,15 @@ require("node:fs").mkdirSync(path.join(config.rootDir, "data"), { recursive: tru
 const controlDb = new (require("better-sqlite3"))(path.join(config.rootDir, "data", "control-plane.db"));
 const { DeviceTelemetryStore } = require("./deviceTelemetry");
 const deviceTelemetryStore = new DeviceTelemetryStore(controlDb);
+const { AgentActivityStore, derivePhonePresence, deriveTelemetryFreshness, ACTIVITY_SOURCES } = require("./agentActivity");
+// Phone liveness is server-observed authenticated activity, NOT telemetry
+// freshness. See src/agentActivity.js for the production incident this fixes.
+const agentActivityStore = new AgentActivityStore(controlDb);
+const activityBackfilled = agentActivityStore.backfillFromEvents();
+// Live Android runtime metadata (app version + advertised command types) from
+// the authenticated command poll — deliberately NOT from device telemetry.
+const { AgentRuntimeStore } = require("./agentRuntime");
+const agentRuntimeStore = new AgentRuntimeStore(controlDb);
 controlDb.pragma("journal_mode = WAL");
 const trustRegistry = new TrustRegistry(controlDb);
 const commandEngine = new CommandEngine(controlDb);
@@ -221,6 +230,12 @@ const eventStore = new EventStore(controlDb, {
     emitControlEvent({ type: "sync.available", newEvents: count,
       conversationIds, at: new Date().toISOString() });
     void webPushService.notifySyncAvailable(count).catch(() => {});
+  },
+  onPull: (gatewayRequestId, entry) => {
+    if (!entry?.jobId) return;
+    sendStore.markStage(entry.jobId, "phone_pulled");
+    emitSse({ type: "send_stage", requestId: gatewayRequestId, jobId: entry.jobId,
+      stage: "phone_pulled", at: new Date().toISOString() });
   },
 });
 const pwaAccessTokens = new PwaAccessTokenStore(controlDb);
@@ -248,23 +263,43 @@ const DEFAULT_ACCOUNT_ID = "default";
  * the shared key alone no longer authorizes that device. Returns the bound
  * deviceId or null.
  */
+/** Which channel a request belongs to, for the presence evidence breakdown. */
+const ACTIVITY_SOURCE_BY_PATH = [
+  [/\/api\/v1\/agent\/commands/, ACTIVITY_SOURCES.COMMAND_POLL],
+  [/\/api\/v1\/agent\/events/, ACTIVITY_SOURCES.EVENT_UPLOAD],
+  [/\/api\/v1\/agent\/device-telemetry/, ACTIVITY_SOURCES.TELEMETRY],
+  [/\/api\/v1\/agent\/trust/, ACTIVITY_SOURCES.TRUST],
+  [/\/api\/v1\/agent\/identity/, ACTIVITY_SOURCES.IDENTITY],
+];
+
+/**
+ * Every authenticated agent request is proof the phone is running. Recording
+ * it here — the single choke point all /api/v1/agent/* routes pass through —
+ * means presence is correct even when a particular channel (telemetry) stops
+ * working while others keep succeeding.
+ */
+function recordAgentActivity(deviceId, url) {
+  const path = String(url || "");
+  const match = ACTIVITY_SOURCE_BY_PATH.find(([pattern]) => pattern.test(path));
+  agentActivityStore.record(deviceId, match ? match[1] : ACTIVITY_SOURCES.UNKNOWN);
+}
+
+function grantAgent(deviceId, request) {
+  recordAgentActivity(deviceId, request.url || request.raw?.url);
+  return { deviceId, role: agentAuthService.getRole(deviceId) };
+}
+
 function authorizeAgent(request, rawBody) {
   // The global /api/v1/agent/* gate has already verified this exact request.
   // Re-verifying here would reject the same timestamp as a replay.
   if (request.authenticatedAgentId) {
-    return {
-      deviceId: request.authenticatedAgentId,
-      role: agentAuthService.getRole(request.authenticatedAgentId),
-    };
+    return grantAgent(request.authenticatedAgentId, request);
   }
   const header = String(request.headers["x-agent-auth"] || "");
   if (header) {
     const result = agentAuthService.verifyAgentHeader(request, rawBody);
     if (!result.ok) return null;
-    return {
-      deviceId: result.deviceId,
-      role: agentAuthService.getRole(result.deviceId),
-    };
+    return grantAgent(result.deviceId, request);
   }
   // Legacy fallback: shared device key (pre-PR-08b agents). Only valid while
   // the agent has NOT enrolled a signature identity — an enrolled device
@@ -274,7 +309,7 @@ function authorizeAgent(request, rawBody) {
     if (claimed && agentAuthService.getIdentity(String(claimed))) {
       return null; // enrolled device MUST use signatures
     }
-    return { deviceId: "legacy-shared-agent", role: "LEGACY_AGENT" };
+    return grantAgent("legacy-shared-agent", request);
   }
   return null;
 }
@@ -344,7 +379,9 @@ function androidThreadFromLedger(number, limit) {
       messages.push({ index: messages.length, type: "timestamp", text: day });
       lastDay = day;
     }
-    messages.push({ index: messages.length, type: "message", direction: "out", text: String(r.text || ""), status: r.status });
+    messages.push({ index: messages.length, type: "message", direction: "out", text: String(r.text || ""),
+      status: r.status, stage: r.stage, failedReason: r.error, clientMessageId: r.client_message_id,
+      requestId: sendStore.requestId(r.id), submittedOnce: Boolean(r.physical_submitted), carrierStatus: sendStore.carrierStatus(r.id) });
   }
   return {
     conversation: { id: `sms:${wanted}`, href: wanted, title: wanted, snippet: "", timestamp: "", origin: "ledger" },
@@ -759,7 +796,7 @@ function requireToken(request, reply, done) {
       requestPath(request.url) === "/api/v1/pairing/status") return done();
   // POST-PAIR: linked-session introspection is public — the route itself
   // reports authenticated:false when no valid cookie is present.
-  if (requestPath(request.url) === "/api/v1/linked-session") return done();
+  if (requestPath(request.url) === "/api/v1/linked-session" && request.method === "GET") return done();
   if (requestPath(request.url) === "/api/v1/pairing/challenge" || requestPath(request.url) === "/api/v1/pairing/complete") return done();
   // FIX 2 (review): the Android-only pairing endpoints delegate to the SAME
   // agent pipeline as /api/v1/agent/* — verified here ONCE (method-aware,
@@ -815,16 +852,16 @@ function requireToken(request, reply, done) {
         (p === "/api/v1/web/sync/ack" || p === "/api/v1/web/snapshot-v2" ||
           p === "/api/v1/web/conversations/changed")) ||
       (caps.includes("READ_MESSAGES") && request.method === "GET" &&
-        p === "/api/v1/linked-device/telemetry") ||
+        (p === "/api/v1/linked-device/telemetry" || p === "/api/v1/linked-device/status")) ||
       (caps.includes("CONTACTS_READ") && request.method === "GET" &&
         p === "/api/v1/linked-device/contacts/events") ||
-      (caps.includes("SEND_MESSAGES") && request.method === "GET" &&
+      ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ")) && request.method === "GET" &&
         p === "/api/v1/linked-device/command-key") ||
       ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ")) &&
         (p === "/api/v1/commands" || p.startsWith("/api/v1/commands/"))) ||
       (caps.includes("READ_PAIRING_DIAGNOSTICS") &&
         request.method === "GET" && p === "/api/v1/pairing/diagnostics") ||
-      p === "/api/v1/linked-session"; // introspection always allowed
+      (p === "/api/v1/linked-session" && ["GET", "DELETE"].includes(request.method));
     if (allowed) {
       request.linkedDevice = linkedSession;
       linkedSessions.observe(linkedCookie, request.ip, request.headers["user-agent"],
@@ -899,6 +936,9 @@ function requireToken(request, reply, done) {
     const auth = agentAuthService.verifyAgentHeader(request, request.rawBody || Buffer.alloc(0));
     if (auth.ok) {
       request.authenticatedAgentId = auth.deviceId;
+      // Record liveness at the gate so EVERY authenticated agent route counts,
+      // including ones that never call authorizeAgent.
+      recordAgentActivity(auth.deviceId, request.url);
       return done();
     }
     reply.code(401).send({ error: "unauthorized" });
@@ -1059,13 +1099,18 @@ function recordActivity(request, reply, done) {
       route: request.routeOptions?.url || null,
       params: safeActivityFields(request.params),
       query: safeActivityFields(request.query),
-      ...(pairing ? { pairing } : {})
+      ...(pairing ? { pairing } : {}),
+      ...(request._readAudit ? { read: request._readAudit } : {})
     }
   }).catch(() => {});
   done();
 }
 
 function emitSse(event) {
+  if (event.requestId || event.jobId) {
+    const row = sendStore.byReference(event.requestId || event.jobId);
+    if (row) event = { ...event, requestId: sendStore.requestId(row.id), clientMessageId: row.client_message_id || undefined };
+  }
   const payload = `data: ${JSON.stringify(event)}\n\n`;
   for (const [reply, scope] of sseClients) {
     // Project API keys may only receive events for their own sends. /send/status
@@ -1086,6 +1131,60 @@ function emitSse(event) {
 // clients re-pull /api/v1/sync with their cursor. Durability is untouched:
 // if the SSE drops, the cursor sync still catches everything up.
 const controlSseClients = new Set();
+
+// ── SSE transport hardening (P0: realtime never reached the browser) ────────
+//
+// ROOT CAUSE: nginx sits in front of this API in production and its default is
+// `proxy_buffering on`. A proxied `text/event-stream` response is therefore
+// accumulated in nginx's proxy buffer instead of being flushed, so
+// {type:"sync.available"} never reached the PWA. The browser's EventSource
+// still fired `onopen` (the response HEAD is forwarded immediately), so the UI
+// showed a healthy "Connected" indicator while zero invalidations arrived —
+// exactly the "I have to press Refresh" defect.
+//
+// `X-Accel-Buffering: no` disables proxy buffering for THIS response only
+// (nginx honours it per-response, so no global proxy setting has to change),
+// and the heartbeat comment frame gives intermediaries traffic so idle
+// connections are not reaped and the client can detect a dead stream.
+const SSE_HEARTBEAT_MS = 20_000;
+const SSE_RETRY_MS = 3_000;
+
+function sseResponseHeaders() {
+  return {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    // nginx / ingress: never buffer this stream.
+    "x-accel-buffering": "no"
+  };
+}
+
+/**
+ * Keep the stream warm AND observable.
+ *
+ * A comment frame (`: hb`) is invisible to `EventSource`, so it could never be
+ * used by the client to tell a healthy stream from a black-holed one. This
+ * sends a `data:` heartbeat instead: it keeps intermediaries from reaping the
+ * connection and lets the browser prove the channel is still live. It carries
+ * no identifiers, no content and performs no database work, and the client
+ * only ever acts on `sync.available` frames.
+ */
+function attachSseHeartbeat(reply) {
+  const timer = setInterval(() => {
+    if (reply.raw.writableEnded || reply.raw.destroyed) {
+      clearInterval(timer);
+      return;
+    }
+    try {
+      reply.raw.write(`data: ${JSON.stringify({ type: "heartbeat", at: new Date().toISOString() })}\n\n`);
+    } catch {
+      clearInterval(timer);
+    }
+  }, SSE_HEARTBEAT_MS);
+  timer.unref?.();
+  reply.raw.on("close", () => clearInterval(timer));
+  return timer;
+}
 
 function emitControlEvent(event) {
   const payload = `data: ${JSON.stringify(event)}\n\n`;
@@ -1782,6 +1881,8 @@ function startSendWorker() {
           client.sendMessage({
             to: job.data.to,
             text: job.data.text,
+            subscriptionId: ledgerRow?.subscription_id ?? job.data.subscriptionId,
+            clientMessageId: ledgerRow?.client_message_id ?? job.data.clientMessageId,
             ledgerId: ledgerRow?.id ?? null,
             jobId: job.id,
             requestId: gatewayRequestId,
@@ -2090,7 +2191,14 @@ app.addSchema({
     type: { type: "string", enum: ["message", "timestamp"] },
     direction: { type: "string", enum: ["in", "out"] },
     text: { type: "string" },
-    aria: { type: "string" }
+    aria: { type: "string" },
+    clientMessageId: { type: ["string", "null"] },
+    requestId: { type: "string" },
+    status: { type: "string" },
+    stage: { type: ["string", "null"] },
+    failedReason: { type: ["string", "null"] },
+    submittedOnce: { type: "boolean" },
+    carrierStatus: { type: "object", additionalProperties: true }
   }
 });
 
@@ -3250,7 +3358,9 @@ registerGatewayRoutes(app, {
   checkRateLimit,
   isPullModeActive: () => Boolean(client.pullMode && client.name === "android" && client.outbox),
   log: app.log,
-  telemetry: gatewayTelemetry
+  telemetry: gatewayTelemetry,
+  onCarrierReport: emitSse,
+  onSendProgress: emitSse
 });
 
 // ── Phase 2 Control Plane (ADR-001/004, TechSpec §51–58) ────────────────────
@@ -3264,6 +3374,10 @@ registerControlPlaneRoutes(app, {
   authorizeAgent,
   linkedSessions,
   deviceTelemetryStore,
+  agentActivityStore,
+  agentRuntimeStore,
+  derivePhonePresence,
+  deriveTelemetryFreshness,
   agentAuthService,
   checkRateLimit,
 });
@@ -3334,12 +3448,12 @@ app.get("/api/v1/sse", {
   // "return reply" alone does NOT stop Fastify from later serializing.
   reply.hijack();
 
-  reply.raw.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive"
-  });
+  reply.raw.writeHead(200, sseResponseHeaders());
+  // `retry:` tells EventSource how fast to reconnect; the comment frame forces
+  // any intermediary to flush the response head immediately.
+  reply.raw.write(`retry: ${SSE_RETRY_MS}\n\n`);
   reply.raw.write(": connected\n\n");
+  attachSseHeartbeat(reply);
 
   if (request.linkedDevice) {
     reply._linkedToken = request.cookies[linkedSessions.COOKIE_NAME];
@@ -3810,6 +3924,8 @@ app.post("/send", {
       properties: {
         to: { type: "string", minLength: 3, maxLength: 32, description: "Recipient phone number with country code, e.g. `+989121234567`" },
         text: { type: "string", minLength: 1, maxLength: 4000, description: "Message content. Plain text only." },
+        subscriptionId: { type: "integer", minimum: 0, description: "Explicit Android SMS subscription; preserved across queue recovery." },
+        clientMessageId: { type: "string", minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_-]+$", description: "Stable browser message identity. Reuse only for the same exact payload and SIM." },
         wait: { type: "boolean", default: false, description: "If true, block until the send completes (max 90s) and return the result." },
         priority: {
           oneOf: [
@@ -3970,7 +4086,9 @@ app.post("/send", {
 
   const schema = z.object({
     to: z.string().min(3).max(32),
-    text: z.string().min(1).max(4000),
+    text: z.string().min(1).max(4000).refine(value => value.trim().length > 0),
+    subscriptionId: z.number().int().nonnegative().optional(),
+    clientMessageId: z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/).optional(),
     wait: z.boolean().optional(),
     priority: z.union([
       z.enum([...PRIORITY_NAMES, "high", "normal"]),
@@ -3995,7 +4113,29 @@ app.post("/send", {
     reply.code(400).send({ error: "invalid_body", details: parsed.error.flatten() });
     return;
   }
-  const { to, text, wait, priority, meta } = parsed.data;
+  const { to, text, wait, priority, meta, subscriptionId, clientMessageId } = parsed.data;
+  if (subscriptionId !== undefined && client.name !== "android") {
+    return reply.code(409).send({ error: "sim_selection_requires_android", message: "SIM selection requires the Android transport." });
+  }
+  if (clientMessageId) {
+    const original = sendStore.byClientMessageId(clientMessageId, projectKey?.name || "master");
+    if (original) {
+      if (original.to_number !== to || original.text !== text || original.subscription_id !== (subscriptionId ?? null))
+        return reply.code(409).send({ error: "idempotency_key_reused", message: "This message identity was already used with a different body or SIM." });
+      reply.code(["queued", "active"].includes(original.status) ? 202 : 200);
+      return { ok: true, requestId: sendStore.requestId(original.id), statusUrl: `/send/status/${sendStore.requestId(original.id)}`,
+        jobId: original.job_id, status: ["queued", "active"].includes(original.status) ? "queued" : original.status === "sent" ? "completed" : original.status,
+        deduped: true };
+    }
+  }
+  if (subscriptionId !== undefined) {
+    const primary = agentAuthService.getPrimaryIdentity();
+    const caps = require("./smsCapabilities").smsCapabilities(primary ? deviceTelemetryStore.get(primary.device_id) : null);
+    const sim = caps.items.find(item => item.subscriptionId === subscriptionId && item.isActive && item.sendCapable !== false);
+    if (!caps.available || !sim) return reply.code(409).send({ error: "selected_sim_unavailable", message: "Selected SIM unavailable. Refresh the Primary phone's SIM information." });
+    if (caps.sendSmsPermission === false) return reply.code(409).send({ error: "send_sms_permission_missing", message: "SEND_SMS permission missing" });
+    if (caps.isDefaultSmsApp === false) return reply.code(409).send({ error: "not_default_sms_app", message: "Phone is not default SMS app" });
+  }
   // Optional consumer notification identity. No meta = the historical payload,
   // handled exactly as before. A HALF-filled tag is rejected (400) rather than
   // stored: a tag that cannot be revoked is worse than no tag at all.
@@ -4014,8 +4154,9 @@ app.post("/send", {
 
   // Idempotency: if the caller sends an `Idempotency-Key` header, dedupe retries
   // so a network blip doesn't send the SMS twice. Same key -> original jobId.
-  const idemKey = String(request.headers["idempotency-key"] || "").trim().slice(0, 200) || null;
-  const bodyHash = idemKey ? crypto.createHash("sha256").update(`${to}\n${text}`).digest("hex").slice(0, 16) : null;
+  const idemKey = String(request.headers["idempotency-key"] || (clientMessageId ? `client:${projectKey?.name || "master"}:${clientMessageId}` : "")).trim().slice(0, 200) || null;
+  const bodyHash = idemKey ? crypto.createHash("sha256").update(subscriptionId === undefined && !clientMessageId
+    ? `${to}\n${text}` : JSON.stringify([to, text, subscriptionId ?? null, clientMessageId ?? null])).digest("hex").slice(0, 16) : null;
   if (idemKey) {
     const reserved = await sendQueue.reserveIdempotency(idemKey, bodyHash).catch(() => "OK");
     if (reserved !== "OK") {
@@ -4089,7 +4230,7 @@ app.post("/send", {
     const claim = sendStore.claim({
       to, text, keyName: projectKey?.name || "master",
       priority: sendPriority.name, windowMs: SEND_DEDUPE_MS,
-      notification: notificationMeta
+      notification: notificationMeta, subscriptionId
     });
     if (claim.action !== "new") {
       app.log.warn({ to, reason: claim.action }, "duplicate send suppressed by ledger");
@@ -4110,11 +4251,20 @@ app.post("/send", {
     }
     ledgerId = claim.id;
   } else {
-    ledgerId = sendStore.create({
-      to, text, keyName: projectKey?.name || "master",
-      priority: sendPriority.name, idempotencyKey: idemKey,
-      notification: notificationMeta
-    });
+    try {
+      ledgerId = sendStore.create({
+        to, text, keyName: projectKey?.name || "master",
+        priority: sendPriority.name, idempotencyKey: idemKey,
+        notification: notificationMeta, subscriptionId, clientMessageId
+      });
+    } catch (error) {
+      if (error.message !== "client_message_already_exists") throw error;
+      const original = error.row;
+      reply.code(["queued", "active"].includes(original.status) ? 202 : 200);
+      return { ok: true, requestId: sendStore.requestId(original.id), statusUrl: `/send/status/${sendStore.requestId(original.id)}`,
+        jobId: original.job_id, status: ["queued", "active"].includes(original.status) ? "queued" : original.status === "sent" ? "completed" : original.status,
+        deduped: true };
+    }
   }
   const requestId = sendStore.requestId(ledgerId);
 
@@ -4124,6 +4274,8 @@ app.post("/send", {
       {
         to,
         text,
+        subscriptionId,
+        clientMessageId,
         keyId: projectKey?.id || null,
         keyName: projectKey?.name || "master",
         priority: sendPriority.name,
@@ -4267,6 +4419,8 @@ app.get("/send/status/:reference", {
           carrierStatus: { type: "object", additionalProperties: true },
           carrierEvents: { type: "array", items: { type: "object", additionalProperties: true } },
           gatewayRequestId: { type: ["string", "null"] },
+          clientMessageId: { type: ["string", "null"] },
+          subscriptionId: { type: ["integer", "null"] },
           priority: { type: "string", enum: ["critical", "expired", "expiring", "announcement"] },
           priorityLevel: { type: "integer", enum: [1, 3, 6, 10] },
           stage: { type: ["string", "null"] },
@@ -4377,6 +4531,8 @@ app.get("/send/status/:reference", {
     ok: true,
     requestId: sendStore.requestId(ledger.id),
     statusUrl: `/send/status/${sendStore.requestId(ledger.id)}`,
+    clientMessageId: ledger.client_message_id || null,
+    subscriptionId: ledger.subscription_id ?? null,
     jobId: ledger.job_id || live?.id || null,
     id: ledger.job_id || live?.id || null,
     state: superseded && !revoked ? "superseded" : (live?.state || fallbackState),
@@ -5682,12 +5838,10 @@ app.get("/events", {
   // double-sends and crashes the process (Eve/dashboard can trigger this).
   reply.hijack();
 
-  reply.raw.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive"
-  });
+  reply.raw.writeHead(200, sseResponseHeaders());
+  reply.raw.write(`retry: ${SSE_RETRY_MS}\n\n`);
   reply.raw.write(": connected\n\n");
+  attachSseHeartbeat(reply);
   const scope = request._projectKey
     ? { type: "project", keyName: request._projectKey.name }
     : { type: "full" };
@@ -5722,6 +5876,7 @@ async function reconcilePending() {
       const job = await sendQueue.enqueue(
         {
           to: row.to_number, text: row.text, keyId: null,
+          subscriptionId: row.subscription_id ?? undefined, clientMessageId: row.client_message_id ?? undefined,
           keyName: row.key_name || "reconcile",
           priority: priority.name,
           priorityLevel: priority.level
@@ -5824,8 +5979,16 @@ async function shutdown(signal) {
   await sendQueue.close({ force: true }).catch((error) => app.log.warn({ error }, "queue close failed"));
   await eveSmsEvents.stop().catch((error) => app.log.warn({ error }, "Eve callback worker close failed"));
   try { sendStore.close(); } catch (error) { app.log.warn({ error }, "ledger close failed"); }
-  if (config.browserMode === "connect") client.detachForShutdown();
-  else await client.stop().catch((error) => app.log.warn({ error }, "browser stop failed"));
+  // Transport shutdown goes through the SELECTOR's explicit lifecycle methods.
+  // Calling a transport method directly relied on proxy fall-through to the
+  // ACTIVE transport, which in pull mode is the outbox and has no
+  // detachForShutdown — that threw, aborted shutdown before app.close(), and
+  // produced the restart/502 cycles. Guarded so one failure cannot skip the
+  // remaining cleanup.
+  try {
+    if (config.browserMode === "connect") await client.detachForShutdown?.();
+    else await client.stop?.();
+  } catch (error) { app.log.warn({ error }, "transport shutdown failed"); }
   await app.close().catch((error) => app.log.warn({ error }, "server close failed"));
   clearTimeout(forceExit);
   process.exit(0);

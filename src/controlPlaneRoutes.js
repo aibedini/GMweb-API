@@ -15,7 +15,31 @@ const EVENT_TYPES = Object.keys({
   ...eventCryptoPolicy.controlKey,
   ...eventCryptoPolicy.nonContentControl,
 });
-const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ"]);
+const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY", "FETCH_THREAD_HISTORY"]);
+
+/**
+ * Defensive validation of Android-advertised command capabilities (telemetry
+ * path). Shared with the live runtime store so there is one implementation.
+ *
+ * These are FEATURE NEGOTIATION ONLY, never authorization: a linked browser
+ * still needs its session, the command crypto and a valid target agent.
+ */
+function normalizeCommandTypes(value) {
+  return require("./agentRuntime").normalizeCommandTypes(value);
+}
+
+/** Persist only the capability block, leaving the rest of the payload intact. */
+function withNormalizedCapabilities(body) {
+  if (!body || typeof body !== "object") return body;
+  const types = normalizeCommandTypes(body.capabilities?.commandTypes);
+  if (types === null) {
+    // Older clients simply omit it; do not invent an empty capability set
+    // (absent means "unsupported", which is the honest reading).
+    const { capabilities, ...rest } = body;
+    return rest;
+  }
+  return { ...body, capabilities: { ...body.capabilities, commandTypes: types } };
+}
 const SAFE_INGEST_ERROR_CODES = new Set(["invalid_event_id", "invalid_metadata", "invalid_payload_encoding",
   "invalid_encrypted_envelope", "unsupported_schema_version", "unsupported_crypto_version",
   "encrypted_payload_required", "event_payload_too_large"]);
@@ -33,7 +57,7 @@ const SAFE_INGEST_ERROR_CODES = new Set(["invalid_event_id", "invalid_metadata",
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentAuthService, checkRateLimit, enableCommandLeases = false }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentActivityStore, agentRuntimeStore, derivePhonePresence, deriveTelemetryFreshness, agentAuthService, checkRateLimit, enableCommandLeases = false }) {
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
   const replicationCapabilities = () => ({
     preferredProtocolVersion: 1,
@@ -285,13 +309,21 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (!agent) return reply.code(401).send({ error: "agent_auth_required" });
     if (request.body.deviceId !== agent.deviceId) return reply.code(403).send({ error: "device_id_mismatch" });
     if (!deviceTelemetryStore) return reply.code(503).send({ error: "telemetry_unavailable" });
-    deviceTelemetryStore.upsert(request.body, agent.role);
+    deviceTelemetryStore.upsert(withNormalizedCapabilities(request.body), agent.role);
     return { ok: true };
   });
 
   app.get("/admin/device-telemetry", {
     schema: { summary: "Latest Android fleet telemetry", tags: ["Admin"] },
   }, async () => ({ devices: deviceTelemetryStore?.getAll() || [] }));
+
+  app.get("/admin/sms-capabilities", {
+    schema: { summary: "Current Primary SIM capabilities; unknown permissions remain null", tags: ["Admin"] },
+  }, async () => {
+    const primary = agentAuthService?.getPrimaryIdentity();
+    const telemetry = primary ? deviceTelemetryStore?.get(primary.device_id) : null;
+    return require("./smsCapabilities").smsCapabilities(telemetry);
+  });
 
   app.get("/api/v1/admin/sync-stats", {
     schema: { summary: "Encrypted sync and device queue statistics", tags: ["Admin"] },
@@ -309,7 +341,94 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     schema: { summary: "Latest Primary Android telemetry", tags: ["Trust"] },
   }, async (request, reply) => {
     if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
-    return { telemetry: deviceTelemetryStore?.getPrimary() || null };
+    const primary = agentAuthService?.getPrimaryIdentity();
+    return { telemetry: primary ? deviceTelemetryStore?.get(primary.device_id) || null
+      : deviceTelemetryStore?.getPrimary() || null };
+  });
+
+  /**
+   * Canonical, honest Android status: PHONE LIVENESS and TELEMETRY FRESHNESS are
+   * reported as two independent axes.
+   *
+   * This exists because deriving presence from telemetry `receivedAt` produced a
+   * production false "Phone Offline · last seen 2 days ago" while the phone was
+   * authenticating command polls every few seconds. Liveness comes from
+   * server-observed authenticated activity only.
+   */
+  app.get("/api/v1/linked-device/status", {
+    schema: { summary: "Primary Android liveness and telemetry freshness", tags: ["Trust"] },
+  }, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    const now = Date.now();
+    const primary = agentAuthService?.getPrimaryIdentity?.() || null;
+    const deviceId = primary?.device_id || null;
+    const activity = deviceId ? agentActivityStore?.get(deviceId) || null : null;
+    const telemetry = deviceId ? deviceTelemetryStore?.get(deviceId) || null
+      : deviceTelemetryStore?.getPrimary() || null;
+
+    const phoneState = derivePhonePresence
+      ? derivePhonePresence(activity?.lastActivityAt ?? null, now)
+      : "NEVER_SEEN";
+    const telemetryState = deriveTelemetryFreshness
+      ? deriveTelemetryFreshness(telemetry?.receivedAt ?? null, now)
+      : "NEVER_REPORTED";
+
+    // Live runtime metadata comes from the authenticated command poll, never
+    // from telemetry. See src/agentRuntime.js.
+    const runtime = deviceId ? agentRuntimeStore?.get(deviceId) || null : null;
+
+    // `phone.appVersion` is retained for older clients but is explicitly a
+    // DERIVED value, and says whether it fell back to a stale telemetry row.
+    const appVersionName = runtime?.appVersionName ?? telemetry?.app?.versionName ?? null;
+    const appVersionSource = runtime?.appVersionName ? "RUNTIME"
+      : telemetry?.app?.versionName ? "TELEMETRY_FALLBACK" : null;
+
+    return {
+      phone: {
+        state: phoneState,
+        lastActivityAt: activity?.lastActivityAt ?? null,
+        lastActivitySource: activity?.lastSource ?? null,
+        ageMs: activity?.lastActivityAt ? Math.max(0, now - activity.lastActivityAt) : null,
+        // Deprecated: use `runtime`. True when this is a stale telemetry value.
+        appVersion: appVersionName,
+        appVersionSource,
+        appVersionIsFallback: appVersionSource === "TELEMETRY_FALLBACK",
+        // Safe device facts only; never SIM identifiers or phone numbers.
+        model: telemetry?.device?.model ?? null,
+        manufacturer: telemetry?.device?.manufacturer ?? null,
+        androidVersion: telemetry?.device?.androidVersion ?? null,
+      },
+      runtime: {
+        appVersionName: runtime?.appVersionName ?? null,
+        appVersionCode: runtime?.appVersionCode ?? null,
+        protocolVersion: runtime?.protocolVersion ?? null,
+        commandTypes: runtime?.commandTypes ?? [],
+        receivedAt: runtime?.receivedAt ?? null,
+        source: runtime?.source ?? null,
+        ageMs: runtime?.receivedAt ? Math.max(0, now - runtime.receivedAt) : null,
+      },
+      telemetry: {
+        state: telemetryState,
+        receivedAt: telemetry?.receivedAt ?? null,
+        ageMs: telemetry?.receivedAt ? Math.max(0, now - telemetry.receivedAt) : null,
+        // Diagnostic only: the phone's clock offset, which NEVER affects state.
+        clockSkewMs: telemetry?.clockSkewMs ?? null,
+        // The version the last telemetry row carried. Historical, not current.
+        reportedAppVersion: telemetry?.app?.versionName ?? null,
+      },
+      now,
+    };
+  });
+
+  app.delete("/api/v1/linked-session", {
+    schema: { summary: "Sign out and unlink this browser's server sessions", tags: ["Pairing"],
+      response: { 200: { type: "object", properties: { ok: { type: "boolean" } } } } },
+  }, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    linkedSessions.revokeDevice(request.linkedDevice.deviceId);
+    reply.clearCookie(linkedSessions.COOKIE_NAME, { path: "/" });
+    reply.header("Cache-Control", "no-store");
+    return { ok: true };
   });
 
   app.get("/api/v1/linked-device/sessions", {
@@ -332,12 +451,22 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   app.get("/api/v1/linked-device/command-key", {
     schema: { summary: "Primary Android command encryption public key", tags: ["Commands"] },
   }, async (request, reply) => {
-    if (!request.linkedDevice?.capabilities?.includes("SEND_MESSAGES")) {
-      return reply.code(403).send({ error: "send_messages_capability_required" });
+    if (!request.linkedDevice?.capabilities?.some(cap => ["SEND_MESSAGES", "MARK_READ"].includes(cap))) {
+      return reply.code(403).send({ error: "command_capability_required" });
     }
     const identity = agentAuthService?.getPrimaryIdentity();
     if (!identity?.encryption_public_key) return reply.code(404).send({ error: "primary_command_key_unavailable" });
-    return { deviceId: identity.device_id, encryptionPublicKey: identity.encryption_public_key };
+    // The format travels with the key so the client never has to guess from
+    // byte length. An unusable stored key is reported, never served as valid.
+    const classified = require("./publicKeyFormat").classifyPublicKey(identity.encryption_public_key);
+    if (!classified.ok) {
+      return reply.code(409).send({ error: "invalid_primary_command_key", reason: classified.error });
+    }
+    return {
+      deviceId: identity.device_id,
+      encryptionPublicKey: identity.encryption_public_key,
+      encryptionPublicKeyFormat: classified.format,
+    };
   });
 
   // ── POST-PAIR: linked-device presence telemetry (Android-authenticated) ──
@@ -375,7 +504,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         type: "object",
         required: ["type", "payload"],
         properties: {
-          type: { type: "string", examples: ["SEND_SMS", "MARK_THREAD_READ"] },
+          type: { type: "string", examples: ["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY"] },
           payload: { type: "string", description: "base64-encoded opaque payload bytes" },
           encoding: { type: "string", default: "application/json" },
           schemaVersion: { type: "integer", default: 1 },
@@ -404,6 +533,21 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (request.linkedDevice && body.type === "SEND_SMS" &&
         !request.linkedDevice.capabilities?.includes("SEND_MESSAGES")) {
       return reply.code(403).send({ error: "send_messages_capability_required" });
+    }
+    // Fetching older provider history READS message content from the phone, so it
+    // is gated by the same READ_MESSAGES capability as reading history. The
+    // payload is opaque encrypted data: the server never learns the phone
+    // number, the branded sender, the Android thread id or the SMS body.
+    if (request.linkedDevice && body.type === "FETCH_THREAD_HISTORY" &&
+        !request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    }
+    // Refreshing device telemetry reads device/SIM state, so it needs the same
+    // capability that already gates reading that state. A linked browser may
+    // refresh exactly what it is allowed to read.
+    if (request.linkedDevice && body.type === "REFRESH_DEVICE_TELEMETRY" &&
+        !request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
     }
     if (request.linkedDevice && ENCRYPTED_LINKED_COMMAND_TYPES.has(String(body.type))) {
       if (Number(body.cryptoVersion) !== 1 || body.encoding !== "envelope.v1" || Number(body.schemaVersion) !== 1) {
@@ -444,6 +588,10 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       if (request.linkedDevice && command.sourceClientId !== request.linkedDevice.deviceId) {
         return reply.code(409).send({ error: "idempotency_owner_mismatch" });
       }
+      if (command.type === "MARK_THREAD_READ") request._readAudit = {
+        action: "read_requested", commandId: command.id, readerDeviceId: command.sourceClientId,
+        targetAgentId: command.targetAgentId, state: command.state, created,
+      };
       reply.code(202).send({ commandId: command.id, state: command.state, created });
     } catch (error) {
       reply.code(error.code === "idempotency_key_reused" ? 409 : 400).send({ error: error.message });
@@ -483,7 +631,20 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         type: "object",
         properties: {
           agentId: { type: "string", description: "device/agent identity (device-key auth until PR-08 mTLS)" },
-          limit: { type: "integer", minimum: 1, maximum: 100, default: 25 }
+          limit: { type: "integer", minimum: 1, maximum: 100, default: 25 },
+          // Optional, additive live runtime evidence. Older clients omit it.
+          // Feature negotiation only — never authorization.
+          runtime: {
+            type: "object",
+            description: "Live Android runtime metadata (app version, advertised command types)",
+            additionalProperties: true,
+            properties: {
+              protocolVersion: { type: "integer" },
+              appVersionName: { type: "string", maxLength: 64 },
+              appVersionCode: { type: "integer", minimum: 0 },
+              commandTypes: { type: "array", items: { type: "string", maxLength: 64 }, maxItems: 32 }
+            }
+          }
         }
       },
       response: { 200: { type: "object", properties: { commands: { type: "array", items: { type: "object", additionalProperties: true } } } } }
@@ -491,6 +652,14 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   }, async (request) => {
     const agentId = String(request.body?.agentId || "android-agent");
     const limit = Math.max(1, Math.min(100, Number(request.body?.limit) || 25));
+
+    // Runtime metadata is recorded only for an AgentAuth-authenticated request,
+    // and is keyed by the AUTHENTICATED device id — never the body's claim.
+    const authenticated = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (authenticated && request.body?.runtime) {
+      agentRuntimeStore?.record(authenticated.deviceId, request.body.runtime, "COMMAND_POLL");
+    }
+
     const commands = commandEngine.claimForAgent(agentId, { limit }).map((c) => ({
       ...c,
       ciphertext: b64(c.ciphertext),
@@ -556,6 +725,12 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     if (!from) return reply.code(400).send({ error: "invalid_state" });
     const ok = commandEngine.transitionClaim(String(request.params.id), state === "ACCEPTED" ? "ACCEPTED_BY_AGENT" : state,
       { agentId: identity.deviceId, claimGeneration, fromStates: from, result: result ?? null });
+    const command = commandEngine.get(String(request.params.id));
+    if (ok && command?.type === "MARK_THREAD_READ") request._readAudit = {
+      action: state === "COMPLETED" ? "read_completed" : "read_status",
+      commandId: command.id, readerDeviceId: command.sourceClientId,
+      targetAgentId: command.targetAgentId, state,
+    };
     return ok ? { ok: true } : reply.code(409).send({ error: "stale_or_illegal_claim" });
   });
 
@@ -589,6 +764,12 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       result: result ?? null,
     });
     if (!ok) { reply.code(409).send({ error: "illegal_transition" }); return; }
+    const command = commandEngine.get(id);
+    if (command?.type === "MARK_THREAD_READ") request._readAudit = {
+      action: state === "COMPLETED" ? "read_completed" : "read_status",
+      commandId: id, readerDeviceId: command.sourceClientId,
+      targetAgentId: command.targetAgentId, state,
+    };
     return { ok: true };
   });
 
