@@ -15,6 +15,7 @@ const { DomainStore, normalizeHostname, getService, SERVICE_REGISTRY, deriveStat
   upstreamFor } = require("./domainStore");
 const { verifyDns, verifyRouting } = require("./domainVerification");
 const { createHelperClient } = require("./domainPrivileged");
+const { detectServedHostnames } = require("./domainDetect");
 
 /** This host's own addresses, so a domain can be checked against reality. */
 function localAddresses() {
@@ -40,6 +41,8 @@ function registerDomainRoutes(app, deps = {}) {
     enabled = true,
     // Privileged helper client. Absent => verification-only (Phase 1 behaviour).
     helper = createHelperClient({ enabled: false }),
+    // Hostnames this server already serves (read-only discovery; injectable for tests).
+    detect = () => detectServedHostnames({ origins: [process.env.PUBLIC_WEB_ORIGIN, process.env.PUBLIC_API_ORIGIN] }),
   } = deps;
   if (!domainStore) throw new Error("registerDomainRoutes requires a domainStore");
 
@@ -92,7 +95,14 @@ function registerDomainRoutes(app, deps = {}) {
     }
     const domains = domainStore.list().map(present);
     const live = await helper.capability();
-    return { enabled, capability: { ...capability(), ...live }, domains };
+    const served = detect();
+    const servedNames = new Set(served.map((d) => d.hostname));
+    const tracked = new Set(domains.map((d) => d.hostname));
+    const detected = served.filter((d) => !tracked.has(d.hostname));
+    // `servedByServer`: the server already answers for this name through configuration
+    // the panel did not create (so Apply would be refused; it can be marked existing).
+    const rows = domains.map((d) => ({ ...d, servedByServer: d.proxy.status !== "APPLIED" && servedNames.has(d.hostname) }));
+    return { enabled, capability: { ...capability(), ...live }, domains: rows, detected };
   });
 
   app.post("/admin/domains", {
@@ -104,18 +114,28 @@ function registerDomainRoutes(app, deps = {}) {
       body: { type: "object", additionalProperties: false, required: ["hostname", "serviceId"],
         properties: { hostname: { type: "string", minLength: 1, maxLength: 253 },
           serviceId: { type: "string", minLength: 1, maxLength: 64 },
-          autoRenew: { type: "boolean" } } },
+          autoRenew: { type: "boolean" },
+          existing: { type: "boolean", description: "Track a hostname this server already serves (never modified by the panel)." } } },
       response: { 200: { type: "object", additionalProperties: true },
         400: { type: "object", properties: { error: { type: "string" }, message: { type: "string" } } },
         409: { type: "object", properties: { error: { type: "string" } } } },
     },
   }, async (request, reply) => {
     if (!limit(request, "admin-domains-create", 30, 60_000)) return reply.code(429).send({ error: "rate_limited" });
-    const { hostname, serviceId, autoRenew } = request.body || {};
+    const { hostname, serviceId, autoRenew, existing } = request.body || {};
     const result = domainStore.create({ hostname, serviceId, autoRenew: autoRenew !== false,
       createdBy: request.dashboardUser?.username || "master" });
     if (result.error === "DUPLICATE_DOMAIN") return reply.code(409).send(result);
     if (result.error) return reply.code(400).send(result);
+    if (existing) {
+      if (!detect().some((d) => d.hostname === result.domain.hostname_normalized)) {
+        domainStore.remove(result.domain.id);
+        return reply.code(400).send({ error: "NOT_DETECTED", message: "This server does not appear to serve that hostname yet, so it cannot be tracked as existing." });
+      }
+      domainStore.recordProxy(result.domain.id, { status: "EXTERNAL" });
+      return { ok: true, domain: present(domainStore.byId(result.domain.id)),
+        next: "Tracked as existing. Use Check DNS and Check HTTPS; the panel will not modify its server configuration." };
+    }
     return { ok: true, domain: present(result.domain),
       next: "Create the DNS record, run verify-dns, then apply the domain to the server and "
         + "issue a certificate. Both of those need the privileged helper." };
@@ -134,12 +154,27 @@ function registerDomainRoutes(app, deps = {}) {
   app.patch("/admin/domains/:id", {
     schema: { summary: "Update a domain's service or auto-renew setting", tags: ["Admin"],
       body: { type: "object", additionalProperties: false,
-        properties: { serviceId: { type: "string" }, autoRenew: { type: "boolean" } } },
+        properties: { serviceId: { type: "string" }, autoRenew: { type: "boolean" }, existing: { type: "boolean" } } },
       response: { 200: { type: "object", additionalProperties: true },
         400: { type: "object", additionalProperties: true },
         404: { type: "object", properties: { error: { type: "string" } } } } },
   }, async (request, reply) => {
-    const result = domainStore.update(request.params.id, request.body || {});
+    const { existing, ...patch } = request.body || {};
+    if (existing !== undefined) {
+      const row = domainStore.byId(request.params.id);
+      if (!row) return reply.code(404).send({ error: "NOT_FOUND" });
+      if (existing) {
+        if (row.proxy_status === "APPLIED") return reply.code(409).send({ error: "ALREADY_MANAGED", message: "This panel already manages its server entry." });
+        if (!detect().some((d) => d.hostname === row.hostname_normalized)) {
+          return reply.code(400).send({ error: "NOT_DETECTED", message: "This server does not appear to serve that hostname." });
+        }
+        domainStore.recordProxy(row.id, { status: "EXTERNAL" });
+      } else if (row.proxy_status === "EXTERNAL") {
+        domainStore.recordProxy(row.id, { status: "NONE" });
+      }
+      if (!Object.keys(patch).length) return { ok: true, domain: present(domainStore.byId(row.id)) };
+    }
+    const result = domainStore.update(request.params.id, patch);
     if (result.error === "NOT_FOUND") return reply.code(404).send(result);
     if (result.error) return reply.code(400).send(result);
     return { ok: true, domain: present(result.domain) };
@@ -204,6 +239,10 @@ function registerDomainRoutes(app, deps = {}) {
     if (!limit(request, "admin-domains-apply", 20, 60_000)) return reply.code(429).send({ error: "rate_limited" });
     const row = domainStore.byId(request.params.id);
     if (!row) return reply.code(404).send({ error: "not_found" });
+    if (row.proxy_status === "EXTERNAL") {
+      return reply.code(409).send({ error: "EXTERNAL_PROXY",
+        message: "This domain is served by existing server configuration that this panel did not create, so it is not modified." });
+    }
     const result = await helper.apply(row.hostname_normalized, row.service_id);
     domainStore.recordOperation(row.id, { kind: "APPLY", outcome: result.ok ? "OK" : "FAILED",
       detail: result.ok ? `Applied for ${row.service_id}.` : `${result.code}: ${result.message}` });
@@ -231,6 +270,10 @@ function registerDomainRoutes(app, deps = {}) {
     if (row.dns_status !== "OK") {
       return reply.code(409).send({ error: "DNS_NOT_VERIFIED",
         message: "Verify DNS first: the domain must resolve to this server before a certificate can be issued." });
+    }
+    if (row.proxy_status === "EXTERNAL") {
+      return reply.code(409).send({ error: "EXTERNAL_PROXY",
+        message: "This domain's certificate is managed outside this panel." });
     }
     if (row.proxy_status !== "APPLIED" || row.proxy_service_id !== row.service_id) {
       return reply.code(409).send({ error: "PROXY_NOT_APPLIED",
@@ -346,8 +389,9 @@ function capability() {
   };
 }
 
-/** NONE | APPLIED | STALE (applied for a different service than is now assigned). */
+/** NONE | APPLIED | EXTERNAL | STALE (applied for a different service than is now assigned). */
 function proxyStatus(row) {
+  if (row.proxy_status === "EXTERNAL") return "EXTERNAL";
   if (row.proxy_status !== "APPLIED") return "NONE";
   return row.proxy_service_id === row.service_id ? "APPLIED" : "STALE";
 }

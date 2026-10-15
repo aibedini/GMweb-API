@@ -40,10 +40,10 @@ const fakeConnect = (certOrError) => () => {
 };
 const okFetch = (status = 200) => async () => ({ status });
 
-async function setup({ helper = fakeHelper(), host = "sms.example.com", dnsOk = true, ...extra } = {}) {
+async function setup({ helper = fakeHelper(), host = "sms.example.com", dnsOk = true, detect = () => [], ...extra } = {}) {
   const s = store();
   const app = Fastify();
-  registerDomainRoutes(app, { domainStore: s, helper, ...extra });
+  registerDomainRoutes(app, { domainStore: s, helper, detect, ...extra });
   const created = await app.inject({ method: "POST", url: "/admin/domains", payload: { hostname: host, serviceId: "main-web" } });
   const id = created.json().domain.id;
   if (dnsOk) s.recordCheck(id, { dnsStatus: "OK", dnsObserved: "203.0.113.5" });
@@ -348,4 +348,90 @@ test("the configured ACME e-mail is passed only when well-formed", async () => {
   const bad = clientWith(async (args) => (args.includes("-l") ? {} : { stdout: OK_LINE }), { acmeEmail: "x; rm -rf /" });
   await bad.client.issue("a.example.com");
   assert.equal(bad.exec.calls.at(-1).args.at(-1), "a.example.com");
+});
+
+// ── existing (already-served) domains ───────────────────────────────────────
+
+const { detectServedHostnames } = require("../src/domainDetect");
+
+test("detection reads origins and foreign nginx server_names, skips managed files and bad names", () => {
+  const files = {
+    "a.conf": "server {\n  server_name gmweb.example.com www.example.com _;\n}\n",
+    "b.conf": "# managed-by: gmweb-domain-helper\nserver { server_name mine.example.com; }\n",
+    "c.conf": "server { server_name bad;name.example.com; }\n server_name ok.example.net;",
+  };
+  const found = detectServedHostnames({
+    origins: ["https://web.example.org/x", "not a url", ""],
+    dirs: ["/d"], readdir: () => Object.keys(files), readFile: (p) => files[require("node:path").basename(p)],
+  });
+  const names = found.map((f) => f.hostname).sort();
+  assert.deepEqual(names, ["gmweb.example.com", "ok.example.net", "web.example.org", "www.example.com"]);
+  assert.equal(found.find((f) => f.hostname === "web.example.org").source, "configured-origin");
+});
+
+test("detection tolerates unreadable directories", () => {
+  assert.deepEqual(detectServedHostnames({ dirs: ["/nope"], readdir: () => { throw new Error("EACCES"); } }), []);
+});
+
+test("list offers detected hostnames that are not tracked yet", async () => {
+  const t = await setup({ detect: () => [{ hostname: "sms.example.com", source: "nginx" }, { hostname: "old.example.com", source: "nginx" }] });
+  const listed = (await t.app.inject({ method: "GET", url: "/admin/domains" })).json();
+  assert.deepEqual(listed.detected, [{ hostname: "old.example.com", source: "nginx" }]);
+  await t.app.close();
+});
+
+test("an existing domain is tracked as EXTERNAL and the panel never modifies it", async () => {
+  const t = await setup({ host: "gmweb.example.com", detect: () => [{ hostname: "gmweb.example.com", source: "nginx" }] });
+  const marked = await t.app.inject({ method: "PATCH", url: `/admin/domains/${t.id}`, payload: { existing: true } });
+  assert.equal(marked.statusCode, 200);
+  assert.equal(marked.json().domain.proxy.status, "EXTERNAL");
+  for (const url of ["/apply", "/issue-certificate"]) {
+    const r = await t.post(url);
+    assert.equal(r.statusCode, 409, url);
+    assert.equal(r.json().error, "EXTERNAL_PROXY");
+  }
+  assert.equal(t.helper.calls.length, 0, "the helper was never invoked");
+  // Verification still works, and removal never touches nginx.
+  assert.equal((await t.post("/verify-dns")).statusCode, 200);
+  const del = await t.app.inject({ method: "DELETE", url: `/admin/domains/${t.id}` });
+  assert.equal(del.json().proxyRemoved, false);
+  assert.equal(t.helper.calls.length, 0);
+  await t.app.close();
+});
+
+test("adding with existing=true requires the hostname to be detected", async () => {
+  const s = store();
+  const app = Fastify();
+  registerDomainRoutes(app, { domainStore: s, helper: fakeHelper(), detect: () => [{ hostname: "yes.example.com", source: "nginx" }] });
+  const bad = await app.inject({ method: "POST", url: "/admin/domains", payload: { hostname: "no.example.com", serviceId: "main-web", existing: true } });
+  assert.equal(bad.statusCode, 400);
+  assert.equal(bad.json().error, "NOT_DETECTED");
+  assert.equal(s.list().length, 0, "nothing was left behind");
+  const ok = await app.inject({ method: "POST", url: "/admin/domains", payload: { hostname: "yes.example.com", serviceId: "main-web", existing: true } });
+  assert.equal(ok.json().domain.proxy.status, "EXTERNAL");
+  await app.close();
+});
+
+test("a panel-managed domain cannot be flipped to existing, and existing can be released", async () => {
+  const t = await setup({ detect: () => [{ hostname: "sms.example.com", source: "nginx" }] });
+  await t.post("/apply");
+  const flip = await t.app.inject({ method: "PATCH", url: `/admin/domains/${t.id}`, payload: { existing: true } });
+  assert.equal(flip.statusCode, 409);
+  await t.app.close();
+  const u = await setup({ detect: () => [{ hostname: "sms.example.com", source: "nginx" }] });
+  await u.app.inject({ method: "PATCH", url: `/admin/domains/${u.id}`, payload: { existing: true } });
+  const back = await u.app.inject({ method: "PATCH", url: `/admin/domains/${u.id}`, payload: { existing: false } });
+  assert.equal(back.json().domain.proxy.status, "NONE");
+  await u.app.close();
+});
+
+test("a tracked domain the server already serves is flagged so it can be marked existing", async () => {
+  const t = await setup({ detect: () => [{ hostname: "sms.example.com", source: "nginx" }] });
+  const listed = (await t.app.inject({ method: "GET", url: "/admin/domains" })).json();
+  assert.equal(listed.domains[0].servedByServer, true);
+  assert.equal(listed.detected.length, 0, "already tracked, so not offered again");
+  await t.post("/apply");
+  const after = (await t.app.inject({ method: "GET", url: "/admin/domains" })).json();
+  assert.equal(after.domains[0].servedByServer, false, "panel-managed entries are not 'foreign'");
+  await t.app.close();
 });

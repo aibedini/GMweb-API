@@ -289,11 +289,16 @@ class DomainStore {
   recordProxy(id, { status, serviceId = null }) {
     const row = this.byId(id);
     if (!row) return { error: "NOT_FOUND" };
-    if (!["APPLIED", "NONE"].includes(status)) return { error: "INVALID_STATUS" };
+    if (!["APPLIED", "NONE", "EXTERNAL"].includes(status)) return { error: "INVALID_STATUS" };
     const now = Date.now();
     if (status === "APPLIED") {
       this.db.prepare("UPDATE domains SET proxy_status='APPLIED', proxy_service_id=?, proxy_applied_at=?, updated_at=? WHERE id=?")
         .run(serviceId || row.service_id, now, now, row.id);
+    } else if (status === "EXTERNAL") {
+      // Served by configuration this panel did not create. Tracked and verifiable,
+      // but never modified: the helper refuses foreign files anyway.
+      this.db.prepare("UPDATE domains SET proxy_status='EXTERNAL', proxy_service_id=NULL, proxy_applied_at=NULL, updated_at=? WHERE id=?")
+        .run(now, row.id);
     } else if (status === "NONE") {
       this.db.prepare("UPDATE domains SET proxy_status='NONE', proxy_service_id=NULL, proxy_applied_at=NULL, updated_at=? WHERE id=?")
         .run(now, row.id);
