@@ -18,9 +18,10 @@ type Domain = {
   status: string;
   dns: { status: string | null; observed: string[]; checkedAt: string | null };
   routing: { status: string | null; checkedAt: string | null };
-  proxy: { status: "NONE" | "APPLIED" | "STALE"; appliedServiceId: string | null; appliedAt: string | null };
+  proxy: { status: "NONE" | "APPLIED" | "STALE" | "EXTERNAL"; appliedServiceId: string | null; appliedAt: string | null };
   ssl: { status: string | null; issuer: string | null; notAfter: string | null; daysRemaining: number | null };
   autoRenew: boolean;
+  servedByServer?: boolean;
   lastError: { code: string; message: string } | null;
 };
 
@@ -33,7 +34,9 @@ type Capability = {
   reason: string | null;
 };
 
-type ListResponse = { enabled: boolean; capability: Capability; domains: Domain[] };
+type Detected = { hostname: string; source: string };
+
+type ListResponse = { enabled: boolean; capability: Capability; domains: Domain[]; detected?: Detected[] };
 
 const STATUS_VARIANT: Record<string, "success" | "warning" | "destructive" | "secondary"> = {
   SSL_ACTIVE: "success",
@@ -67,6 +70,7 @@ export function DomainsCard() {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [services, setServices] = useState<Service[]>([]);
   const [capability, setCapability] = useState<Capability | null>(null);
+  const [detected, setDetected] = useState<Detected[]>([]);
   const [enabled, setEnabled] = useState(true);
   const [loading, setLoading] = useState(true);
   const [hostname, setHostname] = useState("");
@@ -84,6 +88,7 @@ export function DomainsCard() {
       ]);
       setDomains(list.domains);
       setCapability(list.capability);
+      setDetected(list.detected ?? []);
       setEnabled(list.enabled);
       setServices(svc.services);
       setServiceId((current) => current || svc.services[0]?.id || "");
@@ -126,6 +131,10 @@ export function DomainsCard() {
     }
   }
 
+  async function track(hostname: string) {
+    await run(hostname, "track", () => api("/admin/domains", { method: "POST", body: { hostname, serviceId: serviceId || "main-web", existing: true } }));
+  }
+
   async function remove(domain: Domain) {
     if (!window.confirm(domain.proxy.status === "NONE" ? `Remove ${domain.hostname} from management?` : `Remove ${domain.hostname}? Its web-server entry will be removed too. The certificate is kept.`)) return;
     await run(domain.id, "remove", async () => {
@@ -160,6 +169,25 @@ export function DomainsCard() {
           <div className="rounded-lg border border-amber-400/30 bg-amber-400/5 p-3 text-xs leading-relaxed text-amber-200/90">
             <div className="mb-1 font-medium">Verification only</div>
             {capability.reason} Until then you can record domains and check DNS and HTTPS, but the web-server entry and the certificate cannot be created from here.
+          </div>
+        )}
+
+        {detected.length > 0 && (
+          <div className="rounded-lg border border-sky-400/20 bg-sky-400/5 p-3">
+            <div className="mb-2 text-xs font-medium text-sky-200">Already served by this server</div>
+            <ul className="space-y-1.5">
+              {detected.map((item) => (
+                <li key={item.hostname} className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-mono text-xs">{item.hostname}
+                    <span className="ml-2 text-[11px] text-muted-foreground">{item.source === "nginx" ? "found in nginx" : "configured origin"}</span>
+                  </span>
+                  <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => track(item.hostname)}>
+                    {busy === `${item.hostname}:track` ? <Loader2 className="animate-spin" /> : <Plus />} Show in list
+                  </Button>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-2 text-[11px] text-muted-foreground">Listed domains keep working exactly as they are. The panel only checks them; it never edits their server configuration.</p>
           </div>
         )}
 
@@ -201,6 +229,7 @@ export function DomainsCard() {
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="truncate font-mono text-sm font-medium">{domain.hostname}</span>
                         <Badge variant={STATUS_VARIANT[domain.status] ?? "secondary"}>{STATUS_LABEL[domain.status] ?? domain.status}</Badge>
+                        {domain.proxy.status === "EXTERNAL" && <Badge variant="secondary">Existing</Badge>}
                       </div>
                       <div className="mt-1 text-xs text-muted-foreground">Serves {domain.serviceLabel ?? domain.serviceId}</div>
                     </div>
@@ -218,15 +247,23 @@ export function DomainsCard() {
                         onClick={() => run(domain.id, "routing", () => api(`/admin/domains/${domain.id}/verify-routing`, { method: "POST", body: {} }))}>
                         {isBusy("routing") ? <Loader2 className="animate-spin" /> : <ShieldCheck />} Check HTTPS
                       </Button>
+                      {domain.servedByServer && domain.proxy.status === "NONE" && (
+                        <Button size="sm" variant="outline" disabled={busy !== null}
+                          title="The server already answers for this name through configuration the panel did not create."
+                          onClick={() => run(domain.id, "existing", () => api(`/admin/domains/${domain.id}`, { method: "PATCH", body: { existing: true } }))}>
+                          {isBusy("existing") ? <Loader2 className="animate-spin" /> : <Server />} Mark existing
+                        </Button>
+                      )}
                       <Button size="sm" variant={domain.proxy.status === "APPLIED" ? "outline" : "default"}
-                        disabled={busy !== null || !canApply}
-                        title={canApply ? "Write this domain's web-server entry (HTTP until a certificate is issued)." : "Needs the privileged helper."}
+                        disabled={busy !== null || !canApply || domain.proxy.status === "EXTERNAL"}
+                        title={domain.proxy.status === "EXTERNAL" ? "Served by existing server configuration; the panel does not modify it." : canApply ? "Write this domain's web-server entry (HTTP until a certificate is issued)." : "Needs the privileged helper (see the notice above)."}
                         onClick={() => run(domain.id, "apply", () => api(`/admin/domains/${domain.id}/apply`, { method: "POST", body: {} }))}>
                         {isBusy("apply") ? <Loader2 className="animate-spin" /> : <Server />}
                         {domain.proxy.status === "NONE" ? "Apply" : "Re-apply"}
                       </Button>
                       <Button size="sm" disabled={busy !== null || !canIssue || domain.proxy.status !== "APPLIED" || domain.dns.status !== "OK" || domain.ssl.status === "ACTIVE"}
-                        title={!canIssue ? "Needs the privileged helper."
+                        title={domain.proxy.status === "EXTERNAL" ? "This certificate is managed outside the panel."
+                          : !canIssue ? "Needs the privileged helper (see the notice above)."
                           : domain.dns.status !== "OK" ? "Check DNS first: it must point at this server."
                           : domain.proxy.status !== "APPLIED" ? "Apply the domain first."
                           : domain.ssl.status === "ACTIVE" ? "A valid certificate is already active." : "Request a Let's Encrypt certificate."}
@@ -239,7 +276,7 @@ export function DomainsCard() {
                     </div>
                   </div>
                   <dl className="grid gap-x-6 gap-y-1 text-xs sm:grid-cols-4">
-                    <div><dt className="text-muted-foreground">Server entry</dt><dd className="font-mono">{domain.proxy.status === "NONE" ? "not applied" : domain.proxy.status === "STALE" ? "out of date: re-apply" : "applied"}</dd></div>
+                    <div><dt className="text-muted-foreground">Server entry</dt><dd className="font-mono">{domain.proxy.status === "NONE" ? "not applied" : domain.proxy.status === "STALE" ? "out of date: re-apply" : domain.proxy.status === "EXTERNAL" ? "existing (not edited)" : "applied"}</dd></div>
                     <div><dt className="text-muted-foreground">DNS</dt><dd className="font-mono">{domain.dns.status ?? "not checked"}{domain.dns.observed.length > 0 && ` · ${domain.dns.observed.join(", ")}`}</dd></div>
                     <div><dt className="text-muted-foreground">HTTPS routing</dt><dd className="font-mono">{domain.routing.status ?? "not checked"}</dd></div>
                     <div><dt className="text-muted-foreground">Certificate</dt><dd className="font-mono">{domain.ssl.status ?? "none observed"}{domain.ssl.daysRemaining !== null && ` · ${domain.ssl.daysRemaining}d left`}</dd></div>
