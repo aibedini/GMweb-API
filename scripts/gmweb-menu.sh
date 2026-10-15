@@ -754,7 +754,10 @@ update_app() {
   # ── Operator lock ─────────────────────────────────────────────────────────
   # main is shared by multiple operator/AI sessions. A second updater must not
   # race this one: take a non-blocking OS lock and exit immediately if held.
-  exec 9>/run/lock/gmweb-update.lock 2>/dev/null || exec 9>"$APP_DIR/data/.gmweb-update.lock"
+  # The 2>/dev/null belongs to a group: on a bare `exec` a redirection is permanent,
+  # so `exec 9>file 2>/dev/null` silenced stderr for the WHOLE update and hid every
+  # later git error (and the -x trace) behind a silent exit.
+  { exec 9>/run/lock/gmweb-update.lock; } 2>/dev/null || exec 9>"$APP_DIR/data/.gmweb-update.lock"
   if ! flock -n 9; then
     echo "${C_RED}update_already_running${C_RESET}"
     echo "Another gmweb update is in progress; try again when it finishes."
@@ -770,6 +773,12 @@ update_app() {
   # unreadable file used to abort the whole update with a bare "Permission
   # denied ... Cannot save the untracked files".
   chown -R "$APP_USER:$APP_USER" "$APP_DIR" 2>/dev/null || true
+
+  # The chown above makes the app user own the checkout, and git refuses to touch a
+  # repository owned by someone else when run as root ("dubious ownership"). Every
+  # root-side git call in this function would then die, silently. Trust the checkout
+  # explicitly, once.
+  git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$APP_DIR"     || git config --global --add safe.directory "$APP_DIR"
 
   local local_status stash_ref
   local_status="$(run_as_app "git -C '$APP_DIR' status --porcelain --untracked-files=normal")"
