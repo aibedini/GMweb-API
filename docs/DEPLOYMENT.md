@@ -139,3 +139,23 @@ queue look broken.
 Window statistics are computed in SQLite (`sendStore.statsSince(ts)`) with the
 additive index `idx_sends_terminal_time`, not by loading rows into JavaScript.
 History is never rewritten or purged to make counters look clean.
+
+## Custom domains and SSL (privileged helper)
+
+Settings → **Domains & SSL** can add a domain, apply it to nginx and obtain a Let's Encrypt certificate. The API process stays unprivileged; the two privileged actions are done by `scripts/gmweb-domain-helper.sh`, installed root-owned and reachable only through exact-subcommand sudoers rules (spec `specs/011-domain-proxy-ssl`).
+
+One-time install on the host (re-run after upgrading the helper):
+
+```bash
+sudo bash scripts/install-domain-helper.sh --with-packages
+```
+
+`--with-packages` also installs nginx and certbot. Open ports 80 and 443 before requesting a certificate. Optional environment: `DOMAIN_ACME_EMAIL` (certificate expiry notices), `DOMAIN_APPLY_ENABLED=false` (turn the feature off), `DOMAIN_HELPER_PATH`.
+
+Behaviour to rely on:
+
+- Each change is `nginx -t` gated and rolled back on failure; only files carrying the helper's marker are ever modified or removed, and a hostname already served by another nginx site is refused.
+- Certificate issuance needs DNS verified OK and the domain applied for its current service. `SSL_ACTIVE` is set only by the independent HTTPS probe, never by certbot's exit code.
+- Removing an applied domain removes its nginx entry first; the certificate is kept. Renewal is certbot's own timer with a `systemctl reload nginx` deploy hook.
+- If the helper is not installed the card says so and stays verification-only.
+- Production acceptance (real nginx reload, real issuance, first renewal) is **NOT VERIFIED** until run on a host.

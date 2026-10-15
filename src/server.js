@@ -216,10 +216,12 @@ const activityBackfilled = agentActivityStore.backfillFromEvents();
 // the authenticated command poll — deliberately NOT from device telemetry.
 const { AgentRuntimeStore } = require("./agentRuntime");
 const agentRuntimeStore = new AgentRuntimeStore(controlDb);
-// Domain management (Phase 1: verification only — this process has no privilege
-// to write /etc/nginx or run certbot, and the API says so explicitly).
+// Domain management. This process stays unprivileged: apply/issue go through the
+// root-owned helper via sudo (src/domainPrivileged.js) and are reported unavailable
+// when the helper is not installed.
 const { DomainStore } = require("./domainStore");
 const { registerDomainRoutes } = require("./domainRoutes");
+const { createHelperClient } = require("./domainPrivileged");
 const domainStore = new DomainStore(controlDb);
 controlDb.pragma("journal_mode = WAL");
 const trustRegistry = new TrustRegistry(controlDb);
@@ -2318,7 +2320,7 @@ if (config.dashboardEnabled) {
 // the generated OpenAPI spec (/docs would only show the proxy routes otherwise).
 app.after(() => {
 
-registerDomainRoutes(app, { domainStore, checkRateLimit });
+registerDomainRoutes(app, { domainStore, checkRateLimit, helper: createHelperClient() });
 
 function parseLimit(value, fallback, max) {
   const parsed = Number.parseInt(value, 10);

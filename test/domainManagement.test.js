@@ -305,15 +305,20 @@ test("adding a domain says what did NOT happen", async () => {
   await instance.close();
 });
 
-test("there is no route that can apply configuration or issue a certificate", async () => {
+test("without a privileged helper no route can apply configuration or issue a certificate", async () => {
   const instance = app(store());
   const created = await instance.inject({ method: "POST", url: "/admin/domains",
     payload: { hostname: "r.example.com", serviceId: "main-web" } });
   const id = created.json().domain.id;
   for (const url of [`/admin/domains/${id}/ssl/issue`, `/admin/domains/${id}/ssl/renew`,
-    `/admin/domains/${id}/apply`, `/admin/domains/${id}/configure`]) {
+    `/admin/domains/${id}/configure`]) {
     const response = await instance.inject({ method: "POST", url });
-    assert.equal(response.statusCode, 404, `${url} must not exist in Phase 1`);
+    assert.equal(response.statusCode, 404, `${url} must not exist`);
+  }
+  // Phase 2 routes exist but refuse to act when the helper is not available.
+  for (const url of [`/admin/domains/${id}/apply`, `/admin/domains/${id}/issue-certificate`]) {
+    const response = await instance.inject({ method: "POST", url });
+    assert.ok([409].includes(response.statusCode), `${url} -> ${response.statusCode}`);
   }
   await instance.close();
 });
@@ -368,7 +373,7 @@ test("removal states that no host configuration was changed", async () => {
   const id = created.json().domain.id;
   const removed = (await instance.inject({ method: "DELETE", url: `/admin/domains/${id}` })).json();
   assert.equal(removed.ok, true);
-  assert.match(removed.note, /NOT touched/);
+  assert.match(removed.note, /No proxy configuration had been applied/);
   await instance.close();
 });
 

@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.50",
+    "version": "0.19.51",
     "contact": {
       "name": "GMweb API"
     }
@@ -509,7 +509,7 @@
         "tags": [
           "Admin"
         ],
-        "description": "Validates and records the domain. It does NOT configure routing or issue a certificate — that requires a privileged helper this process does not have.",
+        "description": "Validates and records the domain. It does NOT configure routing or issue a certificate — use /apply and /issue-certificate for that.",
         "requestBody": {
           "required": true,
           "content": {
@@ -708,7 +708,7 @@
         }
       },
       "delete": {
-        "summary": "Remove a domain from management",
+        "summary": "Remove a domain (and its proxy configuration if applied)",
         "tags": [
           "Admin"
         ],
@@ -745,6 +745,28 @@
                       "type": "string"
                     }
                   }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }
@@ -821,6 +843,144 @@
                       "type": "string"
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/domains/{id}/apply": {
+      "post": {
+        "summary": "Apply the domain to the web server (privileged helper)",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Writes the nginx site for this domain's assigned service through the privileged helper, gated by `nginx -t` with automatic rollback. HTTP only until a certificate is issued.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/domains/{id}/issue-certificate": {
+      "post": {
+        "summary": "Obtain a Let's Encrypt certificate (privileged helper)",
+        "tags": [
+          "Admin"
+        ],
+        "description": "Requires DNS verified OK and the domain applied for its current service. A successful helper exit is never reported as SSL active: the TLS/HTTP probe is re-run and only that observation can produce `SSL_ACTIVE`.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
                 }
               }
             }

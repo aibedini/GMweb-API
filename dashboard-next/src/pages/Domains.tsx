@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
-import { Globe, Loader2, Lock, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { Globe, Loader2, Lock, Plus, RefreshCw, Server, ShieldCheck, Trash2 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -18,6 +18,7 @@ type Domain = {
   status: string;
   dns: { status: string | null; observed: string[]; checkedAt: string | null };
   routing: { status: string | null; checkedAt: string | null };
+  proxy: { status: "NONE" | "APPLIED" | "STALE"; appliedServiceId: string | null; appliedAt: string | null };
   ssl: { status: string | null; issuer: string | null; notAfter: string | null; daysRemaining: number | null };
   autoRenew: boolean;
   lastError: { code: string; message: string } | null;
@@ -29,7 +30,7 @@ type Capability = {
   canConfigureProxy: boolean;
   canIssueCertificate: boolean;
   canRenewCertificate: boolean;
-  reason: string;
+  reason: string | null;
 };
 
 type ListResponse = { enabled: boolean; capability: Capability; domains: Domain[] };
@@ -126,7 +127,7 @@ export function DomainsCard() {
   }
 
   async function remove(domain: Domain) {
-    if (!window.confirm(`Remove ${domain.hostname} from management? Existing server configuration is not touched.`)) return;
+    if (!window.confirm(domain.proxy.status === "NONE" ? `Remove ${domain.hostname} from management?` : `Remove ${domain.hostname}? Its web-server entry will be removed too. The certificate is kept.`)) return;
     await run(domain.id, "remove", async () => {
       const result = await api<{ note?: string }>(`/admin/domains/${domain.id}`, { method: "DELETE" });
       if (result.note) setNote(result.note);
@@ -158,7 +159,7 @@ export function DomainsCard() {
         {capability && (!canApply || !canIssue) && (
           <div className="rounded-lg border border-amber-400/30 bg-amber-400/5 p-3 text-xs leading-relaxed text-amber-200/90">
             <div className="mb-1 font-medium">Verification only</div>
-            {capability.reason} Adding a domain records it and lets you check DNS and HTTPS; it does not yet create the web-server entry or request a certificate.
+            {capability.reason} Until then you can record domains and check DNS and HTTPS, but the web-server entry and the certificate cannot be created from here.
           </div>
         )}
 
@@ -217,15 +218,28 @@ export function DomainsCard() {
                         onClick={() => run(domain.id, "routing", () => api(`/admin/domains/${domain.id}/verify-routing`, { method: "POST", body: {} }))}>
                         {isBusy("routing") ? <Loader2 className="animate-spin" /> : <ShieldCheck />} Check HTTPS
                       </Button>
-                      <Button size="sm" disabled title={canIssue ? "" : "Certificate issuance needs the privileged helper, which is not installed."}>
-                        <Lock /> Get SSL
+                      <Button size="sm" variant={domain.proxy.status === "APPLIED" ? "outline" : "default"}
+                        disabled={busy !== null || !canApply}
+                        title={canApply ? "Write this domain's web-server entry (HTTP until a certificate is issued)." : "Needs the privileged helper."}
+                        onClick={() => run(domain.id, "apply", () => api(`/admin/domains/${domain.id}/apply`, { method: "POST", body: {} }))}>
+                        {isBusy("apply") ? <Loader2 className="animate-spin" /> : <Server />}
+                        {domain.proxy.status === "NONE" ? "Apply" : "Re-apply"}
+                      </Button>
+                      <Button size="sm" disabled={busy !== null || !canIssue || domain.proxy.status !== "APPLIED" || domain.dns.status !== "OK" || domain.ssl.status === "ACTIVE"}
+                        title={!canIssue ? "Needs the privileged helper."
+                          : domain.dns.status !== "OK" ? "Check DNS first: it must point at this server."
+                          : domain.proxy.status !== "APPLIED" ? "Apply the domain first."
+                          : domain.ssl.status === "ACTIVE" ? "A valid certificate is already active." : "Request a Let's Encrypt certificate."}
+                        onClick={() => run(domain.id, "ssl", () => api(`/admin/domains/${domain.id}/issue-certificate`, { method: "POST", body: {} }))}>
+                        {isBusy("ssl") ? <Loader2 className="animate-spin" /> : <Lock />} Get SSL
                       </Button>
                       <Button size="sm" variant="ghost" aria-label={`Remove ${domain.hostname}`} disabled={busy !== null} onClick={() => remove(domain)}>
                         {isBusy("remove") ? <Loader2 className="animate-spin" /> : <Trash2 />}
                       </Button>
                     </div>
                   </div>
-                  <dl className="grid gap-x-6 gap-y-1 text-xs sm:grid-cols-3">
+                  <dl className="grid gap-x-6 gap-y-1 text-xs sm:grid-cols-4">
+                    <div><dt className="text-muted-foreground">Server entry</dt><dd className="font-mono">{domain.proxy.status === "NONE" ? "not applied" : domain.proxy.status === "STALE" ? "out of date: re-apply" : "applied"}</dd></div>
                     <div><dt className="text-muted-foreground">DNS</dt><dd className="font-mono">{domain.dns.status ?? "not checked"}{domain.dns.observed.length > 0 && ` · ${domain.dns.observed.join(", ")}`}</dd></div>
                     <div><dt className="text-muted-foreground">HTTPS routing</dt><dd className="font-mono">{domain.routing.status ?? "not checked"}</dd></div>
                     <div><dt className="text-muted-foreground">Certificate</dt><dd className="font-mono">{domain.ssl.status ?? "none observed"}{domain.ssl.daysRemaining !== null && ` · ${domain.ssl.daysRemaining}d left`}</dd></div>

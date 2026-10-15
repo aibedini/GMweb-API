@@ -1,6 +1,7 @@
 "use strict";
 /**
- * /admin/domains* — Phase 1, VERIFICATION ONLY.
+ * /admin/domains* — verification (Phase 1) plus apply/issue through the
+ * privileged helper (Phase 2, spec domain-proxy-ssl-v1).
  *
  * Auth is inherited from the global onRequest guard (the same one that protects
  * every other /admin route: master token or an authenticated dashboard session).
@@ -13,6 +14,7 @@ const crypto = require("node:crypto");
 const { DomainStore, normalizeHostname, getService, SERVICE_REGISTRY, deriveStatus,
   upstreamFor } = require("./domainStore");
 const { verifyDns, verifyRouting } = require("./domainVerification");
+const { createHelperClient } = require("./domainPrivileged");
 
 /** This host's own addresses, so a domain can be checked against reality. */
 function localAddresses() {
@@ -36,6 +38,8 @@ function registerDomainRoutes(app, deps = {}) {
     fetchImpl = undefined,
     connect = undefined,
     enabled = true,
+    // Privileged helper client. Absent => verification-only (Phase 1 behaviour).
+    helper = createHelperClient({ enabled: false }),
   } = deps;
   if (!domainStore) throw new Error("registerDomainRoutes requires a domainStore");
 
@@ -87,14 +91,15 @@ function registerDomainRoutes(app, deps = {}) {
       return reply.code(429).send({ error: "rate_limited" });
     }
     const domains = domainStore.list().map(present);
-    return { enabled, capability: capability(), domains };
+    const live = await helper.capability();
+    return { enabled, capability: { ...capability(), ...live }, domains };
   });
 
   app.post("/admin/domains", {
     schema: {
       summary: "Add a domain (records intent; changes nothing on the host)",
       description: "Validates and records the domain. It does NOT configure routing or issue a "
-        + "certificate — that requires a privileged helper this process does not have.",
+        + "certificate — use /apply and /issue-certificate for that.",
       tags: ["Admin"],
       body: { type: "object", additionalProperties: false, required: ["hostname", "serviceId"],
         properties: { hostname: { type: "string", minLength: 1, maxLength: 253 },
@@ -112,8 +117,8 @@ function registerDomainRoutes(app, deps = {}) {
     if (result.error === "DUPLICATE_DOMAIN") return reply.code(409).send(result);
     if (result.error) return reply.code(400).send(result);
     return { ok: true, domain: present(result.domain),
-      next: "Run verify-dns, then verify-routing. Configuring the proxy and issuing a certificate "
-        + "require the privileged helper, which is not available in this build." };
+      next: "Create the DNS record, run verify-dns, then apply the domain to the server and "
+        + "issue a certificate. Both of those need the privileged helper." };
   });
 
   app.get("/admin/domains/:id", {
@@ -155,18 +160,100 @@ function registerDomainRoutes(app, deps = {}) {
   });
 
   app.delete("/admin/domains/:id", {
-    schema: { summary: "Remove a domain from management", tags: ["Admin"],
+    schema: { summary: "Remove a domain (and its proxy configuration if applied)", tags: ["Admin"],
       response: { 200: { type: "object", additionalProperties: true },
-        404: { type: "object", properties: { error: { type: "string" } } } } },
+        404: { type: "object", properties: { error: { type: "string" } } },
+        409: { type: "object", additionalProperties: true },
+        502: { type: "object", additionalProperties: true } } },
   }, async (request, reply) => {
     const row = domainStore.byId(request.params.id);
     if (!row) return reply.code(404).send({ error: "not_found" });
-    const result = domainStore.remove(row.id);
+    let proxyRemoved = false;
+    if (row.proxy_status === "APPLIED") {
+      // Remove the web-server entry FIRST. If that fails the row is kept, so a live
+      // vhost is never orphaned without any record of it.
+      const result = await helper.remove(row.hostname_normalized);
+      domainStore.recordOperation(row.id, { kind: "REMOVE_PROXY", outcome: result.ok ? "OK" : "FAILED",
+        detail: result.ok ? "Proxy configuration removed." : `${result.code}: ${result.message}` });
+      if (!result.ok) {
+        return reply.code(result.status === 400 ? 502 : result.status).send({ error: result.code,
+          message: `The proxy configuration could not be removed, so the domain was kept. ${result.message || ""}`.trim() });
+      }
+      proxyRemoved = true;
+    }
+    const removed = domainStore.remove(row.id);
     domainStore.recordOperation(row.id, { kind: "REMOVE", outcome: "OK",
-      detail: `${row.hostname_normalized} removed from management (no host configuration was changed).` });
-    return { ok: true, removed: result.removed,
-      note: "Removed from management only. Any existing proxy configuration and certificate were "
-        + "NOT touched — this build has no privilege to change them." };
+      detail: `${row.hostname_normalized} removed from management.` });
+    return { ok: true, removed: removed.removed, proxyRemoved,
+      note: proxyRemoved
+        ? "Proxy configuration removed. The certificate, if any, was kept on the server."
+        : "Removed from management only. No proxy configuration had been applied." };
+  });
+
+  app.post("/admin/domains/:id/apply", {
+    schema: { summary: "Apply the domain to the web server (privileged helper)",
+      description: "Writes the nginx site for this domain's assigned service through the privileged "
+        + "helper, gated by `nginx -t` with automatic rollback. HTTP only until a certificate is issued.",
+      tags: ["Admin"],
+      response: { 200: { type: "object", additionalProperties: true },
+        404: { type: "object", properties: { error: { type: "string" } } },
+        409: { type: "object", additionalProperties: true },
+        502: { type: "object", additionalProperties: true } } },
+    config: { rateLimit: { max: 30, timeWindow: "1 minute" } },
+  }, async (request, reply) => {
+    if (!limit(request, "admin-domains-apply", 20, 60_000)) return reply.code(429).send({ error: "rate_limited" });
+    const row = domainStore.byId(request.params.id);
+    if (!row) return reply.code(404).send({ error: "not_found" });
+    const result = await helper.apply(row.hostname_normalized, row.service_id);
+    domainStore.recordOperation(row.id, { kind: "APPLY", outcome: result.ok ? "OK" : "FAILED",
+      detail: result.ok ? `Applied for ${row.service_id}.` : `${result.code}: ${result.message}` });
+    if (!result.ok) return reply.code(result.status).send({ error: result.code, message: result.message });
+    domainStore.recordProxy(row.id, { status: "APPLIED", serviceId: row.service_id });
+    return { ok: true, domain: present(domainStore.byId(row.id)),
+      next: "Run verify-dns, then issue-certificate once DNS points at this server." };
+  });
+
+  app.post("/admin/domains/:id/issue-certificate", {
+    schema: { summary: "Obtain a Let's Encrypt certificate (privileged helper)",
+      description: "Requires DNS verified OK and the domain applied for its current service. A "
+        + "successful helper exit is never reported as SSL active: the TLS/HTTP probe is re-run and "
+        + "only that observation can produce `SSL_ACTIVE`.",
+      tags: ["Admin"],
+      response: { 200: { type: "object", additionalProperties: true },
+        404: { type: "object", properties: { error: { type: "string" } } },
+        409: { type: "object", additionalProperties: true },
+        502: { type: "object", additionalProperties: true } } },
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } },
+  }, async (request, reply) => {
+    if (!limit(request, "admin-domains-issue", 5, 60_000)) return reply.code(429).send({ error: "rate_limited" });
+    const row = domainStore.byId(request.params.id);
+    if (!row) return reply.code(404).send({ error: "not_found" });
+    if (row.dns_status !== "OK") {
+      return reply.code(409).send({ error: "DNS_NOT_VERIFIED",
+        message: "Verify DNS first: the domain must resolve to this server before a certificate can be issued." });
+    }
+    if (row.proxy_status !== "APPLIED" || row.proxy_service_id !== row.service_id) {
+      return reply.code(409).send({ error: "PROXY_NOT_APPLIED",
+        message: "Apply the domain for its current service before requesting a certificate." });
+    }
+    const result = await helper.issue(row.hostname_normalized);
+    domainStore.recordOperation(row.id, { kind: "ISSUE_CERT", outcome: result.ok ? "OK" : "FAILED",
+      detail: result.ok ? "Certificate obtained; verifying." : `${result.code}: ${result.message}` });
+    if (!result.ok) {
+      domainStore.recordCheck(row.id, { errorCode: "CERT_ISSUE_FAILED", errorMessage: result.message || result.code });
+      return reply.code(result.status).send({ error: result.code, message: result.message });
+    }
+    // Independent observation decides the status — never the helper's exit code.
+    const verified = await verifyRouting({ hostname: row.hostname_normalized,
+      service: getService(row.service_id), fetchImpl, connect });
+    domainStore.recordCheck(row.id, { routingStatus: verified.routingStatus, sslStatus: verified.sslStatus,
+      sslProvider: "letsencrypt", certName: row.hostname_normalized,
+      certNotAfter: verified.certificate?.validTo ?? null, certIssuer: verified.certificate?.issuer ?? null,
+      errorCode: verified.errorCode, errorMessage: verified.message });
+    domainStore.recordOperation(row.id, { kind: "VERIFY_ROUTING",
+      outcome: verified.routingStatus === "OK" ? "OK" : "FAILED", detail: verified.message });
+    return { ok: true, domain: present(domainStore.byId(row.id)),
+      verified: { routing: verified.routingStatus, ssl: verified.sslStatus, message: verified.message } };
   });
 
   app.post("/admin/domains/:id/verify-dns", {
@@ -245,6 +332,7 @@ function registerDomainRoutes(app, deps = {}) {
  * The UI must render this so a stored row is never mistaken for a live vhost.
  */
 function capability() {
+  // Static baseline (no helper). The live value comes from helper.capability().
   return {
     canVerifyDns: true,
     canVerifyRouting: true,
@@ -256,6 +344,12 @@ function capability() {
       + "certificate client. Applying configuration requires a narrowly-scoped privileged helper "
       + "that is not part of this build.",
   };
+}
+
+/** NONE | APPLIED | STALE (applied for a different service than is now assigned). */
+function proxyStatus(row) {
+  if (row.proxy_status !== "APPLIED") return "NONE";
+  return row.proxy_service_id === row.service_id ? "APPLIED" : "STALE";
 }
 
 /** Row → API shape. Never exposes anything privileged. */
@@ -273,6 +367,9 @@ function present(row) {
       checkedAt: row.dns_checked_at ? new Date(row.dns_checked_at).toISOString() : null },
     routing: { status: row.routing_status,
       checkedAt: row.routing_checked_at ? new Date(row.routing_checked_at).toISOString() : null },
+    proxy: { status: proxyStatus(row),
+      appliedServiceId: row.proxy_service_id || null,
+      appliedAt: row.proxy_applied_at ? new Date(row.proxy_applied_at).toISOString() : null },
     ssl: { status: row.ssl_status, provider: row.ssl_provider, certName: row.cert_name,
       issuer: row.cert_issuer,
       notAfter: row.cert_not_after ? new Date(row.cert_not_after).toISOString() : null,

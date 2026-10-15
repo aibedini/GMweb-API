@@ -165,6 +165,11 @@ class DomainStore {
       "ALTER TABLE domains ADD COLUMN cert_issuer TEXT",
       "ALTER TABLE domains ADD COLUMN routing_status TEXT NOT NULL DEFAULT 'UNKNOWN'",
       "ALTER TABLE domains ADD COLUMN routing_checked_at INTEGER",
+      // Phase 2: what the privileged helper last applied, and for which service,
+      // so a later service change is visible as STALE rather than "applied".
+      "ALTER TABLE domains ADD COLUMN proxy_status TEXT NOT NULL DEFAULT 'NONE'",
+      "ALTER TABLE domains ADD COLUMN proxy_service_id TEXT",
+      "ALTER TABLE domains ADD COLUMN proxy_applied_at INTEGER",
     ]) {
       try { db.exec(clause); } catch { /* already present */ }
     }
@@ -278,6 +283,22 @@ class DomainStore {
     if (!row) return { error: "NOT_FOUND" };
     this.db.prepare("DELETE FROM domains WHERE id=?").run(row.id);
     return { ok: true, removed: row.hostname_normalized };
+  }
+
+  /** Record the outcome of a privileged proxy action. `status`: APPLIED | NONE. A failed action changes nothing: the helper rolls back, so the previous state still holds. */
+  recordProxy(id, { status, serviceId = null }) {
+    const row = this.byId(id);
+    if (!row) return { error: "NOT_FOUND" };
+    if (!["APPLIED", "NONE"].includes(status)) return { error: "INVALID_STATUS" };
+    const now = Date.now();
+    if (status === "APPLIED") {
+      this.db.prepare("UPDATE domains SET proxy_status='APPLIED', proxy_service_id=?, proxy_applied_at=?, updated_at=? WHERE id=?")
+        .run(serviceId || row.service_id, now, now, row.id);
+    } else if (status === "NONE") {
+      this.db.prepare("UPDATE domains SET proxy_status='NONE', proxy_service_id=NULL, proxy_applied_at=NULL, updated_at=? WHERE id=?")
+        .run(now, row.id);
+    }
+    return { ok: true, domain: this.byId(row.id) };
   }
 
   /** Persist an observation. Always the OBSERVED truth, never an assumption. */
