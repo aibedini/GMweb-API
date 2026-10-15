@@ -194,3 +194,28 @@ test("rollback still resets source, artifacts and health", () => {
   assert.match(menu, /git -C '\$APP_DIR' reset --hard/);
   assert.match(menu, /git clean -fd public\/web-app public\/dashboard-next/);
 });
+
+// ── silent-update regression: dubious ownership + permanent stderr redirect ──
+
+test("update_app trusts the checkout before any root-side git call", () => {
+  const body = menu.slice(menu.indexOf("update_app() {"));
+  const trust = body.indexOf("safe.directory");
+  assert.ok(trust > 0, "update_app must add the checkout to safe.directory");
+  assert.ok(trust < body.indexOf("git -C \"$APP_DIR\" rev-parse HEAD"), "trust must precede the first root-side git call");
+  assert.ok(trust > body.indexOf("chown -R"), "trust is needed because of the chown above it");
+});
+
+test("the update lock never leaves stderr permanently redirected", () => {
+  // `exec 9>file 2>/dev/null` makes the 2>/dev/null permanent for the whole script.
+  assert.doesNotMatch(menu, /^\s*exec\s+\d>[^\n]*\s2>\/dev\/null/m);
+  assert.match(menu, /\{ exec 9>\/run\/lock\/gmweb-update\.lock; \} 2>\/dev\/null/);
+});
+
+test("a bare exec with a trailing 2>/dev/null really does silence later stderr", { skip: process.platform === "win32" && "needs a POSIX bash" }, () => {
+  const { spawnSync } = require("node:child_process");
+  const run = (script) => spawnSync("bash", ["-c", script], { encoding: "utf8" });
+  const bad = run('exec 9>/dev/null 2>/dev/null; echo oops >&2');
+  const good = run('{ exec 9>/dev/null; } 2>/dev/null; echo oops >&2');
+  assert.equal(bad.stderr, "", "the old form hides stderr");
+  assert.match(good.stderr, /oops/, "the grouped form keeps stderr");
+});
