@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { DomainsCard } from "@/pages/Domains";
 
 type SendPacingSettings = {
   maxPerMinute: number;
@@ -79,6 +80,7 @@ export function SettingsPage() {
   }
 
   return (
+    <div className="space-y-4">
     <div className="grid gap-4 lg:grid-cols-[minmax(0,1.25fr)_minmax(280px,0.75fr)]">
       <form onSubmit={save}>
         <Card className="overflow-hidden">
@@ -194,6 +196,8 @@ export function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+    </div>
+    <DomainsCard />
     </div>
   );
 }
