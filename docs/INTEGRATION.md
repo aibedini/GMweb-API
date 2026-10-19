@@ -376,7 +376,7 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `POST /api/v1/agent/identity` | Bootstrap/refresh Android's stable device identity and public keys. Existing identities sign the exact request with `X-Agent-Auth`. A fresh/recovery pairing can instead use the short-lived, session-bound bootstrap capability embedded in an admin-authorized QR. | Agent signature, pairing bootstrap, or legacy device key |
 | `POST /api/v1/pwa/token-login` | QR-independent access: consume a short-lived, one-time `pwa_...` token created in Dashboard → **PWA Access**, then receive a 7-day restricted HttpOnly session. Master/project API tokens are rejected. | One-time token in JSON body; HTTPS only, rate-limited |
 | `GET /api/v1/pairing/diagnostics` | Recent sanitized pairing state/reason trail. Session/device identifiers are hashed; credentials, signatures, certificates and message content are never logged. | Dashboard/master, or restricted admin-recovery PWA session |
-| `POST /api/v1/agent/commands/claim` | **Android Agent only** (device key). Atomically claims queued commands. | `X-API-Key` device key |
+| `POST /api/v1/agent/commands/claim` | **Android Agent only** (device key). Atomically claims queued commands. Optional `?waitMs=` long-poll (0–25000, authenticated agents only). | `X-API-Key` device key |
 | `POST /api/v1/agent/commands/:id/status` | Agent reports `ACCEPTED/EXECUTING/COMPLETED/FAILED`; guarded transitions, illegal jumps → `409`. | device key |
 | `POST /api/v1/agent/events/batch` | Agent uploads opaque event batches. Legacy `accepted` and `duplicates` remain; additive `results[]` gives each `eventId` an `ACCEPTED`, byte-identical `DUPLICATE`, or permanent `CONFLICTING_DUPLICATE` / `INVALID_*` outcome. A matching duplicate returns its original sequence and consumes no new sequence. Clients must never ACK a conflict; they must preserve it as a visible dead letter and continue later events. | device key |
 | `POST /api/v1/agent/events/batch-v2` | Indexed per-item upload: each index returns `ACCEPTED` with new sequence, `DUPLICATE` with original sequence, `CONFLICTING_DUPLICATE` with `errorClass: IDENTITY_CONFLICT`, or `INVALID_EVENT` with a safe code and `errorClass: VALIDATION`. `highWatermark` is the committed account cursor. V2 is not preferred until the full rollout is ready. | Agent signature or compatible device key |
@@ -397,6 +397,16 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `POST /api/v1/push/subscribe` / `unsubscribe` | Register/remove a push subscription (§89). **Content-less wake-ups only** (§30): notifications never carry message content. | Bearer |
 | `GET /api/v1/push/subscriptions` | List subscriptions (endpoint hashes truncated for privacy). This dashboard-only route is not called by the linked PWA. | Dashboard/bearer |
 | `POST /api/v1/trust/statements` / `GET /api/v1/trust/{snapshot,statements}` | Signed Trust Registry relay (ADR-001): Android signs, GMweb only stores/relays; **clients verify `rootSignature` locally** — GMweb cannot mint or revoke devices. | Bearer |
+
+**Claim long-poll (0.20.0):** `POST /api/v1/agent/commands/claim` accepts an
+optional `?waitMs=` integer (0–25000). Values above 25000 are clamped; absent,
+0, negative, fractional or non-numeric values mean "do not wait" and keep the
+old immediate behaviour. An authenticated agent whose first claim is empty is
+held until a command is enqueued for the same `agentId`, the deadline expires,
+or the client disconnects. Expiry returns exactly the old empty body,
+`200 {commands: []}`. Unauthenticated callers ignore `waitMs`. Every wake runs
+the same atomic claim, and at most one waiter exists per `agentId`: a new
+request replaces the old one, which receives the normal empty response.
 
 **Eve compatibility:** the legacy `POST /send` and `/gateway/*` flows are
 unchanged and remain fully supported; per ADR-004 they will become thin

@@ -48,6 +48,18 @@ describe("AgentAuthService (PR-08b) — per-device signed auth", () => {
     assert.equal(r.deviceId, "dev-1");
   });
 
+  test("the query string is outside the signed canonical string", () => {
+    const svc = new AgentAuthService(new Database(":memory:"));
+    const pair = makeKey();
+    const spki = pair.publicKey.export({ format: "der", type: "spki" });
+    svc.registerIdentity({ deviceId: "dev-1", publicKeys: { signing: spki.toString("base64") } });
+    const req = authedRequest(svc, pair, "dev-1", '{"agentId":"dev-1"}');
+    const withQuery = { ...req, url: `${req.url}?waitMs=25000` };
+    const r = svc.verifyAgentHeader(withQuery, req.bodyBuf);
+    assert.equal(r.ok, true, r.reason);
+    assert.equal(r.deviceId, "dev-1");
+  });
+
   test("replayed (device, ts) pair is rejected within the window", () => {
     const svc = new AgentAuthService(new Database(":memory:"));
     const pair = makeKey();

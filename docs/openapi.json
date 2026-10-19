@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.19.51",
+    "version": "0.20.0",
     "contact": {
       "name": "GMweb API"
     }
@@ -3800,7 +3800,7 @@
         "tags": [
           "Agent"
         ],
-        "description": "Atomically flips claimed rows QUEUED→DELIVERED_TO_AGENT. Payload stays opaque. Agent reports lifecycle via /status.",
+        "description": "Atomically flips claimed rows QUEUED→DELIVERED_TO_AGENT. Optional query waitMs (0–25000) holds the request for an authenticated agent until a command is claimable. Payload stays opaque. Agent reports lifecycle via /status.",
         "requestBody": {
           "required": true,
           "content": {
@@ -3849,6 +3849,19 @@
             }
           }
         },
+        "parameters": [
+          {
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 25000
+            },
+            "in": "query",
+            "name": "waitMs",
+            "required": false,
+            "description": "Optional long-poll wait in milliseconds. Values above 25000 are clamped; absent, 0, negative, fractional or non-numeric values are treated as absent. Ignored for unauthenticated callers."
+          }
+        ],
         "responses": {
           "200": {
             "description": "Default Response",
