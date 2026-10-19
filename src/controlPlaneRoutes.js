@@ -9,6 +9,7 @@ const {
   MAX_DECODED_BATCH_BYTES,
   MAX_HTTP_BODY_BYTES,
 } = require("./eventCryptoPolicy");
+const { ClaimWaiters, clampWaitMs } = require("./claimWaiters");
 
 const EVENT_TYPES = Object.keys({
   ...eventCryptoPolicy.contentBearing,
@@ -57,7 +58,10 @@ const SAFE_INGEST_ERROR_CODES = new Set(["invalid_event_id", "invalid_metadata",
  * @param {import("fastify").FastifyInstance} app
  * @param {object} deps { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent }
  */
-function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentActivityStore, agentRuntimeStore, derivePhonePresence, deriveTelemetryFreshness, agentAuthService, checkRateLimit, enableCommandLeases = false }) {
+function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventStore, accountId, authorizeAgent, linkedSessions, deviceTelemetryStore, agentActivityStore, agentRuntimeStore, derivePhonePresence, deriveTelemetryFreshness, agentAuthService, checkRateLimit, enableCommandLeases = false, claimWaiters = new ClaimWaiters() }) {
+  // Held claim requests are resolved before Fastify completes shutdown; no
+  // timer or promise outlives the app that owns it.
+  app.addHook("onClose", async () => claimWaiters.shutdown());
   const b64 = (buf) => (buf ? Buffer.from(buf).toString("base64") : null);
   const replicationCapabilities = () => ({
     preferredProtocolVersion: 1,
@@ -588,6 +592,9 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       if (request.linkedDevice && command.sourceClientId !== request.linkedDevice.deviceId) {
         return reply.code(409).send({ error: "idempotency_owner_mismatch" });
       }
+      // Only a fresh row can wake a waiter; an idempotent replay (created
+      // false) must not produce a second empty wake-up.
+      if (created) claimWaiters.notify(command.targetAgentId);
       if (command.type === "MARK_THREAD_READ") request._readAudit = {
         action: "read_requested", commandId: command.id, readerDeviceId: command.sourceClientId,
         targetAgentId: command.targetAgentId, state: command.state, created,
@@ -625,8 +632,19 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   app.post("/api/v1/agent/commands/claim", {
     schema: {
       summary: "Android Agent claims queued commands (long-poll friendly)",
-      description: "Atomically flips claimed rows QUEUED→DELIVERED_TO_AGENT. Payload stays opaque. Agent reports lifecycle via /status.",
+      description: "Atomically flips claimed rows QUEUED→DELIVERED_TO_AGENT. Optional query waitMs (0–25000) holds the request for an authenticated agent until a command is claimable. Payload stays opaque. Agent reports lifecycle via /status.",
       tags: ["Agent"],
+      querystring: {
+        type: "object",
+        properties: {
+          waitMs: {
+            type: "integer",
+            minimum: 0,
+            maximum: 25000,
+            description: "Optional long-poll wait in milliseconds. Values above 25000 are clamped; absent, 0, negative, fractional or non-numeric values are treated as absent. Ignored for unauthenticated callers."
+          }
+        }
+      },
       body: {
         type: "object",
         properties: {
@@ -648,24 +666,56 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
         }
       },
       response: { 200: { type: "object", properties: { commands: { type: "array", items: { type: "object", additionalProperties: true } } } } }
+    },
+    preValidation: (request, _reply, done) => {
+      // Fastify's AJV would reject `?waitMs=abc` with 400, but the contract
+      // says invalid values mean "do not wait". Normalise before validation
+      // so the integer schema can still describe the parameter accurately.
+      const waitMs = clampWaitMs(request.query?.waitMs);
+      if (request.query) {
+        if (waitMs > 0) request.query.waitMs = waitMs;
+        else delete request.query.waitMs;
+      }
+      done();
     }
-  }, async (request) => {
+  }, async (request, reply) => {
     const agentId = String(request.body?.agentId || "android-agent");
     const limit = Math.max(1, Math.min(100, Number(request.body?.limit) || 25));
 
     // Runtime metadata is recorded only for an AgentAuth-authenticated request,
     // and is keyed by the AUTHENTICATED device id — never the body's claim.
+    // This runs exactly once per request, before any wait.
     const authenticated = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
     if (authenticated && request.body?.runtime) {
       agentRuntimeStore?.record(authenticated.deviceId, request.body.runtime, "COMMAND_POLL");
     }
 
-    const commands = commandEngine.claimForAgent(agentId, { limit }).map((c) => ({
+    // The immediate path and every waiter wake use the SAME claim function.
+    // The engine's conditional UPDATE remains the only delivery gate, so a
+    // waiter cannot bypass at-most-once even when it races an immediate claim.
+    const claim = () => commandEngine.claimForAgent(agentId, { limit }).map((c) => ({
       ...c,
       ciphertext: b64(c.ciphertext),
       clientSignature: b64(c.clientSignature),
     }));
-    return { commands };
+
+    let commands = claim();
+    if (commands.length > 0) return { commands };
+
+    const waitMs = clampWaitMs(request.query?.waitMs);
+    if (!authenticated || waitMs <= 0) return { commands };
+    // The client may already be gone between the first claim and registration.
+    if (request.raw.aborted || reply.raw.destroyed) return { commands };
+
+    const controller = new AbortController();
+    const onClose = () => controller.abort();
+    reply.raw.once("close", onClose);
+    try {
+      const result = await claimWaiters.wait(agentId, waitMs, claim, { signal: controller.signal });
+      return { commands: result.commands };
+    } finally {
+      reply.raw.off("close", onClose);
+    }
   });
 
   // V2 is opt-in and requires a signed, device-bound agent identity. Android
