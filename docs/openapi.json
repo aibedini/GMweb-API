@@ -534,6 +534,10 @@
                   },
                   "autoRenew": {
                     "type": "boolean"
+                  },
+                  "existing": {
+                    "type": "boolean",
+                    "description": "Track a hostname this server already serves (never modified by the panel)."
                   }
                 }
               }
@@ -650,6 +654,9 @@
                     "type": "string"
                   },
                   "autoRenew": {
+                    "type": "boolean"
+                  },
+                  "existing": {
                     "type": "boolean"
                   }
                 }
