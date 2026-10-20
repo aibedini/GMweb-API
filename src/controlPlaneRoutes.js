@@ -715,6 +715,12 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       return { commands: result.commands };
     } finally {
       reply.raw.off("close", onClose);
+      // Presence is recorded at the request gate (START). Refresh it when the
+      // hold ends too: a request that spent its whole window suspended must
+      // not age the device into STALE/OFFLINE before its next claim. The
+      // activity store coalesces writes (15 s), so a 25 s hold adds at most
+      // one row update.
+      agentActivityStore?.record(authenticated.deviceId, "COMMAND_POLL");
     }
   });
 
