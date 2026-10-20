@@ -11,6 +11,7 @@ const { CommandEngine } = require("../src/commandEngine");
 const { EventStore } = require("../src/eventStore");
 const { registerControlPlaneRoutes } = require("../src/controlPlaneRoutes");
 const { ClaimWaiters, clampWaitMs } = require("../src/claimWaiters");
+const { AgentAuthService } = require("../src/agentAuth");
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -22,7 +23,7 @@ async function waitFor(predicate, label, timeoutMs = 2000) {
   }
 }
 
-function makeHarness({ waiters = new ClaimWaiters({ recheckMs: 100 }), runtimeStore = undefined } = {}) {
+function makeHarness({ waiters = new ClaimWaiters({ recheckMs: 100 }), runtimeStore = undefined, activityStore = undefined } = {}) {
   const db = new Database(":memory:");
   const app = Fastify({ logger: false });
   app.addHook("preHandler", (request, _reply, done) => {
@@ -40,9 +41,49 @@ function makeHarness({ waiters = new ClaimWaiters({ recheckMs: 100 }), runtimeSt
       : null,
     linkedSessions: require("../src/linkedSessions"),
     agentRuntimeStore: runtimeStore,
+    agentActivityStore: activityStore,
     claimWaiters: waiters,
   });
   return { app, db, waiters };
+}
+
+/**
+ * Harness with REAL AgentAuthService verification and the same exact-byte
+ * body capture src/server.js installs.
+ */
+function makeSignedHarness() {
+  const db = new Database(":memory:");
+  const app = Fastify({ logger: false });
+  const auth = new AgentAuthService(db);
+  const pair = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  auth.registerIdentity({
+    deviceId: "phone",
+    publicKeys: { signing: pair.publicKey.export({ format: "der", type: "spki" }).toString("base64") },
+  });
+
+  const defaultJsonParser = app.getDefaultJsonParser("error", "error");
+  app.removeContentTypeParser("application/json");
+  app.addContentTypeParser("application/json", { parseAs: "string" }, (req, body, done) => {
+    req.rawBody = Buffer.from(body, "utf8");
+    defaultJsonParser(req, body, done);
+  });
+
+  registerControlPlaneRoutes(app, {
+    trustRegistry: new TrustRegistry(db),
+    commandEngine: new CommandEngine(db),
+    eventStore: new EventStore(db),
+    accountId: "a",
+    authorizeAgent: (request, rawBody) => {
+      if (request.authenticatedAgentId) {
+        return { deviceId: request.authenticatedAgentId, role: "PRIMARY_TRUST_AGENT" };
+      }
+      const result = auth.verifyAgentHeader(request, rawBody);
+      return result.ok ? { deviceId: result.deviceId, role: "PRIMARY_TRUST_AGENT" } : null;
+    },
+    linkedSessions: require("../src/linkedSessions"),
+    claimWaiters: new ClaimWaiters({ recheckMs: 100 }),
+  });
+  return { app, db, pair };
 }
 
 function headersFor(agentId) {
@@ -160,6 +201,20 @@ describe("claim long-poll waitMs", () => {
     assert.ok(elapsed >= 100, `expected a held response, got ${elapsed}ms`);
     assert.ok(elapsed < 1500, `expected a prompt timeout, got ${elapsed}ms`);
     assert.equal(waiters.size, 0);
+  });
+
+  test("a held claim refreshes presence when the hold ends", async (t) => {
+    const records = [];
+    const activityStore = { record: (deviceId, source) => records.push({ deviceId, source }) };
+    const { app, db, waiters } = makeHarness({ activityStore });
+    t.after(async () => { await app.close(); db.close(); });
+    const pending = claim(app, { agentId: "phone", waitMs: 120 });
+    await waitFor(() => waiters.size === 1, "waiter registration");
+    assert.deepEqual(records, [], "the close-time refresh must happen after the hold");
+    const response = await pending;
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json(), { commands: [] });
+    assert.deepEqual(records, [{ deviceId: "phone", source: "COMMAND_POLL" }]);
   });
 
   test("invalid waitMs values are immediate and never register a waiter", async (t) => {
@@ -310,5 +365,33 @@ describe("claim long-poll waitMs", () => {
     await waitFor(() => waiters.size === 1, "waiter registration before disconnect");
     request.destroy();
     await waitFor(() => waiters.size === 0, "waiter release after disconnect");
+  });
+
+  test("a near-edge timestamp survives a held claim without end-of-hold re-verification", async (t) => {
+    const { app, db, pair } = makeSignedHarness();
+    t.after(async () => { await app.close(); db.close(); });
+    const body = JSON.stringify({ agentId: "phone", limit: 25 });
+    // 89 s old at START. Re-verifying the same bytes at the end of the hold
+    // would put them outside the 90 s window (and trip the nonce ledger).
+    const ts = Date.now() - 89_000;
+    const bodyHash = crypto.createHash("sha256").update(Buffer.from(body)).digest("hex");
+    const canonical = `POST\n/api/v1/agent/commands/claim\n${bodyHash}\nX-AGENT-TS:${ts}\n`;
+    const signature = crypto.sign("sha256", Buffer.from(canonical), pair.privateKey).toString("base64");
+    const started = Date.now();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/agent/commands/claim?waitMs=1500",
+      headers: {
+        "content-type": "application/json",
+        "x-agent-auth": `phone:${signature}`,
+        "x-agent-ts": String(ts),
+      },
+      payload: body,
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(response.statusCode, 200, response.payload);
+    assert.deepEqual(response.json(), { commands: [] });
+    assert.ok(elapsed >= 1200, `expected a held request, got ${elapsed}ms`);
+    assert.ok(elapsed < 5000, `expected the hold to end, got ${elapsed}ms`);
   });
 });
