@@ -21,6 +21,7 @@ export function MessageTextarea({
   placeholder,
   className,
   textareaRef,
+  enterToSend = false,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -29,6 +30,7 @@ export function MessageTextarea({
   placeholder?: string;
   className?: string;
   textareaRef?: RefObject<HTMLTextAreaElement | null>;
+  enterToSend?: boolean;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
 
@@ -73,8 +75,9 @@ export function MessageTextarea({
             key: event.key,
             ctrlKey: event.ctrlKey,
             metaKey: event.metaKey,
+            shiftKey: event.shiftKey,
             isComposing: event.nativeEvent.isComposing,
-          })
+          }, { enterToSend })
         ) {
           return;
         }

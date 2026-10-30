@@ -260,6 +260,18 @@ test("Enter, Ctrl/Cmd+Enter and IME composition keep their exact semantics", asy
   assert.equal(shouldSendMessage({ ...base, key: "a", ctrlKey: true }), false);
 });
 
+test("Enter to send: plain Enter sends, Shift+Enter is a new line, IME never sends", async () => {
+  const { shouldSendMessage } = await import("../shared/smsComposer.ts");
+  const base = { key: "Enter", ctrlKey: false, metaKey: false, isComposing: false };
+  const on = { enterToSend: true };
+  assert.equal(shouldSendMessage(base, on), true);
+  assert.equal(shouldSendMessage({ ...base, shiftKey: true }, on), false);
+  assert.equal(shouldSendMessage({ ...base, isComposing: true }, on), false);
+  assert.equal(shouldSendMessage({ ...base, ctrlKey: true }, on), true, "Ctrl+Enter keeps working");
+  assert.equal(shouldSendMessage({ ...base, key: "a" }, on), false);
+  assert.equal(shouldSendMessage(base, { enterToSend: false }), false, "off by default");
+});
+
 test("command lifecycle text maps to a pending/ok/failed tone without changing semantics", async () => {
   const { commandTone, commandFeedback } = await import("../web/src/lib/inboxActions.ts");
   for (const pending of [
