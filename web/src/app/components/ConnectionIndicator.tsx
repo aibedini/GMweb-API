@@ -32,7 +32,7 @@ export function ConnectionIndicator({ state, detail }: { state: ConnectionState;
       aria-label={`Connection: ${label}`}
     >
       <IconStatusDot width={7} height={7} aria-hidden />
-      <Chip.Label>{label}</Chip.Label>
+      <Chip.Label><span className="status-chip__axis">Server</span> {label}</Chip.Label>
     </Chip>
   );
 }

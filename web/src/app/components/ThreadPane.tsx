@@ -1,10 +1,11 @@
-import { useRef, type ReactNode, type RefObject } from "react";
-import { Button } from "@heroui/react";
+import { useLayoutEffect, useRef, type ReactNode, type RefObject } from "react";
+import { Button, Spinner } from "@heroui/react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { MessageBubble } from "./MessageBubble";
 import { MessageDaySeparator } from "./MessageDaySeparator";
 import { ThreadEmptyState } from "./ThreadEmptyState";
 import type { ThreadItem, ThreadRow, ThreadState } from "./types";
+import { firstMessageAnchor, prependScrollDelta, type ScrollAnchor } from "../../lib/threadScrollAnchor";
 
 /**
  * §15/§49: the message list stays virtualized.
@@ -25,6 +26,7 @@ export function ThreadPane({
   composer,
   hasMore,
   loadingOlder,
+  historyFailed = false,
   onLoadOlder,
   onOpenStatus,
 }: {
@@ -38,6 +40,7 @@ export function ThreadPane({
   composer: ReactNode;
   hasMore: boolean;
   loadingOlder: boolean;
+  historyFailed?: boolean;
   onLoadOlder: () => void;
   onOpenStatus?: (item: ThreadItem) => void;
 }) {
@@ -52,6 +55,18 @@ export function ThreadPane({
     getItemKey: (index) => rows[index]?.key ?? index,
   });
 
+  // Runs before paint, after the virtualizer has laid out the new rows, so a
+  // prepended page never flashes at the wrong position. Rows measured later
+  // are compensated by the virtualizer itself (they sit above the viewport).
+  const anchor = useRef<ScrollAnchor | null>(null);
+  useLayoutEffect(() => {
+    const startOf = (index: number) => virtualizer.measurementsCache[index]?.start ?? 0;
+    const element = effectiveRef.current;
+    const delta = state === "READY" ? prependScrollDelta(anchor.current, rows, startOf) : 0;
+    if (element && delta > 0) element.scrollTop += delta;
+    anchor.current = state === "READY" ? firstMessageAnchor(rows, startOf) : null;
+  }, [rows, state, virtualizer, effectiveRef]);
+
   return (
     <section className="thread-pane" aria-label="Conversation">
       {header}
@@ -62,14 +77,25 @@ export function ThreadPane({
         ref={effectiveRef}
         className="thread-scroll scroll-region"
         onScroll={(event) => {
-          if (hasMore && !loadingOlder && event.currentTarget.scrollTop < 80) onLoadOlder();
+          if (hasMore && !loadingOlder && !historyFailed && event.currentTarget.scrollTop < 120) onLoadOlder();
         }}
       >
-        {hasMore ? (
-          <div className="thread-load-more">
-            <Button size="sm" variant="tertiary" onPress={onLoadOlder} isDisabled={loadingOlder}>
-              {loadingOlder ? "Loading older messages…" : "Load older messages"}
-            </Button>
+        {state === "READY" ? (
+          // Fixed height in every state, so swapping button / spinner / end
+          // marker never shifts the messages below it.
+          <div className="thread-load-more" role="status" aria-live="polite">
+            {loadingOlder ? (
+              <span className="thread-load-more__status">
+                <Spinner size="sm" />
+                Loading older messages…
+              </span>
+            ) : hasMore ? (
+              <Button size="sm" variant="tertiary" onPress={onLoadOlder}>
+                Load older messages
+              </Button>
+            ) : (
+              <span className="thread-load-more__end">Start of conversation</span>
+            )}
           </div>
         ) : null}
 

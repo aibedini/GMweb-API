@@ -276,6 +276,7 @@
   flex-direction: column;
   overflow-y: auto;
   overscroll-behavior: contain;
+  overflow-anchor: none;
   padding: 14px clamp(12px, 3.5vw, 40px) 18px;
   scrollbar-gutter: stable;
 }
@@ -294,8 +295,23 @@
 
 .thread-load-more {
   display: flex;
+  align-items: center;
   justify-content: center;
-  padding-block-end: 12px;
+  block-size: 48px;
+  flex-shrink: 0;
+}
+
+.thread-load-more__status,
+.thread-load-more__end {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted, currentColor);
+}
+
+.thread-load-more__end {
+  opacity: 0.7;
 }
 
 /* --------------------------------------------------------------- messages */

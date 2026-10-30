@@ -55,7 +55,7 @@ export function RealtimeIndicator() {
           aria-label={`Realtime: ${presentation.label}`}
         >
           <IconStatusDot width={7} height={7} aria-hidden />
-          <Chip.Label>{presentation.label}</Chip.Label>
+          <Chip.Label><span className="status-chip__axis">Live</span> {presentation.label}</Chip.Label>
         </Chip>
       </Tooltip.Trigger>
       <Tooltip.Content>

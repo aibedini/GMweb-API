@@ -102,7 +102,10 @@ export function commandStateForText(commandStatus: string | null | undefined): S
   if (/pulled by phone|delivered_to_agent/i.test(text)) return "PHONE_CLAIMED";
   if (/submitting|accepted_by_agent|executing/i.test(text)) return "PHONE_ACCEPTED";
   if (/queued locally|preparing|encrypting/i.test(text)) return "LOCAL_QUEUED";
-  if (/queued|waiting for phone|accepted by gmweb|command completed/i.test(text)) return "SERVER_QUEUED";
+  // The phone finished the SEND_SMS command: the SMS left the phone. That is
+  // "Sent" (progress), never delivery, which only carrier evidence can prove.
+  if (/command completed/i.test(text)) return "SENT";
+  if (/queued|waiting for phone|accepted by gmweb/i.test(text)) return "SERVER_QUEUED";
   // Anything else is a failure code or an unclassified command state.
   return /FAILED|EXPIRED|_FAILED$/.test(text) ? null : null;
 }
@@ -178,4 +181,42 @@ export function diagnosticHash(value: string | null | undefined): string | null 
     h = Math.imul(h, 0x01000193) >>> 0;
   }
   return h.toString(16).padStart(8, "0");
+}
+
+/** What the browser knows about its in-flight send, to find the row that proves it. */
+export interface SendCorrelation {
+  clientMessageId: string;
+  commandId?: string | null;
+  body?: string;
+  /** Epoch ms the send started; rows older than this (minus clock skew) cannot be it. */
+  startedAt?: number;
+}
+
+interface CorrelatableMessage {
+  payload: { clientMessageId?: string; originCommandId?: string; direction: "in" | "out"; body: string; dateMs: number };
+}
+
+const CLOCK_SKEW_MS = 120_000;
+
+/**
+ * Find the message row for this send. Exact ids first (clientMessageId, then
+ * the command id Android stamps as originCommandId). Rows written from the
+ * phone's SMS provider can carry neither, so the last resort is the ONE
+ * outgoing row with the identical text sent after this send began. Ambiguity
+ * (two identical texts) matches nothing: no evidence is invented.
+ */
+export function findSendEvidence<T extends CorrelatableMessage>(items: readonly T[], send: SendCorrelation | null): T | undefined {
+  if (!send) return undefined;
+  const byClient = items.find((item) => item.payload.clientMessageId === send.clientMessageId);
+  if (byClient) return byClient;
+  if (send.commandId) {
+    const byCommand = items.find((item) => item.payload.originCommandId === send.commandId);
+    if (byCommand) return byCommand;
+  }
+  if (!send.body || send.startedAt === undefined) return undefined;
+  const candidates = items.filter((item) => item.payload.direction === "out"
+    && !item.payload.clientMessageId
+    && item.payload.body === send.body
+    && item.payload.dateMs >= send.startedAt! - CLOCK_SKEW_MS);
+  return candidates.length === 1 ? candidates[0] : undefined;
 }
