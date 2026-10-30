@@ -45,7 +45,7 @@ export function PhoneIndicator({
           aria-label={`Primary phone: ${detail}`}
         >
           <IconStatusDot width={7} height={7} aria-hidden />
-          <Chip.Label>{label}</Chip.Label>
+          <Chip.Label><span className="status-chip__axis">Phone</span> {label}</Chip.Label>
         </Chip>
       </Tooltip.Trigger>
       <Tooltip.Content>

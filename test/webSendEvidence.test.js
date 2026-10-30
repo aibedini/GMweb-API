@@ -135,3 +135,24 @@ test("commandStateForText classifies without inventing delivery", () => {
   assert.equal(commandStateForText(null), null);
   assert.equal(commandStateForText(""), null);
 });
+
+test("a completed command reads as Sent, never Queued and never Delivered", () => {
+  const view = resolveSendStatus({ evidenceStatus: null, commandStatus: "Command completed; waiting for Android evidence" });
+  assert.equal(view.text, "Sent");
+  assert.notEqual(view.text, "Queued");
+  assert.equal(view.terminal, false);
+});
+
+test("send evidence is found by command id or by one unambiguous same-text outgoing row", async () => {
+  const { findSendEvidence } = await import("../web/src/lib/sendEvidence.ts");
+  const row = (payload) => ({ payload: { direction: "out", body: "hi", dateMs: 10_000_000, ...payload } });
+  const send = { clientMessageId: "c1", commandId: "k1", body: "hi", startedAt: 10_000_000 };
+  const byCommand = row({ originCommandId: "k1" });
+  assert.equal(findSendEvidence([row({ body: "x" }), byCommand], send), byCommand);
+  const provider = row({});
+  assert.equal(findSendEvidence([provider, row({ direction: "in" })], send), provider);
+  assert.equal(findSendEvidence([provider, row({})], send), undefined, "two identical texts: ambiguous");
+  assert.equal(findSendEvidence([row({ dateMs: 1 })], send), undefined, "older than the send");
+  assert.equal(findSendEvidence([row({ clientMessageId: "other" })], send), undefined, "belongs to another send");
+  assert.equal(findSendEvidence([provider], null), undefined);
+});

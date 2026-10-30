@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Button, useMediaQuery } from "@heroui/react";
 import { syncVisibleInbox, loadContactsOnDemand, listRecentEvents, listAggregateEventsPage, listContacts, listConversations, listChangedConversationHeads, getCursor, getBrowserSyncStatus, resetLocal, subscribeSyncAvailable, subscribeKeyMaintenance, type BrowserSyncStatus, type StoredContact, type StoredEvent } from "../lib/sync";
 import { messagesForAggregate, reconcileConversationHead, type ConversationProjection } from "../lib/inbox";
@@ -13,7 +13,7 @@ import { collectWebDiagnostics, type WebDiagnosticReport } from "../lib/diagnost
 import { MessageComposer } from "./MessageComposer";
 import { applyReadConfirmation, contactTitle, phoneKey } from "../lib/inboxActions";
 import { senderSearchText } from "../lib/senderIdentity";
-import { resolveSendStatus, detectSendDivergence, diagnosticHash } from "../lib/sendEvidence";
+import { resolveSendStatus, detectSendDivergence, diagnosticHash, findSendEvidence, type SendCorrelation } from "../lib/sendEvidence";
 import { defaultModeFreshnessNotice, deriveSendReadiness, sendBlocked, sendReadinessNotice, simListIsHistorical } from "../lib/sendReadiness";
 import { supportsPreferredSim } from "../lib/simRefresh";
 import { markBrowserProjected, markBrowserRendered } from "../lib/sync/live-invalidation";
@@ -94,6 +94,17 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [applied, setApplied] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const syncError = useRef<string | null>(null);
+  const reportSyncError = useCallback((cause: unknown) => {
+    const text = cause instanceof Error ? cause.message : String(cause);
+    syncError.current = text;
+    setError(text);
+  }, []);
+  const clearSyncError = useCallback(() => {
+    const stale = syncError.current;
+    syncError.current = null;
+    if (stale) setError(current => (current === stale ? null : current));
+  }, []);
   const [trust, setTrust] = useState<TrustSnapshot | null>(null);
   const [version, setVersion] = useState("");
   const [online, setOnline] = useState(navigator.onLine);
@@ -156,6 +167,7 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [pendingMessage, setPendingMessage] = useState<{ clientMessageId: string; body: string; recipient: string; at: number; failure?: string } | null>(null);
   const sendEvidence = useRef<{ clientMessageId: string; status: string } | null>(null);
+  const sendCorrelation = useRef<SendCorrelation | null>(null);
   // Carrier/message evidence for the in-flight send as REACTIVE state. The ref
   // above is not reactive, so a footer that only read it could keep showing the
   // low-truth command view after true delivery evidence had arrived.
@@ -391,7 +403,7 @@ export default function App() {
       .catch(cause => {
         setBootstrapState("FAILED");
         setSyncStatus(getBrowserSyncStatus());
-        setError(cause instanceof Error ? cause.message : String(cause));
+        reportSyncError(cause);
       });
     refreshTelemetry();
     const telemetryTimer = window.setInterval(refreshTelemetry, 60_000);
@@ -405,10 +417,11 @@ export default function App() {
     const linkedBrowsersTimer = window.setInterval(refreshLinkedBrowsers, 60_000);
     const refreshVisible = () => void syncVisibleInbox().then(changed => {
       setSyncStatus(getBrowserSyncStatus());
+      clearSyncError();
       if (changed) { setApplied(changed); setThreadReload(value => value + 1); void refresh(); }
     }).catch(cause => {
       setSyncStatus(getBrowserSyncStatus());
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportSyncError(cause);
     });
     const visibleTimer = window.setInterval(refreshVisible, 30_000);
     const unsubscribe = subscribeSyncAvailable((count, ids) => {
@@ -424,7 +437,7 @@ export default function App() {
       void resetLocal();
     }, cause => {
       setSyncStatus(getBrowserSyncStatus());
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportSyncError(cause);
     }, syncVisibleInbox);
     const unsubscribeKeys = subscribeKeyMaintenance(() => {
       setSyncStatus(getBrowserSyncStatus());
@@ -612,12 +625,8 @@ export default function App() {
       const merged = mergeThreadEvents(threadEvents, page.items);
       const mergedNewCount = merged.length - threadEvents.length;
       assertHistoryMergeProgress(requestedCursor, page, mergedNewCount);
-      const scroll = messageScrollRef.current;
-      const previousHeight = scroll?.scrollHeight ?? 0;
+      // ThreadPane keeps the reader's place across the prepend.
       setThreadEvents(merged);
-      requestAnimationFrame(() => {
-        if (scroll) scroll.scrollTop += scroll.scrollHeight - previousHeight;
-      });
       historyTrace.current = {
         lastRequestAt: Date.now(),
         lastReturnedCount: page.items.length,
@@ -700,9 +709,10 @@ export default function App() {
   };
 
   useEffect(() => {
-    const clientId = pendingMessage?.clientMessageId || sendEvidence.current?.clientMessageId;
-    const matched = clientId && messages.find(item => item.payload.clientMessageId === clientId);
-    if (matched) {
+    const correlation = sendCorrelation.current;
+    const clientId = correlation?.clientMessageId;
+    const matched = findSendEvidence(messages, correlation);
+    if (clientId && matched) {
       const status = messageStatus(matched.payload.status);
       sendEvidence.current = { clientMessageId: clientId, status };
       // Carrier evidence is delivery truth and must be reactive, not only a ref,
@@ -907,6 +917,7 @@ export default function App() {
     setCommandStatus("Preparing send…");
     sendEvidence.current = null;
     setPendingMessage({ clientMessageId, body, recipient: selectedRecipient, at: Date.now() });
+    sendCorrelation.current = { clientMessageId, body, startedAt: Date.now() };
     let failureCode = "COMMAND_CREATE_FAILED";
     try {      const identity = await getStoredDeviceIdentity();
       if (!identity) { failureCode = "BROWSER_IDENTITY_UNAVAILABLE"; throw new Error(failureCode); }
@@ -946,6 +957,9 @@ export default function App() {
       }
       failureCode = "COMMAND_CREATE_FAILED";
       const commandId = await ensurePendingCommandId(pending);
+      if (sendCorrelation.current?.clientMessageId === clientMessageId) {
+        sendCorrelation.current = { ...sendCorrelation.current, commandId };
+      }
       setCommandStatus("Accepted by GMweb; waiting for phone");
       if (!existing) setDraft(current => current === body ? "" : current);
       for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -991,6 +1005,9 @@ export default function App() {
           setCommandStatus("Recovering pending send");
           try {
             const commandId = await ensurePendingCommandId(pending);
+            if (!sendCorrelation.current || sendCorrelation.current.clientMessageId === pending.clientMessageId) {
+              sendCorrelation.current = { ...sendCorrelation.current, clientMessageId: pending.clientMessageId, commandId };
+            }
             const state = await fetchCommand(commandId);
           setCommandStatus(observedSendStatus(pending.clientMessageId) || (state?.state === "COMPLETED" ? "Command completed; waiting for Android evidence" :
             state?.state === "FAILED" ? (state.result || "COMMAND_FAILED") : state?.state === "EXPIRED" ? "COMMAND_EXPIRED" :
@@ -1018,8 +1035,9 @@ export default function App() {
       setThreadReload(value => value + 1);
       if (tab === "contacts") await refreshContacts();
       await refresh();
+      setSyncStatus(getBrowserSyncStatus());
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      reportSyncError(cause);
       setSyncStatus(getBrowserSyncStatus());
     } finally {
       setBusy(false);
@@ -1354,6 +1372,7 @@ export default function App() {
           composer={composer}
           hasMore={showLoadOlder(history, threadState)}
           loadingOlder={history.loading}
+          historyFailed={Boolean(history.error)}
           onLoadOlder={() => void loadOlderThread()}
           onOpenStatus={(item) => {
             setDeliveryItem(item);

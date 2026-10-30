@@ -6,6 +6,28 @@
 
 const API = "/api/v1";
 
+/**
+ * One readable line for a failed request. Gateway pages (nginx HTML) and raw
+ * bodies never reach the UI; a JSON `error`/`message` field is kept.
+ */
+export function describeHttpFailure(status: number, body: unknown): string {
+  let detail = "";
+  if (body && typeof body === "object") {
+    const record = body as Record<string, unknown>;
+    const value = record.message ?? record.error;
+    if (typeof value === "string") detail = value;
+  } else if (typeof body === "string" && !/^\s*</.test(body)) {
+    try { return describeHttpFailure(status, JSON.parse(body)); } catch { /* plain text */ }
+    detail = body.trim();
+  }
+  detail = detail.replace(/\s+/g, " ").slice(0, 160);
+  if (status === 502 || status === 503 || status === 504) {
+    return `The GMweb server is not responding (HTTP ${status}). It may be restarting; this retries automatically.`;
+  }
+  if (status === 401 || status === 403) return detail ? `${detail} (HTTP ${status})` : `This browser's session was rejected (HTTP ${status}).`;
+  return detail ? `${detail} (HTTP ${status})` : `Request failed (HTTP ${status}).`;
+}
+
 export interface SyncEvent {
   sequence: number;
   eventId: string;
@@ -91,7 +113,7 @@ export interface TrustSnapshot {
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+    throw new Error(describeHttpFailure(res.status, body));
   }
   return (await res.json()) as T;
 }
@@ -139,7 +161,7 @@ export async function continueWebSnapshot(token: string, cursor: string, limit =
   if (res.status === 409 || res.status === 403) {
     const body = await res.json().catch(() => ({})) as Record<string, unknown>;
     if (res.status === 409 || body.error === "snapshot_forbidden") throw new SnapshotRequiredError(body);
-    throw new Error(`HTTP ${res.status}: ${JSON.stringify(body).slice(0, 200)}`);
+    throw new Error(describeHttpFailure(res.status, body));
   }
   return jsonOrThrow<WebSnapshotPage>(res);
 }

@@ -24,6 +24,10 @@ export function SyncAlerts({
   busy: boolean;
   onRetry: () => void;
 }) {
+  const syncAlertShown = syncStatus.state === "DEGRADED" || syncStatus.state === "FAILED";
+  // The same failure often reaches both the sync state and the generic error;
+  // show it once, under the sync alert that carries a Retry.
+  const showError = Boolean(error) && !(syncAlertShown && error === syncStatus.lastErrorMessage);
   const retry = (
     <Button size="sm" variant="ghost" onPress={onRetry} isDisabled={busy}>
       Retry
@@ -71,7 +75,7 @@ export function SyncAlerts({
         </Alert>
       ) : null}
 
-      {error ? (
+      {showError ? (
         <Alert status="danger">
           <Alert.Indicator />
           <Alert.Content>
