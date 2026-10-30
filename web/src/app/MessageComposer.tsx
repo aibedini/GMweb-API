@@ -9,6 +9,7 @@ import { SimSelector } from "./components/SimSelector";
 import { SmsCounter } from "./components/SmsCounter";
 import { IconSend, IconSmile } from "./components/icons";
 import { MessageTextarea } from "./MessageTextarea";
+import { readEnterToSend, writeEnterToSend } from "../lib/composerPrefs";
 
 type Sim = NonNullable<DeviceTelemetry["smsSubscriptions"]>["items"][number];
 
@@ -68,6 +69,7 @@ export function MessageComposer({
   const disabled = sendDisabled({ draft, sending, canSend, noticeBlocks: notice?.blocking === true });
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [emojiOpen, setEmojiOpen] = useState(false);
+  const [enterToSend, setEnterToSend] = useState(readEnterToSend);
 
   const guardedSend = () => {
     if (disabled) return;
@@ -100,6 +102,7 @@ export function MessageComposer({
         placeholder="Type a message…"
         className="message-composer__textarea"
         textareaRef={textareaRef}
+        enterToSend={enterToSend}
       />
 
       <div className="composer-toolbar">
@@ -214,7 +217,22 @@ export function MessageComposer({
         <p className="composer-hint composer-hint--freshness" role="status">{freshnessNotice}</p>
       ) : null}
 
-      <p className="composer-hint">Ctrl+Enter / ⌘+Enter to send</p>
+      <div className="composer-hint composer-keys">
+        <label className="composer-keys__toggle">
+          <input
+            type="checkbox"
+            checked={enterToSend}
+            onChange={(event) => {
+              setEnterToSend(event.target.checked);
+              writeEnterToSend(event.target.checked);
+              textareaRef.current?.focus();
+            }}
+          />
+          Enter to send
+        </label>
+        <span aria-hidden="true">·</span>
+        <span>{enterToSend ? "Shift+Enter for a new line" : "Ctrl+Enter / ⌘+Enter to send"}</span>
+      </div>
     </section>
   );
 }

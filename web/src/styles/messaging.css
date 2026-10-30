@@ -507,6 +507,28 @@
   font-size: 10.5px;
 }
 
+.composer-keys {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.composer-keys__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  color: var(--foreground);
+}
+
+.composer-keys__toggle input {
+  inline-size: 13px;
+  block-size: 13px;
+  margin: 0;
+  accent-color: var(--accent, currentColor);
+  cursor: pointer;
+}
+
 /* §20: SIM refresh outcome — informational, not an alarm. */
 .composer-hint--notice {
   color: var(--foreground);
