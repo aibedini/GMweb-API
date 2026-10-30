@@ -204,6 +204,8 @@ export default function App() {
   const loadingOlderRef = useRef(false);
   const hasLoadedOlderConversations = useRef(false);
   const messageScrollRef = useRef<HTMLDivElement>(null);
+  const threadEventsRef = useRef<StoredEvent[]>([]);
+  useEffect(() => { threadEventsRef.current = threadEvents; }, [threadEvents]);
   const conversationSearchRef = useRef<HTMLInputElement>(null);
   const scriptFile = useMemo(() => loadedScriptFile(), []);
 
@@ -549,16 +551,19 @@ export default function App() {
     }
     const sameThread = lastThreadSelection.current === selected;
     lastThreadSelection.current = selected;
-    const scroll = messageScrollRef.current;
-    const stickToBottom = !sameThread || !scroll ||
-      scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 100;
     if (!sameThread) { setThreadEvents([]); setThreadState("LOADING"); }
     const startedAt = performance.now();
     void listAggregateEventsPage(selected, { limit: 10 }).then(page => {
       if (cancelled) return;
       setReadyThreadId(selected);
       setThreadFirstPageMs(Math.round(performance.now() - startedAt));
-      if (sameThread && !stickToBottom) {
+      // A refresh of the open thread MERGES the newest page: replacing it with
+      // only the latest page dropped loaded history and re-laid-out the whole
+      // list on every read-status event, which made the view jump. Without
+      // overlap there may be a gap, so that case still starts over.
+      const known = new Set(threadEventsRef.current.map(event => event.eventId));
+      const overlaps = !page.hasMore || page.items.some(event => known.has(event.eventId));
+      if (sameThread && overlaps) {
         // Merging newer arrivals must NOT rewind the user's deep history
         // cursor, but the invariant still has to hold afterwards.
         setThreadEvents(previous => mergeThreadEvents(previous, page.items));
@@ -569,10 +574,6 @@ export default function App() {
         setThreadEvents(page.items);
         // One atomic derivation for the whole (hasMore, next) pair.
         setHistory(pagingFromPage(page));
-        requestAnimationFrame(() => {
-          const pane = messageScrollRef.current;
-          if (pane) pane.scrollTop = pane.scrollHeight;
-        });
       }
       const rawMessages = page.items.filter(event => event.type === "MESSAGE_CREATED" || event.type === "MESSAGE_UPDATED");
       const readable = messagesForAggregate(page.items, selected);
@@ -1351,6 +1352,7 @@ export default function App() {
         <ThreadPane
           scrollRef={messageScrollRef}
           rows={threadRows}
+          threadId={selected}
           state={threadState}
           error={threadError}
           onRetryThread={() => setThreadReload(value => value + 1)}

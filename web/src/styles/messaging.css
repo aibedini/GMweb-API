@@ -287,6 +287,9 @@
 .thread-scroll > .thread-virtual {
   margin-block-start: auto;
   position: relative;
+  /* Its rows are absolutely positioned, so as a flex item it would otherwise
+     shrink to the pane and the scroll height would come from overflow only. */
+  flex-shrink: 0;
 }
 
 .thread-scroll > .empty-block {
@@ -625,7 +628,30 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  min-height: 24px;
+  /* Fixed: the label changes several times per read and a Retry button comes
+     and goes; neither may change the height of the message list below. */
+  block-size: 28px;
+  overflow: hidden;
+}
+
+.read-status-row .button,
+.read-status-row button {
+  block-size: 24px;
+  min-block-size: 0;
+}
+
+.thread-jump {
+  position: sticky;
+  inset-block-end: 12px;
+  align-self: flex-end;
+  block-size: 0;
+  overflow: visible;
+  z-index: 2;
+}
+
+.thread-jump > * {
+  transform: translateY(calc(-100% - 4px));
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.25);
 }
 
 .read-status-row__label {
