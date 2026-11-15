@@ -1,0 +1,11 @@
+# Gitleaks configuration for GMweb-API.
+#
+# Extends the upstream default rule set (`useDefault = true`). Allowlist
+# entries are added below only for findings verified to be non-secret
+# fixtures; each entry is scoped to one rule and a narrow path, never to a
+# secret value.
+
+title = "GMweb-API secret scanning"
+
+[extend]
+useDefault = true
