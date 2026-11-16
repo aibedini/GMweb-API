@@ -52,6 +52,7 @@ function verifyP256(data, sigB64, pubB64) {
 
 const pairing = require("./pairingSessions");
 const linkedSessions = require("./linkedSessions");
+const { AI_AGENT } = require("./devicePolicy");
 const crypto = require("crypto");
 const { db } = require("./pairingDb");
 const { CAPABILITIES, certificateFailureReport } = require("./pairingCertificate");
@@ -454,6 +455,13 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
   // over the canonical challenge bytes. GMweb verifies and issues an
   // HttpOnly Secure SameSite=Strict linked-device session cookie.
   // Capability-scoped: the session inherits exactly the certificate's caps.
+  //
+  // XR-GA-008 device token: an AI_AGENT certificate cannot use an HttpOnly
+  // cookie (it has no browser), so its completion returns the SAME session
+  // token in the JSON body and does NOT set the cookie. WEB_PWA keeps the
+  // cookie-only behaviour and never receives the token in JSON. Delivery is
+  // over the existing TLS assumption; GMweb stores only the SHA-256 hash and
+  // never logs the token.
   app.post("/api/v1/pairing/complete", {
     config: { rateLimit: { max: 10, timeWindow: 60000 } },
     schema: {
@@ -462,7 +470,9 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
         "Called by the browser after it verified the Android-signed DeviceCertificate locally.",
         "The browser signs the canonical challenge (GMweb-Link-Session-v1) with the same",
         "operational signing key bound in the certificate. Single-use challenge.",
-        "Success sets the HttpOnly linked-session cookie.",
+        "WEB_PWA success sets the HttpOnly linked-session cookie and returns no token.",
+        "AI_AGENT success returns `token` in the JSON body (for `Authorization: Device <token>`)",
+        "and does not set the cookie. The token is a secret: only the hash is stored by GMweb.",
       ].join("\n"),
       tags: ["Pairing"],
       body: {
@@ -484,7 +494,11 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
             ok: { type: "boolean" },
             deviceId: { type: "string" },
             deviceType: { type: "string" },
-            capabilities: { type: "array", items: { type: "string" } }
+            capabilities: { type: "array", items: { type: "string" } },
+            token: {
+              type: "string",
+              description: "Linked-session credential for the `Authorization: Device <token>` scheme. Returned ONLY when the approved certificate's deviceType is AI_AGENT. WEB_PWA completions receive the HttpOnly cookie instead and this field is absent. Treat it as a secret: store it in the device's OS keystore, never log it and never place it in a URL."
+            }
           }
         }
       }
@@ -587,13 +601,18 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
       reply.code(409).send({ error: "challenge_already_used" });
       return reply;
     }
-    reply.setCookie(linkedSessions.COOKIE_NAME, token, {
-      httpOnly: true,
-      secure: true,
-      sameSite: "strict",
-      path: "/",
-      maxAge: Math.floor(linkedSessions.SESSION_TTL_MS / 1000),
-    });
+    // AI_AGENT is a native client: it gets the token in the body and no
+    // cookie. WEB_PWA keeps the HttpOnly cookie and never sees the token.
+    const aiAgent = cert.deviceType === AI_AGENT;
+    if (!aiAgent) {
+      reply.setCookie(linkedSessions.COOKIE_NAME, token, {
+        httpOnly: true,
+        secure: true,
+        sameSite: "strict",
+        path: "/",
+        maxAge: Math.floor(linkedSessions.SESSION_TTL_MS / 1000),
+      });
+    }
     markPairing(request, "WEB_LINK_SESSION", "SUCCESS", "linked_session_issued", {
       sessionId: body.pairingSessionId,
       deviceId: taken.deviceId,
@@ -603,6 +622,9 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
       deviceId: taken.deviceId,
       deviceType: cert.deviceType,
       capabilities,
+      // Never included in a log or in the persisted session: the registry
+      // stores the SHA-256 hash only (linkedSessions.issue).
+      ...(aiAgent ? { token } : {}),
     };
   });
 

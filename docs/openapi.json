@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.20.6",
+    "version": "0.20.7",
     "contact": {
       "name": "GMweb API"
     }
@@ -4521,6 +4521,67 @@
         }
       }
     },
+    "/api/v1/sync/ack": {
+      "post": {
+        "summary": "Acknowledge processed sync events for the linked AI device",
+        "tags": [
+          "Sync"
+        ],
+        "description": "Adapter-compatibility surface for `Authorization: Device <token>` clients (XR-GA-008).\nThe authenticated linked session, never the body or query, selects the device: a\n`device_id` naming any other device is rejected with 403 device_mismatch.\nGMweb's durable catch-up cursor stays sequence-based (`GET /api/v1/sync?after=`);\nthis acknowledgement validates and accepts the adapter's processed event IDs but\ndoes not delete events, advance a cursor or compact the store (`durable:false`).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "sync_event_ids"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "device_id": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "sync_event_ids": {
+                    "type": "array",
+                    "maxItems": 1000,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "accepted": {
+                      "type": "integer"
+                    },
+                    "durable": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/web/snapshot-v2": {
       "post": {
         "summary": "Start immutable encrypted replica snapshot",
@@ -5595,7 +5656,7 @@
         "tags": [
           "Pairing"
         ],
-        "description": "Called by the browser after it verified the Android-signed DeviceCertificate locally.\nThe browser signs the canonical challenge (GMweb-Link-Session-v1) with the same\noperational signing key bound in the certificate. Single-use challenge.\nSuccess sets the HttpOnly linked-session cookie.",
+        "description": "Called by the browser after it verified the Android-signed DeviceCertificate locally.\nThe browser signs the canonical challenge (GMweb-Link-Session-v1) with the same\noperational signing key bound in the certificate. Single-use challenge.\nWEB_PWA success sets the HttpOnly linked-session cookie and returns no token.\nAI_AGENT success returns `token` in the JSON body (for `Authorization: Device <token>`)\nand does not set the cookie. The token is a secret: only the hash is stored by GMweb.",
         "requestBody": {
           "required": true,
           "content": {
@@ -5661,6 +5722,10 @@
                       "items": {
                         "type": "string"
                       }
+                    },
+                    "token": {
+                      "type": "string",
+                      "description": "Linked-session credential for the `Authorization: Device <token>` scheme. Returned ONLY when the approved certificate's deviceType is AI_AGENT. WEB_PWA completions receive the HttpOnly cookie instead and this field is absent. Treat it as a secret: store it in the device's OS keystore, never log it and never place it in a URL."
                     }
                   }
                 }
