@@ -12,7 +12,7 @@ Android owns telephony observation and irreversible modem submission. GMweb owns
 
 | Operation | Route | Current behavior |
 |---|---|---|
-| Android event upload | `POST /api/v1/agent/events/batch` | Validates the whole batch, allocates per-account sequences for accepted events, returns `accepted[]` and a duplicate count. A repeated identical event returns its original sequence in `accepted[]`. |
+| Android event upload | `POST /api/v1/agent/events/batch` | Validates the whole batch, allocates per-account sequences for accepted events, returns `accepted[]` and a duplicate count. A repeated identical event returns its original sequence in `accepted[]`. Control-key types (`KEY_GRANT`, `KEYRING_ENTRY`, `HISTORY_KEY_GRANT`, `CONTACTS_KEY_GRANT`) require the authenticated `PRIMARY_TRUST_AGENT`; any other authenticated agent gets `403 primary_trust_agent_required` and nothing from that batch is stored. |
 | Browser delta | `GET /api/v1/sync?after=&limit=` | Ordered ciphertext, `nextCursor`, `hasMore` and replica metadata; stale retained cursor returns `snapshot_required`. |
 | Initial encrypted state | `GET /api/v1/web/bootstrap` | V1 first-page bootstrap retained for older consumers. The current PWA uses the V2 snapshot session instead. |
 | Additional state | `GET /api/v1/web/conversations`, `GET /api/v1/web/conversations/:conversationId/messages` | Keyset pages of mutable encrypted current state. They are not an immutable V2 snapshot session. |
@@ -24,7 +24,7 @@ Android owns telephony observation and irreversible modem submission. GMweb owns
 
 ## V2 additive contract
 
-Implemented ingest slice: `POST /api/v1/agent/events/batch-v2` returns one indexed result per item: `ACCEPTED`, `DUPLICATE` with its original sequence, `CONFLICTING_DUPLICATE`, or `INVALID_EVENT` with a safe error code. The response includes the committed account `highWatermark`. The route binds source identity from agent authentication, not request body. V2 is not advertised as the preferred protocol until browser and command contracts are complete.
+Implemented ingest slice: `POST /api/v1/agent/events/batch-v2` returns one indexed result per item: `ACCEPTED`, `DUPLICATE` with its original sequence, `CONFLICTING_DUPLICATE`, or `INVALID_EVENT` with a safe error code. The response includes the committed account `highWatermark`. The route binds source identity from agent authentication, not request body. A batch containing any control-key event is `403 primary_trust_agent_required` unless the authenticated agent is the `PRIMARY_TRUST_AGENT`, and no item from that batch is ingested. V2 is not advertised as the preferred protocol until browser and command contracts are complete.
 
 Implemented snapshot: `POST /api/v1/web/snapshot-v2` creates a device-bound, hour-lived snapshot session in one SQLite transaction at `baselineSequence`. Immutable ciphertext conversation, message and contact state is stored in SQLite. The test suite verifies continuation after a `SIGKILL` of the creator process and a new PWA sync-module instance resuming from IndexedDB; this is not physical-browser or production acceptance. `GET /api/v1/web/snapshot-v2?token=&cursor=&limit=` continues its ordered pages; each response repeats baseline, generation and expiry. The PWA stores each page and its cursor atomically in IndexedDB, restarts expired sessions, and begins delta from the baseline only after the final page commits. Its local event cursor is not advanced while a snapshot is incomplete. V1 endpoints remain available to older consumers.
 

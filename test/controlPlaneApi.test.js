@@ -631,8 +631,11 @@ describe("Phase 2 control plane HTTP API", () => {
   test("linked key bootstrap returns only opaque grants and requires READ_MESSAGES", async () => {
     const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/key-grants?after=0" });
     assert.equal(denied.statusCode, 403);
-    await app.inject({
+    const seededGrants = await app.inject({
       method: "POST", url: "/api/v1/agent/events/batch",
+      // LDV-004 PR-D: control-key events are publishable only by the
+      // authenticated PRIMARY_TRUST_AGENT.
+      headers: { "x-test-agent-device": "primary-phone", "x-test-agent-role": "PRIMARY_TRUST_AGENT" },
       payload: { events: [
         { eventId: `grant-${Date.now()}`, type: "KEY_GRANT", conversationId: "thread",
           payload: Buffer.from(JSON.stringify({ deviceId: "web-device", wrapped: "opaque" })).toString("base64"), encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1 },
@@ -640,6 +643,7 @@ describe("Phase 2 control plane HTTP API", () => {
           payload: Buffer.from(JSON.stringify({ deviceId: "other-device", wrapped: "opaque" })).toString("base64"), encoding: "envelope.v1", schemaVersion: 1, cryptoVersion: 1 },
       ] },
     });
+    assert.equal(seededGrants.statusCode, 200);
     const response = await app.inject({
       method: "GET", url: "/api/v1/linked-device/key-grants?after=0&limit=1000",
       headers: { "x-test-linked": "web-device" },
@@ -655,8 +659,11 @@ describe("Phase 2 control plane HTTP API", () => {
   test("linked key bootstrap returns only this browser's v2/v3 keys", async () => {
     const denied = await app.inject({ method: "GET", url: "/api/v1/linked-device/keyring" });
     assert.equal(denied.statusCode, 403);
-    await app.inject({
+    const seededKeys = await app.inject({
       method: "POST", url: "/api/v1/agent/events/batch",
+      // LDV-004 PR-D: control-key events are publishable only by the
+      // authenticated PRIMARY_TRUST_AGENT.
+      headers: { "x-test-agent-device": "primary-phone", "x-test-agent-role": "PRIMARY_TRUST_AGENT" },
       payload: { events: [
         { eventId: `keyring-${Date.now()}`, type: "KEYRING_ENTRY", conversationId: "__account_keyring__",
           payload: Buffer.from(JSON.stringify({ deviceId: "web-device", keyId: "messages" })).toString("base64"), encoding: "envelope.v2", schemaVersion: 1, cryptoVersion: 2 },
@@ -667,6 +674,7 @@ describe("Phase 2 control plane HTTP API", () => {
           encoding: "envelope.v3", schemaVersion: 1, cryptoVersion: 3 },
       ] },
     });
+    assert.equal(seededKeys.statusCode, 200);
     const response = await app.inject({
       method: "GET", url: "/api/v1/linked-device/keyring?limit=1000",
       headers: { "x-test-linked": "web-device" },
