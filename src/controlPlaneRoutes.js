@@ -23,6 +23,31 @@ const EVENT_TYPES = Object.keys({
 // an unencrypted suggestion command is rejected before persistence.
 const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY", "FETCH_THREAD_HISTORY", "SUGGESTIONS_READY"]);
 
+// LDV-004 PR-D (§4.4.1): KEY_GRANT / KEYRING_ENTRY / HISTORY_KEY_GRANT /
+// CONTACTS_KEY_GRANT carry account and conversation key material. The phone's
+// rootSignature remains the end-to-end cryptographic authentication; this
+// relay-side set is the AUTHORIZATION gate that stops any other authenticated
+// agent (e.g. a LEGACY_AGENT or a linked browser) from publishing a control-key
+// event into the account. It is applied after wire validation and before any
+// ingestion.
+const CONTROL_KEY_EVENT_TYPES = new Set(Object.keys(eventCryptoPolicy.controlKey));
+
+/**
+ * Summarize control-key events in a batch WITHOUT touching payloads.
+ * @returns {{types: string[], count: number}|null} null when none are present.
+ */
+function controlKeyEventSummary(events) {
+  const types = new Set();
+  let count = 0;
+  for (const event of Array.isArray(events) ? events : []) {
+    if (event && CONTROL_KEY_EVENT_TYPES.has(event.type)) {
+      types.add(event.type);
+      count += 1;
+    }
+  }
+  return count > 0 ? { types: [...types], count } : null;
+}
+
 /**
  * Defensive validation of Android-advertised command capabilities (telemetry
  * path). Shared with the live runtime store so there is one implementation.
@@ -895,6 +920,29 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
 
   // ── Event batch upload + cursor sync (PR-09, §54/§55, LOCK 10) ──────────
 
+  /**
+   * LDV-004 PR-D (§4.4.1): reject a control-key batch unless the authenticated
+   * agent is exactly PRIMARY_TRUST_AGENT. authorizeAgent() short-circuits to the
+   * identity the global /api/v1/agent/* gate already verified
+   * (request.authenticatedAgentId), so the signature and replay window are NOT
+   * checked twice. Returns true when the 403 was sent.
+   */
+  const rejectControlKeyBatchFromNonPrimary = (request, reply, events) => {
+    const summary = controlKeyEventSummary(events);
+    if (!summary) return false;
+    const agent = authorizeAgent(request, request.rawBody || Buffer.alloc(0));
+    if (agent?.role === "PRIMARY_TRUST_AGENT") return false;
+    // Privacy: event types, a count and the authenticated device id only —
+    // never a payload, wrapped key, signature or conversation identifier.
+    request.log.warn({
+      eventTypes: summary.types,
+      eventCount: summary.count,
+      agentId: agent?.deviceId || request.authenticatedAgentId || null,
+    }, "control-key event batch rejected before ingestion: primary_trust_agent_required");
+    reply.code(403).send({ error: "primary_trust_agent_required" });
+    return true;
+  };
+
   app.post("/api/v1/agent/events/batch", {
     bodyLimit: MAX_HTTP_BODY_BYTES,
     schema: {
@@ -902,7 +950,8 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       description: [
         "Each accepted event receives the account's next monotonic sequence (LOCK 10: per-account, never global).",
         "Response ACKs per eventId with its serverSequence — events missing from accepted[] stay PENDING in the device outbox and retry (LOCK 13 partial ACK).",
-        "Duplicate eventIds are skipped WITHOUT consuming a sequence. Payload is opaque (encrypted in Phase 7)."
+        "Duplicate eventIds are skipped WITHOUT consuming a sequence. Payload is opaque (encrypted in Phase 7).",
+        "Control-key event types (KEY_GRANT, KEYRING_ENTRY, HISTORY_KEY_GRANT, CONTACTS_KEY_GRANT) are accepted only from the authenticated PRIMARY_TRUST_AGENT; any other authenticated agent receives 403 primary_trust_agent_required before ingestion."
       ].join("\n"),
       tags: ["Agent"],
       body: {
@@ -951,7 +1000,8 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
               serverSequence: { type: "integer" }
             } } }
           }
-        }
+        },
+        403: { type: "object", properties: { error: { type: "string" } } }
       }
     }
   }, async (request, reply) => {
@@ -965,6 +1015,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       "agent event batch rejected before ingestion");
       return reply.code(400).send({ error: error.code || "invalid_event_batch" });
     }
+    if (rejectControlKeyBatchFromNonPrimary(request, reply, events)) return;
     // P0: sourceDeviceId is NEVER taken from the request body. The per-device
     // identity was bound by the global agent gate from the verified
     // X-Agent-Auth signature (request.authenticatedAgentId). A legacy
@@ -981,6 +1032,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     bodyLimit: MAX_HTTP_BODY_BYTES,
     schema: {
       summary: "Per-item encrypted event ingest outcomes",
+      description: "Control-key event types (KEY_GRANT, KEYRING_ENTRY, HISTORY_KEY_GRANT, CONTACTS_KEY_GRANT) are accepted only from the authenticated PRIMARY_TRUST_AGENT; any other authenticated agent receives 403 primary_trust_agent_required before ingestion.",
       tags: ["Agent"],
       body: { type: "object", required: ["events"], properties: {
         events: { type: "array", minItems: 1, maxItems: MAX_BATCH_EVENTS, items: { type: "object", additionalProperties: true } }
@@ -990,7 +1042,8 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
           index: { type: "integer" }, eventId: { type: "string" }, status: { type: "string" }, serverSequence: { type: "integer" }, error: { type: "string" }, errorClass: { type: "string", enum: ["VALIDATION", "IDENTITY_CONFLICT"] }
         } } },
         highWatermark: { type: "integer" }
-      } } }
+      } },
+      403: { type: "object", properties: { error: { type: "string" } } } }
     }
   }, async (request, reply) => {
     const submitted = request.body.events;
@@ -1024,6 +1077,7 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
           error: SAFE_INGEST_ERROR_CODES.has(error.code) ? error.code : "invalid_event", errorClass: "VALIDATION" };
       }
     }
+    if (rejectControlKeyBatchFromNonPrimary(request, reply, valid)) return;
     const stored = valid.length
       ? eventStore.ingestBatch({ accountId, sourceDeviceId: request.authenticatedAgentId || null, events: valid, perItem: true })
       : { results: [], highWatermark: eventStore.highWatermark(accountId) };

@@ -3,7 +3,7 @@
   "info": {
     "title": "GMweb API",
     "description": "Google Messages SMS/RCS gateway — control Google Messages Web via a REST API.\n\n## Authentication\nAll endpoints (except `/health`) require a Bearer token in the `Authorization` header.\n\nTwo token types are accepted:\n- **Master token** (`API_TOKEN` env var) — full access to all endpoints including admin and key management.\n- **Project API key** (`gmw_...`) — access to messaging & conversation endpoints only. Admin routes return 401.\n\n```\nAuthorization: Bearer gmw_your_project_token\n```\n\n## Rate Limits\nProject keys have configurable per-minute and per-hour send limits.\nRepeated auth failures from an IP trigger a 30-minute block.",
-    "version": "0.20.5",
+    "version": "0.20.6",
     "contact": {
       "name": "GMweb API"
     }
@@ -4197,7 +4197,7 @@
         "tags": [
           "Agent"
         ],
-        "description": "Each accepted event receives the account's next monotonic sequence (LOCK 10: per-account, never global).\nResponse ACKs per eventId with its serverSequence — events missing from accepted[] stay PENDING in the device outbox and retry (LOCK 13 partial ACK).\nDuplicate eventIds are skipped WITHOUT consuming a sequence. Payload is opaque (encrypted in Phase 7).",
+        "description": "Each accepted event receives the account's next monotonic sequence (LOCK 10: per-account, never global).\nResponse ACKs per eventId with its serverSequence — events missing from accepted[] stay PENDING in the device outbox and retry (LOCK 13 partial ACK).\nDuplicate eventIds are skipped WITHOUT consuming a sequence. Payload is opaque (encrypted in Phase 7).\nControl-key event types (KEY_GRANT, KEYRING_ENTRY, HISTORY_KEY_GRANT, CONTACTS_KEY_GRANT) are accepted only from the authenticated PRIMARY_TRUST_AGENT; any other authenticated agent receives 403 primary_trust_agent_required before ingestion.",
         "requestBody": {
           "required": true,
           "content": {
@@ -4362,6 +4362,21 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -4372,6 +4387,7 @@
         "tags": [
           "Agent"
         ],
+        "description": "Control-key event types (KEY_GRANT, KEYRING_ENTRY, HISTORY_KEY_GRANT, CONTACTS_KEY_GRANT) are accepted only from the authenticated PRIMARY_TRUST_AGENT; any other authenticated agent receives 403 primary_trust_agent_required before ingestion.",
         "requestBody": {
           "required": true,
           "content": {
@@ -4436,6 +4452,21 @@
                     },
                     "highWatermark": {
                       "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
                     }
                   }
                 }

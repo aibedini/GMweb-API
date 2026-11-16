@@ -407,8 +407,8 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `GET /api/v1/pairing/diagnostics` | Recent sanitized pairing state/reason trail. Session/device identifiers are hashed; credentials, signatures, certificates and message content are never logged. | Dashboard/master, or restricted admin-recovery PWA session |
 | `POST /api/v1/agent/commands/claim` | **Android Agent only** (device key). Atomically claims queued commands. Optional `?waitMs=` long-poll (0–25000, authenticated agents only). | `X-API-Key` device key |
 | `POST /api/v1/agent/commands/:id/status` | Agent reports `ACCEPTED/EXECUTING/COMPLETED/FAILED`; guarded transitions, illegal jumps → `409`. | device key |
-| `POST /api/v1/agent/events/batch` | Agent uploads opaque event batches. Legacy `accepted` and `duplicates` remain; additive `results[]` gives each `eventId` an `ACCEPTED`, byte-identical `DUPLICATE`, or permanent `CONFLICTING_DUPLICATE` / `INVALID_*` outcome. A matching duplicate returns its original sequence and consumes no new sequence. Clients must never ACK a conflict; they must preserve it as a visible dead letter and continue later events. | device key |
-| `POST /api/v1/agent/events/batch-v2` | Indexed per-item upload: each index returns `ACCEPTED` with new sequence, `DUPLICATE` with original sequence, `CONFLICTING_DUPLICATE` with `errorClass: IDENTITY_CONFLICT`, or `INVALID_EVENT` with a safe code and `errorClass: VALIDATION`. `highWatermark` is the committed account cursor. V2 is not preferred until the full rollout is ready. | Agent signature or compatible device key |
+| `POST /api/v1/agent/events/batch` | Agent uploads opaque event batches. Legacy `accepted` and `duplicates` remain; additive `results[]` gives each `eventId` an `ACCEPTED`, byte-identical `DUPLICATE`, or permanent `CONFLICTING_DUPLICATE` / `INVALID_*` outcome. A matching duplicate returns its original sequence and consumes no new sequence. Clients must never ACK a conflict; they must preserve it as a visible dead letter and continue later events. Control-key types (`KEY_GRANT`, `KEYRING_ENTRY`, `HISTORY_KEY_GRANT`, `CONTACTS_KEY_GRANT`) require the authenticated `PRIMARY_TRUST_AGENT`; any other authenticated agent gets `403 primary_trust_agent_required` before ingestion. | device key; primary agent signature for control-key types |
+| `POST /api/v1/agent/events/batch-v2` | Indexed per-item upload: each index returns `ACCEPTED` with new sequence, `DUPLICATE` with original sequence, `CONFLICTING_DUPLICATE` with `errorClass: IDENTITY_CONFLICT`, or `INVALID_EVENT` with a safe code and `errorClass: VALIDATION`. `highWatermark` is the committed account cursor. A batch containing any control-key event is `403 primary_trust_agent_required` unless the authenticated agent is the `PRIMARY_TRUST_AGENT`, and no item from that batch is ingested. V2 is not preferred until the full rollout is ready. | Agent signature or compatible device key; primary agent signature for control-key types |
 | `GET /api/v1/agent/replication-capabilities` | Reports implemented replication protocol versions and ingest, snapshot, key and command features. Currently advertises V1 only; Android must not infer V2 availability. | Agent signature or compatible device key |
 | `GET /api/v1/linked-device/replication-capabilities` | Same implemented capability report for a paired browser; requires `READ_MESSAGES`. | Linked session |
 | `GET /api/v1/sync?after=&limit=` | **Cursor catch-up sync**: opaque ciphertext events with monotonic **per-account** sequences, `{events, nextCursor, hasMore}`. Apply transactionally into your local store; the cursor is your only sync state. | Bearer |
@@ -426,6 +426,15 @@ new consumers should prefer them over the legacy `/send` bridge:
 | `POST /api/v1/push/subscribe` / `unsubscribe` | Register/remove a push subscription (§89). **Content-less wake-ups only** (§30): notifications never carry message content. | Bearer |
 | `GET /api/v1/push/subscriptions` | List subscriptions (endpoint hashes truncated for privacy). This dashboard-only route is not called by the linked PWA. | Dashboard/bearer |
 | `POST /api/v1/trust/statements` / `GET /api/v1/trust/{snapshot,statements}` | Signed Trust Registry relay (ADR-001): Android signs, GMweb only stores/relays; **clients verify `rootSignature` locally** — GMweb cannot mint or revoke devices. | Bearer |
+
+**Control-key grant gate (0.20.6, LDV-004 PR-D):** only the authenticated
+`PRIMARY_TRUST_AGENT` may publish `KEY_GRANT`, `KEYRING_ENTRY`,
+`HISTORY_KEY_GRANT` or `CONTACTS_KEY_GRANT`; every other authenticated agent
+receives `403 {"error":"primary_trust_agent_required"}` before any event is
+stored. The phone's `rootSignature` remains the end-to-end cryptographic
+authentication of a grant — this relay gate is authorization only, and GMweb
+still never opens the wrapped key or verifies the signature. Message/status
+batches from other agent roles are unchanged.
 
 **Claim long-poll (0.20.0):** `POST /api/v1/agent/commands/claim` accepts an
 optional `?waitMs=` integer (0–25000). Values above 25000 are clamped; absent,
