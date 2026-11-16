@@ -945,6 +945,11 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
 
   app.post("/api/v1/agent/events/batch", {
     bodyLimit: MAX_HTTP_BODY_BYTES,
+    // The PRIMARY_TRUST_AGENT check below is authorization, so CodeQL's
+    // js/missing-rate-limiting query needs a limit it can model. The server
+    // registers @fastify/rate-limit with global:false; this declares the bound
+    // for this ingest route, complementary to the body and batch caps.
+    config: { rateLimit: { max: 300, timeWindow: "1 minute" } },
     schema: {
       summary: "Android Agent uploads a durable event batch (§55, partial ACK)",
       description: [
@@ -1030,6 +1035,9 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
 
   app.post("/api/v1/agent/events/batch-v2", {
     bodyLimit: MAX_HTTP_BODY_BYTES,
+    // Same modeled rate limit as /batch: the control-key authorization gate
+    // must sit behind a framework-declared bound, not only the body/batch caps.
+    config: { rateLimit: { max: 300, timeWindow: "1 minute" } },
     schema: {
       summary: "Per-item encrypted event ingest outcomes",
       description: "Control-key event types (KEY_GRANT, KEYRING_ENTRY, HISTORY_KEY_GRANT, CONTACTS_KEY_GRANT) are accepted only from the authenticated PRIMARY_TRUST_AGENT; any other authenticated agent receives 403 primary_trust_agent_required before ingestion.",

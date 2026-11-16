@@ -97,6 +97,10 @@ function makeApp({ captureLogs = false } = {}) {
     try { done(null, JSON.parse(body.toString("utf8") || "{}")); } catch (error) { done(error); }
   });
   // Mirror the global /api/v1/agent/* gate: verify once, bind the device id.
+  // CodeQL sees this test-only server's signature/role gate as authorization
+  // and asks for a rate limit; the harness is in-process (fastify.inject, no
+  // network listener) and the production routes declare the actual limit.
+  // codeql[js/missing-rate-limiting]
   app.addHook("preHandler", (request, reply, done) => {
     const header = String(request.headers["x-agent-auth"] || "");
     if (!header) return done();
