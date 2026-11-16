@@ -2,6 +2,7 @@ const Fastify = require("fastify");
 const cors = require("@fastify/cors");
 const cookie = require("@fastify/cookie");
 const linkedSessions = require("./linkedSessions");
+const { authorizeLinkedSession } = require("./linkedDeviceAuth");
 const proxy = require("@fastify/http-proxy");
 const swagger = require("@fastify/swagger");
 const swaggerUi = require("@fastify/swagger-ui");
@@ -829,60 +830,20 @@ function requireToken(request, reply, done) {
     return pairingGate(agentAuthService, request, reply, done);
   }
   // POST-PAIR SECURE BOOTSTRAP: the linked-device session class —
-  // capability-scoped, NEVER master/admin. Paths are whitelisted by
-  // capability; everything else falls through to the normal auth ladder
-  // (and typically 401s for a browser that only holds this cookie).
-  const linkedCookie = request.cookies
-    ? request.cookies[linkedSessions.COOKIE_NAME]
-    : "";
-  const linkedSession = linkedSessions.resolve(linkedCookie);
-  if (linkedSession && requestPath(request.url).startsWith("/api/v1/")) {
-    const p = requestPath(request.url);
-    const caps = linkedSession.capabilities || [];
-    const allowed =
-      (caps.includes("READ_MESSAGES") &&
-        request.method === "GET" &&
-        (p === "/api/v1/sync" ||
-          p === "/api/v1/sse" ||
-          p === "/api/v1/web/bootstrap" ||
-          p === "/api/v1/web/snapshot-v2" ||
-          p === "/api/v1/web/conversations" ||
-          p.startsWith("/api/v1/web/conversations/") ||
-          p === "/api/v1/linked-device/sync-diagnostics" ||
-          p === "/api/v1/linked-device/sessions" ||
-          p === "/api/v1/linked-device/key-grants" ||
-          p === "/api/v1/linked-device/keyring" ||
-          p === "/api/v1/linked-device/replication-capabilities" ||
-          p === "/api/v1/linked-session" ||
-          p.startsWith("/api/v1/trust/"))) ||
-      (caps.includes("READ_MESSAGES") && request.method === "POST" &&
-        (p === "/api/v1/web/sync/ack" || p === "/api/v1/web/snapshot-v2" ||
-          p === "/api/v1/web/conversations/changed")) ||
-      (caps.includes("READ_MESSAGES") && request.method === "GET" &&
-        (p === "/api/v1/linked-device/telemetry" || p === "/api/v1/linked-device/status")) ||
-      (caps.includes("CONTACTS_READ") && request.method === "GET" &&
-        p === "/api/v1/linked-device/contacts/events") ||
-      ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ") || caps.includes("AI_SUGGEST")) && request.method === "GET" &&
-        p === "/api/v1/linked-device/command-key") ||
-      ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ") || caps.includes("AI_SUGGEST")) &&
-        (p === "/api/v1/commands" || p.startsWith("/api/v1/commands/"))) ||
-      (caps.includes("READ_PAIRING_DIAGNOSTICS") &&
-        request.method === "GET" && p === "/api/v1/pairing/diagnostics") ||
-      (p === "/api/v1/linked-session" && ["GET", "DELETE"].includes(request.method));
-    if (allowed) {
-      request.linkedDevice = linkedSession;
-      linkedSessions.observe(linkedCookie, request.ip, request.headers["user-agent"],
-        p === "/api/v1/sync" || p === "/api/v1/web/bootstrap" ||
-        p === "/api/v1/web/snapshot-v2" || p === "/api/v1/web/conversations" ||
-        p.startsWith("/api/v1/web/conversations/") ||
-        p === "/api/v1/linked-device/contacts/events");
-      return done();
-    }
-    // A linked browser must not silently fall through to bearer auth with
-    // its cookie — fail closed for out-of-scope paths.
-    reply.code(403).send({ error: "capability_denied" });
-    return;
-  }
+  // capability-scoped, NEVER master/admin.
+  //
+  // Two credentials share ONE decision (src/linkedDeviceAuth.js):
+  //   * the `gmweb_linked_session` HttpOnly cookie (browser / WEB_PWA), and
+  //   * `Authorization: Device <token>` (native AI_AGENT, XR-GA-008).
+  // Both go through the same capability whitelist and the same
+  // `request.linkedDevice` binding. A valid cookie always wins; without one,
+  // a Device header is resolved with linkedSessions.resolve(). Invalid,
+  // expired or revoked device tokens are a hard 401 invalid_device_token and
+  // NEVER fall through to admin/API-key/bearer auth. Out-of-scope paths fail
+  // closed with 403 capability_denied (same as the cookie).
+  const linkedAccess = authorizeLinkedSession(request, reply);
+  if (linkedAccess === "denied") return;
+  if (linkedAccess === "allowed") return done();
 
   // Android agent bridge: device key (legacy) OR per-device ECDSA signature
   // (PR-08b) — the route handler/hook re-checks and binds the identity.
@@ -3479,7 +3440,11 @@ app.get("/api/v1/sse", {
   attachSseHeartbeat(reply);
 
   if (request.linkedDevice) {
-    reply._linkedToken = request.cookies[linkedSessions.COOKIE_NAME];
+    // Cookie (browser) or Device-token (AI_AGENT) credential — both are
+    // re-checked for revocation while the stream is open. The raw token stays
+    // in memory only; streaming logs never include it.
+    reply._linkedToken = request.linkedDeviceToken ||
+      request.cookies[linkedSessions.COOKIE_NAME];
     const expiryCheck = setInterval(() => {
       if (!linkedSessions.resolve(reply._linkedToken)) {
         reply.raw.write('data: {"type":"device.revoked"}\n\n');

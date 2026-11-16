@@ -1,3 +1,57 @@
+### GMweb 0.20.7: device-token transport for linked AI devices (`xr-ga-008-device-token`)
+
+`POST /api/v1/pairing/complete` now returns the linked-session credential to a
+native `AI_AGENT` in the JSON body. When the approved certificate's
+`deviceType` is `AI_AGENT`, the response contains `token` (the same random
+session credential whose SHA-256 hash GMweb stores in the device registry) and
+**no** `gmweb_linked_session` cookie is set. `WEB_PWA` is unchanged: the
+response contains no `token` and the browser keeps the `HttpOnly; Secure;
+SameSite=Strict` cookie. A browser completion can never be turned into a token
+response, and a certificate can never be registered with an `AI_AGENT` device
+type unless its capability set is exactly `READ_MESSAGES` + `AI_SUGGEST`.
+
+The token is a bearer-style secret for the linked-device protocol. GMweb only
+stores its hash, never logs it, and does not persist it client-side. Delivery
+relies on the existing TLS-only deployment; consumers must keep the token in the
+device OS keystore and never put it in a URL, log line or crash report.
+
+AI devices authenticate linked-device calls with
+`Authorization: Device <token>` (the `Device` scheme is case-insensitive). The
+token is accepted for the same `/api/v1/` surface as the linked-session cookie,
+with the same capability whitelist and the same server-side device binding:
+`GET /api/v1/sync?after=&limit=`, `GET /api/v1/linked-device/key-grants`,
+`GET /api/v1/linked-device/keyring`, `GET /api/v1/linked-device/sessions`,
+`GET /api/v1/linked-device/sync-diagnostics`, `GET /api/v1/linked-device/status`,
+`GET /api/v1/linked-device/telemetry`, `GET /api/v1/sse`, the `/api/v1/web/*`
+linked-browser reads, and `POST /api/v1/sync/ack`. `READ_MESSAGES` is required
+for all of them; `AI_SUGGEST` additionally allows
+`GET /api/v1/linked-device/command-key` and `POST /api/v1/commands`
+(`SUGGESTIONS_READY` only, enforced by the command engine).
+
+Failure semantics are deliberately distinct:
+
+| Condition | Response |
+| --- | --- |
+| no cookie and no `Device` header on a linked-only path | normal auth ladder (`401` without a master Bearer token) |
+| missing, malformed, expired or revoked `Device` token | `401 {"error":"invalid_device_token"}` |
+| valid token, path outside the whitelist | `403 {"error":"capability_denied"}` |
+| valid token, non-`/api/v1/` path (e.g. `/admin/...`, `/gateway/...`) | `401 {"error":"unauthorized"}` |
+
+A `Device` header is never allowed to fall through to dashboard, master-token,
+project-API-key, gateway-key or agent-signature authentication. A valid cookie
+always takes precedence over a `Device` header, so browser behaviour is
+unchanged; an out-of-scope linked path still fails closed with
+`403 capability_denied`.
+
+`POST /api/v1/sync/ack` accepts the adapter acknowledgement shape
+`{"device_id"?: string, "sync_event_ids": string[]}` (at most 1000 ids). The
+authenticated session, not the body or a query parameter, selects the device: a
+`device_id` that names another device returns `403 device_mismatch`. The
+response is `{"ok":true,"accepted":N,"durable":false}` — GMweb's durable
+catch-up cursor remains sequence-based (`GET /api/v1/sync?after=`) and this
+advisory acknowledgement never deletes events, advances a cursor or compacts the
+store. The existing browser `POST /api/v1/web/sync/ack` contract is unchanged.
+
 ### GMweb 0.20.4: linked AI device (`xr-ga-008-ai-device`)
 
 XR-GA-008 / LDV-002+003 adds a second linked-device kind, `AI_AGENT`. A pairing

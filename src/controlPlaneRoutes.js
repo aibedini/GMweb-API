@@ -1124,6 +1124,56 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     return eventStore.after(accountId, after, limit);
   });
 
+  app.post("/api/v1/sync/ack", {
+    // Adapter acknowledgements are small and idempotent; bound abuse without
+    // throttling a normal read/ack loop (the adapter batches ≤1000 ids).
+    config: { rateLimit: { max: 120, timeWindow: 60000 } },
+    schema: {
+      summary: "Acknowledge processed sync events for the linked AI device",
+      description: [
+        "Adapter-compatibility surface for `Authorization: Device <token>` clients (XR-GA-008).",
+        "The authenticated linked session, never the body or query, selects the device: a",
+        "`device_id` naming any other device is rejected with 403 device_mismatch.",
+        "GMweb's durable catch-up cursor stays sequence-based (`GET /api/v1/sync?after=`);",
+        "this acknowledgement validates and accepts the adapter's processed event IDs but",
+        "does not delete events, advance a cursor or compact the store (`durable:false`).",
+      ].join("\n"),
+      tags: ["Sync"],
+      body: {
+        type: "object",
+        required: ["sync_event_ids"],
+        additionalProperties: false,
+        properties: {
+          device_id: { type: "string", maxLength: 128 },
+          sync_event_ids: {
+            type: "array",
+            maxItems: 1000,
+            items: { type: "string", minLength: 1, maxLength: 128 },
+          },
+        },
+      },
+      response: {
+        200: {
+          type: "object",
+          properties: {
+            ok: { type: "boolean" },
+            accepted: { type: "integer" },
+            durable: { type: "boolean" },
+          },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    if (!request.linkedDevice) return reply.code(401).send({ error: "linked_session_required" });
+    if (!request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+      return reply.code(403).send({ error: "read_messages_capability_required" });
+    }
+    if (request.body?.device_id && request.body.device_id !== request.linkedDevice.deviceId) {
+      return reply.code(403).send({ error: "device_mismatch" });
+    }
+    return { ok: true, accepted: request.body.sync_event_ids.length, durable: false };
+  });
+
   const webSnapshotHeaders = (reply) => reply.header("Cache-Control", "no-store");
 
   app.post("/api/v1/web/snapshot-v2", {
