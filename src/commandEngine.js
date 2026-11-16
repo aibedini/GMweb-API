@@ -22,6 +22,8 @@
  * evidence payloads, relayed verbatim into the encrypted event store.
  */
 
+const { assertCommandAllowedForDevice } = require("./devicePolicy");
+
 class CommandEngine {
   /**
    * @param {import("better-sqlite3").Database} db
@@ -144,6 +146,8 @@ class CommandEngine {
     cryptoVersion = 0,
     targetAgentId = null,
     sourceClientId = null,
+    sourceDeviceType = null,
+    sourceCapabilities = null,
     clientSignature = null,
     expiresAt = null,
   }) {
@@ -153,6 +157,12 @@ class CommandEngine {
     if (!Buffer.isBuffer(ciphertext) || ciphertext.length === 0) {
       throw new Error("ciphertext payload is required (durable, opaque)");
     }
+    // XR-GA-008 / LDV-002 (defense in depth): an AI_AGENT device may only
+    // create SUGGESTIONS_READY and must actually hold AI_SUGGEST. This runs
+    // BEFORE the idempotency lookup, so a denied type can never become a
+    // durable row or reveal an existing command. WEB_PWA/legacy callers pass
+    // no deviceType and keep their existing path.
+    assertCommandAllowedForDevice({ deviceType: sourceDeviceType, capabilities: sourceCapabilities, type });
     const existing = this.byIdempotency.get(accountId, idempotencyKey);
     if (existing) {
       if (!sameCommandRequest(existing, { type, ciphertext, targetAgentId, sourceClientId })) {

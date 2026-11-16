@@ -2,6 +2,7 @@
 const crypto = require("node:crypto");
 const { db } = require("./pairingDb");
 const { PROTOCOL, canonicalTranscript, canonicalChallenge } = require("../shared/pairingProtocol.mjs");
+const { WEB_PWA, deviceTypePolicy } = require("./devicePolicy");
 const PAIRING_TTL_MS = 120000;
 const MAX_GLOBAL_SESSIONS = 200;
 const MAX_SESSIONS_PER_IP = 5;
@@ -25,6 +26,11 @@ function createSession(p, ctx) {
     if (typeof p[name] !== "string" || !p[name] || p[name].length > max) fail(`${name} must be a non-empty string of at most ${max} chars`);
   }
   if (p.ephemeralPublicKey === p.webSigningPublicKey) fail("ephemeralPublicKey must differ from webSigningPublicKey");
+  // XR-GA-008: the requested device kind is server-validated against
+  // device_type_policy. It is NOT part of the canonical transcript (the
+  // certificate binds it and the certificate policy enforces the profile).
+  const deviceType = p.deviceType === undefined ? WEB_PWA : p.deviceType;
+  if (typeof deviceType !== "string" || !deviceTypePolicy(deviceType)) fail("unsupported deviceType");
   const webOrigin = String(ctx.origin || "");
   const apiOrigin = String(ctx.apiOrigin || webOrigin);
   for (const origin of [webOrigin, apiOrigin]) {
@@ -36,7 +42,7 @@ function createSession(p, ctx) {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   const pairingCode = [...crypto.randomBytes(10)].map(value => alphabet[value & 31]).join("");
   const session = { pairingSessionId: crypto.randomBytes(18).toString("base64url"),
-    version: 1, protocol: PROTOCOL, webDeviceId: p.webDeviceId,
+    version: 1, protocol: PROTOCOL, webDeviceId: p.webDeviceId, deviceType,
     webSigningPublicKey: p.webSigningPublicKey, webEncryptionPublicKey: p.webEncryptionPublicKey,
     ephemeralPublicKey: p.ephemeralPublicKey, nonce: p.nonce,
     origin: webOrigin, apiOrigin, webOrigin, createdAt: Date.now(), expiresAt: Date.now() + PAIRING_TTL_MS,
@@ -109,9 +115,9 @@ function challengeCanonical(deviceId, challenge, webOrigin, issuedAt, pairingSes
   return Buffer.from(canonicalChallenge({deviceId, challenge, webOrigin, issuedAt, pairingSessionId, apiOrigin}), "utf8");
 }
 function qrPayload(s) {
-  const { version, protocol, pairingSessionId, webDeviceId, webSigningPublicKey, webEncryptionPublicKey,
+  const { version, protocol, pairingSessionId, webDeviceId, deviceType, webSigningPublicKey, webEncryptionPublicKey,
     ephemeralPublicKey, nonce, origin, apiOrigin, webOrigin, expiresAt, transcriptHash } = s;
-  return { version, protocol, pairingSessionId, webDeviceId, webSigningPublicKey, webEncryptionPublicKey,
+  return { version, protocol, pairingSessionId, webDeviceId, deviceType, webSigningPublicKey, webEncryptionPublicKey,
     ephemeralPublicKey, nonce, origin, apiOrigin, webOrigin, expiresAt, transcriptHash };
 }
 const atomic = fn => (...args) => db().transaction(() => fn(...args)).immediate();
