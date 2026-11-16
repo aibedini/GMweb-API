@@ -76,6 +76,10 @@ function makeApp({ captureLogs = false } = {}) {
       write(chunk, _encoding, callback) { logLines.push(String(chunk)); callback(); },
     }) } }
     : { logger: false });
+  // Mirror server.js: the batch routes declare config.rateLimit, and this
+  // opt-in-only plugin enforces it. Registering it here keeps the test app on
+  // the same contract as production (and makes the bound visible to analysis).
+  app.register(require("@fastify/rate-limit"), { global: false });
 
   const db = new Database(":memory:");
   require("../src/pairingDb").configure(db);
@@ -97,10 +101,8 @@ function makeApp({ captureLogs = false } = {}) {
     try { done(null, JSON.parse(body.toString("utf8") || "{}")); } catch (error) { done(error); }
   });
   // Mirror the global /api/v1/agent/* gate: verify once, bind the device id.
-  // CodeQL sees this test-only server's signature/role gate as authorization
-  // and asks for a rate limit; the harness is in-process (fastify.inject, no
-  // network listener) and the production routes declare the actual limit.
-  // codeql[js/missing-rate-limiting]
+  // (The @fastify/rate-limit registration above mirrors server.js and bounds
+  // this in-process app, so no network listener is left unprotected.)
   app.addHook("preHandler", (request, reply, done) => {
     const header = String(request.headers["x-agent-auth"] || "");
     if (!header) return done();
