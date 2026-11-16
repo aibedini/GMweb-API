@@ -1,6 +1,7 @@
 "use strict";
 const crypto = require("node:crypto");
 const { db } = require("./pairingDb");
+const { assertDeviceRegistration, WEB_PWA } = require("./devicePolicy");
 const COOKIE_NAME = "gmweb_linked_session";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const hashToken = token => crypto.createHash("sha256").update(String(token)).digest("hex");
@@ -8,12 +9,22 @@ function gc() {
   db().prepare("DELETE FROM linked_sessions WHERE expires_at <= ?").run(Date.now());
   db().prepare("DELETE FROM linked_session_presence WHERE token_hash NOT IN (SELECT token_hash FROM linked_sessions)").run();
 }
-function issue(deviceId, capabilities, trustSequence = 0, certificateExpiresAt = Date.now() + SESSION_TTL_MS) {
+/**
+ * Register a linked-device session (the device registry).
+ *
+ * XR-GA-008 / LDV-002: `deviceType` is persisted so the command relay can
+ * enforce the device profile later. AI_AGENT registration is rejected unless
+ * the capability set is exactly READ_MESSAGES + AI_SUGGEST (fail-closed,
+ * 403) — a send/mark-read/manage/sensitive capability can never be stored on
+ * an AI device row. WEB_PWA semantics are unchanged.
+ */
+function issue(deviceId, capabilities, trustSequence = 0, certificateExpiresAt = Date.now() + SESSION_TTL_MS, deviceType = WEB_PWA) {
   gc();
+  const registration = assertDeviceRegistration({ deviceType, capabilities });
   const createdAt = Date.now();
   const token = crypto.randomBytes(32).toString("hex");
   const expiresAt = Math.min(createdAt + SESSION_TTL_MS, certificateExpiresAt);
-  const session = { deviceId, capabilities, trustSequence, createdAt, expiresAt };
+  const session = { deviceId, capabilities, trustSequence, deviceType: registration.deviceType, createdAt, expiresAt };
   db().prepare("INSERT INTO linked_sessions VALUES (?, ?, ?, ?, ?)")
     .run(hashToken(token), deviceId, expiresAt, createdAt, JSON.stringify(session));
   return token;

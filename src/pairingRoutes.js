@@ -149,6 +149,10 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
           webEncryptionPublicKey: { type: "string", maxLength: 512 },
           ephemeralPublicKey: { type: "string", maxLength: 512 },
           nonce: { type: "string", maxLength: 128 },
+          // XR-GA-008: optional device kind. Unknown values are rejected by
+          // pairingSessions.createSession against device_type_policy. The
+          // canonical transcript/certificate encoding is unaffected.
+          deviceType: { type: "string", enum: ["WEB_PWA", "AI_AGENT"], default: "WEB_PWA" },
         },
       },
       response: {
@@ -479,6 +483,7 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
           properties: {
             ok: { type: "boolean" },
             deviceId: { type: "string" },
+            deviceType: { type: "string" },
             capabilities: { type: "array", items: { type: "string" } }
           }
         }
@@ -555,11 +560,25 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
     }
 
     // Burn the challenge ONLY after every verification passed (a failed
-    // verify must not lock the browser out of a legitimate retry).
-    const token = db().transaction(() => {
-      if (!pairing.burnChallenge(body.pollSecret)) return null;
-      return linkedSessions.issue(taken.deviceId, capabilities, cert.trustSequence, cert.expiresAt);
-    }).immediate();
+    // verify must not lock the browser out of a legitimate retry). The device
+    // registry re-checks the device-type capability policy before persisting;
+    // a rejected registration rolls the challenge burn back with it.
+    let token;
+    try {
+      token = db().transaction(() => {
+        if (!pairing.burnChallenge(body.pollSecret)) return null;
+        return linkedSessions.issue(taken.deviceId, capabilities, cert.trustSequence, cert.expiresAt, cert.deviceType);
+      }).immediate();
+    } catch (error) {
+      if (error && error.code === "device_registration_rejected") {
+        markPairing(request, "WEB_LINK_SESSION", "FAILED", "device_registration_rejected", {
+          sessionId: body.pairingSessionId,
+          deviceId: body.deviceId,
+        });
+        return reply.code(403).send({ error: "device_registration_rejected", reason: "device_type_policy" });
+      }
+      throw error;
+    }
     if (!token) {
       markPairing(request, "WEB_LINK_SESSION", "FAILED", "challenge_already_used", {
         sessionId: body.pairingSessionId,
@@ -582,6 +601,7 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
     return {
       ok: true,
       deviceId: taken.deviceId,
+      deviceType: cert.deviceType,
       capabilities,
     };
   });
@@ -598,6 +618,7 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
           properties: {
             authenticated: { type: "boolean" },
             deviceId: { type: ["string", "null"] },
+            deviceType: { type: ["string", "null"] },
             capabilities: { type: "array", items: { type: "string" } },
             trustSequence: { type: "integer" },
             historyStage: { type: ["string", "null"] }
@@ -609,11 +630,12 @@ function registerPairingRoutes(app, { agentAuthService, config, checkRateLimit, 
     const token = request.cookies ? request.cookies[linkedSessions.COOKIE_NAME] : "";
     const session = linkedSessions.resolve(token);
     if (!session) {
-      return { authenticated: false, deviceId: null, capabilities: [], trustSequence: 0, historyStage: null };
+      return { authenticated: false, deviceId: null, deviceType: null, capabilities: [], trustSequence: 0, historyStage: null };
     }
     return {
       authenticated: true,
       deviceId: session.deviceId,
+      deviceType: session.deviceType || "WEB_PWA",
       capabilities: session.capabilities,
       trustSequence: session.trustSequence,
       historyStage: !eventStore || !accountId ? null

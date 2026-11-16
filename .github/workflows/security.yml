@@ -21,20 +21,28 @@ jobs:
           languages: javascript-typescript
       - uses: github/codeql-action/analyze@5ba2889ada762081db2c4f32a729827dce632c7b # v3
 
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      # gitleaks-action v2 needs GITHUB_TOKEN to enumerate pull-request
+      # commits. .gitleaks.toml extends the default rule set and allowlists
+      # only verified non-secret test fixtures.
+      - name: Scan for committed secrets
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
   secrets-and-dependencies:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      # gitleaks-action v2 requires GITHUB_TOKEN to enumerate the commits of a
-      # pull request. Without it the job died with
-      # "GITHUB_TOKEN is now required to scan pull requests" and the Security
-      # workflow was red on every PR - a configuration failure that looked like
-      # a detector failure. It scans nothing without this.
-      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
