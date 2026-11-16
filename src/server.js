@@ -862,9 +862,9 @@ function requireToken(request, reply, done) {
         (p === "/api/v1/linked-device/telemetry" || p === "/api/v1/linked-device/status")) ||
       (caps.includes("CONTACTS_READ") && request.method === "GET" &&
         p === "/api/v1/linked-device/contacts/events") ||
-      ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ")) && request.method === "GET" &&
+      ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ") || caps.includes("AI_SUGGEST")) && request.method === "GET" &&
         p === "/api/v1/linked-device/command-key") ||
-      ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ")) &&
+      ((caps.includes("SEND_MESSAGES") || caps.includes("MARK_READ") || caps.includes("AI_SUGGEST")) &&
         (p === "/api/v1/commands" || p.startsWith("/api/v1/commands/"))) ||
       (caps.includes("READ_PAIRING_DIAGNOSTICS") &&
         request.method === "GET" && p === "/api/v1/pairing/diagnostics") ||

@@ -10,13 +10,18 @@ const {
   MAX_HTTP_BODY_BYTES,
 } = require("./eventCryptoPolicy");
 const { ClaimWaiters, clampWaitMs } = require("./claimWaiters");
+const { deviceCommandViolation, isAiDevice } = require("./devicePolicy");
 
 const EVENT_TYPES = Object.keys({
   ...eventCryptoPolicy.contentBearing,
   ...eventCryptoPolicy.controlKey,
   ...eventCryptoPolicy.nonContentControl,
 });
-const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY", "FETCH_THREAD_HISTORY"]);
+// XR-GA-008: SUGGESTIONS_READY is an AI-device command and must travel as an
+// encrypted envelope exactly like every other linked-device write. Adding it
+// here makes the route REQUIRE envelope.v1/schemaVersion 1/cryptoVersion 1 —
+// an unencrypted suggestion command is rejected before persistence.
+const ENCRYPTED_LINKED_COMMAND_TYPES = new Set(["SEND_SMS", "MARK_THREAD_READ", "REFRESH_DEVICE_TELEMETRY", "FETCH_THREAD_HISTORY", "SUGGESTIONS_READY"]);
 
 /**
  * Defensive validation of Android-advertised command capabilities (telemetry
@@ -455,7 +460,10 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
   app.get("/api/v1/linked-device/command-key", {
     schema: { summary: "Primary Android command encryption public key", tags: ["Commands"] },
   }, async (request, reply) => {
-    if (!request.linkedDevice?.capabilities?.some(cap => ["SEND_MESSAGES", "MARK_READ"].includes(cap))) {
+    // SUGGESTIONS_READY (XR-GA-008) is encrypted to this same primary command
+    // key, so an AI device holding AI_SUGGEST may read it too. It still cannot
+    // send SMS: the command route only allows SUGGESTIONS_READY for AI_AGENT.
+    if (!request.linkedDevice?.capabilities?.some(cap => ["SEND_MESSAGES", "MARK_READ", "AI_SUGGEST"].includes(cap))) {
       return reply.code(403).send({ error: "command_capability_required" });
     }
     const identity = agentAuthService?.getPrimaryIdentity();
@@ -530,36 +538,54 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
     }
   }, async (request, reply) => {
     const body = request.body || {};
-    if (request.linkedDevice && body.type === "MARK_THREAD_READ" &&
-        !request.linkedDevice.capabilities?.includes("MARK_READ")) {
+    const linked = request.linkedDevice || null;
+    const commandType = String(body.type);
+    // XR-GA-008 / LDV-002: the linked-device registry profile is authoritative,
+    // never the request body. An AI_AGENT may only create SUGGESTIONS_READY and
+    // must hold AI_SUGGEST; SEND_SMS, legacy SEND_MESSAGES and every other type
+    // are refused here AND again in the command engine (fail closed, 403).
+    if (linked) {
+      const policyViolation = deviceCommandViolation({
+        deviceType: linked.deviceType, capabilities: linked.capabilities, type: commandType,
+      });
+      if (policyViolation) {
+        return reply.code(403).send({ error: "command_type_not_allowed_for_device" });
+      }
+      if (commandType === "SUGGESTIONS_READY" &&
+          (!isAiDevice(linked.deviceType) || !linked.capabilities?.includes("AI_SUGGEST"))) {
+        return reply.code(403).send({ error: "ai_suggest_capability_required" });
+      }
+    }
+    if (linked && body.type === "MARK_THREAD_READ" &&
+        !linked.capabilities?.includes("MARK_READ")) {
       return reply.code(403).send({ error: "mark_read_capability_required" });
     }
-    if (request.linkedDevice && body.type === "SEND_SMS" &&
-        !request.linkedDevice.capabilities?.includes("SEND_MESSAGES")) {
+    if (linked && body.type === "SEND_SMS" &&
+        !linked.capabilities?.includes("SEND_MESSAGES")) {
       return reply.code(403).send({ error: "send_messages_capability_required" });
     }
     // Fetching older provider history READS message content from the phone, so it
     // is gated by the same READ_MESSAGES capability as reading history. The
     // payload is opaque encrypted data: the server never learns the phone
     // number, the branded sender, the Android thread id or the SMS body.
-    if (request.linkedDevice && body.type === "FETCH_THREAD_HISTORY" &&
-        !request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+    if (linked && body.type === "FETCH_THREAD_HISTORY" &&
+        !linked.capabilities?.includes("READ_MESSAGES")) {
       return reply.code(403).send({ error: "read_messages_capability_required" });
     }
     // Refreshing device telemetry reads device/SIM state, so it needs the same
     // capability that already gates reading that state. A linked browser may
     // refresh exactly what it is allowed to read.
-    if (request.linkedDevice && body.type === "REFRESH_DEVICE_TELEMETRY" &&
-        !request.linkedDevice.capabilities?.includes("READ_MESSAGES")) {
+    if (linked && body.type === "REFRESH_DEVICE_TELEMETRY" &&
+        !linked.capabilities?.includes("READ_MESSAGES")) {
       return reply.code(403).send({ error: "read_messages_capability_required" });
     }
-    if (request.linkedDevice && ENCRYPTED_LINKED_COMMAND_TYPES.has(String(body.type))) {
+    if (linked && ENCRYPTED_LINKED_COMMAND_TYPES.has(String(body.type))) {
       if (Number(body.cryptoVersion) !== 1 || body.encoding !== "envelope.v1" || Number(body.schemaVersion) !== 1) {
         return reply.code(400).send({ error: "encrypted_command_required" });
       }
     }
-    if (request.linkedDevice && body.type === "SEND_SMS") {
-      const limit = checkRateLimit(request, `linked-send:${request.linkedDevice.deviceId}`, 10, 60_000);
+    if (linked && body.type === "SEND_SMS") {
+      const limit = checkRateLimit(request, `linked-send:${linked.deviceId}`, 10, 60_000);
       if (!limit.allowed) return reply.code(429).send({ error: "send_rate_limit", retryAfterSeconds: limit.retryAfterSeconds });
     }
     let payload = null;
@@ -577,19 +603,21 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       const { created, command } = commandEngine.createCommand({
         accountId,
         idempotencyKey: String(body.idempotencyKey || ""),
-        type: String(body.type),
+        type: commandType,
         ciphertext: payload,
         encoding: body.encoding,
         schemaVersion: body.schemaVersion,
         cryptoVersion: body.cryptoVersion,
         targetAgentId: body.targetAgentId ?? null,
-        sourceClientId: request.linkedDevice?.deviceId ?? body.sourceClientId ?? null,
+        sourceClientId: linked?.deviceId ?? body.sourceClientId ?? null,
+        sourceDeviceType: linked?.deviceType ?? null,
+        sourceCapabilities: linked?.capabilities ?? null,
         clientSignature: body.clientSignature
           ? Buffer.from(String(body.clientSignature), "base64")
           : null,
         expiresAt: body.expiresAt ?? undefined,
       });
-      if (request.linkedDevice && command.sourceClientId !== request.linkedDevice.deviceId) {
+      if (linked && command.sourceClientId !== linked.deviceId) {
         return reply.code(409).send({ error: "idempotency_owner_mismatch" });
       }
       // Only a fresh row can wake a waiter; an idempotent replay (created
@@ -601,7 +629,11 @@ function registerControlPlaneRoutes(app, { trustRegistry, commandEngine, eventSt
       };
       reply.code(202).send({ commandId: command.id, state: command.state, created });
     } catch (error) {
-      reply.code(error.code === "idempotency_key_reused" ? 409 : 400).send({ error: error.message });
+      if (error.code === "idempotency_key_reused") return reply.code(409).send({ error: error.message });
+      if (error.code === "command_type_not_allowed_for_device") {
+        return reply.code(403).send({ error: error.code });
+      }
+      reply.code(400).send({ error: error.message });
     }
   });
 

@@ -2,16 +2,18 @@
 // Each value is <decimal UTF-8 byte length>:<value>,. No normalization.
 export const PROTOCOL = "GMweb-Pairing-v1";
 // Mirror of `capability_definitions` in shared/pairing-protocol-v1.json
-// (base + sensitive + reserved, flattened). This file is imported by the
+// (base + sensitive + reserved + ai, flattened). This file is imported by the
 // browser bundle (Vite), so it CANNOT read the JSON schema at runtime.
 // test/pairingCapabilityContract.test.js fails the build if this frozen list
 // drifts from the schema — the server-side allowlist itself is read from the
-// JSON in src/pairingCertificate.js, never from here.
+// JSON in src/pairingCertificate.js / src/devicePolicy.js, never from here.
+// AI_SUGGEST is AI-device-only; device_type_policy decides which type may
+// carry it (never a WEB_PWA certificate).
 
 export const PAIRING_CAPABILITIES = Object.freeze([
   "READ_MESSAGES", "SEND_MESSAGES", "MARK_READ", "RECEIVE_NOTIFICATIONS", "CONTACTS_READ",
   "MANAGE_DEVICES", "READ_OTP", "READ_BANK_SECURITY", "READ_PASSWORD_RESET",
-  "READ_AUTH_CODES", "READ_FINANCIAL_NOTIFICATIONS",
+  "READ_AUTH_CODES", "READ_FINANCIAL_NOTIFICATIONS", "AI_SUGGEST",
 ]);
 function text(value) {
   if (typeof value !== "string" || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value)) {

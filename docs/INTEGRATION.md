@@ -1,3 +1,32 @@
+### GMweb 0.20.4: linked AI device (`xr-ga-008-ai-device`)
+
+XR-GA-008 / LDV-002+003 adds a second linked-device kind, `AI_AGENT`. A pairing
+session may carry `deviceType: "AI_AGENT"` (optional body field on
+`POST /api/v1/pairing/session`; it is echoed in the QR/metadata and is NOT part
+of the canonical transcript or certificate bytes). The Android-signed
+certificate for that session must be exactly
+`capabilities: ["READ_MESSAGES","AI_SUGGEST"]` with
+`historyGrant: "FROM_NOW_ON"`. Any other capability (including `SEND_MESSAGES`,
+`MARK_READ`, `MANAGE_DEVICES` or a sensitive category), `FULL_HISTORY`, an
+unknown device type, or a device type that does not match the pairing session is
+rejected with `403 invalid_certificate` and a stable `reason`
+(`certificate_capability_invalid`, `certificate_history_grant_invalid`,
+`certificate_device_type_invalid`, `certificate_device_type_mismatch`).
+
+Linked sessions persist and report their `deviceType`
+(`GET /api/v1/linked-session`). The device registry refuses to store an
+`AI_AGENT` session unless its capability set is exactly those two
+(`403 device_registration_rejected`). Command creation refuses every command
+type outside the AI allowlist for an `AI_AGENT` source (`SEND_SMS`, legacy
+`SEND_MESSAGES`, `MARK_THREAD_READ`, …) with
+`403 command_type_not_allowed_for_device`, at both the HTTP route and the
+durable command engine. `SUGGESTIONS_READY` is accepted only from an
+`AI_AGENT` session that holds `AI_SUGGEST`, and only as an `envelope.v1`
+encrypted payload (`400 encrypted_command_required` otherwise); GMweb never
+parses it. The Primary command key stays readable to AI devices so they can
+encrypt that command. `WEB_PWA` pairing, certificate, registry and command
+behaviour is unchanged.
+
 ## GMweb 0.18.0 / Messages 3.3.0: fail-closed encrypted replication
 
 ### GMweb 0.19.30: linked inbox actions (`linked-inbox-actions-v1`)
