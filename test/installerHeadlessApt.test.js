@@ -156,35 +156,43 @@ test("systemd unit comments cannot execute commands while the installer runs", (
   }
 });
 
-test("a piped installer can reattach to a terminal without dying when there is none", () => {
-  // `exec </dev/tty` without a controlling terminal aborts a non-interactive shell. The
-  // guard therefore has to be defensive, and both installers must use it.
-  assert.match(installer, /^detach_piped_stdin\(\) \{/m);
-  assert.match(legacyInstaller, /^detach_piped_stdin\(\) \{/m);
-  assert.match(installer, /^detach_piped_stdin$/m);
-  assert.match(legacyInstaller, /^detach_piped_stdin$/m);
+test("the installers never reattach stdin", () => {
+  // `curl … | sudo bash` feeds bash the SCRIPT on fd 0. Redirecting fd 0 to /dev/tty in
+  // the middle of such a run sends the parser to the terminal: a 42 KB piped script
+  // stopped dead at the `exec` and never reached the rest of the installer. Per-command
+  // `</dev/null>` (checked above) is the safe boundary.
+  const codeOnly = (text) =>
+    text
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line))
+      .join("\n");
+  assert.doesNotMatch(codeOnly(installer), /exec\s*<\/dev\/tty/);
+  assert.doesNotMatch(codeOnly(legacyInstaller), /exec\s*<\/dev\/tty/);
+  assert.doesNotMatch(installer, /detach_piped_stdin/);
+  assert.doesNotMatch(legacyInstaller, /detach_piped_stdin/);
 });
 
 // ── behavioural check of the real helpers ────────────────────────────────────
 
-test("detach_piped_stdin survives a session with no controlling terminal", { skip: bash ? false : "bash not available" }, () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-detach-"));
-  const toPosix = (value) => value.replace(/\\/g, "/");
-  const probe = path.join(tmp, "detach.sh");
-  fs.writeFileSync(probe, [
+test("a piped script with per-command stdin redirection runs to completion", { skip: bash ? false : "bash not available" }, () => {
+  // Mirrors the documented `curl … | sudo bash` shape: bash reads the script from a pipe,
+  // while the apt stand-in has its stdin detached exactly like apt_get does.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-pipe-"));
+  const probe = path.join(tmp, "piped.sh");
+  const body = [
     "set -euo pipefail",
-    'GMWEB_INSTALL_LIB_ONLY=1 source "$1"',
-    "detach_piped_stdin",
-    'echo survived',
-  ].join("\n"));
+    "apt_get() { cat >/dev/null; }",
+    "for i in $(seq 1 400); do :; done",
+    'apt_get "$@" </dev/null',
+    "echo REACHED_END",
+  ].join("\n");
+  fs.writeFileSync(probe, `${body}\n`);
 
-  // stdin is a file, stdout is a pipe here: no tty at either end, like an SSH exec.
-  const result = spawnSync(bash, [toPosix(probe), toPosix(path.join(root, "install/quick-install.sh"))], {
-    cwd: root,
-    encoding: "utf8",
-  });
-  assert.equal(result.status, 0, `the guard must not abort the script: ${result.stderr}`);
-  assert.equal(result.stdout.trim(), "survived");
+  const source = probe.replace(/\\/g, "/");
+  const shell = bash.replace(/\\/g, "/");
+  const cat = spawnSync(bash, ["-c", `cat "${source}" | "${shell}"`], { encoding: "utf8" });
+  assert.equal(cat.status, 0, `piped run failed: ${cat.stderr}`);
+  assert.equal(cat.stdout.trim(), "REACHED_END");
 });
 
 test("apt_get and apt_repair behave as declared", { skip: bash ? false : "bash not available" }, () => {

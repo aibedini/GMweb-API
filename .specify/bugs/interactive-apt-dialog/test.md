@@ -32,11 +32,15 @@ Additional hardening applied on that host: 2 GB swap file (Chrome on a 1.9 GB bo
 
 ## Defects found and fixed during that deployment
 
-1. **The detach guard aborted non-interactive runs.** The first fix guarded with
-   `-r /dev/tty` and then ran `exec </dev/tty`; without a controlling terminal the open
-   fails with ENXIO and bash exits the script for the exec redirection error. Now
-   `detach_piped_stdin()` probes `/dev/tty` in a subshell and skips when stdout is not a
-   terminal. Regression test runs the real function with no tty at either end.
+1. **Reattaching stdin broke the documented piped install.** The first guard used
+   `-r /dev/tty` and then `exec </dev/tty`; without a controlling terminal the open fails
+   with ENXIO and `set -e` aborts the script. The second version probed `/dev/tty` in a
+   subshell first, which is worse for the documented `curl … | sudo bash`: bash reads the
+   **script** from fd 0, so the `exec` sends the parser to the terminal and every remaining
+   line is lost. Measured with a 42 KB piped script on the host: `START` then nothing, no
+   exit. The same script without the `exec` prints `START`, `END`, `RC=0`. Final design: no
+   stdin reattachment at all; only each `apt` call gets `</dev/null`, and menu prompts keep
+   reading `/dev/tty` directly.
 2. **Backticks in unquoted heredoc comments executed commands.** The `gmweb-api.service`
    heredoc needs `$APP_DIR`, so it is unquoted; a comment written as `` `npm start` `` ran
    npm from `/root` during the install and `` `.env` `` produced a "command not found".
