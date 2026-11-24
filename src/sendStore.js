@@ -393,6 +393,9 @@ class SendStore {
        WHERE id=@id`
     );
     this._setStage = this.db.prepare(`UPDATE sends SET stage=?, stage_at=?, updated_at=? WHERE job_id=?`);
+    this._setWaitingForDevice = this.db.prepare(`UPDATE sends
+      SET status='queued', stage='waiting_device', stage_at=@now, updated_at=@now, error=NULL
+      WHERE job_id=@job_id AND status IN ('queued','active') AND revoked_at IS NULL`);
     this._setPriorityByJob = this.db.prepare(
       `UPDATE sends SET priority=@priority, updated_at=@now
        WHERE job_id=@job_id OR id IN (SELECT send_id FROM send_job_refs WHERE job_id=@job_id)`
@@ -1131,6 +1134,10 @@ class SendStore {
     if (!jobId) return;
     const now = Date.now();
     this._setStage.run(stage, now, now, String(jobId));
+  }
+
+  markWaitingForDevice(jobId) {
+    this._setWaitingForDevice.run({ job_id: String(jobId), now: Date.now() });
   }
 
   updatePriorityByJob(jobId, priority) {

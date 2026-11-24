@@ -2,6 +2,18 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { AndroidOutbox } = require("../src/androidOutbox");
 
+test("only tasks never handed to the phone can return to the durable queue", async () => {
+  const outbox = new AndroidOutbox();
+  const worker = outbox.sendMessage({ requestId: "send_1", to: "+989120000000", text: "canary" });
+  assert.equal(outbox.withdrawUnclaimed("send_1"), true);
+  await assert.rejects(worker, /waiting_for_device/);
+  const retry = outbox.sendMessage({ requestId: "send_1", to: "+989120000000", text: "canary" });
+  const task = await outbox.take(1000);
+  assert.equal(outbox.withdrawUnclaimed(task.requestId), false);
+  outbox.ack(task.requestId, true, {});
+  assert.equal((await retry).type, "sent");
+});
+
 test("outbox hands the task to the phone and resolves on ack", async () => {
   const outbox = new AndroidOutbox();
 
