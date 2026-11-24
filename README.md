@@ -88,6 +88,15 @@ The Ubuntu 22.04 installer provisions the API, Chrome, Redis, operator interface
 curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | sudo bash
 ```
 
+To serve a real domain over HTTPS, pass it (plus a Let's Encrypt email) instead of using the automatic `nip.io` address:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aibedini/GMweb-API/main/install/ubuntu22.sh | \
+  sudo env PUBLIC_DOMAIN=gmweb.example.com LETSENCRYPT_EMAIL=admin@example.com bash
+```
+
+The installer is non-interactive: `apt` runs with `NEEDRESTART_MODE=l`, so it cannot stop at the "Daemons using outdated libraries / Which services should be restarted?" screen, and a half-configured `dpkg` left by a previously interrupted run is repaired before installing. If a machine is already stuck at that screen, see [Simple Setup §7](docs/SIMPLE_SETUP.md#7-install-stops-at-daemons-using-outdated-libraries).
+
 Re-running the installer may rotate credentials and restart services. For release promotion, backups, and rollback, use [the deployment runbook](docs/DEPLOYMENT.md).
 
 ## 🔌 Integrate a service

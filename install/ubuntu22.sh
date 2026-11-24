@@ -10,17 +10,11 @@ export APT_LISTCHANGES_FRONTEND=none
 export NEEDRESTART_MODE=l
 export UCF_FORCE_CONFFOLD=1
 
-# `curl … | sudo bash` gives the interpreter the pipe as stdin, and a child process can
-# inherit it before bash has consumed the whole script. Reattach to a real terminal when
-# one exists. Every step is checked: `exec </dev/tty` without a controlling terminal is a
-# redirection error, and under `set -e` bash exits the whole installer for it.
-detach_piped_stdin() {
-  if [[ -t 0 ]]; then return 0; fi
-  if [[ ! -t 1 ]]; then return 0; fi
-  if ! ( : </dev/tty ) 2>/dev/null; then return 0; fi
-  exec </dev/tty
-}
-detach_piped_stdin
+# Deliberately no stdin reattachment here. `curl … | sudo bash` makes bash read the SCRIPT
+# from fd 0, so an `exec </dev/tty` in the middle of a piped run sends the parser to the
+# terminal: everything after it is never executed and the install appears to hang (a 42 KB
+# piped script stopped dead at that line). Each apt call detaches its own stdin with
+# `</dev/null` instead, which is the only place a child could consume the script.
 
 APP_NAME="GMweb API"
 APP_SLUG="gmweb-api"
