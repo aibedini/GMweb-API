@@ -1,62 +1,66 @@
 # Bug Verification: headless apt for the installer
 
 - **Slug:** interactive-apt-dialog
-- **Result:** verified at the script/interface level; the affected host was not reachable from
-  this workspace, so the end-to-end install there is NOT VERIFIED.
+- **Result:** verified on the affected host — the install that used to hang completed, and
+  needrestart printed its list instead of opening the blocking dialog.
 
-## What was verified
+## Production acceptance (94.184.30.180, 2026-11-24)
+
+Host: Ubuntu 22.04.5 LTS, 2 vCPU, 1.9 GB RAM, `needrestart 3.5-5ubuntu2.5` (the exact
+package whose apt hook draws the dialog). Installer: `install/ubuntu22.sh` from `main`
+(`PUBLIC_DOMAIN=irgm.okgfx.ir`), run over a non-interactive SSH session.
+
+| Check | Evidence |
+| --- | --- |
+| No dialog, list-only instead | `install.log` contains the restart list (`...ed-upgrades.service`, `No containers need to be restarted.`) and the install continued |
+| Install finished | `==> Installed GMweb API`, `systemctl is-active gmweb-api gmweb-chrome nginx redis-server` → all `active` |
+| API on the domain | `GET https://irgm.okgfx.ir/health` → 200, `{"ok":true,"version":"0.20.8"}` (checked from an external machine) |
+| React console / dashboard | `GET /app` → 200, `GET /dashboard` → 200, `GET /` → 301 to HTTPS |
+| Certificate | `CN = irgm.okgfx.ir`, `notBefore Nov 24 2026`, `notAfter Feb 22 2027` |
+| Dashboard auth + VNC proxy | `POST /dashboard/password-login` → 200, `POST /dashboard/login` → 200, `GET /vnc/vnc.html` with the session cookie → 200 |
+| Survives reboot | after `systemctl reboot`: all four services active, HTTPS health 200 |
+| Firewall | `ufw` active, only 22/80/443 allowed; the API's 3030 is no longer reachable from outside |
+
+Additional hardening applied on that host: 2 GB swap file (Chrome on a 1.9 GB box).
+
+## Not verified
+
+- Google Messages QR pairing. On this host Google now requires signing in to the Google
+  account before it shows the pairing QR, so the account owner has to do it inside the VNC
+  console (`https://irgm.okgfx.ir/dashboard` → VNC, or an SSH tunnel to `127.0.0.1:6080`).
+  The API correctly reports `"state":"not_paired","reason":"chrome_not_paired"` until then.
+
+## Defects found and fixed during that deployment
+
+1. **The detach guard aborted non-interactive runs.** The first fix guarded with
+   `-r /dev/tty` and then ran `exec </dev/tty`; without a controlling terminal the open
+   fails with ENXIO and bash exits the script for the exec redirection error. Now
+   `detach_piped_stdin()` probes `/dev/tty` in a subshell and skips when stdout is not a
+   terminal. Regression test runs the real function with no tty at either end.
+2. **Backticks in unquoted heredoc comments executed commands.** The `gmweb-api.service`
+   heredoc needs `$APP_DIR`, so it is unquoted; a comment written as `` `npm start` `` ran
+   npm from `/root` during the install and `` `.env` `` produced a "command not found".
+   The backticks are escaped and a test parses every unquoted heredoc body and rejects
+   backticks in comment lines.
+
+## Local verification
 
 | Evidence | Command | Result |
 | --- | --- | --- |
-| Syntax, all touched bash | `bash -n` (Git Bash, and again on Ubuntu 22.04.5 LTS) | 6/6 OK on both |
-| Helper contract (static) | `node --test test/installerHeadlessApt.test.js` | 7/7 pass |
-| Helper behaviour on Ubuntu 22.04 bash | probe sources the real `install/quick-install.sh` with stubbed `apt-get`/`dpkg` | see below |
+| Syntax, all touched bash | `bash -n` (Git Bash and Ubuntu 22.04.5) | 6/6 OK |
+| Installer contract (static + behavioural) | `node --test test/installerHeadlessApt.test.js` | 10/10 pass |
+| Helper behaviour on Ubuntu 22.04 bash | probe sources the real `install/quick-install.sh` with stubbed `apt-get`/`dpkg` | `mode=l tty=no stdin=/dev/null`, `-y`, bounded lock, `dpkg --configure -a` |
 | JS syntax | `npm run check` | exit 0 |
 | Unit/contract suite | `npm test` | 988 tests, 987 pass, 0 fail, 1 skipped |
 
-Behaviour probe on the Ubuntu 22.04 host (real bash 5.1, the target platform), running the
-actual helpers from the modified installer:
-
-```text
---- apt args ---
--y -o DPkg::Lock::Timeout=120 -f install
--y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::Retries=3 update
--y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o Acquire::Retries=3 install curl
---- apt env ---
-mode=l tty=no stdin=/dev/null        (x3)
---- dpkg calls ---
---configure -a
---- conf ---
-$nrconf{restart} = 'l';
-```
-
-That is the whole failure mode removed: apt sees `NEEDRESTART_MODE=l`, stdin is
-`/dev/null` (so whiptail cannot take the terminal or the script's pipe), every call is
-`-y` with a bounded lock, and the interrupted-dpkg state from the earlier stuck run is
-repaired with `--configure -a` before installing.
-
-The needrestart contract itself was checked against the upstream documentation:
-`NEEDRESTART_MODE` overrides the configured restart mode with `(l)ist only`,
-`(i)nteractive`, `(a)utomatically` ([needrestart(1)](https://manpages.ubuntu.com/manpages/noble/man1/needrestart.1.html)).
-Ubuntu 24.04's "always restart" change ([LP #2068543](https://bugs.launchpad.net/ubuntu/+source/needrestart/+bug/2068543))
-does not reintroduce a prompt, and list-only remains the explicit policy.
-
-## NOT VERIFIED
-
-- The real dialog disappearing on the machine in the screenshot. That host was not reachable
-  from this workspace (the only reachable Ubuntu 22.04 box has no `needrestart` installed,
-  and installing it there would mutate a production server). The operator must re-run the
-  install on that host; the new code is what makes that run immune.
-- A full `install/quick-install.sh` end-to-end run on Ubuntu 22.04 with Chrome/VNC/Redis.
-  No disposable Ubuntu host with `needrestart` was available, and the installer is not run
-  on the Windows development machine.
-- `install/ubuntu22.sh` end-to-end. Same reason; only `bash -n` and the shared helper probe
-  cover it.
+`NEEDRESTART_MODE` and the `conf.d` drop-in were confirmed against the Ubuntu package
+itself: `needrestart` 3.5 reads `/etc/needrestart/conf.d/*.conf` via `eval do { ... }` and
+resolves the mode with `$opt_r = $ENV{NEEDRESTART_MODE} ...; $opt_r = $nrconf{restart}
+unless defined`. With `-t` absent it also falls back to list mode.
 
 ## Note on the local full-suite run
 
-The first `npm test` on this checkout failed only `test/frontendArtifacts.test.js`:
-`PWA build-info version drift: 0.20.0 != 0.20.8`. `public/web-app/build-info.json` is a
-git-ignored local build artifact left over from a 0.20.0 build; it is absent from every CI
-checkout (`git check-ignore` confirms the path is ignored). It was removed from this
-worktree — no tracked file changed — and the suite then passed 987/987 with 1 skip.
+The first `npm test` on the development checkout failed only
+`test/frontendArtifacts.test.js`: `PWA build-info version drift: 0.20.0 != 0.20.8`.
+`public/web-app/build-info.json` is a git-ignored local build artifact from an older build
+and is absent from CI checkouts; removing it made the suite pass 987/987 with 1 skip.
