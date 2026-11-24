@@ -631,9 +631,13 @@ GMweb has two interchangeable delivery transports behind the same API:
 Both transports run side by side; exactly one is active. Everything a consumer
 depends on — auth, `POST /send`, priority lanes, idempotency, status polling,
 cancel, capacity, SSE/webhooks — behaves identically regardless of the active
-transport. While `android` is active, `POST /send` returns
-`503 android_gateway_unreachable` if no device is connected (treat as "retry
-later").
+transport. With Android active, asynchronous `POST /send` returns `202` when
+the phone is offline. GMweb retains the original request and job. Poll its
+`statusUrl` for `queued` with stage `waiting_device` until the phone reconnects.
+Waiting for a device leaves the delivery attempt count unchanged. A task already
+handed to a phone may still require manual review if its acknowledgment is lost.
+`GET /ready` still reports device reachability. Its `status.queueAccepting`
+flag tells consumers whether they can submit to the queue while readiness is `503`.
 
 ### Android pull mode (default)
 

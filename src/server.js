@@ -404,6 +404,7 @@ const apiKeyStore = new ApiKeyStore(
 );
 const activityLogStore = new ActivityLogStore(path.join(config.rootDir, "data", "activity.jsonl"));
 const sendQueue = new SendQueue();
+const { DelayedError } = require("bullmq");
 // Durable send ledger — survives crashes, tracks per-message status, powers the
 // 24h de-dupe, and lets us rebuild the queue from disk if Redis is ever wiped.
 const sendStore = new SendStore(path.join(config.rootDir, "data", "sends.db"));
@@ -1517,6 +1518,16 @@ function releaseGatewayTask(job) {
   return false;
 }
 
+async function waitForAndroidDevice(job, token) {
+  await job.moveToDelayed(Date.now() + 30000, token);
+  try {
+    sendStore.markWaitingForDevice(job.id);
+  } catch (error) {
+    app.log.warn({ jobId: job.id, code: error.code }, "could not record offline device wait");
+  }
+  throw new DelayedError();
+}
+
 async function deferQuietHoursJob(job, releaseAt) {
   const priority = priorityForJob(job);
   const ledger = sendStore.byJob(job.id);
@@ -1793,7 +1804,7 @@ async function handleSendCompleted(job, result) {
 
 function startSendWorker() {
   sendQueue.startWorker(
-    async (job) => {
+    async (job, token) => {
       if (!sendPowerOn) return deferPowerOffJob(job);
       // DURABLE revocation barrier, read from the SQLite ledger rather than an
       // in-memory Set: a restarted process, a BullMQ-stalled job that got
@@ -1821,7 +1832,12 @@ function startSendWorker() {
         endHour: SEND_QUIET_END_HOUR
       });
       if (schedule.blocked) return deferQuietHoursJob(job, schedule.releaseAt);
+      if (client.name === "android" && !androidOutbox.tracks(gatewayTaskKey(job))) {
+        const phone = await client.readyState();
+        if (!phone.paired && client.name === "android") return waitForAndroidDevice(job, token);
+      }
       await waitForSendPace(job);
+      let sendTimeout;
       try {
         // The consumer notification identity is re-read from the ledger at send
         // time so the Android bridge can hand it to the phone (meta) and bind
@@ -1866,12 +1882,18 @@ function startSendWorker() {
               emitSse({ type: "send_stage", requestId: requestIdForJob(job), jobId: job.id, to: job.data?.to, priority: priority.name, priorityLevel: priority.level, stage: s, at: new Date().toISOString() });
             }
           }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("send_timeout")), SEND_TIMEOUT_MS))
+          new Promise((_, reject) => {
+            sendTimeout = setTimeout(() => reject(new Error("send_timeout")), SEND_TIMEOUT_MS);
+          })
         ]);
         sendFailStreak = 0; // a success clears the streak
         recoverEscalations = 0; // and proves the browser is genuinely healthy again
         return result;
       } catch (error) {
+        if (error?.message === "send_timeout" && client.name === "android"
+            && androidOutbox.withdrawUnclaimed(gatewayTaskKey(job))) {
+          return waitForAndroidDevice(job, token);
+        }
         if (error?.code === "SEND_CANCELLED") {
           // A cooperative stop can mean "the consumer cancelled" or "the
           // lifecycle was invalidated". The ledger knows which.
@@ -1919,6 +1941,8 @@ function startSendWorker() {
           return deferConversationJob(job, error);
         }
         throw error;
+      } finally {
+        clearTimeout(sendTimeout);
       }
     },
     {
@@ -3616,8 +3640,8 @@ app.post("/api/v1/auth/credentials/remove", {
 
 app.get("/ready", {
   schema: {
-    summary: "Readiness check",
-    description: "Returns 200 if Google Messages is paired and ready to send/receive. Returns 503 if not paired. Use this before calling `/send` to verify readiness.",
+    summary: "Device readiness and SMS queue acceptance",
+    description: "Returns 200 when the active device transport is ready and 503 when it is unavailable. `status.queueAccepting` indicates whether `/send` can accept jobs regardless of device readiness.",
     tags: ["Session"],
     response: {
       200: { type: "object", properties: { ready: { type: "boolean" }, status: { type: "object", additionalProperties: true } } },
@@ -3637,6 +3661,7 @@ app.get("/ready", {
     ready: health.ready,
     status: {
       ...health,
+      queueAccepting: sendPowerOn && (health.ready || health.activeTransport === "android"),
       // Back-compat aliases for consumers that read the old shape.
       paired: health.ready,
       transport: health.activeTransport === "android"
@@ -3889,7 +3914,9 @@ app.post("/send", {
       "**Synchronous mode:** pass `\"wait\": true` to block until the send finishes",
       "(up to 90s) and receive the result directly. Use only for low-volume callers.",
       "",
-      "**Priority lanes:** use `critical` (purchase/renewal), `expired` (already expired),",
+    "Android messages are queued when the phone is offline and resume when it reconnects.",
+    "",
+    "**Priority lanes:** use `critical` (purchase/renewal), `expired` (already expired),",
       "`expiring` (near expiry; default), or `announcement` (bulk/lowest). Lower numeric",
       "levels run first and every lane remains FIFO. Legacy `high` maps to `critical`;",
       "legacy `normal` maps to `expiring`.",
@@ -4037,23 +4064,6 @@ app.post("/send", {
   if (!sendPowerOn) {
     reply.code(503).send({ error: "powered_off", message: "Sending is powered off. No messages will be sent until power-on." });
     return;
-  }
-
-  // Active transport: the phone is the only delivery path in android mode.
-  // Pull mode: the phone connects to US, so "ready" means a device has an
-  // active long-poll; push mode probes the phone directly. Fail closed with
-  // 503 like powered_off so Eve treats it as "retry later", never an error.
-  if (client.name === "android") {
-    let phone;
-    if (client.pullMode && client.outbox) {
-      phone = client.outbox.readyState();
-    } else {
-      phone = await client.readyState();
-    }
-    if (!phone.paired) {
-      reply.code(503).send({ error: "android_gateway_unreachable", message: "No Android gateway device is connected (pull) or reachable (push). No messages will be queued until a device checks in." });
-      return;
-    }
   }
 
   // Per-project rate limit (only applies to project API keys, not master)
@@ -5996,5 +6006,5 @@ if (require.main === module) {
 
 module.exports = { app, deviceKeyStore, agentAuthService };
 if (config.appEnv === "test") {
-  module.exports.__testing = { apiKeyStore, sendQueue, sendStore, rateBuckets };
+  module.exports.__testing = { apiKeyStore, sendQueue, sendStore, rateBuckets, client, startSendWorker };
 }

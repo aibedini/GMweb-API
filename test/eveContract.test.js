@@ -60,7 +60,7 @@ test("production Fastify accepts Eve /send and denies unscoped commands", async 
 
   const { app, __testing } = require("../src/server");
   assert.equal(require("../src/config").apiToken, "contract-master-token");
-  const { apiKeyStore, sendQueue, sendStore, rateBuckets } = __testing;
+  const { apiKeyStore, sendQueue, sendStore, rateBuckets, client, startSendWorker } = __testing;
   const linkedSessions = require("../src/linkedSessions");
   const readToken = linkedSessions.issue("read-only-contract-browser", ["MARK_READ"]);
   const readCookie = { cookie: `${linkedSessions.COOKIE_NAME}=${readToken}` };
@@ -99,6 +99,11 @@ test("production Fastify accepts Eve /send and denies unscoped commands", async 
     authorization: `Bearer ${key.token}`,
     "idempotency-key": "eve-contract-idempotency",
   };
+  await client.setTransport("android");
+  t.after(() => client.setTransport("chrome"));
+  const ready = await app.inject({ method: "GET", url: "/ready", headers });
+  assert.equal(ready.statusCode, 503, ready.payload);
+  assert.equal(ready.json().status.queueAccepting, true);
   const response = await app.inject({
     method: "POST",
     url: "/send",
@@ -112,6 +117,23 @@ test("production Fastify accepts Eve /send and denies unscoped commands", async 
   assert.equal(response.json().statusUrl, "/send/status/contract-request");
   assert.equal(response.json().terminal, false);
   assert.equal(response.json().successful, null);
+
+  let processor;
+  sendQueue.startWorker = (callback) => { processor = callback; };
+  startSendWorker();
+  const delays = [];
+  const job = { id: "contract-job", data: { to: "+989121234567", text: "contract", priority: "critical", _ledgerId: 1 },
+    moveToDelayed: async (_at, token) => { delays.push(token); } };
+  await assert.rejects(processor(job, "worker-token"), { name: "DelayedError" });
+  assert.deepEqual(delays, ["worker-token"]);
+  assert.equal(client.outbox.stats().pending, 0, "offline job stays in BullMQ, before phone handoff");
+  const phone = client.outbox.take(1000);
+  const worker = processor(job, "worker-token");
+  const task = await phone;
+  assert.equal(task.requestId, "contract-request");
+  assert.equal(client.outbox.ack(task.requestId, true, {}), true);
+  assert.equal((await worker).type, "sent");
+  assert.deepEqual(delays, ["worker-token"]);
 
   const durableRow = {
     id: 1, key_name: "eve-runtime-contract", job_id: "contract-job",

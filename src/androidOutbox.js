@@ -244,6 +244,15 @@ class AndroidOutbox {
     return null;
   }
 
+  /** Withdraw a timed-out task only when it has never reached a phone. */
+  withdrawUnclaimed(requestId) {
+    const entry = this.pending.get(requestId);
+    if (!entry || entry.claimedAt !== null) return false;
+    this.pending.delete(requestId);
+    this.#settleWaiters(entry, "reject", new Error("waiting_for_device"));
+    return true;
+  }
+
   /** Settle every worker waiting on this task exactly once. */
   #settleWaiters(entry, kind, payload) {
     const waiters = entry?.waiters || [];
