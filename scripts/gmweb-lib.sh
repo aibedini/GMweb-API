@@ -44,10 +44,11 @@ ensure_zstd() {
   echo "zstd not found — installing once..."
 
   if command -v apt-get >/dev/null 2>&1; then
-    # DPkg::Lock::Timeout bounds the wait instead of blocking forever.
-    if DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 update >/dev/null 2>&1 &&
-       DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 \
-         install -y --no-install-recommends zstd >/dev/null 2>&1 &&
+    # DPkg::Lock::Timeout bounds the wait instead of blocking forever, and NEEDRESTART_MODE=l
+    # keeps the restart dialog (which cannot be answered from an updater) out of the way.
+    if DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=30 update >/dev/null 2>&1 </dev/null &&
+       DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -o DPkg::Lock::Timeout=30 \
+         install -y --no-install-recommends zstd >/dev/null 2>&1 </dev/null &&
        command -v zstd >/dev/null 2>&1; then
       echo "✓ zstd installed: $(zstd --version 2>/dev/null | head -1)"
       return 0

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Installing nginx/certbot must never hand the terminal to needrestart's blocking
+# "Daemons using outdated libraries / Which services should be restarted?" dialog.
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l UCF_FORCE_CONFFOLD=1
+export APT_LISTCHANGES_FRONTEND=none
+
 APP_NAME="${APP_NAME:-GMweb API}"
 APP_DIR="${APP_DIR:-/opt/gmweb-api}"
 APP_USER="${APP_USER:-gmweb}"
@@ -76,8 +81,8 @@ install_public_dashboard() {
   fi
 
   echo "==> Installing Nginx and Certbot"
-  apt-get update
-  apt-get install -y nginx certbot python3-certbot-nginx
+  apt-get -o DPkg::Lock::Timeout=120 update </dev/null
+  apt-get install -y -o DPkg::Lock::Timeout=120 nginx certbot python3-certbot-nginx </dev/null
 
   echo "==> Creating dashboard login credentials"
   local dashboard_user="${GMWEB_DASHBOARD_USER:-gmwebadmin}"

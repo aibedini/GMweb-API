@@ -103,6 +103,48 @@ https://dashboard.example.com/dashboard
 The normal installer already configures HTTPS automatically. Run this command
 only to replace the automatic `nip.io` address or repair HTTPS.
 
+## 7. Install Stops At "Daemons using outdated libraries"
+
+A screen like this is **not** the installer asking a question:
+
+```text
+┌ Daemons using outdated libraries ─┐
+│ Which services should be restarted? │
+│ [ ] packagekit.service              │
+│ [ ] unattended-upgrades.service     │
+│        <Ok>          <Cancel>       │
+└─────────────────────────────────────┘
+```
+
+It is `needrestart`, which Ubuntu runs as an `apt` hook after library upgrades.
+It takes over the terminal, and on a headless VPS — or when the installer is piped
+into `bash` — it cannot be answered: Enter and the arrow keys do nothing (they may
+appear as literal `^[[A^[[B`), and the install waits there forever.
+
+Current installers never reach this screen: every `apt` call runs with
+`DEBIAN_FRONTEND=noninteractive`, `NEEDRESTART_MODE=l` (list only — never prompt,
+never restart a daemon behind your back), bounded dpkg lock waits and
+`--force-confold`. On start they also repair the half-configured dpkg state that a
+previously interrupted run leaves behind, so re-running the install is safe.
+
+If a machine is stuck right now, open a second SSH session and run:
+
+```bash
+sudo pkill -f needrestart; sudo pkill -f whiptail
+sudo dpkg --configure -a
+sudo apt-get -f install -y
+```
+
+Then re-run the install (option 1 of `sudo gmweb-install`, or the `curl` command
+above). To keep the dialog away from every future manual `apt` run on that box:
+
+```bash
+echo "\$nrconf{restart} = 'l';" | sudo tee /etc/needrestart/conf.d/99-list-only.conf
+```
+
+Reboot once the install has finished so upgraded libraries reach the running
+daemons (`needrestart` only lists them in this mode).
+
 ## Speed Notes
 
 `POLL_INTERVAL_MS=0` is the default production setting. This prevents background

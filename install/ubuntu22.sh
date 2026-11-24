@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# apt must never open a dialog: needrestart's "Which services should be restarted?"
+# whiptail screen blocks an unattended install and cannot be answered when stdin is a
+# pipe. List-only mode exits immediately; the operator reboots when convenient.
+export DEBIAN_FRONTEND=noninteractive
+export DEBCONF_NONINTERACTIVE_SEEN=true
+export APT_LISTCHANGES_FRONTEND=none
+export NEEDRESTART_MODE=l
+export UCF_FORCE_CONFFOLD=1
+
+# `curl … | sudo bash` gives the interpreter the pipe as stdin, and a child process can
+# inherit it before bash has consumed the whole script. Detach so nothing can eat it.
+if [[ ! -t 0 && -r /dev/tty ]]; then exec </dev/tty; fi
+
 APP_NAME="GMweb API"
 APP_SLUG="gmweb-api"
 APP_USER="${APP_USER:-gmweb}"
@@ -60,8 +73,34 @@ if [[ "$(lsb_release -rs 2>/dev/null || true)" != "22.04" ]]; then
 fi
 
 echo "==> Installing system packages"
-apt-get update
-apt-get install -y ca-certificates curl wget gnupg git rsync sudo tar xvfb x11vnc fluxbox novnc websockify redis-server jq logrotate
+# ── headless apt ──────────────────────────────────────────────────────────────
+# needrestart is an apt hook, so the exported policy is persisted where it reads it;
+# a later manual apt run must not resurrect the blocking dialog either.
+needrestart_headless() {
+  install -d -m 0755 /etc/needrestart/conf.d 2>/dev/null || return 0
+  cat >/etc/needrestart/conf.d/99-gmweb-headless.conf <<'NR' || true
+# Managed by the GMweb installer: list daemons that need a restart, never prompt.
+$nrconf{restart} = 'l';
+NR
+}
+
+apt_update() { apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 update </dev/null; }
+
+apt_install() {
+  needrestart_headless
+  apt-get install -y -o DPkg::Lock::Timeout=120 \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+    "$@" </dev/null
+}
+
+# A previous run killed at the needrestart prompt leaves dpkg half-configured and every
+# retry dies with "dpkg was interrupted". Recover before installing anything.
+needrestart_headless
+apt-get -y -o DPkg::Lock::Timeout=120 -f install </dev/null || true
+dpkg --configure -a </dev/null || true
+
+apt_update
+apt_install ca-certificates curl wget gnupg git rsync sudo tar xvfb x11vnc fluxbox novnc websockify redis-server jq logrotate
 systemctl enable --now redis-server
 
 # ── Log hygiene (bounded disk) ──────────────────────────────────────────────
@@ -71,7 +110,7 @@ systemctl enable --now redis-server
 # /var/log/btmp to 301 MB of brute-force login records. Ubuntu's default
 # journald has no size cap at all.
 if ! command -v logrotate >/dev/null 2>&1; then
-  apt-get install -y logrotate || true
+  apt_install logrotate || true
 fi
 systemctl enable --now logrotate.timer 2>/dev/null || true
 
@@ -101,7 +140,7 @@ LOGROTATE
 if ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'Number(process.versions.node.split(`.`)[0])')" -lt 20 ]]; then
   echo "==> Installing Node.js 22"
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  apt-get install -y nodejs
+  apt_install nodejs
 fi
 
 if ! command -v google-chrome >/dev/null 2>&1; then
@@ -111,8 +150,8 @@ if ! command -v google-chrome >/dev/null 2>&1; then
     | gpg --dearmor -o /etc/apt/keyrings/google-linux.gpg
   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
     > /etc/apt/sources.list.d/google-chrome.list
-  apt-get update
-  apt-get install -y google-chrome-stable
+  apt_update
+  apt_install google-chrome-stable
 fi
 
 if ! id "$APP_USER" >/dev/null 2>&1; then

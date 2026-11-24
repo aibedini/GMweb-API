@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Purging packages must never open needrestart's interactive restart dialog.
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l UCF_FORCE_CONFFOLD=1
+export APT_LISTCHANGES_FRONTEND=none
+
 APP_NAME="${APP_NAME:-GMweb API}"
 APP_USER="${APP_USER:-gmweb}"
 APP_DIR="${APP_DIR:-/opt/gmweb-api}"
@@ -129,10 +133,10 @@ maybe_purge_packages() {
 
   if [[ "$PURGE_PACKAGES" == "true" ]]; then
     echo "==> Purging optional packages"
-    apt-get purge -y google-chrome-stable xvfb x11vnc fluxbox novnc websockify || true
+    apt-get purge -y -o DPkg::Lock::Timeout=120 google-chrome-stable xvfb x11vnc fluxbox novnc websockify </dev/null || true
     rm -f /etc/apt/sources.list.d/google-chrome.list
     rm -f /etc/apt/keyrings/google-linux.gpg
-    apt-get autoremove -y || true
+    apt-get autoremove -y -o DPkg::Lock::Timeout=120 </dev/null || true
   fi
 }
 
