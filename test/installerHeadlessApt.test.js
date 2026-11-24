@@ -123,7 +123,36 @@ test("supporting scripts install packages headlessly too", () => {
   assert.match(lib, /DPkg::Lock::Timeout=30/);
 });
 
+test("a piped installer can reattach to a terminal without dying when there is none", () => {
+  // `exec </dev/tty` without a controlling terminal aborts a non-interactive shell. The
+  // guard therefore has to be defensive, and both installers must use it.
+  assert.match(installer, /^detach_piped_stdin\(\) \{/m);
+  assert.match(legacyInstaller, /^detach_piped_stdin\(\) \{/m);
+  assert.match(installer, /^detach_piped_stdin$/m);
+  assert.match(legacyInstaller, /^detach_piped_stdin$/m);
+});
+
 // ── behavioural check of the real helpers ────────────────────────────────────
+
+test("detach_piped_stdin survives a session with no controlling terminal", { skip: bash ? false : "bash not available" }, () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-detach-"));
+  const toPosix = (value) => value.replace(/\\/g, "/");
+  const probe = path.join(tmp, "detach.sh");
+  fs.writeFileSync(probe, [
+    "set -euo pipefail",
+    'GMWEB_INSTALL_LIB_ONLY=1 source "$1"',
+    "detach_piped_stdin",
+    'echo survived',
+  ].join("\n"));
+
+  // stdin is a file, stdout is a pipe here: no tty at either end, like an SSH exec.
+  const result = spawnSync(bash, [toPosix(probe), toPosix(path.join(root, "install/quick-install.sh"))], {
+    cwd: root,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, `the guard must not abort the script: ${result.stderr}`);
+  assert.equal(result.stdout.trim(), "survived");
+});
 
 test("apt_get and apt_repair behave as declared", { skip: bash ? false : "bash not available" }, () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gmweb-headless-apt-"));

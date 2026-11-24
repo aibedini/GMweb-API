@@ -154,6 +154,18 @@ apt_get() { # apt_get <apt-get args…> — always -y, non-interactive, never on
     "$@" </dev/null
 }
 
+# `curl … | sudo bash` gives the interpreter the pipe as stdin, and a child process can
+# inherit it before bash has consumed the whole script. Reattach to a real terminal when
+# one exists. The checks are deliberately defensive: `exec </dev/tty` on a host without a
+# controlling terminal is a redirection error, and bash kills a non-interactive shell for
+# it — which turns an unattended SSH run into an instant, confusing failure.
+detach_piped_stdin() {
+  if [[ -t 0 ]]; then return 0; fi
+  if [[ ! -t 1 ]]; then return 0; fi
+  if ! ( : </dev/tty ) 2>/dev/null; then return 0; fi
+  exec </dev/tty
+}
+
 svc_active() { systemctl is-active --quiet "$1" 2>/dev/null && echo "${GRN}active${RST}" || echo "${RED}inactive${RST}"; }
 port_busy()  { ss -ltn 2>/dev/null | grep -q ":$1 "; }
 
@@ -895,10 +907,8 @@ if [[ "${GMWEB_INSTALL_LIB_ONLY:-0}" == "1" ]]; then
   return 0 2>/dev/null || exit 0
 fi
 
-# `curl … | sudo bash` gives the interpreter the pipe as stdin, and a child process can
-# inherit it before bash has consumed the whole script. Detach from it so apt, needrestart
-# or npm can never swallow the remaining lines. Prompts already read /dev/tty directly.
-if [[ ! -t 0 && -r /dev/tty ]]; then exec </dev/tty; fi
+# `curl … | sudo bash` gives the interpreter the pipe as stdin; reattach before any prompt.
+detach_piped_stdin
 
 require_root "$@"
 mkdir -p "$LOG_DIR" "$STATE_DIR"

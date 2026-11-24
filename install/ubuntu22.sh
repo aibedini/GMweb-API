@@ -11,8 +11,16 @@ export NEEDRESTART_MODE=l
 export UCF_FORCE_CONFFOLD=1
 
 # `curl … | sudo bash` gives the interpreter the pipe as stdin, and a child process can
-# inherit it before bash has consumed the whole script. Detach so nothing can eat it.
-if [[ ! -t 0 && -r /dev/tty ]]; then exec </dev/tty; fi
+# inherit it before bash has consumed the whole script. Reattach to a real terminal when
+# one exists. Every step is checked: `exec </dev/tty` without a controlling terminal is a
+# redirection error, and under `set -e` bash exits the whole installer for it.
+detach_piped_stdin() {
+  if [[ -t 0 ]]; then return 0; fi
+  if [[ ! -t 1 ]]; then return 0; fi
+  if ! ( : </dev/tty ) 2>/dev/null; then return 0; fi
+  exec </dev/tty
+}
+detach_piped_stdin
 
 APP_NAME="GMweb API"
 APP_SLUG="gmweb-api"
