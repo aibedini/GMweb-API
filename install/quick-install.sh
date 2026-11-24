@@ -389,7 +389,7 @@ WorkingDirectory=$APP_DIR
 Environment=NODE_ENV=production
 Environment=TZ=$SERVER_TIMEZONE
 # ADR-007 requires PUBLIC_WEB_ORIGIN / PUBLIC_API_ORIGIN in the process environment. Relying
-# on dotenv resolving `.env` from the working directory is what produced the production
+# on dotenv resolving \`.env\` from the working directory is what produced the production
 # restart loop, so systemd delivers the file directly. The leading '-' keeps the unit
 # startable before .env exists.
 EnvironmentFile=-$APP_DIR/.env

@@ -123,6 +123,39 @@ test("supporting scripts install packages headlessly too", () => {
   assert.match(lib, /DPkg::Lock::Timeout=30/);
 });
 
+/** Bodies of unquoted heredocs, where the shell still expands backticks and $(). */
+function unquotedHeredocBodies(text) {
+  const lines = text.split("\n");
+  const bodies = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const opener = lines[i].match(/<<-?\s*([A-Za-z_][A-Za-z0-9_]*)\s*$/);
+    if (!opener) continue;
+    const delimiter = opener[1];
+    const body = [];
+    for (i += 1; i < lines.length && lines[i].trim() !== delimiter; i += 1) body.push(lines[i]);
+    bodies.push(body);
+  }
+  return bodies;
+}
+
+test("systemd unit comments cannot execute commands while the installer runs", () => {
+  // Real incident: the gmweb-api.service heredoc is unquoted (it needs $APP_DIR), so a
+  // comment written as `npm start` ran `npm start` during the install, and `.env` ran
+  // `.env`. Both errors landed in the log and the unit file lost its comment text.
+  for (const [name, text] of Object.entries({
+    "install/quick-install.sh": installer,
+    "install/ubuntu22.sh": legacyInstaller,
+  })) {
+    for (const body of unquotedHeredocBodies(text)) {
+      for (const line of body) {
+        if (!line.trimStart().startsWith("#")) continue;
+        const unescaped = line.replace(/\\`/g, "");
+        assert.ok(!unescaped.includes("`"), `${name}: a backtick in a heredoc comment runs a command: ${line.trim()}`);
+      }
+    }
+  }
+});
+
 test("a piped installer can reattach to a terminal without dying when there is none", () => {
   // `exec </dev/tty` without a controlling terminal aborts a non-interactive shell. The
   // guard therefore has to be defensive, and both installers must use it.
