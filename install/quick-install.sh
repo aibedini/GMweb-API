@@ -9,6 +9,21 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 set -uo pipefail
 
+# ── apt/dpkg must never stop and wait for a human ─────────────────────────────
+# On Ubuntu 22.04 an `apt-get install` ends by handing the terminal to needrestart,
+# which draws a whiptail "Daemons using outdated libraries / Which services should be
+# restarted?" dialog. On a headless VPS — and even more so on a `curl … | bash` run,
+# where the script itself owns stdin — that dialog cannot be answered: the installer
+# sits there forever (keys show up as literal `^[[A^[[B`), and every later apt call
+# then fails on the dpkg lock the interrupted run left behind. These are exported
+# before anything else runs so every child process (apt-get, dpkg, its maintainer
+# script hooks, npm postinstalls) inherits a non-interactive policy.
+export DEBIAN_FRONTEND=noninteractive
+export DEBCONF_NONINTERACTIVE_SEEN=true
+export APT_LISTCHANGES_FRONTEND=none
+export NEEDRESTART_MODE=l        # l = list only: never prompt, never restart a daemon
+export UCF_FORCE_CONFFOLD=1      # keep local conffiles instead of asking
+
 # ── Identity / defaults ───────────────────────────────────────────────────────
 APP_NAME="GMweb API"
 APP_SLUG="gmweb-api"
@@ -81,6 +96,64 @@ logged() { # logged <cmd...> — run, echo, and append output to install.log
   return "${PIPESTATUS[0]}"
 }
 
+# ── Headless apt helpers ──────────────────────────────────────────────────────
+# needrestart runs as an apt hook, so an exported variable alone is not durable: a
+# later manual `apt` (or unattended-upgrades) would show the dialog again. Persist the
+# policy where needrestart reads it. The drop-in directory may not exist before
+# needrestart is installed; creating it is harmless and takes effect when it lands.
+needrestart_headless() {
+  local dir="${NEEDRESTART_CONF_DIR:-/etc/needrestart/conf.d}"
+  install -d -m 0755 "$dir" 2>/dev/null || return 0
+  cat >"$dir/99-gmweb-headless.conf" <<'NR' || true
+# Managed by the GMweb installer (install/quick-install.sh).
+# 'l' lists the daemons that would need a restart and exits: no whiptail prompt, and no
+# automatic restart of a daemon this installer does not own. A reboot hint is printed
+# when /run/reboot-required exists.
+$nrconf{restart} = 'l';
+NR
+}
+
+apt_wait_lock() {
+  local i
+  for i in $(seq 1 90); do
+    if ! fuser -s /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+                  /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null; then
+      return 0
+    fi
+    (( i == 1 )) && info "Waiting for another apt/dpkg run to release its lock…"
+    sleep 2
+  done
+  warn "apt/dpkg is still locked after three minutes — continuing anyway."
+}
+
+apt_repair() {
+  # A run killed at the needrestart dialog leaves dpkg half-configured, and every retry
+  # then dies with "dpkg was interrupted, you must manually run 'dpkg --configure -a'".
+  # That is why "just install it again" looked broken. Recover instead of failing.
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -f needrestart >/dev/null 2>&1
+    pkill -f whiptail >/dev/null 2>&1
+    true
+  fi
+  apt_wait_lock
+  if dpkg --audit 2>/dev/null | grep -q '[^[:space:]]'; then
+    warn "dpkg has unfinished configuration (an earlier run was interrupted) — repairing."
+    logged dpkg --configure -a </dev/null || true
+  fi
+  logged apt-get -y -o DPkg::Lock::Timeout=120 -f install </dev/null || true
+}
+
+apt_get() { # apt_get <apt-get args…> — always -y, non-interactive, never on the tty
+  needrestart_headless
+  apt_wait_lock
+  logged apt-get -y \
+    -o DPkg::Lock::Timeout=120 \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold \
+    -o Acquire::Retries=3 \
+    "$@" </dev/null
+}
+
 svc_active() { systemctl is-active --quiet "$1" 2>/dev/null && echo "${GRN}active${RST}" || echo "${RED}inactive${RST}"; }
 port_busy()  { ss -ltn 2>/dev/null | grep -q ":$1 "; }
 
@@ -112,15 +185,19 @@ preflight() {
 # ── 1. Full install ───────────────────────────────────────────────────────────
 install_packages() {
   step "Installing system packages (Chrome, Redis, VNC, Node)"
-  export DEBIAN_FRONTEND=noninteractive
-  logged apt-get update
-  logged apt-get install -y ca-certificates curl wget gnupg git rsync sudo tar \
-        xvfb x11vnc fluxbox novnc websockify redis-server jq
+  needrestart_headless
+  apt_repair
+  apt_get update
+  apt_get install ca-certificates curl wget gnupg git rsync sudo tar \
+        xvfb x11vnc fluxbox novnc websockify redis-server jq || {
+    err "apt could not install the base packages — see $INSTALL_LOG"
+    return 1
+  }
 
   if ! command -v node >/dev/null 2>&1 || (( $(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0) < 20 )); then
     step "Installing Node.js 22"
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >>"$INSTALL_LOG" 2>&1
-    logged apt-get install -y nodejs
+    apt_get install nodejs || { err "apt could not install Node.js — see $INSTALL_LOG"; return 1; }
   else
     ok "Node $(node -v) already present"
   fi
@@ -130,14 +207,16 @@ install_packages() {
     install -d -m 0755 /etc/apt/keyrings
     wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-linux.gpg
     echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >/etc/apt/sources.list.d/google-chrome.list
-    logged apt-get update
-    logged apt-get install -y google-chrome-stable
+    apt_get update
+    apt_get install google-chrome-stable || { err "apt could not install Chrome — see $INSTALL_LOG"; return 1; }
   else
     ok "Chrome already present"
   fi
 
   systemctl enable --now redis-server >>"$INSTALL_LOG" 2>&1 || true
   redis-cli ping >/dev/null 2>&1 && ok "Redis running" || warn "Redis not responding — queue won't work until it does."
+  [[ -f /run/reboot-required ]] && warn "Library upgrades need a reboot to reach every daemon. The needrestart dialog is suppressed on purpose — reboot once the install is complete."
+  return 0
 }
 
 configure_timezone() {
@@ -485,7 +564,13 @@ show_credentials() {
 do_full_install() {
   banner; preflight || { pause; return; }
   echo; confirm "Proceed with full install?" || return
-  configure_timezone && install_packages && sync_app && write_env && install_systemd && start_core
+  # Stop at the first failed stage. Printing credentials after a half-finished install
+  # claimed success for a server that was never started.
+  if ! { configure_timezone && install_packages && sync_app && write_env && install_systemd && start_core; }; then
+    err "The install did not complete. Fix the error above and run option 1 again — it is safe to re-run."
+    pause
+    return 1
+  fi
   show_credentials
   echo
   if confirm "Google Messages is not paired yet. Run the pairing wizard now?"; then
@@ -655,7 +740,7 @@ security_audit() {
   hr
 }
 firewall_lockdown() {
-  command -v ufw >/dev/null 2>&1 || { logged apt-get install -y ufw; }
+  command -v ufw >/dev/null 2>&1 || { apt_get install ufw; }
   ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1
   ufw allow "$APP_PORT/tcp" >/dev/null 2>&1
   confirm "Also allow 80/443 (for public dashboard)?" && { ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null; }
@@ -754,9 +839,9 @@ do_uninstall() {
 
   if [[ "$purge" == true ]]; then
     step "Purging packages (Chrome, VNC, Redis)"
-    apt-get purge -y google-chrome-stable xvfb x11vnc fluxbox novnc websockify redis-server 2>/dev/null || true
+    apt_get purge google-chrome-stable xvfb x11vnc fluxbox novnc websockify redis-server 2>/dev/null || true
     rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/keyrings/google-linux.gpg
-    apt-get autoremove -y 2>/dev/null || true
+    apt_get autoremove 2>/dev/null || true
   fi
 
   ok "GMweb removed."
@@ -803,6 +888,17 @@ main_menu() {
     esac
   done
 }
+
+# Tests source this file with GMWEB_INSTALL_LIB_ONLY=1 to exercise the helpers above
+# without opening the menu or touching the machine.
+if [[ "${GMWEB_INSTALL_LIB_ONLY:-0}" == "1" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+# `curl … | sudo bash` gives the interpreter the pipe as stdin, and a child process can
+# inherit it before bash has consumed the whole script. Detach from it so apt, needrestart
+# or npm can never swallow the remaining lines. Prompts already read /dev/tty directly.
+if [[ ! -t 0 && -r /dev/tty ]]; then exec </dev/tty; fi
 
 require_root "$@"
 mkdir -p "$LOG_DIR" "$STATE_DIR"

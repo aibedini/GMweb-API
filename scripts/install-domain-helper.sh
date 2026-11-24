@@ -9,6 +9,10 @@
 # --with-packages additionally installs nginx and certbot (apt).
 set -euo pipefail
 
+# apt must stay non-interactive: needrestart's restart dialog would block this step.
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l UCF_FORCE_CONFFOLD=1
+export APT_LISTCHANGES_FRONTEND=none
+
 APP_USER="gmweb"
 WITH_PACKAGES=0
 while [[ $# -gt 0 ]]; do
@@ -30,8 +34,8 @@ SUDOERS=/etc/sudoers.d/gmweb-domain-helper
 
 if [[ "$WITH_PACKAGES" -eq 1 ]]; then
   echo "==> Installing nginx and certbot"
-  apt-get update
-  apt-get install -y nginx certbot python3-certbot-nginx
+  apt-get -o DPkg::Lock::Timeout=120 update </dev/null
+  apt-get install -y -o DPkg::Lock::Timeout=120 nginx certbot python3-certbot-nginx </dev/null
   systemctl enable --now nginx
 fi
 
